@@ -9,6 +9,7 @@ const vk = @import("gpu/vk.zig");
 const buffer = @import("gpu/buffer.zig");
 const pipeline = @import("gpu/pipeline.zig");
 const safetensors = @import("safetensors.zig");
+const model_mod = @import("model.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -21,6 +22,10 @@ pub fn main() !void {
 
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
         try runInspect(allocator, args[2]);
+        return;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--load")) {
+        try runLoad(allocator, args[2]);
         return;
     }
 
@@ -82,6 +87,51 @@ fn runInspect(allocator: std.mem.Allocator, path: []const u8) !void {
             });
         }
     }
+}
+
+// ── load: parse config + open shards + bind layer weights ────────────
+
+fn runLoad(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    const t0 = std.time.nanoTimestamp();
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const t1 = std.time.nanoTimestamp();
+    const load_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("Loaded {s}\n", .{dir_path});
+    try stdout.print("Load time: {d:.2} ms ({d} shard(s), {d} tensors)\n\n", .{
+        load_ms, model.shards.shards.len, model.shards.count(),
+    });
+    try model.config.print(stdout);
+    try stdout.print("\nLM head: {s}\n", .{
+        if (model.isLmHeadTied()) "tied (shares embed_tokens)" else "separate (lm_head.weight)",
+    });
+
+    // Sanity: walk every layer once and confirm we can read the first
+    // and last byte of each weight from the mmap. If a shard's offset
+    // table is wrong, that page-faults; if it's right, this is free.
+    var bytes_touched: usize = 0;
+    for (model.layers) |layer| {
+        inline for (.{
+            "input_layernorm",      "q_proj",     "k_proj",
+            "v_proj",               "o_proj",     "post_attention_layernorm",
+            "gate_proj",            "up_proj",    "down_proj",
+        }) |fname| {
+            const t = @field(layer, fname);
+            if (t.bytes.len > 0) {
+                bytes_touched +%= @intCast(t.bytes[0]);
+                bytes_touched +%= @intCast(t.bytes[t.bytes.len - 1]);
+            }
+        }
+    }
+    bytes_touched +%= @intCast(model.embed_tokens.bytes[0]);
+    bytes_touched +%= @intCast(model.final_norm.bytes[0]);
+    bytes_touched +%= @intCast(model.lm_head.bytes[0]);
+    // The xor folds the first/last byte of every weight into one word —
+    // a cheap way to force the OS to actually touch each tensor page.
+    // Print it so the optimizer can't elide the loop.
+    try stdout.print("\nPASS load (touch checksum: 0x{x})\n", .{bytes_touched});
 }
 
 // ── vec_add smoke: validates the whole Vulkan compute path ───────────
