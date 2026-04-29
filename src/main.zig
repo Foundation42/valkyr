@@ -17,6 +17,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
 const gpu_scratch = @import("gpu/scratch.zig");
+const gpu_recorder = @import("gpu/recorder.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -1304,18 +1305,13 @@ fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void 
     const vocab: u32 = @intCast(cfg.vocab_size);
     const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
 
-    const t_gpu0 = std.time.nanoTimestamp();
+    // ── Recorder: one command buffer for the whole forward pass ────
+    // Sizing: 291 dispatches at ~3 storage-buffer descriptors each =
+    // ~728 descriptors. Round up generously so we don't trip on any
+    // future kernel that adds bindings.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
+    defer rec.deinit();
 
-    // ── Embed lookup → residual stream ──────────────────────────────
-    try k_embed.bind(&.{ &gm.embed_tokens, &sc.stream });
-    const embed_push = EmbedLookupPush{
-        .token_id = token_id,
-        .dim = hidden,
-        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
-    };
-    try dispatch1D(&ctx, &k_embed, &embed_push, hidden);
-
-    // ── 18 transformer blocks ───────────────────────────────────────
     const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
     const add_push = AddInPlacePush{ .n = hidden };
     const attn_push = AttnDecodeSinglePush{
@@ -1336,66 +1332,53 @@ fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void 
         .theta_base = cfg.rope_theta,
     };
     const geglu_push = GegluPush{ .n = inter };
+    const embed_push = EmbedLookupPush{
+        .token_id = token_id,
+        .dim = hidden,
+        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+    };
 
+    const t_gpu0 = std.time.nanoTimestamp();
+
+    try rec.begin();
+
+    // Embed lookup → residual stream.
+    try recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+
+    // 18 transformer blocks.
     for (gm.layers) |*layer| {
-        // rmsnorm₁
-        try k_rmsnorm.bind(&.{ &sc.stream, &layer.input_layernorm, &sc.x_norm });
-        try dispatchPerRow(&ctx, &k_rmsnorm, &rms_push, 1);
+        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
 
-        // Q, K, V
-        try k_matmul.bind(&.{ &sc.x_norm, &layer.q_proj, &sc.q });
-        try dispatchMatmul(&ctx, &k_matmul, 1, q_dim, hidden);
-        try k_matmul.bind(&.{ &sc.x_norm, &layer.k_proj, &sc.k });
-        try dispatchMatmul(&ctx, &k_matmul, 1, kv_dim, hidden);
-        try k_matmul.bind(&.{ &sc.x_norm, &layer.v_proj, &sc.v });
-        try dispatchMatmul(&ctx, &k_matmul, 1, kv_dim, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.q_proj, &sc.q }, 1, q_dim, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.k_proj, &sc.k }, 1, kv_dim, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.v_proj, &sc.v }, 1, kv_dim, hidden);
 
-        // RoPE on Q and K (pos=0; identity here, kept for layout symmetry)
-        try k_rope.bind(&.{ &sc.q, &sc.q_rot });
-        try dispatchRope(&ctx, &k_rope, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
-        try k_rope.bind(&.{ &sc.k, &sc.k_rot });
-        try dispatchRope(&ctx, &k_rope, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+        try recDispatchRope(&rec, &k_rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+        try recDispatchRope(&rec, &k_rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
 
-        // Attention (single-position degenerate → head_out = V replicated)
-        try k_attn.bind(&.{ &sc.v, &sc.head_out });
-        try dispatch1D(&ctx, &k_attn, &attn_push, q_dim);
+        try recDispatch1D(&rec, &k_attn, &.{ &sc.v, &sc.head_out }, &attn_push, q_dim);
 
-        // o_proj
-        try k_matmul.bind(&.{ &sc.head_out, &layer.o_proj, &sc.attn_out });
-        try dispatchMatmul(&ctx, &k_matmul, 1, hidden, q_dim);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.head_out, &layer.o_proj, &sc.attn_out }, 1, hidden, q_dim);
 
-        // residual stream += attn_out
-        try k_add.bind(&.{ &sc.stream, &sc.attn_out });
-        try dispatch1D(&ctx, &k_add, &add_push, hidden);
+        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
 
-        // rmsnorm₂
-        try k_rmsnorm.bind(&.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm });
-        try dispatchPerRow(&ctx, &k_rmsnorm, &rms_push, 1);
+        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
 
-        // gate, up, geglu, down
-        try k_matmul.bind(&.{ &sc.mid_norm, &layer.gate_proj, &sc.gate });
-        try dispatchMatmul(&ctx, &k_matmul, 1, inter, hidden);
-        try k_matmul.bind(&.{ &sc.mid_norm, &layer.up_proj, &sc.up });
-        try dispatchMatmul(&ctx, &k_matmul, 1, inter, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
 
-        try k_geglu.bind(&.{ &sc.gate, &sc.up, &sc.fused });
-        try dispatch1D(&ctx, &k_geglu, &geglu_push, inter);
+        try recDispatch1D(&rec, &k_geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
 
-        try k_matmul.bind(&.{ &sc.fused, &layer.down_proj, &sc.ffn_out });
-        try dispatchMatmul(&ctx, &k_matmul, 1, hidden, inter);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
 
-        // residual stream += ffn_out
-        try k_add.bind(&.{ &sc.stream, &sc.ffn_out });
-        try dispatch1D(&ctx, &k_add, &add_push, hidden);
+        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
     }
 
-    // ── Final rmsnorm ───────────────────────────────────────────────
-    try k_rmsnorm.bind(&.{ &sc.stream, &gm.final_norm, &sc.final_norm_out });
-    try dispatchPerRow(&ctx, &k_rmsnorm, &rms_push, 1);
+    // Final rmsnorm + LM head.
+    try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+    try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
 
-    // ── LM head: matmul against the embedding (tied) ───────────────
-    try k_matmul.bind(&.{ &sc.final_norm_out, &gm.lm_head, &sc.logits });
-    try dispatchMatmul(&ctx, &k_matmul, 1, vocab, hidden);
+    try rec.endAndSubmit();
 
     const t_gpu1 = std.time.nanoTimestamp();
     const gpu_ms = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
@@ -1408,7 +1391,37 @@ fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void 
     const sampled = cpu_forward.argmax(logits);
     const out_str = tok.decode(sampled) orelse "<unknown>";
 
-    try stdout.print("forward (GPU, ~291 dispatches via submitOneShot): {d:.0} ms\n", .{gpu_ms});
+    try stdout.print("forward (GPU, ~291 dispatches in 1 command buffer): {d:.0} ms\n", .{gpu_ms});
+
+    // A second forward to measure the warm-cache time. Recorder needs
+    // to be reset before re-recording.
+    try rec.reset();
+    const t_warm0 = std.time.nanoTimestamp();
+    try rec.begin();
+    try recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+    for (gm.layers) |*layer| {
+        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.q_proj, &sc.q }, 1, q_dim, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.k_proj, &sc.k }, 1, kv_dim, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.v_proj, &sc.v }, 1, kv_dim, hidden);
+        try recDispatchRope(&rec, &k_rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+        try recDispatchRope(&rec, &k_rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+        try recDispatch1D(&rec, &k_attn, &.{ &sc.v, &sc.head_out }, &attn_push, q_dim);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.head_out, &layer.o_proj, &sc.attn_out }, 1, hidden, q_dim);
+        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
+        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
+        try recDispatch1D(&rec, &k_geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
+        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
+        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
+    }
+    try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+    try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    try rec.endAndSubmit();
+    const t_warm1 = std.time.nanoTimestamp();
+    const warm_ms = @as(f64, @floatFromInt(t_warm1 - t_warm0)) / 1_000_000.0;
+    try stdout.print("forward (warm, 2nd pass)                          : {d:.0} ms\n", .{warm_ms});
 
     const k_top: usize = 5;
     const top = try topK(gpa, logits, k_top);
@@ -1687,6 +1700,59 @@ fn cpuLayer0Forward(gpa: std.mem.Allocator, cpu: *const model_mod.Model, token_i
     for (stream, ffn_out) |*s, f| s.* += f;
 
     return stream;
+}
+
+// ── Recorder-based dispatch helpers (one command buffer for whole pass) ──
+
+fn recDispatch1D(
+    rec: *gpu_recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    push: anytype,
+    n: u32,
+) !void {
+    const local: u32 = 256;
+    const groups: u32 = (n + local - 1) / local;
+    try rec.dispatch(kern, bufs, push, groups, 1, 1);
+}
+
+fn recDispatchPerRow(
+    rec: *gpu_recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    push: anytype,
+    n_rows: u32,
+) !void {
+    try rec.dispatch(kern, bufs, push, n_rows, 1, 1);
+}
+
+fn recDispatchMatmul(
+    rec: *gpu_recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    m: u32,
+    n: u32,
+    k: u32,
+) !void {
+    const local_xy: u32 = 16;
+    const gx: u32 = (m + local_xy - 1) / local_xy;
+    const gy: u32 = (n + local_xy - 1) / local_xy;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    try rec.dispatch(kern, bufs, &push, gx, gy, 1);
+}
+
+fn recDispatchRope(
+    rec: *gpu_recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    push: *const RopePush,
+    n_heads: usize,
+    head_dim: usize,
+) !void {
+    const local: u32 = 256;
+    const pairs: u32 = @intCast(n_heads * (head_dim / 2));
+    const groups: u32 = (pairs + local - 1) / local;
+    try rec.dispatch(kern, bufs, push, groups, 1, 1);
 }
 
 // ── Dispatch helpers — keep call sites readable ──────────────────────
