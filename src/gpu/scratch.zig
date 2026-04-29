@@ -20,6 +20,13 @@ pub const GpuScratch = struct {
     /// Residual stream — flows through every layer. Written by embed
     /// lookup, then read+written by each layer's two residual adds.
     stream: buffer.Buffer,
+    /// Final-norm output and LM head input. Separate from `stream` so
+    /// the read-only post-norm view doesn't alias the residual that
+    /// later steps might still want.
+    final_norm_out: buffer.Buffer,
+    /// LM head output — one fp32 per vocab token. 1 MiB at vocab_size
+    /// = 256000.
+    logits: buffer.Buffer,
 
     // Per-layer reused scratch.
     x_norm: buffer.Buffer,
@@ -44,25 +51,29 @@ pub const GpuScratch = struct {
 
         const f = @sizeOf(f32);
         return .{
-            .stream    = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .x_norm    = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .q         = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .k         = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .v         = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .q_rot     = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .k_rot     = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .head_out  = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .attn_out  = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .mid_norm  = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .gate      = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .up        = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .fused     = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .ffn_out   = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .stream         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .final_norm_out = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .logits         = try buffer.Buffer.initDeviceOnly(ctx, cfg.vocab_size * f),
+            .x_norm         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .q              = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .k              = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
+            .v              = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
+            .q_rot          = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .k_rot          = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
+            .head_out       = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .attn_out       = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .mid_norm       = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .gate           = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
+            .up             = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
+            .fused          = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
+            .ffn_out        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
         };
     }
 
     pub fn deinit(self: *GpuScratch, device: vk.c.VkDevice) void {
         self.stream.deinit(device);
+        self.final_norm_out.deinit(device);
+        self.logits.deinit(device);
         self.x_norm.deinit(device);
         self.q.deinit(device);
         self.k.deinit(device);

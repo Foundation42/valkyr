@@ -99,6 +99,11 @@ pub fn main() !void {
         try runGpuLayer0Test(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-gen")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGpuGen(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
@@ -1244,6 +1249,211 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
         }
     }
     return out;
+}
+
+// ── gpu-gen: full forward on GPU + parity vs CPU --gen ─────────────
+
+fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var cpu = try model_mod.Model.load(gpa, dir_path);
+    defer cpu.deinit();
+    const cfg = cpu.config;
+
+    const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{dir_path});
+    defer gpa.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(gpa, tok_path);
+    defer tok.deinit();
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    const input_str = tok.decode(token_id) orelse "<unknown>";
+    try stdout.print("input  token id={d}  string={s}\n", .{ token_id, input_str });
+    try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
+
+    const t_up0 = std.time.nanoTimestamp();
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    defer gm.deinit(ctx.device);
+    const t_up1 = std.time.nanoTimestamp();
+    const upload_ms = @as(f64, @floatFromInt(t_up1 - t_up0)) / 1_000_000.0;
+    try stdout.print("upload: {d:.0} ms\n", .{upload_ms});
+
+    var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg);
+    defer sc.deinit(ctx.device);
+
+    // ── Build kernels once, rebind per-layer ────────────────────────
+    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush));
+    defer k_embed.deinit();
+    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+    defer k_rmsnorm.deinit();
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_rope = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    defer k_rope.deinit();
+    var k_attn = try pipeline.Kernel.init(&ctx, &shaders.attn_decode_single, 2, @sizeOf(AttnDecodeSinglePush));
+    defer k_attn.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush));
+    defer k_add.deinit();
+    var k_geglu = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    defer k_geglu.deinit();
+
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+    const vocab: u32 = @intCast(cfg.vocab_size);
+    const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
+
+    const t_gpu0 = std.time.nanoTimestamp();
+
+    // ── Embed lookup → residual stream ──────────────────────────────
+    try k_embed.bind(&.{ &gm.embed_tokens, &sc.stream });
+    const embed_push = EmbedLookupPush{
+        .token_id = token_id,
+        .dim = hidden,
+        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+    };
+    try dispatch1D(&ctx, &k_embed, &embed_push, hidden);
+
+    // ── 18 transformer blocks ───────────────────────────────────────
+    const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    const add_push = AddInPlacePush{ .n = hidden };
+    const attn_push = AttnDecodeSinglePush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .heads_per_kv = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads),
+        .head_dim = @intCast(cfg.head_dim),
+    };
+    const rope_q_push = RopePush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .pos = 0,
+        .theta_base = cfg.rope_theta,
+    };
+    const rope_k_push = RopePush{
+        .n_heads = @intCast(cfg.num_key_value_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .pos = 0,
+        .theta_base = cfg.rope_theta,
+    };
+    const geglu_push = GegluPush{ .n = inter };
+
+    for (gm.layers) |*layer| {
+        // rmsnorm₁
+        try k_rmsnorm.bind(&.{ &sc.stream, &layer.input_layernorm, &sc.x_norm });
+        try dispatchPerRow(&ctx, &k_rmsnorm, &rms_push, 1);
+
+        // Q, K, V
+        try k_matmul.bind(&.{ &sc.x_norm, &layer.q_proj, &sc.q });
+        try dispatchMatmul(&ctx, &k_matmul, 1, q_dim, hidden);
+        try k_matmul.bind(&.{ &sc.x_norm, &layer.k_proj, &sc.k });
+        try dispatchMatmul(&ctx, &k_matmul, 1, kv_dim, hidden);
+        try k_matmul.bind(&.{ &sc.x_norm, &layer.v_proj, &sc.v });
+        try dispatchMatmul(&ctx, &k_matmul, 1, kv_dim, hidden);
+
+        // RoPE on Q and K (pos=0; identity here, kept for layout symmetry)
+        try k_rope.bind(&.{ &sc.q, &sc.q_rot });
+        try dispatchRope(&ctx, &k_rope, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+        try k_rope.bind(&.{ &sc.k, &sc.k_rot });
+        try dispatchRope(&ctx, &k_rope, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+
+        // Attention (single-position degenerate → head_out = V replicated)
+        try k_attn.bind(&.{ &sc.v, &sc.head_out });
+        try dispatch1D(&ctx, &k_attn, &attn_push, q_dim);
+
+        // o_proj
+        try k_matmul.bind(&.{ &sc.head_out, &layer.o_proj, &sc.attn_out });
+        try dispatchMatmul(&ctx, &k_matmul, 1, hidden, q_dim);
+
+        // residual stream += attn_out
+        try k_add.bind(&.{ &sc.stream, &sc.attn_out });
+        try dispatch1D(&ctx, &k_add, &add_push, hidden);
+
+        // rmsnorm₂
+        try k_rmsnorm.bind(&.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm });
+        try dispatchPerRow(&ctx, &k_rmsnorm, &rms_push, 1);
+
+        // gate, up, geglu, down
+        try k_matmul.bind(&.{ &sc.mid_norm, &layer.gate_proj, &sc.gate });
+        try dispatchMatmul(&ctx, &k_matmul, 1, inter, hidden);
+        try k_matmul.bind(&.{ &sc.mid_norm, &layer.up_proj, &sc.up });
+        try dispatchMatmul(&ctx, &k_matmul, 1, inter, hidden);
+
+        try k_geglu.bind(&.{ &sc.gate, &sc.up, &sc.fused });
+        try dispatch1D(&ctx, &k_geglu, &geglu_push, inter);
+
+        try k_matmul.bind(&.{ &sc.fused, &layer.down_proj, &sc.ffn_out });
+        try dispatchMatmul(&ctx, &k_matmul, 1, hidden, inter);
+
+        // residual stream += ffn_out
+        try k_add.bind(&.{ &sc.stream, &sc.ffn_out });
+        try dispatch1D(&ctx, &k_add, &add_push, hidden);
+    }
+
+    // ── Final rmsnorm ───────────────────────────────────────────────
+    try k_rmsnorm.bind(&.{ &sc.stream, &gm.final_norm, &sc.final_norm_out });
+    try dispatchPerRow(&ctx, &k_rmsnorm, &rms_push, 1);
+
+    // ── LM head: matmul against the embedding (tied) ───────────────
+    try k_matmul.bind(&.{ &sc.final_norm_out, &gm.lm_head, &sc.logits });
+    try dispatchMatmul(&ctx, &k_matmul, 1, vocab, hidden);
+
+    const t_gpu1 = std.time.nanoTimestamp();
+    const gpu_ms = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+    // ── Read back logits, argmax, decode ───────────────────────────
+    const logits = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(logits);
+    try sc.logits.readBack(&ctx, f32, logits);
+
+    const sampled = cpu_forward.argmax(logits);
+    const out_str = tok.decode(sampled) orelse "<unknown>";
+
+    try stdout.print("forward (GPU, ~291 dispatches via submitOneShot): {d:.0} ms\n", .{gpu_ms});
+
+    const k_top: usize = 5;
+    const top = try topK(gpa, logits, k_top);
+    defer gpa.free(top);
+    try stdout.print("\ntop {d} logits (GPU):\n", .{k_top});
+    for (top) |entry| {
+        const s = tok.decode(entry.id) orelse "<unknown>";
+        try stdout.print("  id={d:>6}  logit={d:>10.4}  {s}\n", .{ entry.id, entry.value, s });
+    }
+    try stdout.print("\nGPU sampled (greedy): id={d}  string={s}\n", .{ sampled, out_str });
+
+    // ── Parity vs CPU --gen ─────────────────────────────────────────
+    try stdout.print("\nrunning CPU forward for parity check (this takes ~18 s)...\n", .{});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const cpu_logits = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(cpu_logits);
+    const t_cpu0 = std.time.nanoTimestamp();
+    try cpu_forward.forward(&cpu, token_id, 0, arena.allocator(), cpu_logits);
+    const t_cpu1 = std.time.nanoTimestamp();
+    const cpu_ms = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+    const cpu_argmax = cpu_forward.argmax(cpu_logits);
+    var max_abs: f32 = 0;
+    var max_idx: usize = 0;
+    for (logits, cpu_logits, 0..) |g, c, i| {
+        const d = @abs(g - c);
+        if (d > max_abs) {
+            max_abs = d;
+            max_idx = i;
+        }
+    }
+
+    try stdout.print("CPU forward: {d:.0} ms\n", .{cpu_ms});
+    try stdout.print("CPU argmax: id={d} ({s}) logit={d:.4}\n", .{
+        cpu_argmax, tok.decode(cpu_argmax) orelse "?", cpu_logits[cpu_argmax],
+    });
+    try stdout.print("max |Δ| over the whole logit vector = {e:.3}  (at idx {d}: cpu={d:.4} gpu={d:.4})\n", .{
+        max_abs, max_idx, cpu_logits[max_idx], logits[max_idx],
+    });
+    if (sampled != cpu_argmax) {
+        std.debug.print("FAIL: GPU argmax {d} ≠ CPU argmax {d}\n", .{ sampled, cpu_argmax });
+        return error.ParityFailed;
+    }
+    try stdout.print("\nPASS GPU --gen argmax matches CPU --gen ({d} → {s})\n", .{ sampled, out_str });
 }
 
 // ── gpu-layer0-test: full layer 0 forward on GPU vs CPU ────────────
