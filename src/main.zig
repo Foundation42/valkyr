@@ -882,7 +882,42 @@ fn runTurboquantSmoke(allocator: std.mem.Allocator) !void {
     if (turboquant.lloydMaxIndex(-0.6, .b3) != 2) return error.ParityFailed;
     if (turboquant.lloydMaxIndex(0.0, .b4) != 8) return error.ParityFailed;
 
-    std.debug.print("PASS turboquant tables (RHT signs + b3/b4 codebooks vs YATQ)\n", .{});
+    // 5) FWHT hand-checked at d=4: [1,2,3,4] → [10,-2,-4,0].
+    {
+        var x = [_]f32{ 1, 2, 3, 4 };
+        turboquant.fwht(&x);
+        const want = [_]f32{ 10, -2, -4, 0 };
+        for (x, want) |got, w| if (got != w) return error.ParityFailed;
+    }
+
+    // 6) FWHT applied twice multiplies by d (since H · H = d · I).
+    {
+        var x = [_]f32{ 0.5, -1.25, 3.0, 0.0, -2.5, 1.75, 0.125, -0.75 };
+        const orig = x;
+        turboquant.fwht(&x);
+        turboquant.fwht(&x);
+        const d: f32 = @floatFromInt(x.len);
+        for (x, orig) |got, w| if (@abs(got - d * w) > 1e-5) return error.ParityFailed;
+    }
+
+    // 7) RHT round-trip on a 256-vector: rhtInverse(rhtForward(x)) ≈ x.
+    {
+        var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
+        const r = prng.random();
+        var x: [256]f32 = undefined;
+        for (&x) |*v| v.* = r.floatNorm(f32);
+        const orig = x;
+        turboquant.rhtForward(&x);
+        turboquant.rhtInverse(&x);
+        var max_err: f32 = 0;
+        for (x, orig) |got, w| max_err = @max(max_err, @abs(got - w));
+        if (max_err > 1e-4) {
+            std.debug.print("rht round-trip max |Δ| = {e}\n", .{max_err});
+            return error.ParityFailed;
+        }
+    }
+
+    std.debug.print("PASS turboquant tables + FWHT + RHT round-trip (vs YATQ)\n", .{});
 }
 
 // ── rmsnorm-test: first math primitive on a real layer ──────────────

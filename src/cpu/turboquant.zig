@@ -69,6 +69,61 @@ pub inline fn rhtSign(i: usize) f32 {
     return if (bit == 1) -1.0 else 1.0;
 }
 
+// ── Fast Walsh-Hadamard transform + sign-flip pre-conditioner ───────
+//
+// Naturally-ordered, unnormalised butterfly — H · H = d · I, so the
+// inverse is FWHT followed by /d. The pre-conditioner multiplies each
+// coordinate by `rhtSign(i)` before the forward FWHT (and after the
+// inverse), which makes Π·x near-Gaussian for a wide range of input
+// distributions and is what lets a single global Lloyd-Max codebook
+// suffice for every layer / head / token.
+
+/// In-place forward FWHT. Replaces x with H · x. `x.len` must be a
+/// non-zero power of 2. Matches YATQ `serial_wht()` butterfly order.
+pub fn fwht(x: []f32) void {
+    const d = x.len;
+    std.debug.assert(d > 0 and (d & (d - 1)) == 0);
+    var length: usize = 1;
+    while (length < d) : (length *= 2) {
+        var i: usize = 0;
+        while (i < d) : (i += 2 * length) {
+            var j: usize = 0;
+            while (j < length) : (j += 1) {
+                const u = x[i + j];
+                const v = x[i + j + length];
+                x[i + j] = u + v;
+                x[i + j + length] = u - v;
+            }
+        }
+    }
+}
+
+/// In-place inverse FWHT: H · x / d. Matches YATQ `inverse_wht()`.
+pub fn ifwht(x: []f32) void {
+    fwht(x);
+    const inv_d: f32 = 1.0 / @as(f32, @floatFromInt(x.len));
+    for (x) |*v| v.* *= inv_d;
+}
+
+/// In-place RHT sign-flip step: x[i] *= rhtSign(i). Cycles through
+/// tbq_signs every 256 elements.
+pub fn applySignFlips(x: []f32) void {
+    for (x, 0..) |*v, i| v.* *= rhtSign(i);
+}
+
+/// Forward RHT pre-conditioner: sign-flips, then FWHT.
+pub fn rhtForward(x: []f32) void {
+    applySignFlips(x);
+    fwht(x);
+}
+
+/// Inverse RHT: IFWHT, then sign-flips. The composition
+/// rhtInverse(rhtForward(x)) recovers x exactly (modulo fp32 rounding).
+pub fn rhtInverse(x: []f32) void {
+    ifwht(x);
+    applySignFlips(x);
+}
+
 // ── Lloyd-Max quantize / dequantize ─────────────────────────────────
 
 /// Bit-width parameter for the codebook. Phase 1 supports 3 and 4;
@@ -168,4 +223,55 @@ test "Lloyd-Max codebooks are symmetric about zero" {
             try std.testing.expectApproxEqAbs(-lo, hi, 1e-6);
         }
     }
+}
+
+test "fwht hand-checked at d=4" {
+    // Hand-computed: WHT([1,2,3,4]) = [10, -2, -4, 0].
+    var x = [_]f32{ 1, 2, 3, 4 };
+    fwht(&x);
+    try std.testing.expectEqual(@as(f32, 10), x[0]);
+    try std.testing.expectEqual(@as(f32, -2), x[1]);
+    try std.testing.expectEqual(@as(f32, -4), x[2]);
+    try std.testing.expectEqual(@as(f32, 0), x[3]);
+}
+
+test "fwht of delta_0 is all-ones" {
+    // First row of the natural-ordered Hadamard matrix is all +1.
+    var x = [_]f32{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    fwht(&x);
+    for (x) |v| try std.testing.expectEqual(@as(f32, 1), v);
+}
+
+test "fwht twice multiplies by d" {
+    // H · H = d · I.
+    var x = [_]f32{ 0.5, -1.25, 3.0, 0.0, -2.5, 1.75, 0.125, -0.75 };
+    const x_orig = x;
+    fwht(&x);
+    fwht(&x);
+    const d: f32 = @floatFromInt(x.len);
+    for (x, x_orig) |got, want| {
+        try std.testing.expectApproxEqAbs(d * want, got, 1e-5);
+    }
+}
+
+test "ifwht inverts fwht for an arbitrary 256-vector" {
+    var prng = std.Random.DefaultPrng.init(0xCAFEBABE);
+    const r = prng.random();
+    var x: [256]f32 = undefined;
+    for (&x) |*v| v.* = r.floatNorm(f32);
+    var y = x;
+    fwht(&y);
+    ifwht(&y);
+    for (x, y) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
+}
+
+test "rht round-trip recovers the original vector" {
+    var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
+    const r = prng.random();
+    var x: [256]f32 = undefined;
+    for (&x) |*v| v.* = r.floatNorm(f32);
+    var y = x;
+    rhtForward(&y);
+    rhtInverse(&y);
+    for (x, y) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
 }
