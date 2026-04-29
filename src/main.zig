@@ -2340,7 +2340,7 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision);
+    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
     defer ks.embed.deinit();
     defer ks.rmsnorm.deinit();
     defer ks.matmul.deinit();
@@ -2445,6 +2445,121 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
     }
 }
 
+// ── chat templates ─────────────────────────────────────────────────
+//
+// Different model families serialize a chat turn into very different
+// token sequences. ChatTemplate is the small abstraction that hides
+// the difference from the chat loop.
+//
+//   Gemma (`<bos>` + `<start_of_turn>` markers):
+//     [<bos>?] <start_of_turn> "user\n" {msg} <end_of_turn> "\n"
+//              <start_of_turn> "model\n"
+//     stop on <end_of_turn>.
+//
+//   Qwen3 (ChatML, `<|im_start|>` / `<|im_end|>` markers):
+//     <|im_start|> "user\n" {msg} <|im_end|> "\n"
+//     <|im_start|> "assistant\n"
+//     stop on <|im_end|>.
+//
+// Both share the same KV-cache discipline: `pos == 0` means start of
+// conversation (only Gemma emits an explicit BOS in that case; Qwen3
+// doesn't emit anything extra).
+
+const ChatTemplate = struct {
+    family: config_mod.Family,
+    /// First-conversation-turn marker. Some families (Gemma) want a
+    /// BOS at the very start; Qwen3 doesn't emit one.
+    bos: ?u32,
+    /// Per-turn opening marker (`<start_of_turn>` / `<|im_start|>`).
+    start_of_turn: u32,
+    /// Per-turn closing marker (`<end_of_turn>` / `<|im_end|>`). Also
+    /// the stop token the sampler watches for.
+    end_of_turn: u32,
+    /// Role prefix typed BY the model in its response prefix
+    /// (`"model"` for Gemma, `"assistant"` for Qwen3 / ChatML).
+    assistant_role: []const u8,
+
+    pub fn resolve(family: config_mod.Family, tok: *const tokenizer_mod.Tokenizer) !ChatTemplate {
+        return switch (family) {
+            .gemma => .{
+                .family = family,
+                .bos = tok.specialTokenId("<bos>") orelse return error.NoBos,
+                .start_of_turn = tok.specialTokenId("<start_of_turn>") orelse return error.NoStartOfTurn,
+                .end_of_turn = tok.specialTokenId("<end_of_turn>") orelse return error.NoEndOfTurn,
+                .assistant_role = "model",
+            },
+            .llama => .{
+                .family = family,
+                .bos = tok.specialTokenId("<|begin_of_text|>"),
+                .start_of_turn = tok.specialTokenId("<|start_header_id|>") orelse return error.NoStartOfTurn,
+                .end_of_turn = tok.specialTokenId("<|eot_id|>") orelse return error.NoEndOfTurn,
+                .assistant_role = "assistant",
+            },
+            .qwen3 => .{
+                .family = family,
+                // Qwen3 chat doesn't prepend BOS in the canonical
+                // template; we just leave it null. (`<|endoftext|>`
+                // exists at id 151643 but isn't emitted at turn start.)
+                .bos = null,
+                .start_of_turn = tok.specialTokenId("<|im_start|>") orelse return error.NoStartOfTurn,
+                .end_of_turn = tok.specialTokenId("<|im_end|>") orelse return error.NoEndOfTurn,
+                .assistant_role = "assistant",
+            },
+        };
+    }
+
+    pub fn banner(self: ChatTemplate) []const u8 {
+        return switch (self.family) {
+            .gemma => "Gemma chat",
+            .llama => "Llama chat",
+            .qwen3 => "Qwen3 chat",
+        };
+    }
+
+    /// Compose a turn's prompt token sequence into `out`. `is_first`
+    /// controls BOS emission (only Gemma actually uses it).
+    pub fn composePrompt(
+        self: ChatTemplate,
+        gpa: std.mem.Allocator,
+        tok: *const tokenizer_mod.Tokenizer,
+        user_msg: []const u8,
+        is_first: bool,
+        out: *std.ArrayList(u32),
+    ) !void {
+        if (is_first) {
+            if (self.bos) |b| try out.append(b);
+        }
+        try out.append(self.start_of_turn);
+        {
+            const ids = try tok.encode(gpa, "user\n");
+            defer gpa.free(ids);
+            try out.appendSlice(ids);
+        }
+        {
+            const ids = try tok.encode(gpa, user_msg);
+            defer gpa.free(ids);
+            try out.appendSlice(ids);
+        }
+        try out.append(self.end_of_turn);
+        {
+            const ids = try tok.encode(gpa, "\n");
+            defer gpa.free(ids);
+            try out.appendSlice(ids);
+        }
+        try out.append(self.start_of_turn);
+        {
+            // Role prefix + newline. We allocate a small buffer rather
+            // than two encodes so the encoder sees the role and \n in
+            // one go (BPE merges may differ at boundaries).
+            const buf = try std.fmt.allocPrint(gpa, "{s}\n", .{self.assistant_role});
+            defer gpa.free(buf);
+            const ids = try tok.encode(gpa, buf);
+            defer gpa.free(ids);
+            try out.appendSlice(ids);
+        }
+    }
+};
+
 // ── chat: prompt prefill + generation, single-turn or REPL ─────────
 
 fn runChat(
@@ -2493,7 +2608,7 @@ fn runChat(
         null;
     defer if (kv_tq4) |*c| c.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision);
+    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
     defer ks.embed.deinit();
     defer ks.rmsnorm.deinit();
     defer ks.matmul.deinit();
@@ -2537,15 +2652,19 @@ fn runChat(
     else
         null;
 
-    // Bigger pool sizing — chat sends one full forward worth of
-    // dispatches (~345) per step, and each Recorder.reset() between
-    // steps frees the lot, so 512 sets is plenty per step.
-    var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
+    // Pool sizing — one full forward worth of dispatches per step.
+    // Gemma 2B (18 layers) = ~345/step. Qwen3-4B (36 layers) ≈ 720/step
+    // before counting q_norm/k_norm. We size proportionally with a
+    // generous slack so future deeper models don't blow up here.
+    const sets_per_step: u32 = @intCast(@max(@as(usize, 512), cfg.num_hidden_layers * 32));
+    var rec = try gpu_recorder.Recorder.init(&ctx, sets_per_step, 2048);
     defer rec.deinit();
 
-    const bos = tok.specialTokenId("<bos>") orelse return error.NoBos;
-    const sot = tok.specialTokenId("<start_of_turn>") orelse return error.NoStartOfTurn;
-    const eot = tok.specialTokenId("<end_of_turn>") orelse return error.NoEndOfTurn;
+    // Resolve chat-template specials based on the model family. Gemma
+    // uses `<bos>` + `<start_of_turn>` + `<end_of_turn>`; Qwen3 (ChatML)
+    // uses `<|endoftext|>` as BOS-equivalent and `<|im_start|>` /
+    // `<|im_end|>` as turn markers.
+    const tmpl = try ChatTemplate.resolve(cfg.family, &tok);
 
     const logits = try gpa.alloc(f32, cfg.vocab_size);
     defer gpa.free(logits);
@@ -2575,12 +2694,12 @@ fn runChat(
     var pos: usize = 0;
 
     if (single_msg) |m| {
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, false, tq4_hooks);
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, sample_scratch, sample_params, rng, tmpl, false, tq4_hooks);
         return;
     }
 
     // ── REPL ────────────────────────────────────────────────────────
-    try stdout.print("\nGemma 2B IT chat (Ctrl-D to exit)\n", .{});
+    try stdout.print("\n{s} chat (Ctrl-D to exit)\n", .{tmpl.banner()});
     const stdin = std.io.getStdIn().reader();
     var line_buf: [4096]u8 = undefined;
     while (true) {
@@ -2591,7 +2710,7 @@ fn runChat(
             break;
         };
         if (line.len == 0) continue;
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, true, tq4_hooks);
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, sample_scratch, sample_params, rng, tmpl, true, tq4_hooks);
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
             break;
@@ -2600,12 +2719,10 @@ fn runChat(
 }
 
 /// One round-trip through the model: prefill the prompt for `user_msg`
-/// then sample until <end_of_turn> or max_response. `pos` is updated
-/// in place so the next turn picks up where this one stopped.
-///
-/// `is_first_turn` controls the prefix: the very first turn starts
-/// with `<bos>`; subsequent turns omit it (Gemma's chat template only
-/// has one bos at the start of the conversation).
+/// then sample until the family-specific end-of-turn marker (or
+/// max_response). `pos` is updated in place so the next turn picks up
+/// where this one stopped. The `ChatTemplate` arg encapsulates which
+/// special tokens to emit and where.
 fn chatTurn(
     gpa: std.mem.Allocator,
     ctx: *const vk.Context,
@@ -2622,57 +2739,26 @@ fn chatTurn(
     sample_scratch: []f32,
     sample_params: cpu_forward.SampleParams,
     rng: std.Random,
-    bos: u32,
-    sot: u32,
-    eot: u32,
+    tmpl: ChatTemplate,
     is_repl: bool,
     tq4_v: ?Tq4VHooks,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
-    // Compose prompt:
-    //   [<bos>?] <start_of_turn> "user\n" {user_msg} <end_of_turn> "\n"
-    //              <start_of_turn> "model\n"
-    //
-    // <bos> only on the very first turn (pos == 0).
     var prompt = std.ArrayList(u32).init(gpa);
     defer prompt.deinit();
-    if (pos.* == 0) try prompt.append(bos);
-    try prompt.append(sot);
-    {
-        const ids = try tok.encode(gpa, "user\n");
-        defer gpa.free(ids);
-        try prompt.appendSlice(ids);
-    }
-    {
-        const ids = try tok.encode(gpa, user_msg);
-        defer gpa.free(ids);
-        try prompt.appendSlice(ids);
-    }
-    try prompt.append(eot);
-    {
-        const ids = try tok.encode(gpa, "\n");
-        defer gpa.free(ids);
-        try prompt.appendSlice(ids);
-    }
-    try prompt.append(sot);
-    {
-        const ids = try tok.encode(gpa, "model\n");
-        defer gpa.free(ids);
-        try prompt.appendSlice(ids);
-    }
+    try tmpl.composePrompt(gpa, tok, user_msg, pos.* == 0, &prompt);
 
     if (!is_repl) {
         try stdout.print("\nprompt ({d} tokens, starting at pos {d}):\n  ", .{ prompt.items.len, pos.* });
-        for (prompt.items) |id| {
-            if (tok.decode(id)) |s| try stdout.print("{s}", .{s});
-        }
+        for (prompt.items) |id| try printTokenForDisplay(gpa, stdout, tok, id);
         try stdout.print("\n\nresponse: ", .{});
     } else {
         try stdout.print("model> ", .{});
     }
 
     const eos: ?u32 = cfg.eos_token_id;
+    const eot: u32 = tmpl.end_of_turn;
     const max_response: usize = 256;
 
     // Run all prompt tokens through the model. We only need the logits
@@ -2708,9 +2794,7 @@ fn chatTurn(
         if (next == eot) break;
         if (eos != null and next == eos.?) break;
 
-        const s = tok.decode(next) orelse "<unknown>";
-        // Pretty-print: ▁ → space.
-        try printDecoded(stdout, s);
+        try printTokenForDisplay(gpa, stdout, tok, @intCast(next));
 
         generated += 1;
         if (generated >= max_response) break;
@@ -2719,17 +2803,45 @@ fn chatTurn(
     try stdout.print("\n", .{});
 }
 
-fn printDecoded(w: anytype, s: []const u8) !void {
-    // Gemma decoder rule: ▁ (U+2581, bytes E2 96 81) maps back to space.
-    var i: usize = 0;
-    while (i < s.len) {
-        if (i + 3 <= s.len and s[i] == 0xE2 and s[i + 1] == 0x96 and s[i + 2] == 0x81) {
-            try w.print(" ", .{});
-            i += 3;
-        } else {
-            try w.print("{c}", .{s[i]});
-            i += 1;
-        }
+/// Print a single token id to `w` after applying the decoder rule for
+/// the active tokenizer mode:
+///   - SentencePiece (Gemma): ▁ (U+2581, bytes E2 96 81) → ' '.
+///   - ByteLevel (Qwen3 / Llama3): walk the codepoints and reverse the
+///     byte→unicode map back to original bytes.
+///
+/// Falls back to a "<id>" stub for token ids with no surface form (e.g.
+/// holes in the vocab table).
+fn printTokenForDisplay(
+    gpa: std.mem.Allocator,
+    w: anytype,
+    tok: *const tokenizer_mod.Tokenizer,
+    id: u32,
+) !void {
+    switch (tok.mode) {
+        .sentencepiece => {
+            const s = tok.decode(id) orelse {
+                try w.print("<{d}>", .{id});
+                return;
+            };
+            var i: usize = 0;
+            while (i < s.len) {
+                if (i + 3 <= s.len and s[i] == 0xE2 and s[i + 1] == 0x96 and s[i + 2] == 0x81) {
+                    try w.print(" ", .{});
+                    i += 3;
+                } else {
+                    try w.print("{c}", .{s[i]});
+                    i += 1;
+                }
+            }
+        },
+        .bytelevel => {
+            const bytes = tok.decodeByteLevel(gpa, id) catch {
+                try w.print("<{d}>", .{id});
+                return;
+            };
+            defer gpa.free(bytes);
+            try w.writeAll(bytes);
+        },
     }
 }
 
@@ -2841,6 +2953,10 @@ fn recordForwardStep(
         .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
     };
     const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    // Qwen3 per-head q_norm/k_norm push: same shader as the regular
+    // rmsnorm but reduces over `head_dim` per row instead of `hidden`,
+    // and never applies the (1+w) Gemma quirk.
+    const qkn_push = RmsnormPush{ .dim = @intCast(cfg.head_dim), .eps = cfg.rms_norm_eps, .gemma_quirk = 0 };
     const add_push = AddInPlacePush{ .n = hidden };
     const rope_q_push = RopePush{
         .n_heads = @intCast(cfg.num_attention_heads),
@@ -2886,6 +3002,17 @@ fn recordForwardStep(
         try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.q_proj, &sc.q }, 1, q_dim, hidden);
         try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.k_proj, &sc.k }, 1, kv_dim, hidden);
         try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.v_proj, &sc.v }, 1, kv_dim, hidden);
+
+        // Qwen3 q_norm / k_norm: per-head RMSNorm with `pc.dim =
+        // head_dim` and `n_rows = num_{q,kv}_heads`. We reuse the same
+        // rmsnorm shader; only the push constants change. No
+        // gemma_quirk on Qwen3 (qkn_push has gemma_quirk = 0).
+        if (layer.q_norm) |*qn| {
+            try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.q, qn, &sc.q }, &qkn_push, @intCast(cfg.num_attention_heads));
+        }
+        if (layer.k_norm) |*kn| {
+            try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &qkn_push, @intCast(cfg.num_key_value_heads));
+        }
 
         try recDispatchRope(rec, k.rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
         try recDispatchRope(rec, k.rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
@@ -2953,7 +3080,13 @@ fn recordForwardStep(
 /// weights — must agree with the precision the model was uploaded
 /// with. The LM head matmul is always fp32 since lm_head never goes
 /// bf16 in the current scheme.
-fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision) !struct {
+///
+/// The `geglu` kernel slot actually holds whichever gated-FFN
+/// activation the model family wants — geglu (Gemma) or swiglu
+/// (Llama / Qwen3). Both shaders share the same binding layout +
+/// push constant, so the dispatch site doesn't care which one it's
+/// running.
+fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision, family: config_mod.Family) !struct {
     embed: pipeline.Kernel,
     rmsnorm: pipeline.Kernel,
     matmul: pipeline.Kernel,
@@ -2970,6 +3103,10 @@ fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision) !str
         .fp32_all => &shaders.matmul_nt_v2,
         .bf16_matmul => &shaders.matmul_nt_v2_bf16,
     };
+    const ffn_spv: []align(4) const u8 = switch (family.activation()) {
+        .gelu => &shaders.geglu,
+        .silu => &shaders.swiglu,
+    };
     return .{
         .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
         .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
@@ -2981,7 +3118,7 @@ fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision) !str
         .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
         .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
         .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
-        .geglu = try pipeline.Kernel.init(ctx, &shaders.geglu, 3, @sizeOf(GegluPush)),
+        .geglu = try pipeline.Kernel.init(ctx, ffn_spv, 3, @sizeOf(GegluPush)),
     };
 }
 
@@ -3036,7 +3173,7 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision);
+    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
     defer ks.embed.deinit();
     defer ks.rmsnorm.deinit();
     defer ks.matmul.deinit();
@@ -3143,7 +3280,7 @@ fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
     var kv_tq4 = try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos);
     defer kv_tq4.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision);
+    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
     defer ks.embed.deinit();
     defer ks.rmsnorm.deinit();
     defer ks.matmul.deinit();

@@ -17,36 +17,46 @@ const std = @import("std");
 pub const Family = enum {
     gemma,
     llama,
+    qwen3,
 
     pub fn fromArchitectures(archs: []const []const u8) !Family {
         for (archs) |a| {
             if (std.mem.eql(u8, a, "GemmaForCausalLM")) return .gemma;
             if (std.mem.eql(u8, a, "LlamaForCausalLM")) return .llama;
+            if (std.mem.eql(u8, a, "Qwen3ForCausalLM")) return .qwen3;
         }
         return error.UnsupportedArchitecture;
     }
 
-    /// FFN activation. Gemma 1 uses GeGLU (gelu(gate) * up); Llama uses
-    /// SwiGLU (silu(gate) * up). The shapes are identical — only the
-    /// elementwise activation differs, so the FFN kernel can pick at
-    /// dispatch time without any restructuring.
+    /// FFN activation. Gemma 1 uses GeGLU (gelu(gate) * up); Llama and
+    /// Qwen3 use SwiGLU (silu(gate) * up). The shapes are identical —
+    /// only the elementwise activation differs, so the FFN kernel can
+    /// pick at dispatch time without any restructuring.
     pub const Activation = enum { gelu, silu };
     pub fn activation(self: Family) Activation {
         return switch (self) {
             .gemma => .gelu,
-            .llama => .silu,
+            .llama, .qwen3 => .silu,
         };
     }
 
     /// Gemma multiplies the embedding output by sqrt(hidden_size) before
     /// the first transformer block (the pre-norm form expects pre-scaled
-    /// inputs); Llama doesn't. Cheap detail with a big numerical impact —
-    /// forget it and the logits diverge from step 1.
+    /// inputs); Llama and Qwen3 don't. Cheap detail with a big numerical
+    /// impact — forget it and the logits diverge from step 1.
     pub fn embedScalesByDim(self: Family) bool {
         return switch (self) {
             .gemma => true,
-            .llama => false,
+            .llama, .qwen3 => false,
         };
+    }
+
+    /// Qwen3 applies per-head RMSNorm to the Q and K vectors after the
+    /// q_proj/k_proj matmuls and BEFORE RoPE. Tensor names:
+    /// `model.layers.X.self_attn.{q,k}_norm.weight`, both shape [head_dim].
+    /// Gemma and Llama don't have these.
+    pub fn hasQkNorm(self: Family) bool {
+        return self == .qwen3;
     }
 };
 
@@ -123,6 +133,7 @@ pub const Config = struct {
                 if (mt == .string) {
                     if (std.mem.eql(u8, mt.string, "gemma")) family = .gemma;
                     if (std.mem.eql(u8, mt.string, "llama")) family = .llama;
+                    if (std.mem.eql(u8, mt.string, "qwen3")) family = .qwen3;
                 }
             }
         }
@@ -146,7 +157,7 @@ pub const Config = struct {
             .vocab_size = try requireUsize(obj, "vocab_size"),
             .rms_norm_eps = optionalF32(obj, "rms_norm_eps") orelse 1e-6,
             .rope_theta = optionalF32(obj, "rope_theta") orelse 10000.0,
-            .tie_word_embeddings = optionalBool(obj, "tie_word_embeddings") orelse (fam == .gemma),
+            .tie_word_embeddings = optionalBool(obj, "tie_word_embeddings") orelse (fam == .gemma or fam == .qwen3),
             .bos_token_id = optionalU32(obj, "bos_token_id"),
             .eos_token_id = optionalU32(obj, "eos_token_id"),
             .pad_token_id = optionalU32(obj, "pad_token_id"),

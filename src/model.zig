@@ -35,6 +35,11 @@ pub const Layer = struct {
     gate_proj: Tensor,
     up_proj: Tensor,
     down_proj: Tensor,
+    /// Qwen3-only: per-head RMSNorm gain on Q and K vectors after
+    /// q_proj/k_proj and BEFORE RoPE. Shape [head_dim] each. `null` for
+    /// families that don't carry these (Gemma, Llama).
+    q_norm: ?Tensor,
+    k_norm: ?Tensor,
 };
 
 pub const Model = struct {
@@ -104,6 +109,18 @@ pub const Model = struct {
 
             layer.down_proj = try requireLayerTensor(a, &shards, i, "mlp.down_proj.weight");
             try expectShape(layer.down_proj, "down_proj", &.{ cfg.hidden_size, cfg.intermediate_size });
+
+            if (cfg.family.hasQkNorm()) {
+                const qn = try requireLayerTensor(a, &shards, i, "self_attn.q_norm.weight");
+                try expectShape(qn, "q_norm", &.{cfg.head_dim});
+                layer.q_norm = qn;
+                const kn = try requireLayerTensor(a, &shards, i, "self_attn.k_norm.weight");
+                try expectShape(kn, "k_norm", &.{cfg.head_dim});
+                layer.k_norm = kn;
+            } else {
+                layer.q_norm = null;
+                layer.k_norm = null;
+            }
         }
 
         // ── Final norm ──────────────────────────────────────────────

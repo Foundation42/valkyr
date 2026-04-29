@@ -48,6 +48,10 @@ pub const GpuLayer = struct {
     gate_proj: buffer.Buffer,
     up_proj: buffer.Buffer,
     down_proj: buffer.Buffer,
+    /// Qwen3-only: per-head RMSNorm gain on Q and K post-projection,
+    /// pre-RoPE. `null` for Gemma / Llama.
+    q_norm: ?buffer.Buffer,
+    k_norm: ?buffer.Buffer,
 
     pub fn deinit(self: *GpuLayer, device: vk.c.VkDevice) void {
         self.input_layernorm.deinit(device);
@@ -59,6 +63,8 @@ pub const GpuLayer = struct {
         self.gate_proj.deinit(device);
         self.up_proj.deinit(device);
         self.down_proj.deinit(device);
+        if (self.q_norm) |*b| b.deinit(device);
+        if (self.k_norm) |*b| b.deinit(device);
     }
 };
 
@@ -122,6 +128,8 @@ pub const GpuModel = struct {
                 .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path),
                 .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path),
                 .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path),
+                .q_norm = if (layer.q_norm) |t| try uploadTensor(gpa, ctx, t) else null,
+                .k_norm = if (layer.k_norm) |t| try uploadTensor(gpa, ctx, t) else null,
             };
             uploaded_layers = i + 1;
         }

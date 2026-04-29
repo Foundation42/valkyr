@@ -6,3 +6,6 @@ zig-cache/
 # Upstream TRiP source kept locally for cross-checking; not part of our
 # project history (it has its own .git and CC-BY-NC license).
 reference/
+
+# Local Claude Code state (memory, scheduled tasks, settings).
+.claude/

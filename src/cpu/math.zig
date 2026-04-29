@@ -24,7 +24,7 @@ const Family = config_mod.Family;
 /// where:
 ///     rms  = sqrt(mean(in[i]²) + eps)
 ///     gain = (1 + weight[i])  if family == .gemma
-///          = weight[i]         if family == .llama
+///          = weight[i]         if family == .llama or .qwen3
 ///
 /// Length of all three slices is `dim`. `weight` is read straight from
 /// the checkpoint; we dispatch on its dtype here rather than ask the
@@ -94,6 +94,38 @@ pub fn rmsnorm(
             }
         },
         else => return error.UnsupportedWeightDtype,
+    }
+}
+
+/// Qwen3 per-head q_norm / k_norm: applies an independent RMSNorm to
+/// each `head_dim`-sized slice of `in`, all sharing the same gain vector
+/// `weight` (shape [head_dim]).
+///
+/// The mean-of-squares is computed PER HEAD (not across the whole vector
+/// — that would be plain rmsnorm). Each head normalises against its own
+/// L2; the gain vector is shared across heads because each head is
+/// considered an independent unit-variance subspace.
+///
+/// `family` is forwarded so the existing `(1+w)` Gemma quirk handling
+/// stays consistent — but in practice this is only ever called for
+/// Qwen3 (no quirk), so the gemma branch is dead code. Kept for API
+/// symmetry with `rmsnorm`.
+pub fn rmsnormPerHead(
+    out: []f32,
+    in: []const f32,
+    weight: Tensor,
+    eps: f32,
+    num_heads: usize,
+    head_dim: usize,
+    family: Family,
+) !void {
+    if (in.len != num_heads * head_dim) return error.LengthMismatch;
+    if (out.len != in.len) return error.LengthMismatch;
+    if (weight.shape.len != 1 or weight.shape[0] != head_dim) return error.WeightShapeMismatch;
+
+    for (0..num_heads) |h| {
+        const off = h * head_dim;
+        try rmsnorm(out[off .. off + head_dim], in[off .. off + head_dim], weight, eps, family);
     }
 }
 
@@ -261,6 +293,29 @@ pub inline fn gelu_tanh(x: f32) f32 {
 pub fn geglu(out: []f32, gate: []const f32, up: []const f32) !void {
     if (out.len != gate.len or out.len != up.len) return error.LengthMismatch;
     for (out, gate, up) |*o, g, u| o.* = gelu_tanh(g) * u;
+}
+
+/// SwiGLU activation for the gated FFN:
+///     out[i] = silu(gate[i]) * up[i]
+/// where silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
+///
+/// This is the Llama / Qwen3 variant. Same shape as GeGLU; only the
+/// elementwise nonlinearity differs.
+pub fn swiglu(out: []f32, gate: []const f32, up: []const f32) !void {
+    if (out.len != gate.len or out.len != up.len) return error.LengthMismatch;
+    for (out, gate, up) |*o, g, u| {
+        const s = g / (1.0 + std.math.exp(-g));
+        o.* = s * u;
+    }
+}
+
+/// Family-dispatching wrapper: picks GeGLU or SwiGLU based on the
+/// declared activation. Call sites stay family-agnostic.
+pub fn gatedFfn(out: []f32, gate: []const f32, up: []const f32, family: Family) !void {
+    return switch (family.activation()) {
+        .gelu => geglu(out, gate, up),
+        .silu => swiglu(out, gate, up),
+    };
 }
 
 /// Materialise one row of an [N, D] tensor into `dst` as fp32.

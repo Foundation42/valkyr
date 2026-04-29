@@ -1,0 +1,24 @@
+#version 460
+// SwiGLU activation: out[i] = silu(gate[i]) * up[i]
+// where silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
+//
+// Drop-in counterpart to geglu.comp — same shape, same binding layout,
+// same push constant — only the elementwise nonlinearity differs.
+// Llama and Qwen3 use this; Gemma 1 uses geglu.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Gate { float gate[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Up   { float upv[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Out  { float outv[]; };
+
+layout(push_constant) uniform Pc { uint n; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    float x = gate[i];
+    float silu = x / (1.0 + exp(-x));
+    outv[i] = silu * upv[i];
+}

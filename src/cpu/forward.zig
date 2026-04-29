@@ -83,6 +83,13 @@ pub fn forward(
         try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, hidden);
         try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
 
+        if (layer.q_norm) |qn| {
+            try cpu_math.rmsnormPerHead(q, q, qn, cfg.rms_norm_eps, n_heads, head_dim, cfg.family);
+        }
+        if (layer.k_norm) |kn| {
+            try cpu_math.rmsnormPerHead(k, k, kn, cfg.rms_norm_eps, n_kv, head_dim, cfg.family);
+        }
+
         // RoPE on Q and K. At pos 0 these are identity but kept for
         // shape-compat with the multi-position path.
         try cpu_math.applyRope(q_rot, q, n_heads, head_dim, pos, cfg.rope_theta);
@@ -110,7 +117,7 @@ pub fn forward(
         // GeGLU FFN.
         try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, hidden);
         try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, 1, inter, hidden);
-        try cpu_math.geglu(fused, gate, up);
+        try cpu_math.gatedFfn(fused, gate, up, cfg.family);
         try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, 1, hidden, inter);
 
         // Second residual.
@@ -180,6 +187,12 @@ pub fn forwardTq4V(
         try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, hidden);
         try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, hidden);
         try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+        if (layer.q_norm) |qn| {
+            try cpu_math.rmsnormPerHead(q, q, qn, cfg.rms_norm_eps, n_heads, head_dim, cfg.family);
+        }
+        if (layer.k_norm) |kn| {
+            try cpu_math.rmsnormPerHead(k, k, kn, cfg.rms_norm_eps, n_kv, head_dim, cfg.family);
+        }
         try cpu_math.applyRope(q_rot, q, n_heads, head_dim, pos, cfg.rope_theta);
         try cpu_math.applyRope(k_rot, k, n_kv, head_dim, pos, cfg.rope_theta);
 
@@ -203,7 +216,7 @@ pub fn forwardTq4V(
         try cpu_math.rmsnorm(mid_norm, stream, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
         try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, hidden);
         try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, 1, inter, hidden);
-        try cpu_math.geglu(fused, gate, up);
+        try cpu_math.gatedFfn(fused, gate, up, cfg.family);
         try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, 1, hidden, inter);
         for (stream, ffn_out) |*si, fi| si.* += fi;
     }
