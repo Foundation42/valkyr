@@ -115,6 +115,11 @@ pub fn main() !void {
         try runEncode(allocator, args[2], args[3]);
         return;
     }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
+        const user_msg: ?[]const u8 = if (args.len >= 4) args[3] else null;
+        try runChat(allocator, args[2], user_msg);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
@@ -1315,6 +1320,231 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
     return out;
 }
 
+// ── chat: prompt prefill + generation, single-turn or REPL ─────────
+
+fn runChat(gpa: std.mem.Allocator, dir_path: []const u8, single_msg: ?[]const u8) !void {
+    var cpu = try model_mod.Model.load(gpa, dir_path);
+    defer cpu.deinit();
+    const cfg = cpu.config;
+
+    const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{dir_path});
+    defer gpa.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(gpa, tok_path);
+    defer tok.deinit();
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    try stdout.print("uploading weights...\n", .{});
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    defer gm.deinit(ctx.device);
+
+    // KV cache sized for a generous chat. 2048 positions ≈ 18 layers ×
+    // 2 (K + V) × 2048 × 256 × 4 bytes ≈ 72 MiB on disk space — fine.
+    const max_pos: usize = 2048;
+    var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, max_pos);
+    defer sc.deinit(ctx.device);
+    var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
+    defer kv.deinit(ctx.device);
+
+    var ks = try buildChatKernels(&ctx);
+    defer ks.embed.deinit();
+    defer ks.rmsnorm.deinit();
+    defer ks.matmul.deinit();
+    defer ks.rope.deinit();
+    defer ks.kv_write.deinit();
+    defer ks.scores.deinit();
+    defer ks.softmax.deinit();
+    defer ks.attn_out.deinit();
+    defer ks.add.deinit();
+    defer ks.geglu.deinit();
+    const k = ChatKernels{
+        .embed = &ks.embed,
+        .rmsnorm = &ks.rmsnorm,
+        .matmul = &ks.matmul,
+        .rope = &ks.rope,
+        .kv_write = &ks.kv_write,
+        .scores = &ks.scores,
+        .softmax = &ks.softmax,
+        .attn_out = &ks.attn_out,
+        .add = &ks.add,
+        .geglu = &ks.geglu,
+    };
+
+    // Bigger pool sizing — chat sends one full forward worth of
+    // dispatches (~345) per step, and each Recorder.reset() between
+    // steps frees the lot, so 512 sets is plenty per step.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
+    defer rec.deinit();
+
+    const bos = tok.specialTokenId("<bos>") orelse return error.NoBos;
+    const sot = tok.specialTokenId("<start_of_turn>") orelse return error.NoStartOfTurn;
+    const eot = tok.specialTokenId("<end_of_turn>") orelse return error.NoEndOfTurn;
+
+    const logits = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(logits);
+
+    // Position counter persists across turns (multi-turn chat builds on
+    // the same KV cache).
+    var pos: usize = 0;
+
+    if (single_msg) |m| {
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, bos, sot, eot, false);
+        return;
+    }
+
+    // ── REPL ────────────────────────────────────────────────────────
+    try stdout.print("\nGemma 2B IT chat (Ctrl-D to exit)\n", .{});
+    const stdin = std.io.getStdIn().reader();
+    var line_buf: [4096]u8 = undefined;
+    while (true) {
+        try stdout.print("\nuser> ", .{});
+        const maybe_line = try stdin.readUntilDelimiterOrEof(&line_buf, '\n');
+        const line = maybe_line orelse {
+            try stdout.print("\n", .{});
+            break;
+        };
+        if (line.len == 0) continue;
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, bos, sot, eot, true);
+        if (pos >= max_pos - 64) {
+            try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
+            break;
+        }
+    }
+}
+
+/// One round-trip through the model: prefill the prompt for `user_msg`
+/// then sample until <end_of_turn> or max_response. `pos` is updated
+/// in place so the next turn picks up where this one stopped.
+///
+/// `is_first_turn` controls the prefix: the very first turn starts
+/// with `<bos>`; subsequent turns omit it (Gemma's chat template only
+/// has one bos at the start of the conversation).
+fn chatTurn(
+    gpa: std.mem.Allocator,
+    ctx: *const vk.Context,
+    rec: *gpu_recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: ChatKernels,
+    tok: *const tokenizer_mod.Tokenizer,
+    user_msg: []const u8,
+    pos: *usize,
+    logits: []f32,
+    bos: u32,
+    sot: u32,
+    eot: u32,
+    is_repl: bool,
+) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Compose prompt:
+    //   [<bos>?] <start_of_turn> "user\n" {user_msg} <end_of_turn> "\n"
+    //              <start_of_turn> "model\n"
+    //
+    // <bos> only on the very first turn (pos == 0).
+    var prompt = std.ArrayList(u32).init(gpa);
+    defer prompt.deinit();
+    if (pos.* == 0) try prompt.append(bos);
+    try prompt.append(sot);
+    {
+        const ids = try tok.encode(gpa, "user\n");
+        defer gpa.free(ids);
+        try prompt.appendSlice(ids);
+    }
+    {
+        const ids = try tok.encode(gpa, user_msg);
+        defer gpa.free(ids);
+        try prompt.appendSlice(ids);
+    }
+    try prompt.append(eot);
+    {
+        const ids = try tok.encode(gpa, "\n");
+        defer gpa.free(ids);
+        try prompt.appendSlice(ids);
+    }
+    try prompt.append(sot);
+    {
+        const ids = try tok.encode(gpa, "model\n");
+        defer gpa.free(ids);
+        try prompt.appendSlice(ids);
+    }
+
+    if (!is_repl) {
+        try stdout.print("\nprompt ({d} tokens, starting at pos {d}):\n  ", .{ prompt.items.len, pos.* });
+        for (prompt.items) |id| {
+            if (tok.decode(id)) |s| try stdout.print("{s}", .{s});
+        }
+        try stdout.print("\n\nresponse: ", .{});
+    } else {
+        try stdout.print("model> ", .{});
+    }
+
+    const eos: ?u32 = cfg.eos_token_id;
+    const max_response: usize = 256;
+
+    // Run all prompt tokens through the model. We only need the logits
+    // at the LAST prefill position (which gives us the first response
+    // token); intermediate logits are computed and ignored, which is a
+    // small waste — fold the LM head out of prefill for a quick win
+    // later if it matters.
+    var current: u32 = prompt.items[0];
+    var prompt_idx: usize = 0;
+    var generated: usize = 0;
+
+    while (true) {
+        if (pos.* > 0) try rec.reset();
+        try rec.begin();
+        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current);
+        try rec.endAndSubmit();
+
+        // Decide what to do at this position.
+        prompt_idx += 1;
+        pos.* += 1;
+
+        if (prompt_idx < prompt.items.len) {
+            // Still consuming prompt — advance to next prompt token.
+            current = prompt.items[prompt_idx];
+            continue;
+        }
+
+        // Past the last prompt token: sample.
+        try sc.logits.readBack(ctx, f32, logits);
+        const next = cpu_forward.argmax(logits);
+
+        // Stop conditions.
+        if (next == eot) break;
+        if (eos != null and next == eos.?) break;
+
+        const s = tok.decode(next) orelse "<unknown>";
+        // Pretty-print: ▁ → space.
+        try printDecoded(stdout, s);
+
+        generated += 1;
+        if (generated >= max_response) break;
+        current = @intCast(next);
+    }
+    try stdout.print("\n", .{});
+}
+
+fn printDecoded(w: anytype, s: []const u8) !void {
+    // Gemma decoder rule: ▁ (U+2581, bytes E2 96 81) maps back to space.
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + 3 <= s.len and s[i] == 0xE2 and s[i + 1] == 0x96 and s[i + 2] == 0x81) {
+            try w.print(" ", .{});
+            i += 3;
+        } else {
+            try w.print("{c}", .{s[i]});
+            i += 1;
+        }
+    }
+}
+
 // ── encode: BPE round-trip smoke ───────────────────────────────────
 
 fn runEncode(gpa: std.mem.Allocator, dir_path: []const u8, text: []const u8) !void {
@@ -1354,6 +1584,169 @@ fn runEncode(gpa: std.mem.Allocator, dir_path: []const u8, text: []const u8) !vo
         if (tok.decode(id)) |s| try stdout.print("{s}", .{s});
     }
     try stdout.print("\"\n", .{});
+}
+
+// ── Forward-step helper used by both gen-many and chat ─────────────
+
+const ChatKernels = struct {
+    embed: *const pipeline.Kernel,
+    rmsnorm: *const pipeline.Kernel,
+    matmul: *const pipeline.Kernel,
+    rope: *const pipeline.Kernel,
+    kv_write: *const pipeline.Kernel,
+    scores: *const pipeline.Kernel,
+    softmax: *const pipeline.Kernel,
+    attn_out: *const pipeline.Kernel,
+    add: *const pipeline.Kernel,
+    geglu: *const pipeline.Kernel,
+};
+
+/// Record a full forward pass for token `token_id` at position `pos`.
+/// The recorder must already be in the begin() state. After this call
+/// the recorder still needs an endAndSubmit() — the caller controls
+/// when to actually submit (handy for batching multiple steps later).
+///
+/// On exit the device-side `sc.logits` buffer holds the next-token
+/// distribution for position `pos + 1`.
+fn recordForwardStep(
+    rec: *gpu_recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: ChatKernels,
+    pos: usize,
+    token_id: u32,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+    const vocab: u32 = @intCast(cfg.vocab_size);
+    const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
+    const heads_per_kv: u32 = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads);
+    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+    const max_pos_u32: u32 = @intCast(sc.max_pos);
+    const n_pos: u32 = @intCast(pos + 1);
+
+    const embed_push = EmbedLookupPush{
+        .token_id = token_id,
+        .dim = hidden,
+        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+    };
+    const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    const add_push = AddInPlacePush{ .n = hidden };
+    const rope_q_push = RopePush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .pos = @intCast(pos),
+        .theta_base = cfg.rope_theta,
+    };
+    const rope_k_push = RopePush{
+        .n_heads = @intCast(cfg.num_key_value_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .pos = @intCast(pos),
+        .theta_base = cfg.rope_theta,
+    };
+    const kv_write_push = KvWritePush{
+        .n = kv_dim,
+        .dst_off = @intCast(pos * @as(usize, kv_dim)),
+    };
+    const scores_push = AttnScoresPush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .heads_per_kv = heads_per_kv,
+        .head_dim = @intCast(cfg.head_dim),
+        .n_pos = n_pos,
+        .kv_stride = kv_dim,
+        .scores_stride = max_pos_u32,
+        .inv_sqrt_dim = inv_sqrt_dim,
+    };
+    const softmax_push = SoftmaxPush{ .dim = n_pos, .stride = max_pos_u32 };
+    const attn_out_push = AttnOutputPush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .heads_per_kv = heads_per_kv,
+        .head_dim = @intCast(cfg.head_dim),
+        .n_pos = n_pos,
+        .kv_stride = kv_dim,
+        .scores_stride = max_pos_u32,
+    };
+    const geglu_push = GegluPush{ .n = inter };
+
+    try recDispatch1D(rec, k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+
+    for (gm.layers, 0..) |*layer, layer_idx| {
+        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
+
+        try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.q_proj, &sc.q }, 1, q_dim, hidden);
+        try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.k_proj, &sc.k }, 1, kv_dim, hidden);
+        try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.v_proj, &sc.v }, 1, kv_dim, hidden);
+
+        try recDispatchRope(rec, k.rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+        try recDispatchRope(rec, k.rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+
+        const kv_layer = &kv.layers[layer_idx];
+        try recDispatch1D(rec, k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &kv_write_push, kv_dim);
+        try recDispatch1D(rec, k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &kv_write_push, kv_dim);
+
+        try rec.dispatch(
+            k.scores,
+            &.{ &sc.q_rot, &kv_layer.k_cache, &sc.scores },
+            &scores_push,
+            @as(u32, @intCast(cfg.num_attention_heads)) * n_pos,
+            1,
+            1,
+        );
+        try recDispatchPerRow(rec, k.softmax, &.{ &sc.scores, &sc.scores }, &softmax_push, @intCast(cfg.num_attention_heads));
+        try rec.dispatch(
+            k.attn_out,
+            &.{ &sc.scores, &kv_layer.v_cache, &sc.head_out },
+            &attn_out_push,
+            @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
+            1,
+            1,
+        );
+
+        try recDispatchMatmul(rec, k.matmul, &.{ &sc.head_out, &layer.o_proj, &sc.attn_out }, 1, hidden, q_dim);
+        try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
+
+        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
+
+        try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+        try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
+        try recDispatch1D(rec, k.geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
+        try recDispatchMatmul(rec, k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
+
+        try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
+    }
+
+    try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+}
+
+fn buildChatKernels(ctx: *const vk.Context) !struct {
+    embed: pipeline.Kernel,
+    rmsnorm: pipeline.Kernel,
+    matmul: pipeline.Kernel,
+    rope: pipeline.Kernel,
+    kv_write: pipeline.Kernel,
+    scores: pipeline.Kernel,
+    softmax: pipeline.Kernel,
+    attn_out: pipeline.Kernel,
+    add: pipeline.Kernel,
+    geglu: pipeline.Kernel,
+} {
+    return .{
+        .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
+        .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
+        .matmul = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+        .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
+        .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
+        .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
+        .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
+        .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
+        .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
+        .geglu = try pipeline.Kernel.init(ctx, &shaders.geglu, 3, @sizeOf(GegluPush)),
+    };
 }
 
 // ── gpu-gen-many: multi-token generation with KV cache ─────────────
@@ -1587,7 +1980,6 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
         // Flush per token so the user sees streaming output. stdout is
         // line-buffered by default when attached to a TTY but we want
         // per-token visibility regardless.
-        try std.io.getStdOut().sync();
 
         // EOS check: if we hit the end-of-sequence token, stop.
         if (cfg.eos_token_id) |eos| {
