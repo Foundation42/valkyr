@@ -187,6 +187,8 @@ pub fn main() !void {
     try runGpuRhtRoundTripSmoke(allocator);
     try runGpuRhtFusedRoundTripSmoke(allocator);
     try runGpuTq4PackSmoke(allocator);
+    try runGpuTq4UnpackSmoke(allocator);
+    try runGpuTq4RoundTripSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -1061,6 +1063,113 @@ fn runGpuTq4PackSmoke(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print("PASS GPU tq4_pack256 (256 indices bit-exact, γ rel-err {e:.2} vs CPU)\n", .{gamma_rel});
+}
+
+// ── gpu tq4_unpack smoke: dequant a CPU-packed block on GPU vs CPU ──
+
+fn runGpuTq4UnpackSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var input: [256]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i)) / 128.0) - 1.0;
+
+    var cpu_blk: turboquant.BlockTQ4 = undefined;
+    turboquant.quantizeBlockTQ4(&input, &cpu_blk);
+    var cpu_dequant: [256]f32 = undefined;
+    turboquant.dequantizeBlockTQ4(&cpu_blk, &cpu_dequant);
+
+    // Build the 33-u32 GPU input: word[0] = γ as f32 bits, words[1..33] =
+    // 128 bytes of cpu_blk.indices viewed as 32 LE u32s.
+    var gpu_in: [33]u32 = undefined;
+    gpu_in[0] = @bitCast(@as(f32, @floatCast(cpu_blk.gamma)));
+    @memcpy(@as([*]u8, @ptrCast(gpu_in[1..].ptr))[0..128], &cpu_blk.indices);
+
+    var input_buf = try buffer.Buffer.initStatic(&ctx, u32, &gpu_in);
+    defer input_buf.deinit(ctx.device);
+    var output_buf = try buffer.Buffer.initDeviceOnly(&ctx, 256 * @sizeOf(f32));
+    defer output_buf.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0);
+    defer kern.deinit();
+    try kern.bind(&.{ &input_buf, &output_buf });
+
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, null, 1, 1, 1);
+        }
+    }{ .kern = &kern });
+
+    var gpu_dequant: [256]f32 = undefined;
+    try output_buf.readBack(&ctx, f32, &gpu_dequant);
+
+    var max_err: f32 = 0;
+    for (gpu_dequant, cpu_dequant) |g, w| max_err = @max(max_err, @abs(g - w));
+    if (max_err > 1e-4) {
+        std.debug.print("GPU tq4_unpack max |Δ| vs CPU = {e}\n", .{max_err});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU tq4_unpack256 (CPU-packed block dequanted on GPU, max |Δ| vs CPU = {e:.2})\n", .{max_err});
+}
+
+// ── gpu tq4 round-trip: pack → unpack on GPU vs CPU oracle ──────────
+
+fn runGpuTq4RoundTripSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var input: [256]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xACED_F00D);
+    const r = prng.random();
+    for (&input) |*v| v.* = r.floatNorm(f32);
+
+    var cpu_blk: turboquant.BlockTQ4 = undefined;
+    turboquant.quantizeBlockTQ4(&input, &cpu_blk);
+    var cpu_dequant: [256]f32 = undefined;
+    turboquant.dequantizeBlockTQ4(&cpu_blk, &cpu_dequant);
+
+    // GPU: pack input, then unpack the GPU-packed block — chained
+    // through the Recorder so both dispatches share a command buffer
+    // with the auto-emitted compute→compute barrier.
+    var input_buf = try buffer.Buffer.initStatic(&ctx, f32, &input);
+    defer input_buf.deinit(ctx.device);
+    var packed_buf = try buffer.Buffer.initDeviceOnly(&ctx, 33 * @sizeOf(u32));
+    defer packed_buf.deinit(ctx.device);
+    var output_buf = try buffer.Buffer.initDeviceOnly(&ctx, 256 * @sizeOf(f32));
+    defer output_buf.deinit(ctx.device);
+
+    var pack_kern = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack256, 2, 0);
+    defer pack_kern.deinit();
+    var unpack_kern = try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0);
+    defer unpack_kern.deinit();
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4, 8);
+    defer rec.deinit();
+    try rec.begin();
+    try rec.dispatch(&pack_kern,   &.{ &input_buf, &packed_buf }, null, 1, 1, 1);
+    try rec.dispatch(&unpack_kern, &.{ &packed_buf, &output_buf }, null, 1, 1, 1);
+    try rec.endAndSubmit();
+
+    var gpu_dequant: [256]f32 = undefined;
+    try output_buf.readBack(&ctx, f32, &gpu_dequant);
+
+    var max_err: f32 = 0;
+    for (gpu_dequant, cpu_dequant) |g, w| max_err = @max(max_err, @abs(g - w));
+    // GPU and CPU both compute γ in fp32 then truncate to f16, but the
+    // raw γ values differ by ~f32-ULP because the L2 norm reductions
+    // traverse elements in different orders (subgroup-tree on GPU vs
+    // linear on CPU). When the two raw γs straddle an f16 boundary
+    // they round to different f16 values, and that single-ULP delta
+    // multiplies through the centroid magnitudes (max ~2.73), giving
+    // ~5e-4 × 2.73 ≈ 1.4e-3 reconstruction divergence in the worst
+    // case. The indices are bit-exact (verified separately in
+    // tq4_pack256 smoke); only the γ scaling drifts.
+    if (max_err > 5e-3) {
+        std.debug.print("GPU tq4 round-trip max |Δ| vs CPU = {e}\n", .{max_err});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU tq4 pack→unpack round-trip (recorder, max |Δ| vs CPU = {e:.2})\n", .{max_err});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────

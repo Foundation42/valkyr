@@ -1,0 +1,93 @@
+#version 460
+
+// TQ4 unpacking kernel — inverse of tq4_pack256.comp. Mirrors
+// src/cpu/turboquant.zig `dequantizeBlockTQ4` exactly:
+//
+//   1. Unpack indices from the packed nibble stream.
+//   2. Centroid lookup → WHT-domain reconstruction.
+//   3. IFWHT (FWHT, then /256).
+//   4. Sign-flip (completes the inverse RHT to spatial domain).
+//   5. Multiply by γ (norm-correction).
+//
+// Input layout per block: 33 u32s identical to tq4_pack256.comp output.
+//   word[0]      = γ as fp32
+//   word[1..33]  = 32 LE u32s, each holding 8 packed 4-bit indices.
+//
+// Workgroup is 128 threads × 2 elements per thread; one workgroup per
+// 256-element block. Dispatch (n_blocks, 1, 1).
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Input  { uint  input_data[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Output { float output_data[]; };
+
+shared float buf[256];
+
+const uint TBQ_SIGN_WORDS[8] = uint[8](
+    0xf4913ba7u, 0x0e58c26du, 0xd6247fb3u, 0x1cea4589u,
+    0x52d8af63u, 0x3de10b97u, 0xfe19c476u, 0xdb2c854au
+);
+
+float rhtSign(uint i) {
+    uint bit = (TBQ_SIGN_WORDS[i >> 5u] >> (i & 31u)) & 1u;
+    return bit == 1u ? -1.0 : 1.0;
+}
+
+const float LM_CENTROIDS_B4[16] = float[16](
+    -2.7326, -2.0690, -1.6180, -1.2562,
+    -0.9423, -0.6568, -0.3880, -0.1284,
+     0.1284,  0.3880,  0.6568,  0.9423,
+     1.2562,  1.6180,  2.0690,  2.7326
+);
+
+void main() {
+    uint tid    = gl_LocalInvocationID.x;
+    uint blkIdx = gl_WorkGroupID.x;
+    uint base_in  = blkIdx * 33u;
+    uint base_out = blkIdx * 256u;
+
+    uint i0 = 2u * tid;
+    uint i1 = i0 + 1u;
+
+    float gamma = uintBitsToFloat(input_data[base_in]);
+
+    // Zero-γ short circuit: write zeros and exit.
+    if (gamma == 0.0) {
+        output_data[base_out + i0] = 0.0;
+        output_data[base_out + i1] = 0.0;
+        return;
+    }
+
+    // Unpack the byte holding our two nibble indices. Byte tid lives at
+    // u32 word (1 + tid/4), shifted by 8 * (tid % 4).
+    uint word_idx   = 1u + (tid >> 2u);
+    uint byte_shift = (tid & 3u) << 3u;
+    uint byte_val = (input_data[base_in + word_idx] >> byte_shift) & 0xffu;
+    uint idx0 = byte_val & 0xfu;
+    uint idx1 = (byte_val >> 4u) & 0xfu;
+
+    // Centroid LUT in the WHT domain.
+    buf[i0] = LM_CENTROIDS_B4[idx0];
+    buf[i1] = LM_CENTROIDS_B4[idx1];
+    barrier();
+
+    // IFWHT (FWHT butterfly then /256).
+    for (uint length = 1u; length < 256u; length <<= 1u) {
+        uint block = tid / length;
+        uint pos   = tid % length;
+        uint i = block * (2u * length) + pos;
+        uint j = i + length;
+        float u = buf[i];
+        float v = buf[j];
+        buf[i] = u + v;
+        buf[j] = u - v;
+        barrier();
+    }
+    const float inv_d = 1.0 / 256.0;
+    float v0 = buf[i0] * inv_d;
+    float v1 = buf[i1] * inv_d;
+
+    // Sign-flip + γ scale → spatial-domain reconstruction.
+    output_data[base_out + i0] = v0 * rhtSign(i0) * gamma;
+    output_data[base_out + i1] = v1 * rhtSign(i1) * gamma;
+}

@@ -178,9 +178,17 @@ void main() {
     barrier();
 
     // Phase F: γ + write packed output.
+    //
+    // BlockTQ4 stores γ as f16; round-trip through f16 here so the
+    // value emitted by GPU pack matches the value stored by CPU
+    // quantizeBlockTQ4 bit-for-bit. Without this the f16 truncation on
+    // the CPU side surfaces as ~1e-3 reconstruction divergence from
+    // the GPU side that doesn't truncate.
     if (tid == 0u) {
-        float gamma = raw_norm / recon_norm_shared;
-        output_data[base_out] = floatBitsToUint(gamma);
+        float gamma_raw = raw_norm / recon_norm_shared;
+        uint gamma_h = packHalf2x16(vec2(gamma_raw, 0.0));
+        float gamma_f16 = unpackHalf2x16(gamma_h).x;
+        output_data[base_out] = floatBitsToUint(gamma_f16);
     }
     if (tid < 32u) output_data[base_out + 1u + tid] = indices_packed[tid];
 }
