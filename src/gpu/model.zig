@@ -120,10 +120,10 @@ pub const GpuModel = struct {
         for (cpu.layers, 0..) |layer, i| {
             layers[i] = .{
                 .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm),
-                .q_proj = try uploadByPath(gpa, ctx, layer.q_proj, matmul_path),
-                .k_proj = try uploadByPath(gpa, ctx, layer.k_proj, matmul_path),
-                .v_proj = try uploadByPath(gpa, ctx, layer.v_proj, matmul_path),
-                .o_proj = try uploadByPath(gpa, ctx, layer.o_proj, matmul_path),
+                .q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path),
+                .k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path),
+                .v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path),
+                .o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path),
                 .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm),
                 .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path),
                 .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path),

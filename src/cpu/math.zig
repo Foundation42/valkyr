@@ -322,6 +322,26 @@ pub fn gatedFfn(out: []f32, gate: []const f32, up: []const f32, family: Family) 
 /// `dst.len == D`. Convenience for the per-token embedding lookup that
 /// kicks off every forward pass — could live in a more general "tensor
 /// helper" module later, but it's tiny and only called from one place.
+/// Materialise an entire tensor as fp32. `dst.len` must equal the
+/// tensor's element count. Bf16 / fp16 are bit-pattern-converted; fp32
+/// is byte-copied. Used for small Gated-DeltaNet scalars (A_log,
+/// dt_bias) that we read once per layer at decode time and operate on
+/// in fp32 throughout.
+pub fn tensorToF32Slice(dst: []f32, tensor: Tensor) !void {
+    var n_elem: usize = 1;
+    for (tensor.shape) |d| n_elem *= d;
+    if (dst.len != n_elem) return error.LengthMismatch;
+    switch (tensor.dtype) {
+        .f32 => {
+            const src = @as([*]align(1) const f32, @ptrCast(tensor.bytes.ptr))[0..n_elem];
+            @memcpy(dst, src);
+        },
+        .bf16 => dtype.bf16SliceToF32(dtype.asU16(tensor.bytes), dst),
+        .f16 => dtype.f16SliceToF32(dtype.asU16(tensor.bytes), dst),
+        else => return error.UnsupportedTensorDtype,
+    }
+}
+
 pub fn embedRowAsF32(dst: []f32, tensor: Tensor, row_idx: usize) !void {
     if (tensor.shape.len != 2) return error.NotMatrix;
     const d = tensor.shape[1];

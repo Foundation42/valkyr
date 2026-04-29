@@ -13,6 +13,7 @@ const model_mod = @import("model.zig");
 const dtype = @import("dtype.zig");
 const cpu_math = @import("cpu/math.zig");
 const cpu_forward = @import("cpu/forward.zig");
+const cpu_gated_delta = @import("cpu/gated_delta.zig");
 const turboquant = @import("cpu/turboquant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
@@ -35,6 +36,16 @@ pub fn main() !void {
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--load")) {
         try runLoad(allocator, args[2]);
+        return;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--config")) {
+        try runConfig(allocator, args[2]);
+        return;
+    }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--qwen35-layer-test")) {
+        // args[2] = model dir, args[3] = path to layer-0 reference
+        // dump from scripts/dump_qwen35_layer0.py.
+        try runQwen35LayerTest(allocator, args[2], args[3]);
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--dump-embed")) {
@@ -261,6 +272,107 @@ fn runInspect(allocator: std.mem.Allocator, path: []const u8) !void {
 
 // ── load: parse config + open shards + bind layer weights ────────────
 
+fn runQwen35LayerTest(
+    gpa: std.mem.Allocator,
+    dir_path: []const u8,
+    dump_path: []const u8,
+) !void {
+    // ── Load model ──────────────────────────────────────────────────
+    var model = try model_mod.Model.load(gpa, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    if (cfg.family != .qwen35) {
+        std.debug.print("expected qwen3.5 model, got {s}\n", .{@tagName(cfg.family)});
+        return error.WrongFamily;
+    }
+    if (model.layers[0].layer_type != .linear_attention) {
+        std.debug.print("expected layer 0 to be .linear_attention, got {s}\n", .{@tagName(model.layers[0].layer_type)});
+        return error.WrongLayerType;
+    }
+
+    // ── Read reference dump ─────────────────────────────────────────
+    // Format: header (3 × i32) followed by hidden_size fp32 (input) and
+    // hidden_size fp32 (expected output). The header is a sanity check
+    // against silent shape drift between the Python dumper and Zig.
+    const file = try std.fs.cwd().openFile(dump_path, .{ .mode = .read_only });
+    defer file.close();
+    const want_header = [3]i32{ 0x515E_3503, @intCast(cfg.hidden_size), @intCast(cfg.linear_value_head_dim) };
+    var got_header: [3]i32 = undefined;
+    const hdr_bytes_read = try file.read(std.mem.sliceAsBytes(got_header[0..]));
+    if (hdr_bytes_read != @sizeOf(@TypeOf(got_header))) return error.DumpHeaderTruncated;
+    for (want_header, got_header, 0..) |w, g, i| {
+        if (w != g) {
+            std.debug.print("dump header mismatch at field {d}: want {d}, got {d}\n", .{ i, w, g });
+            return error.DumpHeaderMismatch;
+        }
+    }
+
+    const x = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x);
+    const expected = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(expected);
+    if (try file.read(std.mem.sliceAsBytes(x)) != cfg.hidden_size * @sizeOf(f32)) return error.DumpInputTruncated;
+    if (try file.read(std.mem.sliceAsBytes(expected)) != cfg.hidden_size * @sizeOf(f32)) return error.DumpOutputTruncated;
+
+    // ── Run the Zig CPU layer-0 step ────────────────────────────────
+    // Ref Python: x_in is post-input_layernorm. We get x_in directly
+    // from the dump, so skip the layernorm and feed straight into the
+    // Gated DeltaNet kernel. The HF reference returns the layer's
+    // ATTN-PATH output (i.e. `out_proj(...)`), not `x + out` — the
+    // residual add stays in the calling code. Same here.
+    var state = try cpu_gated_delta.State.init(gpa, cfg);
+    defer state.deinit(gpa);
+
+    const got = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(got);
+    try cpu_gated_delta.decodeStep(gpa, cfg, model.layers[0], &state, x, got);
+
+    // ── Compare ─────────────────────────────────────────────────────
+    var max_abs: f32 = 0.0;
+    var sum_sq_diff: f64 = 0.0;
+    var sum_sq_ref: f64 = 0.0;
+    for (got, expected) |g, e| {
+        const d = @abs(g - e);
+        if (d > max_abs) max_abs = d;
+        sum_sq_diff += @as(f64, d) * @as(f64, d);
+        sum_sq_ref += @as(f64, e) * @as(f64, e);
+    }
+    const rel = if (sum_sq_ref > 0) @sqrt(sum_sq_diff / sum_sq_ref) else 0.0;
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("layer 0 (linear_attn) parity:\n", .{});
+    try stdout.print("  hidden_size  = {d}\n", .{cfg.hidden_size});
+    try stdout.print("  max |Δ|      = {e}\n", .{max_abs});
+    try stdout.print("  ‖Δ‖ / ‖ref‖ = {e}\n", .{rel});
+    try stdout.print("  first 4 (got vs ref):\n", .{});
+    for (0..@min(4, got.len)) |i| {
+        try stdout.print("    [{d}] {e:.6}  vs  {e:.6}\n", .{ i, got[i], expected[i] });
+    }
+    if (max_abs > 1e-3) {
+        try stdout.print("FAIL: |Δ| > 1e-3\n", .{});
+        return error.ParityFailed;
+    }
+    try stdout.print("PASS qwen35 layer 0 (linear_attn) — max |Δ| = {e}\n", .{max_abs});
+}
+
+fn runConfig(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    // Parse `config.json` only — no safetensors loader. Useful for
+    // validating new architectures' config plumbing in isolation before
+    // wiring up the rest of the loader.
+    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(cfg_path);
+    const cfg = try config_mod.Config.loadFromFile(allocator, cfg_path);
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("Parsed {s}\n\n", .{cfg_path});
+    try cfg.print(stdout);
+    try stdout.print("\n[in_proj_qkv conv dim] {d}\n", .{cfg.linearAttnConvDim()});
+    if (cfg.family.isHybrid()) {
+        try stdout.print("[layer_types[0..8]]    ", .{});
+        const n = @min(cfg.num_hidden_layers, 8);
+        for (cfg.layer_types[0..n]) |t| try stdout.print("{s} ", .{@tagName(t)});
+        try stdout.print("\n", .{});
+    }
+}
+
 fn runLoad(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     const t0 = std.time.nanoTimestamp();
     var model = try model_mod.Model.load(allocator, dir_path);
@@ -281,17 +393,34 @@ fn runLoad(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     // Sanity: walk every layer once and confirm we can read the first
     // and last byte of each weight from the mmap. If a shard's offset
     // table is wrong, that page-faults; if it's right, this is free.
+    // For hybrid models the per-layer fields differ between full and
+    // linear-attention blocks — touch whichever is present.
     var bytes_touched: usize = 0;
     for (model.layers) |layer| {
+        // FFN trio + the two LayerNorms are always present.
         inline for (.{
-            "input_layernorm",      "q_proj",     "k_proj",
-            "v_proj",               "o_proj",     "post_attention_layernorm",
-            "gate_proj",            "up_proj",    "down_proj",
+            "input_layernorm",          "post_attention_layernorm",
+            "gate_proj",                "up_proj",                  "down_proj",
         }) |fname| {
             const t = @field(layer, fname);
             if (t.bytes.len > 0) {
                 bytes_touched +%= @intCast(t.bytes[0]);
                 bytes_touched +%= @intCast(t.bytes[t.bytes.len - 1]);
+            }
+        }
+        // Optional per-flavor tensors. `inline for` on a tuple of field
+        // names lets us walk them uniformly, dereference the optional,
+        // and skip nulls.
+        inline for (.{
+            "q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm",
+            "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+            "conv1d_weight", "A_log", "dt_bias", "ssm_norm_weight", "out_proj",
+        }) |fname| {
+            if (@field(layer, fname)) |t| {
+                if (t.bytes.len > 0) {
+                    bytes_touched +%= @intCast(t.bytes[0]);
+                    bytes_touched +%= @intCast(t.bytes[t.bytes.len - 1]);
+                }
             }
         }
     }
@@ -1585,7 +1714,7 @@ fn runQprojTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u3
     defer allocator.free(q);
 
     const t0 = std.time.nanoTimestamp();
-    try cpu_math.matmul_nt(q, x_norm, model.layers[0].q_proj, 1, q_dim, cfg.hidden_size);
+    try cpu_math.matmul_nt(q, x_norm, model.layers[0].q_proj.?, 1, q_dim, cfg.hidden_size);
     const t1 = std.time.nanoTimestamp();
     const ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
 
@@ -1642,7 +1771,7 @@ fn runRopeTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32
     const q_dim = cfg.num_attention_heads * cfg.head_dim;
     const q = try allocator.alloc(f32, q_dim);
     defer allocator.free(q);
-    try cpu_math.matmul_nt(q, x_norm, model.layers[0].q_proj, 1, q_dim, cfg.hidden_size);
+    try cpu_math.matmul_nt(q, x_norm, model.layers[0].q_proj.?, 1, q_dim, cfg.hidden_size);
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("RoPE on Q [n_heads={d}, head_dim={d}] for token {d}\n\n", .{
@@ -1760,9 +1889,9 @@ fn runAttentionTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id
         try cpu_math.rmsnorm(x_norm, x, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
 
         // ── Q, K, V projections ─────────────────────────────────────
-        try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, cfg.hidden_size);
-        try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, cfg.hidden_size);
-        try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, cfg.hidden_size);
+        try cpu_math.matmul_nt(q, x_norm, layer.q_proj.?, 1, q_dim, cfg.hidden_size);
+        try cpu_math.matmul_nt(k, x_norm, layer.k_proj.?, 1, kv_dim, cfg.hidden_size);
+        try cpu_math.matmul_nt(v, x_norm, layer.v_proj.?, 1, kv_dim, cfg.hidden_size);
 
         // ── RoPE on Q and K (V is not rotated) ──────────────────────
         try cpu_math.applyRope(q_rot, q, n_heads, head_dim, pos, cfg.rope_theta);
@@ -1804,7 +1933,7 @@ fn runAttentionTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id
         }
 
         // ── Output projection: head_out @ o_proj^T → attn_out ───────
-        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, cfg.hidden_size, q_dim);
+        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj.?, 1, cfg.hidden_size, q_dim);
 
         // ── Stats ───────────────────────────────────────────────────
         var min_v: f32 = std.math.inf(f32);
@@ -1887,9 +2016,9 @@ fn runLayer0Test(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u
     defer allocator.free(k);
     const v = try allocator.alloc(f32, kv_dim);
     defer allocator.free(v);
-    try cpu_math.matmul_nt(q, x_norm1, layer.q_proj, 1, q_dim, hidden);
-    try cpu_math.matmul_nt(k, x_norm1, layer.k_proj, 1, kv_dim, hidden);
-    try cpu_math.matmul_nt(v, x_norm1, layer.v_proj, 1, kv_dim, hidden);
+    try cpu_math.matmul_nt(q, x_norm1, layer.q_proj.?, 1, q_dim, hidden);
+    try cpu_math.matmul_nt(k, x_norm1, layer.k_proj.?, 1, kv_dim, hidden);
+    try cpu_math.matmul_nt(v, x_norm1, layer.v_proj.?, 1, kv_dim, hidden);
 
     const q_rot = try allocator.alloc(f32, q_dim);
     defer allocator.free(q_rot);
@@ -1914,7 +2043,7 @@ fn runLayer0Test(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u
 
     const attn_out = try allocator.alloc(f32, hidden);
     defer allocator.free(attn_out);
-    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj.?, 1, hidden, q_dim);
     try printStreamStats(stdout, "attn output (pre-residual)", attn_out);
 
     // ── Stage 2: residual add ───────────────────────────────────────
@@ -2048,9 +2177,9 @@ fn runTq4KvTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u3
         try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
 
         // Q/K/V projections.
-        try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, hidden);
-        try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, hidden);
-        try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(q, x_norm, layer.q_proj.?, 1, q_dim, hidden);
+        try cpu_math.matmul_nt(k, x_norm, layer.k_proj.?, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(v, x_norm, layer.v_proj.?, 1, kv_dim, hidden);
 
         // RoPE on Q and K.
         try cpu_math.applyRope(q_rot, q, n_heads, head_dim, pos, cfg.rope_theta);
@@ -2095,7 +2224,7 @@ fn runTq4KvTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u3
             const out_off = h * head_dim;
             @memcpy(head_out[out_off .. out_off + head_dim], v[v_off .. v_off + head_dim]);
         }
-        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj.?, 1, hidden, q_dim);
         for (stream, attn_out) |*si, ai| si.* += ai;
 
         try cpu_math.rmsnorm(mid_norm, stream, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
@@ -2495,11 +2624,12 @@ const ChatTemplate = struct {
                 .end_of_turn = tok.specialTokenId("<|eot_id|>") orelse return error.NoEndOfTurn,
                 .assistant_role = "assistant",
             },
-            .qwen3 => .{
+            .qwen3, .qwen35 => .{
                 .family = family,
-                // Qwen3 chat doesn't prepend BOS in the canonical
-                // template; we just leave it null. (`<|endoftext|>`
-                // exists at id 151643 but isn't emitted at turn start.)
+                // Qwen3 / Qwen3.5 chat doesn't prepend BOS; both use the
+                // ChatML `<|im_start|>` / `<|im_end|>` markers (Qwen3.5
+                // adds vision/tool/think specials but the text-only chat
+                // template is the same shape).
                 .bos = null,
                 .start_of_turn = tok.specialTokenId("<|im_start|>") orelse return error.NoStartOfTurn,
                 .end_of_turn = tok.specialTokenId("<|im_end|>") orelse return error.NoEndOfTurn,
@@ -2513,6 +2643,7 @@ const ChatTemplate = struct {
             .gemma => "Gemma chat",
             .llama => "Llama chat",
             .qwen3 => "Qwen3 chat",
+            .qwen35 => "Qwen3.5 chat",
         };
     }
 
@@ -3809,7 +3940,7 @@ fn cpuLayer0Forward(gpa: std.mem.Allocator, cpu: *const model_mod.Model, token_i
 
     const v = try gpa.alloc(f32, kv_dim);
     defer gpa.free(v);
-    try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+    try cpu_math.matmul_nt(v, x_norm, layer.v_proj.?, 1, kv_dim, hidden);
 
     const head_out = try gpa.alloc(f32, q_dim);
     defer gpa.free(head_out);
@@ -3822,7 +3953,7 @@ fn cpuLayer0Forward(gpa: std.mem.Allocator, cpu: *const model_mod.Model, token_i
 
     const attn_out = try gpa.alloc(f32, hidden);
     defer gpa.free(attn_out);
-    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj.?, 1, hidden, q_dim);
     for (stream, attn_out) |*s, a| s.* += a;
 
     const mid_norm = try gpa.alloc(f32, hidden);
@@ -4010,7 +4141,7 @@ fn runGpuLoad(gpa: std.mem.Allocator, dir_path: []const u8) !void {
     // they match the host fp32 representation.
     try roundTripCheck(gpa, &ctx, &gm.embed_tokens, cpu.embed_tokens, "embed_tokens");
     try roundTripCheck(gpa, &ctx, &gm.final_norm, cpu.final_norm, "final_norm");
-    try roundTripCheck(gpa, &ctx, &gm.layers[0].q_proj, cpu.layers[0].q_proj, "layer 0 q_proj");
+    try roundTripCheck(gpa, &ctx, &gm.layers[0].q_proj, cpu.layers[0].q_proj.?, "layer 0 q_proj");
     try roundTripCheck(gpa, &ctx, &gm.layers[0].input_layernorm, cpu.layers[0].input_layernorm, "layer 0 input_layernorm");
     try roundTripCheck(gpa, &ctx, &gm.layers[17].down_proj, cpu.layers[17].down_proj, "layer 17 down_proj");
 
@@ -4176,7 +4307,7 @@ fn runGpuRopeTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !
     const q_dim = cfg.num_attention_heads * cfg.head_dim;
     const q = try gpa.alloc(f32, q_dim);
     defer gpa.free(q);
-    try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, cfg.hidden_size);
+    try cpu_math.matmul_nt(q, x_norm, layer.q_proj.?, 1, q_dim, cfg.hidden_size);
 
     // CPU baseline at pos=1.
     const want = try gpa.alloc(f32, q_dim);
@@ -4273,7 +4404,7 @@ fn runGpuGegluTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) 
     // Single-position attention output = V projected through o_proj.
     const v = try gpa.alloc(f32, cfg.num_key_value_heads * cfg.head_dim);
     defer gpa.free(v);
-    try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, v.len, cfg.hidden_size);
+    try cpu_math.matmul_nt(v, x_norm, layer.v_proj.?, 1, v.len, cfg.hidden_size);
 
     const head_out = try gpa.alloc(f32, cfg.num_attention_heads * cfg.head_dim);
     defer gpa.free(head_out);
@@ -4286,7 +4417,7 @@ fn runGpuGegluTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) 
     }
     const attn_out = try gpa.alloc(f32, cfg.hidden_size);
     defer gpa.free(attn_out);
-    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, cfg.hidden_size, head_out.len);
+    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj.?, 1, cfg.hidden_size, head_out.len);
 
     const mid = try gpa.alloc(f32, cfg.hidden_size);
     defer gpa.free(mid);
@@ -4394,7 +4525,7 @@ fn runGpuQprojTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) 
     const q_cpu = try gpa.alloc(f32, q_dim);
     defer gpa.free(q_cpu);
     const t_cpu0 = std.time.nanoTimestamp();
-    try cpu_math.matmul_nt(q_cpu, x_norm, model.layers[0].q_proj, 1, q_dim, cfg.hidden_size);
+    try cpu_math.matmul_nt(q_cpu, x_norm, model.layers[0].q_proj.?, 1, q_dim, cfg.hidden_size);
     const t_cpu1 = std.time.nanoTimestamp();
     const cpu_ms = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
 
@@ -4404,7 +4535,7 @@ fn runGpuQprojTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) 
     // O(numel) so it doesn't dominate setup, but it does double host
     // memory while we hold both copies — fine for this kernel
     // (32 MiB), would want an in-place stream once we do all weights.
-    const w_bf16 = dtype.asU16(model.layers[0].q_proj.bytes);
+    const w_bf16 = dtype.asU16(model.layers[0].q_proj.?.bytes);
     const w_f32 = try gpa.alloc(f32, w_bf16.len);
     defer gpa.free(w_f32);
     dtype.bf16SliceToF32(w_bf16, w_f32);

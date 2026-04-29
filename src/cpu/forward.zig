@@ -79,9 +79,9 @@ pub fn forward(
         try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
 
         // Q/K/V projections.
-        try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, hidden);
-        try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, hidden);
-        try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(q, x_norm, layer.q_proj.?, 1, q_dim, hidden);
+        try cpu_math.matmul_nt(k, x_norm, layer.k_proj.?, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(v, x_norm, layer.v_proj.?, 1, kv_dim, hidden);
 
         if (layer.q_norm) |qn| {
             try cpu_math.rmsnormPerHead(q, q, qn, cfg.rms_norm_eps, n_heads, head_dim, cfg.family);
@@ -106,7 +106,7 @@ pub fn forward(
         }
 
         // o_proj.
-        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj.?, 1, hidden, q_dim);
 
         // First residual.
         for (stream, attn_out) |*si, ai| si.* += ai;
@@ -184,9 +184,9 @@ pub fn forwardTq4V(
 
     for (model.layers) |layer| {
         try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
-        try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, hidden);
-        try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, hidden);
-        try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(q, x_norm, layer.q_proj.?, 1, q_dim, hidden);
+        try cpu_math.matmul_nt(k, x_norm, layer.k_proj.?, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(v, x_norm, layer.v_proj.?, 1, kv_dim, hidden);
         if (layer.q_norm) |qn| {
             try cpu_math.rmsnormPerHead(q, q, qn, cfg.rms_norm_eps, n_heads, head_dim, cfg.family);
         }
@@ -210,7 +210,7 @@ pub fn forwardTq4V(
             const out_off = h * head_dim;
             @memcpy(head_out[out_off .. out_off + head_dim], v_recon[v_off .. v_off + head_dim]);
         }
-        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj.?, 1, hidden, q_dim);
         for (stream, attn_out) |*si, ai| si.* += ai;
 
         try cpu_math.rmsnorm(mid_norm, stream, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
