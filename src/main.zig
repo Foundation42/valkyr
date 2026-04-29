@@ -50,11 +50,17 @@ pub fn main() !void {
         try runRopeTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--attention-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runAttentionTest(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
     try runMatmulSmoke(allocator);
     try runRopeIdentitySmoke(allocator);
+    try runSoftmaxSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -274,6 +280,29 @@ fn runRopeIdentitySmoke(allocator: std.mem.Allocator) !void {
     std.debug.print("PASS RoPE pos=0 identity ({d} heads × {d} dim)\n", .{ n_heads, head_dim });
 }
 
+// ── softmax smoke: stable form on a hand-checked input ─────────────
+
+fn runSoftmaxSmoke(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    // Inputs include a large positive value; the naive exp(x) form
+    // would overflow but the stable variant should produce normal
+    // probabilities. Reference computed with the same shifted form.
+    var x = [_]f32{ 1.0, 2.0, 3.0, 100.0 };
+    cpu_math.softmax(&x);
+    var sum: f32 = 0;
+    for (x) |v| sum += v;
+    if (@abs(sum - 1.0) > 1e-6) {
+        std.debug.print("softmax sum {d} != 1\n", .{sum});
+        return error.ParityFailed;
+    }
+    // The big value should dominate (≈ 1.0); the others should be tiny.
+    if (x[3] < 0.99 or x[0] > 1e-30 or x[1] > 1e-30 or x[2] > 1e-30) {
+        std.debug.print("softmax distribution wrong: {any}\n", .{x});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS softmax stable form (handles +100 without overflow)\n", .{});
+}
+
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
 
 fn runRmsnormTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
@@ -479,6 +508,150 @@ fn runRopeTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32
         }
     }
     try stdout.print("\nrotation invariant: max ||pair||² delta = {e:.2}  (must be tiny)\n", .{max_err});
+}
+
+// ── attention-test: full single-position attention through layer 0 ──
+
+fn runAttentionTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    const layer = model.layers[0];
+
+    const n_heads = cfg.num_attention_heads;
+    const n_kv = cfg.num_key_value_heads;
+    const head_dim = cfg.head_dim;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv * head_dim;
+    const heads_per_kv = n_heads / n_kv; // 8 for Gemma 2B (MQA)
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print(
+        \\full attention block on layer 0 — token {d} run twice (pos 0, pos 1)
+        \\config: n_heads={d}, n_kv_heads={d}, head_dim={d}, hidden={d}
+        \\
+        \\
+    , .{ token_id, n_heads, n_kv, head_dim, cfg.hidden_size });
+
+    // 2-position KV cache, flat [pos][n_kv * head_dim].
+    const max_pos: usize = 2;
+    const k_cache = try allocator.alloc(f32, max_pos * kv_dim);
+    defer allocator.free(k_cache);
+    const v_cache = try allocator.alloc(f32, max_pos * kv_dim);
+    defer allocator.free(v_cache);
+
+    // Scratch buffers reused across positions.
+    const x = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(x);
+    const x_norm = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(x_norm);
+    const q = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q);
+    const q_rot = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q_rot);
+    const k = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(k);
+    const k_rot = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(k_rot);
+    const v = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(v);
+    const head_out = try allocator.alloc(f32, q_dim);
+    defer allocator.free(head_out);
+    const attn_out = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(attn_out);
+
+    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    var pos: usize = 0;
+    while (pos < max_pos) : (pos += 1) {
+        // ── pre-attention: embed → scale → rmsnorm ──────────────────
+        try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+        if (cfg.family.embedScalesByDim()) {
+            const s: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+            for (x) |*xi| xi.* *= s;
+        }
+        try cpu_math.rmsnorm(x_norm, x, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+        // ── Q, K, V projections ─────────────────────────────────────
+        try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, cfg.hidden_size);
+        try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, cfg.hidden_size);
+        try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, cfg.hidden_size);
+
+        // ── RoPE on Q and K (V is not rotated) ──────────────────────
+        try cpu_math.applyRope(q_rot, q, n_heads, head_dim, pos, cfg.rope_theta);
+        try cpu_math.applyRope(k_rot, k, n_kv, head_dim, pos, cfg.rope_theta);
+
+        // ── Append to KV cache ──────────────────────────────────────
+        @memcpy(k_cache[pos * kv_dim ..][0..kv_dim], k_rot);
+        @memcpy(v_cache[pos * kv_dim ..][0..kv_dim], v);
+
+        // ── Attention: scores → softmax → weighted V sum ────────────
+        const n_pos = pos + 1;
+        const scores = try allocator.alloc(f32, n_pos);
+        defer allocator.free(scores);
+
+        var print_softmax_pos: ?usize = null;
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const q_off = h * head_dim;
+
+            // Score against every cached position.
+            for (0..n_pos) |p| {
+                const k_off = p * kv_dim + kv_h * head_dim;
+                var s: f32 = 0;
+                for (0..head_dim) |d| s += q_rot[q_off + d] * k_cache[k_off + d];
+                scores[p] = s * inv_sqrt_dim;
+            }
+
+            cpu_math.softmax(scores);
+            if (h == 0 and pos == 1) print_softmax_pos = pos;
+
+            // Sum over positions: head_out[h] = Σ scores[p] * v_cache[p, kv_h]
+            const out_off = h * head_dim;
+            for (0..head_dim) |d| head_out[out_off + d] = 0;
+            for (0..n_pos) |p| {
+                const v_off = p * kv_dim + kv_h * head_dim;
+                const w = scores[p];
+                for (0..head_dim) |d| head_out[out_off + d] += w * v_cache[v_off + d];
+            }
+        }
+
+        // ── Output projection: head_out @ o_proj^T → attn_out ───────
+        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, cfg.hidden_size, q_dim);
+
+        // ── Stats ───────────────────────────────────────────────────
+        var min_v: f32 = std.math.inf(f32);
+        var max_v: f32 = -std.math.inf(f32);
+        var sum_sq: f64 = 0;
+        for (attn_out) |val| {
+            if (val < min_v) min_v = val;
+            if (val > max_v) max_v = val;
+            sum_sq += @as(f64, val) * @as(f64, val);
+        }
+        const rms = std.math.sqrt(sum_sq / @as(f64, @floatFromInt(attn_out.len)));
+
+        try stdout.print("pos {d}: attn_out min={d:.6} max={d:.6} rms={d:.6}\n", .{
+            pos, min_v, max_v, rms,
+        });
+        if (print_softmax_pos != null) {
+            // Re-run softmax on head 0 so we can print it (the loop
+            // above destroys scores in-place per head).
+            const dbg_scores = try allocator.alloc(f32, n_pos);
+            defer allocator.free(dbg_scores);
+            for (0..n_pos) |p| {
+                const k_off = p * kv_dim;
+                var s: f32 = 0;
+                for (0..head_dim) |d| s += q_rot[d] * k_cache[k_off + d];
+                dbg_scores[p] = s * inv_sqrt_dim;
+            }
+            const raw0 = dbg_scores[0];
+            const raw1 = dbg_scores[1];
+            cpu_math.softmax(dbg_scores);
+            try stdout.print("       head 0 raw scores=({d:.4}, {d:.4})  softmax=({d:.4}, {d:.4}) sum={d:.6}\n", .{
+                raw0, raw1, dbg_scores[0], dbg_scores[1], dbg_scores[0] + dbg_scores[1],
+            });
+        }
+    }
 }
 
 // ── vec_add smoke: validates the whole Vulkan compute path ───────────

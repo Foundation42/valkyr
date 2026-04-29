@@ -216,6 +216,27 @@ pub fn applyRope(
     }
 }
 
+/// In-place numerically stable softmax over a slice. Subtract the max
+/// before exponentiating so the largest exp() argument is 0 and we
+/// don't overflow on big positive scores; the resulting probabilities
+/// are identical to the naive version in exact arithmetic but tolerate
+/// fp32 inputs in [-∞, +∞] without inf/nan.
+pub fn softmax(x: []f32) void {
+    if (x.len == 0) return;
+    var max_v: f32 = x[0];
+    for (x[1..]) |v| {
+        if (v > max_v) max_v = v;
+    }
+    var sum: f32 = 0;
+    for (x) |*v| {
+        const e = @exp(v.* - max_v);
+        v.* = e;
+        sum += e;
+    }
+    const inv = 1.0 / sum;
+    for (x) |*v| v.* *= inv;
+}
+
 /// Materialise one row of an [N, D] tensor into `dst` as fp32.
 /// `dst.len == D`. Convenience for the per-token embedding lookup that
 /// kicks off every forward pass — could live in a more general "tensor
