@@ -99,6 +99,7 @@ pub fn main() !void {
     try runGpuRmsnormSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
+    try runGpuSoftmaxSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -618,6 +619,67 @@ fn runGpuRopeSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU rope (pos=0 identity + pos=1 vs CPU within 1e-5)\n", .{});
+}
+
+// ── gpu softmax smoke: synthetic vs CPU softmax ─────────────────────
+
+const SoftmaxPush = extern struct { dim: u32 };
+
+fn runGpuSoftmaxSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim: usize = 2048;
+    const x = try allocator.alloc(f32, dim);
+    defer allocator.free(x);
+    // Mix of negative, near-zero, and one big positive — exercises the
+    // numerical-stability subtract-max path.
+    for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 1024)) * 0.01;
+    x[42] = 100.0; // a clear winner; without subtract-max would overflow exp
+
+    const want = try allocator.alloc(f32, dim);
+    defer allocator.free(want);
+    @memcpy(want, x);
+    cpu_math.softmax(want);
+
+    var buf_in = try buffer.Buffer.initStatic(&ctx, f32, x);
+    defer buf_in.deinit(ctx.device);
+    var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, dim * @sizeOf(f32));
+    defer buf_out.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_in, &buf_out });
+
+    const push = SoftmaxPush{ .dim = @intCast(dim) };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const SoftmaxPush,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, 1, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push });
+
+    const got = try allocator.alloc(f32, dim);
+    defer allocator.free(got);
+    try buf_out.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    var sum: f32 = 0;
+    for (got, want) |g, e| {
+        const d = @abs(g - e);
+        if (d > max_abs) max_abs = d;
+        sum += g;
+    }
+    if (max_abs > 1e-5) {
+        std.debug.print("GPU softmax: max |Δ| = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+    if (@abs(sum - 1.0) > 1e-5) {
+        std.debug.print("GPU softmax sum {d} != 1\n", .{sum});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU softmax synthetic (dim=2048, sum=1±1e-5, vs CPU 1e-5)\n", .{});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────

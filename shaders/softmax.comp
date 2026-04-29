@@ -1,0 +1,88 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Numerically stable softmax over the last dim of a [rows, dim] tensor.
+//
+//     out[r, i] = exp(in[r, i] - max(in[r, :])) / Σ exp(in[r, :] - max)
+//
+// One workgroup per row. Three phases:
+//   1. max reduction (subgroupMax → cross-subgroup → broadcast)
+//   2. sum-of-exp reduction (subgroupAdd → cross-subgroup → broadcast)
+//   3. per-thread output write
+//
+// Two passes over the input — phase 1 reads it for max, phase 3 reads
+// it again for the final exp+divide. The bytes are typically still in
+// L1 from phase 1, and the alternative (caching exp(x - max) in shared
+// memory) costs O(dim) shared memory which would cap us at small dims.
+// Two-pass scales arbitrarily.
+//
+// Reuses the same shared-memory reduction layout as rmsnorm, just with
+// an extra phase for the running max → running sum-exp split.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint dim;
+} pc;
+
+shared float sg_partials[32];
+shared float row_max_shared;
+shared float row_sum_shared;
+
+void main() {
+    // GLSL doesn't allow uintBitsToFloat as a global const initializer,
+    // so the IEEE-754 -inf bit pattern lives here as a function-scope
+    // const. Same value either way.
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+
+    uint row = gl_WorkGroupID.x;
+    uint row_off = row * pc.dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    // ── Phase 1: row max ────────────────────────────────────────────
+    float local_max = NEG_INF;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        local_max = max(local_max, in_v[row_off + i]);
+    }
+    float sg_max = subgroupMax(local_max);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_max;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : NEG_INF;
+        float total = subgroupMax(v);
+        if (subgroupElect()) row_max_shared = total;
+    }
+    barrier();
+    float row_max = row_max_shared;
+
+    // ── Phase 2: row sum-exp ────────────────────────────────────────
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        local_sum += exp(in_v[row_off + i] - row_max);
+    }
+    float sg_sum = subgroupAdd(local_sum);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) row_sum_shared = total;
+    }
+    barrier();
+    float inv_sum = 1.0 / row_sum_shared;
+
+    // ── Phase 3: output ─────────────────────────────────────────────
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        out_v[row_off + i] = exp(in_v[row_off + i] - row_max) * inv_sum;
+    }
+}
