@@ -13,6 +13,7 @@ const model_mod = @import("model.zig");
 const dtype = @import("dtype.zig");
 const cpu_math = @import("cpu/math.zig");
 const cpu_forward = @import("cpu/forward.zig");
+const turboquant = @import("cpu/turboquant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
@@ -164,6 +165,7 @@ pub fn main() !void {
     try runRopeIdentitySmoke(allocator);
     try runSoftmaxSmoke(allocator);
     try runGeluSmoke(allocator);
+    try runTurboquantSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runGpuRmsnormSmoke(allocator);
@@ -826,6 +828,61 @@ fn runGeluSmoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS gelu_tanh (5 ref values within 1e-5)\n", .{});
+}
+
+// ── TurboQuant tables smoke: Lloyd-Max codebook + RHT sign pattern ──
+
+fn runTurboquantSmoke(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    // 1) RHT sign pattern: byte 0 = 0xa7 = 0b10100111, so LSB-first
+    //    bits 0..7 = 1,1,1,0,0,1,0,1, signs = -1,-1,-1,+1,+1,-1,+1,-1.
+    const sign_expected = [_]f32{ -1, -1, -1, 1, 1, -1, 1, -1 };
+    for (sign_expected, 0..) |want, i| {
+        if (turboquant.rhtSign(i) != want) {
+            std.debug.print("rhtSign({d}): got {d}, want {d}\n", .{ i, turboquant.rhtSign(i), want });
+            return error.ParityFailed;
+        }
+    }
+    // The pattern is 256-bit periodic.
+    if (turboquant.rhtSign(0) != turboquant.rhtSign(256)) return error.ParityFailed;
+
+    // 2) Lloyd-Max codebooks symmetric about zero (b=3 and b=4).
+    inline for ([_]turboquant.Bits{ .b3, .b4 }) |b| {
+        const n: usize = if (b == .b3) 8 else 16;
+        var i: usize = 0;
+        while (i < n / 2) : (i += 1) {
+            const lo = turboquant.lloydMaxCentroid(@intCast(i), b);
+            const hi = turboquant.lloydMaxCentroid(@intCast(n - 1 - i), b);
+            if (@abs(-lo - hi) > 1e-6) {
+                std.debug.print("centroid asymmetry b={d}: lo={d} hi={d}\n", .{ @intFromEnum(b), lo, hi });
+                return error.ParityFailed;
+            }
+        }
+    }
+
+    // 3) Quantize each centroid back through lloydMaxIndex; should round-trip.
+    inline for ([_]turboquant.Bits{ .b3, .b4 }) |b| {
+        const n: usize = if (b == .b3) 8 else 16;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const c = turboquant.lloydMaxCentroid(@intCast(i), b);
+            const idx = turboquant.lloydMaxIndex(c, b);
+            if (idx != i) {
+                std.debug.print("centroid round-trip b={d} i={d}: got idx={d}\n", .{ @intFromEnum(b), i, idx });
+                return error.ParityFailed;
+            }
+        }
+    }
+
+    // 4) Hand-checked corner values vs YATQ's (x >= b).sum() idiom.
+    //    b=3: x=0.0 → bin 4 (centroid +0.2451), x=0.6 → bin 5 (+0.756),
+    //    x=-0.6 → bin 2 (-0.756). b=4: x=0.0 → bin 8 (+0.1284).
+    if (turboquant.lloydMaxIndex(0.0, .b3) != 4) return error.ParityFailed;
+    if (turboquant.lloydMaxIndex(0.6, .b3) != 5) return error.ParityFailed;
+    if (turboquant.lloydMaxIndex(-0.6, .b3) != 2) return error.ParityFailed;
+    if (turboquant.lloydMaxIndex(0.0, .b4) != 8) return error.ParityFailed;
+
+    std.debug.print("PASS turboquant tables (RHT signs + b3/b4 codebooks vs YATQ)\n", .{});
 }
 
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
