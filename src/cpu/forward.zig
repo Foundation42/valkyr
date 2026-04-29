@@ -21,6 +21,7 @@
 const std = @import("std");
 const model_mod = @import("../model.zig");
 const cpu_math = @import("math.zig");
+const turboquant = @import("turboquant.zig");
 
 /// Run the full forward pass and write the logits over the vocabulary
 /// to `logits` (length must equal `model.config.vocab_size`).
@@ -122,6 +123,93 @@ pub fn forward(
 
     // Logits: matmul against the LM head (which for Gemma is tied to
     // the embedding matrix [vocab_size, hidden_size]).
+    try cpu_math.matmul_nt(logits, final_norm, model.lm_head, 1, cfg.vocab_size, hidden);
+}
+
+/// Same as `forward`, but every layer's V vector is run through a
+/// TQ4 quantize+dequantize before being read by attention. Models
+/// what an asymmetric KV cache (K kept full-precision, V compressed)
+/// would do at single-position, no-history attention. Currently
+/// requires Gemma 2B's shape (n_kv=1, head_dim=256 — exactly one TQ4
+/// block per layer's V).
+pub fn forwardTq4V(
+    model: *const model_mod.Model,
+    token_id: u32,
+    pos: usize,
+    scratch: std.mem.Allocator,
+    logits: []f32,
+) !void {
+    const cfg = model.config;
+    if (logits.len != cfg.vocab_size) return error.LogitsSizeMismatch;
+    if (token_id >= cfg.vocab_size) return error.TokenOutOfRange;
+    if (cfg.head_dim != turboquant.block_size_tq4) return error.HeadDimMismatch;
+    if (cfg.num_key_value_heads != 1) return error.KvHeadCountMismatch;
+
+    const hidden = cfg.hidden_size;
+    const inter = cfg.intermediate_size;
+    const n_heads = cfg.num_attention_heads;
+    const n_kv = cfg.num_key_value_heads;
+    const head_dim = cfg.head_dim;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv * head_dim;
+    const heads_per_kv = n_heads / n_kv;
+
+    const stream = try scratch.alloc(f32, hidden);
+    try cpu_math.embedRowAsF32(stream, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(hidden)));
+        for (stream) |*xi| xi.* *= s;
+    }
+
+    const x_norm = try scratch.alloc(f32, hidden);
+    const q = try scratch.alloc(f32, q_dim);
+    const k = try scratch.alloc(f32, kv_dim);
+    const v = try scratch.alloc(f32, kv_dim);
+    const q_rot = try scratch.alloc(f32, q_dim);
+    const k_rot = try scratch.alloc(f32, kv_dim);
+    const head_out = try scratch.alloc(f32, q_dim);
+    const attn_out = try scratch.alloc(f32, hidden);
+    const mid_norm = try scratch.alloc(f32, hidden);
+    const gate = try scratch.alloc(f32, inter);
+    const up = try scratch.alloc(f32, inter);
+    const fused = try scratch.alloc(f32, inter);
+    const ffn_out = try scratch.alloc(f32, hidden);
+
+    for (model.layers) |layer| {
+        try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+        try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, hidden);
+        try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+        try cpu_math.applyRope(q_rot, q, n_heads, head_dim, pos, cfg.rope_theta);
+        try cpu_math.applyRope(k_rot, k, n_kv, head_dim, pos, cfg.rope_theta);
+
+        // V-cache write+read through TQ4. With a single KV head and
+        // head_dim==block_size, V is exactly one packed block.
+        var v_blk: turboquant.BlockTQ4 = undefined;
+        const v_in: *const [256]f32 = @ptrCast(v.ptr);
+        turboquant.quantizeBlockTQ4(v_in, &v_blk);
+        var v_recon: [256]f32 = undefined;
+        turboquant.dequantizeBlockTQ4(&v_blk, &v_recon);
+
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const v_off = kv_h * head_dim;
+            const out_off = h * head_dim;
+            @memcpy(head_out[out_off .. out_off + head_dim], v_recon[v_off .. v_off + head_dim]);
+        }
+        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+        for (stream, attn_out) |*si, ai| si.* += ai;
+
+        try cpu_math.rmsnorm(mid_norm, stream, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
+        try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, hidden);
+        try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, 1, inter, hidden);
+        try cpu_math.geglu(fused, gate, up);
+        try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, 1, hidden, inter);
+        for (stream, ffn_out) |*si, fi| si.* += fi;
+    }
+
+    const final_norm = try scratch.alloc(f32, hidden);
+    try cpu_math.rmsnorm(final_norm, stream, model.final_norm, cfg.rms_norm_eps, cfg.family);
     try cpu_math.matmul_nt(logits, final_norm, model.lm_head, 1, cfg.vocab_size, hidden);
 }
 

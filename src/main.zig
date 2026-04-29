@@ -121,6 +121,11 @@ pub fn main() !void {
         try runTq4KvTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gen-tq4v")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGenTq4V(allocator, args[2], token_id);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--bench")) {
         var n: usize = 64;
         var i: usize = 3;
@@ -1676,6 +1681,105 @@ fn blockStats(orig: *const [256]f32, recon: *const [256]f32) BlockStats {
         .max_err = max_err,
         .norm_rel_err = norm_rel,
     };
+}
+
+// ── gen-tq4v: side-by-side fp32 vs TQ4-V-cache CPU forward ─────────
+//
+// Runs both code paths on the same input token and prints the
+// argmax, top-5 IDs, and the max single-logit divergence over the
+// 256k-element vocab. Goal is the cleanest "does the V-cache
+// quantisation introduce a token-level regression" signal: if
+// argmax and top-5 hold and max |Δ| stays in fp32-noise range, the
+// TQ4 V path is safe.
+
+fn runGenTq4V(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    if (token_id >= cfg.vocab_size) return error.OutOfRange;
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("gen-tq4v: fp32 vs TQ4-V on token {d}\n\n", .{token_id});
+
+    const logits_a = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_a);
+    const logits_b = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_b);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try cpu_forward.forward(&model, token_id, 0, arena.allocator(), logits_a);
+    _ = arena.reset(.retain_capacity);
+    try cpu_forward.forwardTq4V(&model, token_id, 0, arena.allocator(), logits_b);
+
+    // Top-5 of each.
+    const top_a = try topK(allocator, logits_a, 5);
+    defer allocator.free(top_a);
+    const top_b = try topK(allocator, logits_b, 5);
+    defer allocator.free(top_b);
+
+    try stdout.print("            fp32 baseline                       TQ4-V\n", .{});
+    try stdout.print("rank   id       logit    token              id       logit    token\n", .{});
+    try stdout.print("----   ------   ------   ----------------   ------   ------   ----------------\n", .{});
+    for (0..5) |i| {
+        const ta = top_a[i];
+        const tb = top_b[i];
+        const ta_text = tok.decode(ta.id) orelse "?";
+        const tb_text = tok.decode(tb.id) orelse "?";
+        try stdout.print("{d:>4}   {d:>6}   {d:>6.2}   {s:<16}   {d:>6}   {d:>6.2}   {s:<16}\n", .{
+            i, ta.id, ta.value, truncateStr(ta_text, 16), tb.id, tb.value, truncateStr(tb_text, 16),
+        });
+    }
+
+    // Pairwise stats over the full vocab.
+    var max_abs_delta: f32 = 0;
+    var max_abs_delta_idx: usize = 0;
+    var sum_abs: f64 = 0;
+    var sum_sq: f64 = 0;
+    for (logits_a, logits_b, 0..) |a, b, i| {
+        const d = @abs(a - b);
+        if (d > max_abs_delta) {
+            max_abs_delta = d;
+            max_abs_delta_idx = i;
+        }
+        sum_abs += d;
+        sum_sq += d * d;
+    }
+    const n: f64 = @floatFromInt(logits_a.len);
+    const mean_abs = sum_abs / n;
+    const rms = std.math.sqrt(sum_sq / n);
+
+    try stdout.print("\nlogit divergence over {d} tokens:\n", .{logits_a.len});
+    try stdout.print("  max |Δ|   = {d:.6}  at id={d}\n", .{ max_abs_delta, max_abs_delta_idx });
+    try stdout.print("  mean |Δ|  = {d:.6}\n", .{mean_abs});
+    try stdout.print("  rms  Δ    = {d:.6}\n", .{rms});
+
+    const argmax_a = cpu_forward.argmax(logits_a);
+    const argmax_b = cpu_forward.argmax(logits_b);
+    try stdout.print("\nargmax:  fp32 → {d}    TQ4-V → {d}    {s}\n", .{
+        argmax_a, argmax_b, if (argmax_a == argmax_b) "(MATCH)" else "(DIVERGE!)",
+    });
+
+    var top5_match: usize = 0;
+    for (top_a) |a| {
+        for (top_b) |b| {
+            if (a.id == b.id) {
+                top5_match += 1;
+                break;
+            }
+        }
+    }
+    try stdout.print("top-5 ID overlap: {d}/5\n", .{top5_match});
+}
+
+fn truncateStr(s: []const u8, n: usize) []const u8 {
+    return if (s.len <= n) s else s[0..n];
 }
 
 // ── gen: full forward + greedy + tokenizer decode ──────────────────
