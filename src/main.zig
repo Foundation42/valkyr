@@ -145,11 +145,14 @@ pub fn main() !void {
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
         // Parse optional sampling flags + final user_msg. Format:
         //   --chat <dir> [--temp T] [--top-k K] [--top-p P] [--seed S]
-        //               [user_msg]
-        // The user_msg, if given, is the last positional arg.
+        //                [--tq4v] [user_msg]
+        // --tq4v switches the V cache to TurboQuant TQ4 (asymmetric:
+        // K stays full precision). The user_msg, if given, is the
+        // last positional arg.
         var sp = cpu_forward.SampleParams{};
         var seed: u64 = @intCast(std.time.milliTimestamp());
         var user_msg: ?[]const u8 = null;
+        var tq4v: bool = false;
         var i: usize = 3;
         while (i < args.len) {
             const a = args[i];
@@ -165,12 +168,15 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--seed") and i + 1 < args.len) {
                 seed = try std.fmt.parseInt(u64, args[i + 1], 10);
                 i += 2;
+            } else if (std.mem.eql(u8, a, "--tq4v")) {
+                tq4v = true;
+                i += 1;
             } else {
                 user_msg = a;
                 i += 1;
             }
         }
-        try runChat(allocator, args[2], user_msg, sp, seed);
+        try runChat(allocator, args[2], user_msg, sp, seed, tq4v);
         return;
     }
 
@@ -2447,6 +2453,7 @@ fn runChat(
     single_msg: ?[]const u8,
     sample_params: cpu_forward.SampleParams,
     seed: u64,
+    tq4v: bool,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -2474,6 +2481,18 @@ fn runChat(
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
+    // TurboQuant V cache (asymmetric K=fp / V=TQ4) — only allocated
+    // when --tq4v was passed. The fp32 kv buffer above is still used
+    // for the K side regardless; we just substitute the V path.
+    // Keeping both kv buffers allocated wastes a bit of V memory in
+    // tq4v mode (kv.layers[*].v_cache goes unused) but means the
+    // K-side wiring needs zero changes.
+    var kv_tq4 = if (tq4v)
+        try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos)
+    else
+        null;
+    defer if (kv_tq4) |*c| c.deinit(ctx.device);
+
     var ks = try buildChatKernels(&ctx, gm.precision);
     defer ks.embed.deinit();
     defer ks.rmsnorm.deinit();
@@ -2499,6 +2518,24 @@ fn runChat(
         .add = &ks.add,
         .geglu = &ks.geglu,
     };
+
+    // TQ4 pack/unpack kernels — only built in tq4v mode but kept
+    // allocated for the lifetime of the chat session.
+    var tq_pack: ?pipeline.Kernel = if (tq4v)
+        try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(Tq4PackPush))
+    else
+        null;
+    defer if (tq_pack) |*kk| kk.deinit();
+    var tq_unpack: ?pipeline.Kernel = if (tq4v)
+        try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0)
+    else
+        null;
+    defer if (tq_unpack) |*kk| kk.deinit();
+
+    const tq4_hooks: ?Tq4VHooks = if (tq4v)
+        Tq4VHooks{ .pack = &tq_pack.?, .unpack = &tq_unpack.?, .cache = &kv_tq4.? }
+    else
+        null;
 
     // Bigger pool sizing — chat sends one full forward worth of
     // dispatches (~345) per step, and each Recorder.reset() between
@@ -2531,13 +2568,14 @@ fn runChat(
             sample_params.temperature, sample_params.top_k, sample_params.top_p, seed,
         });
     }
+    if (tq4v) try stdout.print("KV cache: K=fp32, V=TurboQuant TQ4 (asymmetric)\n", .{});
 
     // Position counter persists across turns (multi-turn chat builds on
     // the same KV cache).
     var pos: usize = 0;
 
     if (single_msg) |m| {
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, false);
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, false, tq4_hooks);
         return;
     }
 
@@ -2553,7 +2591,7 @@ fn runChat(
             break;
         };
         if (line.len == 0) continue;
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, true);
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, true, tq4_hooks);
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
             break;
@@ -2588,6 +2626,7 @@ fn chatTurn(
     sot: u32,
     eot: u32,
     is_repl: bool,
+    tq4_v: ?Tq4VHooks,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -2648,7 +2687,7 @@ fn chatTurn(
     while (true) {
         if (pos.* > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, null);
+        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, tq4_v);
         try rec.endAndSubmit();
 
         // Decide what to do at this position.
