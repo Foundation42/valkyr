@@ -12,6 +12,8 @@ const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
 const dtype = @import("dtype.zig");
 const cpu_math = @import("cpu/math.zig");
+const cpu_forward = @import("cpu/forward.zig");
+const tokenizer_mod = @import("tokenizer.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -58,6 +60,11 @@ pub fn main() !void {
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--layer0-test")) {
         const token_id = try std.fmt.parseInt(u32, args[3], 10);
         try runLayer0Test(allocator, args[2], token_id);
+        return;
+    }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gen")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGen(allocator, args[2], token_id);
         return;
     }
 
@@ -793,6 +800,73 @@ fn runLayer0Test(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u
     defer allocator.free(block_out);
     for (block_out, mid, ffn_out) |*o, m, f| o.* = m + f;
     try printStreamStats(stdout, "layer 0 output", block_out);
+}
+
+// ── gen: full forward + greedy + tokenizer decode ──────────────────
+
+fn runGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(gpa, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+
+    const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{dir_path});
+    defer gpa.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(gpa, tok_path);
+    defer tok.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("loaded tokenizer: {d} ids\n", .{tok.vocabSize()});
+
+    const input_str = tok.decode(token_id) orelse "<unknown>";
+    try stdout.print("input  token id={d}  string={s}\n", .{ token_id, input_str });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const logits = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(logits);
+
+    const t0 = std.time.nanoTimestamp();
+    try cpu_forward.forward(&model, token_id, 0, scratch, logits);
+    const t1 = std.time.nanoTimestamp();
+    const ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+    try stdout.print("forward (CPU, scalar, bf16 weights): {d:.0} ms\n", .{ms});
+
+    // Top-K logits — useful sanity, especially when the argmax is a
+    // dud token like <pad>.
+    const k_top: usize = 5;
+    const top = try topK(gpa, logits, k_top);
+    defer gpa.free(top);
+
+    try stdout.print("\ntop {d} logits:\n", .{k_top});
+    for (top) |entry| {
+        const s = tok.decode(entry.id) orelse "<unknown>";
+        try stdout.print("  id={d:>6}  logit={d:>10.4}  {s}\n", .{ entry.id, entry.value, s });
+    }
+
+    const sampled = cpu_forward.argmax(logits);
+    const out_str = tok.decode(sampled) orelse "<unknown>";
+    try stdout.print("\nsampled (greedy): id={d}  string={s}\n", .{ sampled, out_str });
+}
+
+const TopKEntry = struct { id: usize, value: f32 };
+
+fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
+    const out = try gpa.alloc(TopKEntry, k);
+    for (out) |*e| e.* = .{ .id = 0, .value = -std.math.inf(f32) };
+    for (logits, 0..) |v, i| {
+        if (v <= out[k - 1].value) continue;
+        // Insert into sorted (descending) list.
+        var j: usize = k - 1;
+        out[j] = .{ .id = i, .value = v };
+        while (j > 0 and out[j].value > out[j - 1].value) : (j -= 1) {
+            const tmp = out[j];
+            out[j] = out[j - 1];
+            out[j - 1] = tmp;
+        }
+    }
+    return out;
 }
 
 fn printStreamStats(w: anytype, label: []const u8, x: []const f32) !void {
