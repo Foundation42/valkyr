@@ -16,6 +16,7 @@ const cpu_forward = @import("cpu/forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
+const gpu_scratch = @import("gpu/scratch.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -91,6 +92,11 @@ pub fn main() !void {
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--gpu-load")) {
         try runGpuLoad(allocator, args[2]);
+        return;
+    }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-layer0-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGpuLayer0Test(allocator, args[2], token_id);
         return;
     }
 
@@ -1238,6 +1244,317 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
         }
     }
     return out;
+}
+
+// ── gpu-layer0-test: full layer 0 forward on GPU vs CPU ────────────
+
+const EmbedLookupPush = extern struct { token_id: u32, dim: u32, scale: f32 };
+const AddInPlacePush = extern struct { n: u32 };
+const AttnDecodeSinglePush = extern struct { n_heads: u32, heads_per_kv: u32, head_dim: u32 };
+
+fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var cpu = try model_mod.Model.load(gpa, dir_path);
+    defer cpu.deinit();
+    const cfg = cpu.config;
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("GPU layer-0 forward parity test — token {d}\n", .{token_id});
+    try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
+
+    try stdout.print("uploading weights...\n", .{});
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    defer gm.deinit(ctx.device);
+
+    var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg);
+    defer sc.deinit(ctx.device);
+
+    // ── Build kernels ───────────────────────────────────────────────
+    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush));
+    defer k_embed.deinit();
+    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+    defer k_rmsnorm.deinit();
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_rope = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    defer k_rope.deinit();
+    var k_attn = try pipeline.Kernel.init(&ctx, &shaders.attn_decode_single, 2, @sizeOf(AttnDecodeSinglePush));
+    defer k_attn.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush));
+    defer k_add.deinit();
+    var k_geglu = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    defer k_geglu.deinit();
+
+    // ── Stage 0: embed → scale ──────────────────────────────────────
+    try k_embed.bind(&.{ &gm.embed_tokens, &sc.stream });
+    const embed_push = EmbedLookupPush{
+        .token_id = token_id,
+        .dim = @intCast(cfg.hidden_size),
+        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))) else 1.0,
+    };
+    try dispatch1D(&ctx, &k_embed, &embed_push, @intCast(cfg.hidden_size));
+
+    // ── Stage 1: rmsnorm₁ ───────────────────────────────────────────
+    try k_rmsnorm.bind(&.{ &sc.stream, &gm.layers[0].input_layernorm, &sc.x_norm });
+    const rms1_push = RmsnormPush{
+        .dim = @intCast(cfg.hidden_size),
+        .eps = cfg.rms_norm_eps,
+        .gemma_quirk = if (cfg.family == .gemma) 1 else 0,
+    };
+    try dispatchPerRow(&ctx, &k_rmsnorm, &rms1_push, 1);
+
+    // ── Stage 2: Q, K, V projections ────────────────────────────────
+    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    try k_matmul.bind(&.{ &sc.x_norm, &gm.layers[0].q_proj, &sc.q });
+    try dispatchMatmul(&ctx, &k_matmul, 1, q_dim, hidden);
+    try k_matmul.bind(&.{ &sc.x_norm, &gm.layers[0].k_proj, &sc.k });
+    try dispatchMatmul(&ctx, &k_matmul, 1, kv_dim, hidden);
+    try k_matmul.bind(&.{ &sc.x_norm, &gm.layers[0].v_proj, &sc.v });
+    try dispatchMatmul(&ctx, &k_matmul, 1, kv_dim, hidden);
+
+    // ── Stage 3: RoPE on Q and K ────────────────────────────────────
+    try k_rope.bind(&.{ &sc.q, &sc.q_rot });
+    const rope_q_push = RopePush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .pos = 0,
+        .theta_base = cfg.rope_theta,
+    };
+    try dispatchRope(&ctx, &k_rope, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+
+    try k_rope.bind(&.{ &sc.k, &sc.k_rot });
+    const rope_k_push = RopePush{
+        .n_heads = @intCast(cfg.num_key_value_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .pos = 0,
+        .theta_base = cfg.rope_theta,
+    };
+    try dispatchRope(&ctx, &k_rope, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+
+    // ── Stage 4: attention (single-position degenerate) ─────────────
+    // No KV history → softmax over 1 score = 1.0 → head_out[h] = V[kv_h(h)].
+    try k_attn.bind(&.{ &sc.v, &sc.head_out });
+    const attn_push = AttnDecodeSinglePush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .heads_per_kv = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads),
+        .head_dim = @intCast(cfg.head_dim),
+    };
+    try dispatch1D(&ctx, &k_attn, &attn_push, q_dim);
+
+    // ── Stage 5: o_proj ─────────────────────────────────────────────
+    try k_matmul.bind(&.{ &sc.head_out, &gm.layers[0].o_proj, &sc.attn_out });
+    try dispatchMatmul(&ctx, &k_matmul, 1, hidden, q_dim);
+
+    // ── Stage 6: residual add (stream += attn_out) ──────────────────
+    try k_add.bind(&.{ &sc.stream, &sc.attn_out });
+    const add_push = AddInPlacePush{ .n = hidden };
+    try dispatch1D(&ctx, &k_add, &add_push, hidden);
+
+    // ── Stage 7: rmsnorm₂ ───────────────────────────────────────────
+    try k_rmsnorm.bind(&.{ &sc.stream, &gm.layers[0].post_attention_layernorm, &sc.mid_norm });
+    try dispatchPerRow(&ctx, &k_rmsnorm, &rms1_push, 1);
+
+    // ── Stage 8: gate, up projections ───────────────────────────────
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    try k_matmul.bind(&.{ &sc.mid_norm, &gm.layers[0].gate_proj, &sc.gate });
+    try dispatchMatmul(&ctx, &k_matmul, 1, inter, hidden);
+    try k_matmul.bind(&.{ &sc.mid_norm, &gm.layers[0].up_proj, &sc.up });
+    try dispatchMatmul(&ctx, &k_matmul, 1, inter, hidden);
+
+    // ── Stage 9: GeGLU ─────────────────────────────────────────────
+    try k_geglu.bind(&.{ &sc.gate, &sc.up, &sc.fused });
+    const geglu_push = GegluPush{ .n = inter };
+    try dispatch1D(&ctx, &k_geglu, &geglu_push, inter);
+
+    // ── Stage 10: down_proj ─────────────────────────────────────────
+    try k_matmul.bind(&.{ &sc.fused, &gm.layers[0].down_proj, &sc.ffn_out });
+    try dispatchMatmul(&ctx, &k_matmul, 1, hidden, inter);
+
+    // ── Stage 11: residual add (stream += ffn_out) ──────────────────
+    try k_add.bind(&.{ &sc.stream, &sc.ffn_out });
+    try dispatch1D(&ctx, &k_add, &add_push, hidden);
+
+    // ── Read back, compare against CPU layer 0 ──────────────────────
+    const got = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(got);
+    try sc.stream.readBack(&ctx, f32, got);
+
+    const want = try cpuLayer0Forward(gpa, &cpu, token_id);
+    defer gpa.free(want);
+
+    var max_abs: f32 = 0;
+    var max_rel: f32 = 0;
+    var max_idx: usize = 0;
+    for (got, want, 0..) |g, w, i| {
+        const da = @abs(g - w);
+        const dr = da / @max(@abs(w), 1e-30);
+        if (da > max_abs) {
+            max_abs = da;
+            max_idx = i;
+        }
+        if (dr > max_rel) max_rel = dr;
+    }
+
+    try stdout.print("\nlayer 0 output stream: max |Δ| = {e:.3}  (at idx {d}: cpu={d:.6} gpu={d:.6})\n", .{
+        max_abs, max_idx, want[max_idx], got[max_idx],
+    });
+    try stdout.print("max relative error = {e:.3}\n", .{max_rel});
+
+    if (max_abs > 1e-2) {
+        std.debug.print("FAIL: max |Δ| above tolerance\n", .{});
+        return error.ParityFailed;
+    }
+    try stdout.print("\nPASS GPU layer 0 matches CPU within {e:.0}\n", .{@as(f32, 1e-2)});
+}
+
+/// Runs the layer-0-only chunk of the CPU forward pass and returns the
+/// post-FFN-residual stream as fp32, for parity comparison. Mirrors
+/// runLayer0Test but without the per-stage prints.
+fn cpuLayer0Forward(gpa: std.mem.Allocator, cpu: *const model_mod.Model, token_id: u32) ![]f32 {
+    const cfg = cpu.config;
+    const layer = cpu.layers[0];
+    const hidden = cfg.hidden_size;
+    const inter = cfg.intermediate_size;
+    const n_heads = cfg.num_attention_heads;
+    const n_kv = cfg.num_key_value_heads;
+    const head_dim = cfg.head_dim;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv * head_dim;
+    const heads_per_kv = n_heads / n_kv;
+
+    const stream = try gpa.alloc(f32, hidden);
+    errdefer gpa.free(stream);
+    try cpu_math.embedRowAsF32(stream, cpu.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(hidden)));
+        for (stream) |*xi| xi.* *= s;
+    }
+
+    const x_norm = try gpa.alloc(f32, hidden);
+    defer gpa.free(x_norm);
+    try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const v = try gpa.alloc(f32, kv_dim);
+    defer gpa.free(v);
+    try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+
+    const head_out = try gpa.alloc(f32, q_dim);
+    defer gpa.free(head_out);
+    for (0..n_heads) |h| {
+        const kv_h = h / heads_per_kv;
+        const v_off = kv_h * head_dim;
+        const out_off = h * head_dim;
+        @memcpy(head_out[out_off .. out_off + head_dim], v[v_off .. v_off + head_dim]);
+    }
+
+    const attn_out = try gpa.alloc(f32, hidden);
+    defer gpa.free(attn_out);
+    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+    for (stream, attn_out) |*s, a| s.* += a;
+
+    const mid_norm = try gpa.alloc(f32, hidden);
+    defer gpa.free(mid_norm);
+    try cpu_math.rmsnorm(mid_norm, stream, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const gate = try gpa.alloc(f32, inter);
+    defer gpa.free(gate);
+    const up = try gpa.alloc(f32, inter);
+    defer gpa.free(up);
+    try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, hidden);
+    try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, 1, inter, hidden);
+
+    const fused = try gpa.alloc(f32, inter);
+    defer gpa.free(fused);
+    try cpu_math.geglu(fused, gate, up);
+
+    const ffn_out = try gpa.alloc(f32, hidden);
+    defer gpa.free(ffn_out);
+    try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, 1, hidden, inter);
+    for (stream, ffn_out) |*s, f| s.* += f;
+
+    return stream;
+}
+
+// ── Dispatch helpers — keep call sites readable ──────────────────────
+
+fn dispatch1D(
+    ctx: *const vk.Context,
+    kern: *const pipeline.Kernel,
+    push: anytype,
+    n: u32,
+) !void {
+    const local: u32 = 256;
+    const groups: u32 = (n + local - 1) / local;
+    try buffer.submitOneShot(ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: @TypeOf(push),
+        gx: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+        }
+    }{ .kern = kern, .push = push, .gx = groups });
+}
+
+fn dispatchPerRow(
+    ctx: *const vk.Context,
+    kern: *const pipeline.Kernel,
+    push: anytype,
+    n_rows: u32,
+) !void {
+    try buffer.submitOneShot(ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: @TypeOf(push),
+        n_rows: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.n_rows, 1, 1);
+        }
+    }{ .kern = kern, .push = push, .n_rows = n_rows });
+}
+
+fn dispatchMatmul(
+    ctx: *const vk.Context,
+    kern: *const pipeline.Kernel,
+    m: u32,
+    n: u32,
+    k: u32,
+) !void {
+    const local_xy: u32 = 16;
+    const gx: u32 = (m + local_xy - 1) / local_xy;
+    const gy: u32 = (n + local_xy - 1) / local_xy;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    try buffer.submitOneShot(ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const MatmulPush,
+        gx: u32,
+        gy: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, s.gy, 1);
+        }
+    }{ .kern = kern, .push = &push, .gx = gx, .gy = gy });
+}
+
+fn dispatchRope(
+    ctx: *const vk.Context,
+    kern: *const pipeline.Kernel,
+    push: *const RopePush,
+    n_heads: usize,
+    head_dim: usize,
+) !void {
+    const local: u32 = 256;
+    const pairs: u32 = @intCast(n_heads * (head_dim / 2));
+    const groups: u32 = (pairs + local - 1) / local;
+    try buffer.submitOneShot(ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const RopePush,
+        gx: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+        }
+    }{ .kern = kern, .push = push, .gx = groups });
 }
 
 // ── gpu-load: upload all weights to GPU, round-trip-verify a few ────

@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
     const geglu_spv = compileShader(b, "geglu");
     const rope_spv = compileShader(b, "rope");
     const softmax_spv = compileShader(b, "softmax");
+    const embed_lookup_spv = compileShader(b, "embed_lookup");
+    const add_in_place_spv = compileShader(b, "add_in_place");
+    const attn_decode_single_spv = compileShader(b, "attn_decode_single");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -27,6 +30,9 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(geglu_spv, "geglu.spv");
     _ = wf.addCopyFile(rope_spv, "rope.spv");
     _ = wf.addCopyFile(softmax_spv, "softmax.spv");
+    _ = wf.addCopyFile(embed_lookup_spv, "embed_lookup.spv");
+    _ = wf.addCopyFile(add_in_place_spv, "add_in_place.spv");
+    _ = wf.addCopyFile(attn_decode_single_spv, "attn_decode_single.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -34,6 +40,9 @@ pub fn build(b: *std.Build) void {
         \\pub const geglu align(4) = @embedFile("geglu.spv").*;
         \\pub const rope align(4) = @embedFile("rope.spv").*;
         \\pub const softmax align(4) = @embedFile("softmax.spv").*;
+        \\pub const embed_lookup align(4) = @embedFile("embed_lookup.spv").*;
+        \\pub const add_in_place align(4) = @embedFile("add_in_place.spv").*;
+        \\pub const attn_decode_single align(4) = @embedFile("attn_decode_single.spv").*;
     );
 
     const exe = b.addExecutable(.{

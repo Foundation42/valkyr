@@ -1,0 +1,35 @@
+#version 460
+// Single-position attention output: at pos 0 with no KV history the
+// softmax over a 1-element score collapses to 1.0, so head_out[h] for
+// every query head equals V[kv_head_for_h] verbatim. This shader is
+// the GPU-side equivalent of the @memcpy loop the CPU reference uses
+// for the same case.
+//
+//     head_out[h * head_dim + d] = v[(h / heads_per_kv) * head_dim + d]
+//
+// One thread per output element. Total work = n_heads * head_dim,
+// independent. Replaced by a real Q·Kᵀ → softmax → ·V kernel once we
+// wire up KV cache for multi-position generation.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer V    { float v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out  { float head_out[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.n_heads * pc.head_dim;
+    if (idx >= total) return;
+
+    uint h = idx / pc.head_dim;
+    uint d = idx % pc.head_dim;
+    uint kv_h = h / pc.heads_per_kv;
+
+    head_out[h * pc.head_dim + d] = v[kv_h * pc.head_dim + d];
+}
