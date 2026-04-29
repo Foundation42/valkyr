@@ -11,6 +11,7 @@ const pipeline = @import("gpu/pipeline.zig");
 const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
 const dtype = @import("dtype.zig");
+const cpu_math = @import("cpu/math.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -32,6 +33,11 @@ pub fn main() !void {
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--dump-embed")) {
         const token_id = try std.fmt.parseInt(u32, args[3], 10);
         try runDumpEmbed(allocator, args[2], token_id);
+        return;
+    }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--rmsnorm-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runRmsnormTest(allocator, args[2], token_id);
         return;
     }
 
@@ -199,6 +205,71 @@ fn runDumpEmbed(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u3
     const mean = sum / @as(f64, @floatFromInt(row_f32.len - nan_count - inf_count));
     try stdout.print("\nstats: min={d:.6} max={d:.6} mean={d:.6} nan={d} inf={d}\n", .{
         min_v, max_v, mean, nan_count, inf_count,
+    });
+}
+
+// ── rmsnorm-test: first math primitive on a real layer ──────────────
+
+fn runRmsnormTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    if (token_id >= cfg.vocab_size) return error.OutOfRange;
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("rmsnorm test on layer 0 input_layernorm — token {d}\n\n", .{token_id});
+
+    // Materialise the embedding row.
+    const x = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+
+    // Gemma scales the embedding by sqrt(hidden_size) before the first
+    // block. Without this the RMS of `x` is way under 1, and rmsnorm
+    // ends up amplifying noise — the post-rmsnorm activations would be
+    // garbage and every downstream test would lie. Apply unconditionally
+    // for now since we're Gemma-only; when we add Llama, gate on family.
+    if (cfg.family.embedScalesByDim()) {
+        const scale: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+        for (x) |*xi| xi.* *= scale;
+    }
+
+    const x_rms = blk: {
+        var s: f32 = 0;
+        for (x) |v| s += v * v;
+        break :blk @sqrt(s / @as(f32, @floatFromInt(x.len)));
+    };
+    try stdout.print("post-scale embedding rms = {d:.6}\n", .{x_rms});
+
+    // Apply layer 0's input_layernorm.
+    const y = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(y);
+    try cpu_math.rmsnorm(y, x, model.layers[0].input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const n_show: usize = @min(16, y.len);
+    for (y[0..n_show], 0..) |v, i| try stdout.print("  [{d:>4}] {d:.6}\n", .{ i, v });
+
+    var min_v: f32 = std.math.inf(f32);
+    var max_v: f32 = -std.math.inf(f32);
+    var sum_sq: f64 = 0;
+    var nan_count: usize = 0;
+    var inf_count: usize = 0;
+    for (y) |v| {
+        if (std.math.isNan(v)) {
+            nan_count += 1;
+            continue;
+        }
+        if (std.math.isInf(v)) {
+            inf_count += 1;
+            continue;
+        }
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        sum_sq += @as(f64, v) * @as(f64, v);
+    }
+    const post_rms = std.math.sqrt(sum_sq / @as(f64, @floatFromInt(y.len)));
+    try stdout.print("\noutput stats: min={d:.6} max={d:.6} rms={d:.6} nan={d} inf={d}\n", .{
+        min_v, max_v, post_rms, nan_count, inf_count,
     });
 }
 
