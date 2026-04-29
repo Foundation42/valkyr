@@ -139,3 +139,159 @@ pub fn argmax(logits: []const f32) usize {
     }
     return best_idx;
 }
+
+pub const SampleParams = struct {
+    /// Logit temperature divisor. 1.0 = unchanged, lower = sharper
+    /// (more deterministic), higher = flatter (more random). Setting
+    /// 0 falls through to greedy via the early-return path.
+    temperature: f32 = 1.0,
+    /// Keep only the top-K probability mass when > 0. 0 disables.
+    top_k: u32 = 0,
+    /// Nucleus sampling cutoff: keep the smallest set of tokens whose
+    /// cumulative probability ≥ top_p. 1.0 disables.
+    top_p: f32 = 1.0,
+};
+
+/// Sample one token from `logits` according to `params`, using `rng`
+/// for the random draw. `scratch` must hold at least `logits.len`
+/// floats (used for the per-step probability distribution and
+/// reordering — saves repeated allocations across many sample calls).
+///
+/// When `temperature == 0`, `top_k == 1`, OR every filter is
+/// disabled and we'd just pick the max anyway, this short-circuits
+/// to argmax (which doesn't touch the RNG, so seeded runs that mix
+/// greedy and sampled steps are still reproducible).
+pub fn sample(
+    logits: []const f32,
+    params: SampleParams,
+    rng: std.Random,
+    scratch: []f32,
+) !usize {
+    if (params.temperature == 0.0 or params.top_k == 1) return argmax(logits);
+
+    if (scratch.len < logits.len) return error.ScratchTooSmall;
+    const probs = scratch[0..logits.len];
+
+    // Apply temperature.
+    const inv_t: f32 = if (params.temperature == 1.0) 1.0 else 1.0 / params.temperature;
+    for (probs, logits) |*p, l| p.* = l * inv_t;
+
+    // Stable softmax over the whole vocab.
+    var max_v: f32 = probs[0];
+    for (probs[1..]) |v| if (v > max_v) {
+        max_v = v;
+    };
+    var sum: f32 = 0;
+    for (probs) |*p| {
+        const e = @exp(p.* - max_v);
+        p.* = e;
+        sum += e;
+    }
+    const inv_sum = 1.0 / sum;
+    for (probs) |*p| p.* *= inv_sum;
+
+    // Top-K filter via partial selection. Build an index array of the
+    // top-K probabilities; everything outside that set goes to zero.
+    if (params.top_k > 0 and params.top_k < logits.len) {
+        // Find the k-th largest probability via simple O(N·K) selection.
+        // K is small in practice (default ≤ 64), so this beats a full
+        // sort for our typical vocab_size of 256000.
+        const k: usize = params.top_k;
+        const top_idx = scratch.ptr + logits.len; // borrow extra scratch
+        _ = top_idx;
+        // Use a tiny stack-allocated heap.
+        var top: [256]usize = undefined;
+        if (k > top.len) return error.TopKTooLarge;
+        for (0..k) |j| top[j] = j;
+        // Maintain `top` as the indices of the current top-K, with the
+        // smallest probability at top[k-1]. Initialise from the first K
+        // entries, then sort.
+        std.mem.sort(usize, top[0..k], probs, struct {
+            fn lessThan(p: []const f32, a: usize, b: usize) bool {
+                return p[a] > p[b]; // descending so top[k-1] = smallest
+            }
+        }.lessThan);
+        var threshold: f32 = probs[top[k - 1]];
+        for (probs[k..], k..) |v, i| {
+            if (v <= threshold) continue;
+            // Replace the smallest. Maintain sorted order.
+            top[k - 1] = i;
+            std.mem.sort(usize, top[0..k], probs, struct {
+                fn lessThan(p: []const f32, a: usize, b: usize) bool {
+                    return p[a] > p[b];
+                }
+            }.lessThan);
+            threshold = probs[top[k - 1]];
+        }
+        // Zero everything outside the top-K set.
+        var keep = [_]bool{false} ** 256;
+        for (top[0..k], 0..) |idx, j| {
+            _ = idx;
+            keep[j] = true;
+        }
+        // Build a presence mask via a small scratch indexed-set; for
+        // very large vocab a HashSet would be cleaner but we have at
+        // most 256 indices to keep.
+        var keep_set: [256]usize = undefined;
+        @memcpy(keep_set[0..k], top[0..k]);
+        std.mem.sort(usize, keep_set[0..k], {}, std.sort.asc(usize));
+        var keep_idx: usize = 0;
+        for (probs, 0..) |*p, i| {
+            if (keep_idx < k and keep_set[keep_idx] == i) {
+                keep_idx += 1;
+            } else {
+                p.* = 0;
+            }
+        }
+        // Renormalise.
+        var s2: f32 = 0;
+        for (probs) |p| s2 += p;
+        if (s2 > 0) {
+            const inv = 1.0 / s2;
+            for (probs) |*p| p.* *= inv;
+        }
+    }
+
+    // Top-P (nucleus) filter. Sort by prob descending, pick the prefix
+    // whose cumulative probability ≥ top_p, zero the rest, renormalise.
+    if (params.top_p < 1.0) {
+        // For large vocabs we sort indices, not probs. Borrow the
+        // post-logits half of scratch for an index buffer.
+        if (scratch.len < logits.len * 2) return error.ScratchTooSmall;
+        const idx_bytes = std.mem.sliceAsBytes(scratch[logits.len..]);
+        const idx = std.mem.bytesAsSlice(u32, idx_bytes[0 .. logits.len * @sizeOf(u32)]);
+        for (idx, 0..) |*v, i| v.* = @intCast(i);
+        std.mem.sort(u32, idx, probs, struct {
+            fn lessThan(p: []const f32, a: u32, b: u32) bool {
+                return p[a] > p[b];
+            }
+        }.lessThan);
+        var cum: f32 = 0;
+        var cutoff: usize = idx.len;
+        for (idx, 0..) |i, j| {
+            cum += probs[i];
+            if (cum >= params.top_p) {
+                cutoff = j + 1;
+                break;
+            }
+        }
+        // Mark everything past cutoff as zero.
+        for (idx[cutoff..]) |i| probs[i] = 0;
+        // Renormalise.
+        var s2: f32 = 0;
+        for (probs) |p| s2 += p;
+        if (s2 > 0) {
+            const inv = 1.0 / s2;
+            for (probs) |*p| p.* *= inv;
+        }
+    }
+
+    // Inverse-CDF sample.
+    const r = rng.float(f32);
+    var cum: f32 = 0;
+    for (probs, 0..) |p, i| {
+        cum += p;
+        if (r <= cum) return i;
+    }
+    return probs.len - 1; // fallback for fp rounding
+}

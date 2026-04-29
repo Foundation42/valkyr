@@ -116,8 +116,34 @@ pub fn main() !void {
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
-        const user_msg: ?[]const u8 = if (args.len >= 4) args[3] else null;
-        try runChat(allocator, args[2], user_msg);
+        // Parse optional sampling flags + final user_msg. Format:
+        //   --chat <dir> [--temp T] [--top-k K] [--top-p P] [--seed S]
+        //               [user_msg]
+        // The user_msg, if given, is the last positional arg.
+        var sp = cpu_forward.SampleParams{};
+        var seed: u64 = @intCast(std.time.milliTimestamp());
+        var user_msg: ?[]const u8 = null;
+        var i: usize = 3;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--temp") and i + 1 < args.len) {
+                sp.temperature = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--top-k") and i + 1 < args.len) {
+                sp.top_k = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--top-p") and i + 1 < args.len) {
+                sp.top_p = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--seed") and i + 1 < args.len) {
+                seed = try std.fmt.parseInt(u64, args[i + 1], 10);
+                i += 2;
+            } else {
+                user_msg = a;
+                i += 1;
+            }
+        }
+        try runChat(allocator, args[2], user_msg, sp, seed);
         return;
     }
 
@@ -1322,7 +1348,13 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
 
 // ── chat: prompt prefill + generation, single-turn or REPL ─────────
 
-fn runChat(gpa: std.mem.Allocator, dir_path: []const u8, single_msg: ?[]const u8) !void {
+fn runChat(
+    gpa: std.mem.Allocator,
+    dir_path: []const u8,
+    single_msg: ?[]const u8,
+    sample_params: cpu_forward.SampleParams,
+    seed: u64,
+) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
     const cfg = cpu.config;
@@ -1387,13 +1419,32 @@ fn runChat(gpa: std.mem.Allocator, dir_path: []const u8, single_msg: ?[]const u8
 
     const logits = try gpa.alloc(f32, cfg.vocab_size);
     defer gpa.free(logits);
+    // Sampling scratch: top-P needs 2× vocab worth (probs + index list).
+    const sample_scratch = try gpa.alloc(f32, cfg.vocab_size * 2);
+    defer gpa.free(sample_scratch);
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+
+    // Pretty-print the sampling configuration so the user can see
+    // what knobs are active.
+    if (sample_params.temperature == 0.0 or sample_params.top_k == 1 or
+        (sample_params.top_p >= 1.0 and sample_params.top_k == 0 and sample_params.temperature == 1.0))
+    {
+        // Greedy or trivially deterministic.
+        try stdout.print("sampling: greedy\n", .{});
+    } else {
+        try stdout.print("sampling: temp={d} top_k={d} top_p={d} seed={d}\n", .{
+            sample_params.temperature, sample_params.top_k, sample_params.top_p, seed,
+        });
+    }
 
     // Position counter persists across turns (multi-turn chat builds on
     // the same KV cache).
     var pos: usize = 0;
 
     if (single_msg) |m| {
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, bos, sot, eot, false);
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, false);
         return;
     }
 
@@ -1409,7 +1460,7 @@ fn runChat(gpa: std.mem.Allocator, dir_path: []const u8, single_msg: ?[]const u8
             break;
         };
         if (line.len == 0) continue;
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, bos, sot, eot, true);
+        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, sample_scratch, sample_params, rng, bos, sot, eot, true);
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
             break;
@@ -1437,6 +1488,9 @@ fn chatTurn(
     user_msg: []const u8,
     pos: *usize,
     logits: []f32,
+    sample_scratch: []f32,
+    sample_params: cpu_forward.SampleParams,
+    rng: std.Random,
     bos: u32,
     sot: u32,
     eot: u32,
@@ -1516,7 +1570,7 @@ fn chatTurn(
 
         // Past the last prompt token: sample.
         try sc.logits.readBack(ctx, f32, logits);
-        const next = cpu_forward.argmax(logits);
+        const next = try cpu_forward.sample(logits, sample_params, rng, sample_scratch);
 
         // Stop conditions.
         if (next == eot) break;
