@@ -154,3 +154,93 @@ pub const GpuKvCache = struct {
         self.allocator.free(self.layers);
     }
 };
+
+/// Same shape as GpuKvCache but with the V cache stored in TQ4-packed
+/// form: each position is one 33-u32 BlockTQ4 (132 bytes) instead of
+/// kv_dim fp32s (1024 bytes for Gemma 2B). The K cache stays full
+/// fp32 — phase-1 of TurboQuant is asymmetric (K=fp / V=TQ4), per the
+/// llama.cpp practitioner default for dense models.
+///
+/// Plus a per-layer-reused `dequant_v` scratch buffer of size
+/// `max_pos * kv_dim * fp32` — once per attention step the whole
+/// V history is dequantised into this scratch via tq4_unpack256
+/// dispatched with WG count = n_pos, and the existing attn_output
+/// kernel reads the scratch unchanged. The scratch is a single
+/// allocation reused across all 18 layers.
+///
+/// Memory delta on Gemma 2B at max_pos = 2048:
+///   fp32 V cache:   2048 × 256 × 4 × 18 = 36 MiB
+///   TQ4  V cache:   2048 ×  33 × 4 × 18 ≈ 4.6 MiB
+///   plus dequant_v: 2048 × 256 × 4      = 2 MiB (one shared scratch)
+///   net:            ~6.6 MiB vs 36 MiB → ~5.5× cache compression.
+///
+/// Block size is hardcoded to 256 (head_dim for Gemma 2B). Other
+/// architectures would need a parameterised BLOCK_SIZE in the shaders.
+pub const GpuKvCacheTq4 = struct {
+    layers: []LayerKv,
+    dequant_v: buffer.Buffer,
+    max_pos: usize,
+    kv_dim: usize,
+    /// Number of 256-element TQ4 blocks per token's V vector. For
+    /// Gemma 2B this is 1 (kv_dim == 256). For other shapes this is
+    /// the number of full blocks in kv_dim (we currently assert
+    /// kv_dim is a multiple of 256).
+    n_blocks_per_pos: usize,
+    allocator: std.mem.Allocator,
+
+    pub const LayerKv = struct {
+        k_cache: buffer.Buffer,
+        v_cache: buffer.Buffer,
+
+        pub fn deinit(self: *LayerKv, device: vk.c.VkDevice) void {
+            self.k_cache.deinit(device);
+            self.v_cache.deinit(device);
+        }
+    };
+
+    pub const block_size_tq4: usize = 256;
+    pub const u32s_per_block: usize = 33;
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        ctx: *const vk.Context,
+        cfg: config_mod.Config,
+        max_pos: usize,
+    ) !GpuKvCacheTq4 {
+        const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        if (kv_dim % block_size_tq4 != 0) return error.KvDimNotMultipleOfBlockSize;
+        const n_blocks_per_pos = kv_dim / block_size_tq4;
+
+        const layers = try gpa.alloc(LayerKv, cfg.num_hidden_layers);
+        var done: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < done) : (i += 1) layers[i].deinit(ctx.device);
+            gpa.free(layers);
+        }
+        const f = @sizeOf(f32);
+        const u = @sizeOf(u32);
+        for (layers) |*l| {
+            l.* = .{
+                .k_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f),
+                .v_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * n_blocks_per_pos * u32s_per_block * u),
+            };
+            done += 1;
+        }
+        const dequant_v = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
+        return .{
+            .layers = layers,
+            .dequant_v = dequant_v,
+            .max_pos = max_pos,
+            .kv_dim = kv_dim,
+            .n_blocks_per_pos = n_blocks_per_pos,
+            .allocator = gpa,
+        };
+    }
+
+    pub fn deinit(self: *GpuKvCacheTq4, device: vk.c.VkDevice) void {
+        for (self.layers) |*l| l.deinit(device);
+        self.dequant_v.deinit(device);
+        self.allocator.free(self.layers);
+    }
+};
