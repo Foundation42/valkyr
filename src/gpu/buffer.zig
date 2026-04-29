@@ -39,10 +39,16 @@ pub const Buffer = struct {
     /// slice of fp32 weights.
     pub fn initStatic(ctx: *const vk.Context, comptime T: type, data: []const T) !Buffer {
         const total = @max(data.len * @sizeOf(T), @sizeOf(T));
+        // TRANSFER_SRC_BIT lets us read static buffers back to host
+        // for parity testing (round-trip verification of the bf16→fp32
+        // upload). Cost is just a usage-flag bit; the buffer stays
+        // device-local. Without it, validation layers reject the copy.
         const raw = try createBuffer(
             ctx,
             total,
-            c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                c.VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         );
         if (data.len > 0) {

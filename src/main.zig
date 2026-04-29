@@ -15,6 +15,7 @@ const cpu_math = @import("cpu/math.zig");
 const cpu_forward = @import("cpu/forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
+const gpu_model = @import("gpu/model.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -86,6 +87,10 @@ pub fn main() !void {
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-rope-test")) {
         const token_id = try std.fmt.parseInt(u32, args[3], 10);
         try runGpuRopeTest(allocator, args[2], token_id);
+        return;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--gpu-load")) {
+        try runGpuLoad(allocator, args[2]);
         return;
     }
 
@@ -1233,6 +1238,81 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
         }
     }
     return out;
+}
+
+// ── gpu-load: upload all weights to GPU, round-trip-verify a few ────
+
+fn runGpuLoad(gpa: std.mem.Allocator, dir_path: []const u8) !void {
+    var cpu = try model_mod.Model.load(gpa, dir_path);
+    defer cpu.deinit();
+    const cfg = cpu.config;
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("uploading {d} layers + embed + final_norm + lm_head to {s}\n", .{
+        cfg.num_hidden_layers, ctx.deviceName(),
+    });
+
+    const t0 = std.time.nanoTimestamp();
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    defer gm.deinit(ctx.device);
+    const t1 = std.time.nanoTimestamp();
+    const upload_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+    try stdout.print("upload time: {d:.0} ms ({d} buffers)\n\n", .{
+        upload_ms,
+        2 + 9 * cfg.num_hidden_layers + 1, // embed + final_norm + lm_head + 9/layer
+    });
+
+    // ── Round-trip a few tensors ─────────────────────────────────────
+    // Pull representative samples back from the device and check that
+    // they match the host fp32 representation.
+    try roundTripCheck(gpa, &ctx, &gm.embed_tokens, cpu.embed_tokens, "embed_tokens");
+    try roundTripCheck(gpa, &ctx, &gm.final_norm, cpu.final_norm, "final_norm");
+    try roundTripCheck(gpa, &ctx, &gm.layers[0].q_proj, cpu.layers[0].q_proj, "layer 0 q_proj");
+    try roundTripCheck(gpa, &ctx, &gm.layers[0].input_layernorm, cpu.layers[0].input_layernorm, "layer 0 input_layernorm");
+    try roundTripCheck(gpa, &ctx, &gm.layers[17].down_proj, cpu.layers[17].down_proj, "layer 17 down_proj");
+
+    try stdout.print("\nPASS gpu-load (5 tensors round-tripped within fp32 ULP)\n", .{});
+}
+
+fn roundTripCheck(
+    gpa: std.mem.Allocator,
+    ctx: *const vk.Context,
+    buf: *const buffer.Buffer,
+    cpu_t: safetensors.Tensor,
+    label: []const u8,
+) !void {
+    const stdout = std.io.getStdOut().writer();
+    const numel = cpu_t.numel();
+
+    // Materialise the CPU tensor as fp32 for the comparison.
+    const want = try gpa.alloc(f32, numel);
+    defer gpa.free(want);
+    switch (cpu_t.dtype) {
+        .f32 => @memcpy(want, @as([*]align(1) const f32, @ptrCast(cpu_t.bytes.ptr))[0..numel]),
+        .bf16 => dtype.bf16SliceToF32(dtype.asU16(cpu_t.bytes), want),
+        .f16 => dtype.f16SliceToF32(dtype.asU16(cpu_t.bytes), want),
+        else => return error.UnsupportedDtype,
+    }
+
+    const got = try gpa.alloc(f32, numel);
+    defer gpa.free(got);
+    try buf.readBack(ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    for (want, got) |w, g| {
+        const d = @abs(w - g);
+        if (d > max_abs) max_abs = d;
+    }
+    try stdout.print("  {s:<28}  numel={d:>10}  max |Δ| = {e:.3}\n", .{ label, numel, max_abs });
+    if (max_abs > 0.0) {
+        // We expect bit-exact round-trip — the only thing happening
+        // here is bf16→fp32 conversion (deterministic) followed by an
+        // fp32 staging upload + readback (no further conversion).
+        return error.RoundTripMismatch;
+    }
 }
 
 // ── gpu-rmsnorm-test: real Gemma layer 0 input_layernorm on GPU ────
