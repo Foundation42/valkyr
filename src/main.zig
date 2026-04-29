@@ -189,6 +189,7 @@ pub fn main() !void {
     try runGpuTq4PackSmoke(allocator);
     try runGpuTq4UnpackSmoke(allocator);
     try runGpuTq4RoundTripSmoke(allocator);
+    try runGpuTq4PackToCacheSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -1170,6 +1171,100 @@ fn runGpuTq4RoundTripSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU tq4 pack→unpack round-trip (recorder, max |Δ| vs CPU = {e:.2})\n", .{max_err});
+}
+
+// ── gpu tq4_pack_to_cache smoke: positional pack into a multi-block cache ──
+//
+// Pack three different 256-vec inputs into slots 0, 1, 2 of a 3-block
+// cache buffer using the dst_block_idx push constant. Then dispatch
+// tq4_unpack256 with WG count = 3 to dequantise all three blocks at
+// once. Each reconstructed block must match the corresponding
+// CPU pack→dequant output.
+
+const Tq4PackPush = extern struct { dst_block_idx: u32 };
+
+fn runGpuTq4PackToCacheSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_blocks: usize = 3;
+    var inputs: [n_blocks][256]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xCA75_F00D);
+    const r = prng.random();
+    for (&inputs) |*blk_in| for (blk_in) |*v| { v.* = r.floatNorm(f32); };
+
+    // CPU oracle: pack+dequant each block.
+    var cpu_dequants: [n_blocks][256]f32 = undefined;
+    for (&inputs, &cpu_dequants) |*x, *y| {
+        var blk: turboquant.BlockTQ4 = undefined;
+        turboquant.quantizeBlockTQ4(x, &blk);
+        turboquant.dequantizeBlockTQ4(&blk, y);
+    }
+
+    // GPU side: a single 256-vec staging buffer for the input, a
+    // 3-block packed cache, and a 3-block dequant output.
+    var stage_buf = try buffer.Buffer.initStatic(&ctx, f32, &inputs[0]);
+    defer stage_buf.deinit(ctx.device);
+    var cache_buf = try buffer.Buffer.initDeviceOnly(&ctx, n_blocks * 33 * @sizeOf(u32));
+    defer cache_buf.deinit(ctx.device);
+    var deq_buf = try buffer.Buffer.initDeviceOnly(&ctx, n_blocks * 256 * @sizeOf(f32));
+    defer deq_buf.deinit(ctx.device);
+
+    var pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(Tq4PackPush));
+    defer pack.deinit();
+    var unpack = try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0);
+    defer unpack.deinit();
+
+    // For block 0, the staging buffer already holds inputs[0] — pack
+    // it directly. For blocks 1 and 2, update the staging buffer
+    // between dispatches via the dynamic-update path (the buffer was
+    // initStatic so we don't have a host-mapped pointer; instead we
+    // make a fresh static buffer per block). Simpler: recreate stage
+    // buffer per iteration.
+    {
+        var rec = try gpu_recorder.Recorder.init(&ctx, 8, 16);
+        defer rec.deinit();
+        try rec.begin();
+        var push = Tq4PackPush{ .dst_block_idx = 0 };
+        try rec.dispatch(&pack, &.{ &stage_buf, &cache_buf }, &push, 1, 1, 1);
+        try rec.endAndSubmit();
+    }
+    for (1..n_blocks) |b| {
+        var s = try buffer.Buffer.initStatic(&ctx, f32, &inputs[b]);
+        defer s.deinit(ctx.device);
+        var rec = try gpu_recorder.Recorder.init(&ctx, 8, 16);
+        defer rec.deinit();
+        try rec.begin();
+        var push = Tq4PackPush{ .dst_block_idx = @intCast(b) };
+        try rec.dispatch(&pack, &.{ &s, &cache_buf }, &push, 1, 1, 1);
+        try rec.endAndSubmit();
+    }
+
+    // Single dispatch unpacks all 3 blocks (WG count = 3).
+    {
+        var rec = try gpu_recorder.Recorder.init(&ctx, 8, 16);
+        defer rec.deinit();
+        try rec.begin();
+        try rec.dispatch(&unpack, &.{ &cache_buf, &deq_buf }, null, n_blocks, 1, 1);
+        try rec.endAndSubmit();
+    }
+
+    var got: [n_blocks * 256]f32 = undefined;
+    try deq_buf.readBack(&ctx, f32, &got);
+
+    var max_err: f32 = 0;
+    for (0..n_blocks) |b| {
+        for (0..256) |i| {
+            const g = got[b * 256 + i];
+            const w = cpu_dequants[b][i];
+            max_err = @max(max_err, @abs(g - w));
+        }
+    }
+    if (max_err > 5e-3) {
+        std.debug.print("GPU tq4_pack_to_cache max |Δ| = {e}\n", .{max_err});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU tq4_pack_to_cache (3 blocks at distinct positions, max |Δ| vs CPU = {e:.2})\n", .{max_err});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────
