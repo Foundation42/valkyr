@@ -1,0 +1,30 @@
+#version 460
+// kv_write: dst[dst_off + i] = src[i] for i in [0, n).
+//
+// Used to scatter the freshly-RoPE'd K (or freshly-projected V) for
+// the current token into its slot in the per-layer KV cache. Same
+// effect as vkCmdCopyBuffer with a destination offset, but as a
+// compute dispatch it slots into the recorder's compute-shader
+// barrier flow without us having to teach the barrier helper about
+// transfer-stage stalls.
+//
+// One thread per element. n is small (kv_dim = 256 for Gemma 2B
+// MQA), so this dispatch is dominated by submission overhead, not
+// compute. Folding the K-rotate output to write straight into the
+// cache could eliminate the copy entirely later.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Src { float src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Pc {
+    uint n;
+    uint dst_off;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    dst[pc.dst_off + i] = src[i];
+}

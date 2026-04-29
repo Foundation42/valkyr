@@ -1,0 +1,66 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// head_out[h, d] = Σ_p scores[h, p] * V_cache[p, kv_h(h), d]
+//
+// Mirror of attn_scores: one workgroup per (h, d) output, 256 threads
+// cooperate over the position dimension with subgroup reduction.
+//
+// Shapes:
+//     scores     [n_heads, scores_stride] — only first n_pos cols are
+//                live; the kernel only iterates the first n_pos.
+//     V_cache    [max_pos, n_kv_heads, head_dim]
+//     head_out   [n_heads, head_dim]
+//
+// MQA / GQA fold: the same kv_h is shared across `heads_per_kv`
+// query heads, so different query heads pull different scores against
+// the same V slab.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer S { float scores[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer V { float v_cache[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer O { float head_out[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint n_pos;
+    uint kv_stride;
+    uint scores_stride;
+} pc;
+
+shared float sg_partials[32];
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint h = cell / pc.head_dim;
+    uint d = cell - h * pc.head_dim;
+    if (h >= pc.n_heads) return;
+
+    uint kv_h = h / pc.heads_per_kv;
+    uint score_off = h * pc.scores_stride;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint p = tid; p < pc.n_pos; p += gl_WorkGroupSize.x) {
+        uint v_off = p * pc.kv_stride + kv_h * pc.head_dim + d;
+        acc += scores[score_off + p] * v_cache[v_off];
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            head_out[h * pc.head_dim + d] = total;
+        }
+    }
+}

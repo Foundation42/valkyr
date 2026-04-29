@@ -1,0 +1,66 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Attention scoring: scores[h, p] = (Q[h] · K_cache[p, kv_h(h)]) * inv_sqrt_dim
+//
+// Shapes:
+//     Q          [n_heads, head_dim]                         flat
+//     K_cache    [max_pos, n_kv_heads, head_dim]             flat
+//                stride between positions = n_kv_heads * head_dim = kv_stride
+//     scores_out [n_heads, max_pos] (only first n_pos cols filled)  flat
+//                stride per head = max_pos (caller's choice; we get
+//                it as scores_stride to keep this kernel agnostic of
+//                whether the buffer was sized for n_pos or for max_pos)
+//
+// One workgroup per (h, p) pair, 256 threads cooperate over head_dim
+// with subgroup reduction — same pattern as matmul_nt_v2.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Q { float q[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer K { float k_cache[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer S { float scores[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint n_pos;
+    uint kv_stride;       // n_kv_heads * head_dim
+    uint scores_stride;   // row stride in `scores` buffer
+    float inv_sqrt_dim;
+} pc;
+
+shared float sg_partials[32];
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint h = cell / pc.n_pos;
+    uint p = cell - h * pc.n_pos;
+    if (h >= pc.n_heads) return;
+
+    uint kv_h = h / pc.heads_per_kv;
+    uint q_off = h * pc.head_dim;
+    uint k_off = p * pc.kv_stride + kv_h * pc.head_dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint d = tid; d < pc.head_dim; d += gl_WorkGroupSize.x) {
+        acc += q[q_off + d] * k_cache[k_off + d];
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            scores[h * pc.scores_stride + p] = total * pc.inv_sqrt_dim;
+        }
+    }
+}

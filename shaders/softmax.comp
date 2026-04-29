@@ -26,7 +26,15 @@ layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
 layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
 
 layout(push_constant) uniform Pc {
+    /// Work per row: number of live elements. Threads beyond `dim`
+    /// in their strided traversal contribute -inf to the max and 0
+    /// to the sum, leaving them invisible to the result.
     uint dim;
+    /// Row stride in the input/output buffers — caller's choice. Set
+    /// to `dim` for a packed [rows, dim] layout, or to a larger value
+    /// (e.g. attention's max_pos) when softmax is reading a sub-row of
+    /// a wider allocation.
+    uint stride;
 } pc;
 
 shared float sg_partials[32];
@@ -40,7 +48,7 @@ void main() {
     const float NEG_INF = uintBitsToFloat(0xff800000u);
 
     uint row = gl_WorkGroupID.x;
-    uint row_off = row * pc.dim;
+    uint row_off = row * pc.stride;
     uint tid = gl_LocalInvocationID.x;
 
     // ── Phase 1: row max ────────────────────────────────────────────

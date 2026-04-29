@@ -19,6 +19,9 @@ pub fn build(b: *std.Build) void {
     const embed_lookup_spv = compileShader(b, "embed_lookup");
     const add_in_place_spv = compileShader(b, "add_in_place");
     const attn_decode_single_spv = compileShader(b, "attn_decode_single");
+    const attn_scores_spv = compileShader(b, "attn_scores");
+    const attn_output_spv = compileShader(b, "attn_output");
+    const kv_write_spv = compileShader(b, "kv_write");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -35,6 +38,9 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(embed_lookup_spv, "embed_lookup.spv");
     _ = wf.addCopyFile(add_in_place_spv, "add_in_place.spv");
     _ = wf.addCopyFile(attn_decode_single_spv, "attn_decode_single.spv");
+    _ = wf.addCopyFile(attn_scores_spv, "attn_scores.spv");
+    _ = wf.addCopyFile(attn_output_spv, "attn_output.spv");
+    _ = wf.addCopyFile(kv_write_spv, "kv_write.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -46,6 +52,9 @@ pub fn build(b: *std.Build) void {
         \\pub const embed_lookup align(4) = @embedFile("embed_lookup.spv").*;
         \\pub const add_in_place align(4) = @embedFile("add_in_place.spv").*;
         \\pub const attn_decode_single align(4) = @embedFile("attn_decode_single.spv").*;
+        \\pub const attn_scores align(4) = @embedFile("attn_scores.spv").*;
+        \\pub const attn_output align(4) = @embedFile("attn_output.spv").*;
+        \\pub const kv_write align(4) = @embedFile("kv_write.spv").*;
     );
 
     const exe = b.addExecutable(.{

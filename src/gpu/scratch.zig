@@ -27,6 +27,13 @@ pub const GpuScratch = struct {
     /// LM head output — one fp32 per vocab token. 1 MiB at vocab_size
     /// = 256000.
     logits: buffer.Buffer,
+    /// Attention scores buffer, sized [n_heads, max_pos]. Reused across
+    /// all 18 layers within one forward step (each layer overwrites it).
+    scores: buffer.Buffer,
+    /// Maximum position the KV cache supports. attn_scores writes into
+    /// rows of stride `max_pos` and softmax/attn_output read up to
+    /// `n_pos` per row.
+    max_pos: usize,
 
     // Per-layer reused scratch.
     x_norm: buffer.Buffer,
@@ -43,7 +50,7 @@ pub const GpuScratch = struct {
     fused: buffer.Buffer,
     ffn_out: buffer.Buffer,
 
-    pub fn init(ctx: *const vk.Context, cfg: config_mod.Config) !GpuScratch {
+    pub fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: usize) !GpuScratch {
         const hidden = cfg.hidden_size;
         const inter = cfg.intermediate_size;
         const q_dim = cfg.num_attention_heads * cfg.head_dim;
@@ -54,6 +61,8 @@ pub const GpuScratch = struct {
             .stream         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
             .final_norm_out = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
             .logits         = try buffer.Buffer.initDeviceOnly(ctx, cfg.vocab_size * f),
+            .scores         = try buffer.Buffer.initDeviceOnly(ctx, cfg.num_attention_heads * max_pos * f),
+            .max_pos        = max_pos,
             .x_norm         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
             .q              = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
             .k              = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
@@ -74,6 +83,7 @@ pub const GpuScratch = struct {
         self.stream.deinit(device);
         self.final_norm_out.deinit(device);
         self.logits.deinit(device);
+        self.scores.deinit(device);
         self.x_norm.deinit(device);
         self.q.deinit(device);
         self.k.deinit(device);
@@ -87,5 +97,60 @@ pub const GpuScratch = struct {
         self.up.deinit(device);
         self.fused.deinit(device);
         self.ffn_out.deinit(device);
+    }
+};
+
+/// Per-layer K and V caches sized for `max_pos` positions. K_cache and
+/// V_cache layouts: `[max_pos, n_kv_heads, head_dim]` flat. The current
+/// step writes into row `pos`; subsequent steps read rows `[0..pos+1]`.
+///
+/// For Gemma 2B at max_pos = 1024: each layer's K is 1024 × 1 × 256 ×
+/// 4 bytes = 1 MiB, same for V, so the whole cache (18 layers × 2) is
+/// 36 MiB — comfortably small. Resize via re-init if larger contexts
+/// become useful.
+pub const GpuKvCache = struct {
+    layers: []LayerKv,
+    max_pos: usize,
+    kv_dim: usize,
+    allocator: std.mem.Allocator,
+
+    pub const LayerKv = struct {
+        k_cache: buffer.Buffer,
+        v_cache: buffer.Buffer,
+
+        pub fn deinit(self: *LayerKv, device: vk.c.VkDevice) void {
+            self.k_cache.deinit(device);
+            self.v_cache.deinit(device);
+        }
+    };
+
+    pub fn init(gpa: std.mem.Allocator, ctx: *const vk.Context, cfg: config_mod.Config, max_pos: usize) !GpuKvCache {
+        const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        const layers = try gpa.alloc(LayerKv, cfg.num_hidden_layers);
+        var done: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < done) : (i += 1) layers[i].deinit(ctx.device);
+            gpa.free(layers);
+        }
+        const f = @sizeOf(f32);
+        for (layers) |*l| {
+            l.* = .{
+                .k_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f),
+                .v_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f),
+            };
+            done += 1;
+        }
+        return .{
+            .layers = layers,
+            .max_pos = max_pos,
+            .kv_dim = kv_dim,
+            .allocator = gpa,
+        };
+    }
+
+    pub fn deinit(self: *GpuKvCache, device: vk.c.VkDevice) void {
+        for (self.layers) |*l| l.deinit(device);
+        self.allocator.free(self.layers);
     }
 };
