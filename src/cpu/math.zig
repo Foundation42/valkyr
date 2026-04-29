@@ -169,6 +169,53 @@ pub fn matmul_nt(
     }
 }
 
+/// Apply rotary positional embeddings (RoPE), HuggingFace half-split
+/// convention: pairs are `(j, j + head_dim/2)` for j in [0, head_dim/2).
+/// `qk` carries `n_heads` heads of width `head_dim` laid out as one
+/// flat slice `[n_heads * head_dim]`; we rotate each head independently
+/// so the same routine serves both Q (n_heads = num_attention_heads)
+/// and K (n_heads = num_key_value_heads under MQA/GQA).
+///
+/// Convention choice notes: TRiP uses pairwise-interleaved RoPE and a
+/// custom half-split→pairwise permuting matmul (math.c
+/// matmulf_nt_interleaved) so its in-memory Q has pairwise layout.
+/// We don't do that — our Q is in the HF half-split layout direct from
+/// the standard matmul, so the half-split RoPE is the natural match.
+/// Final attention scores are identical between the two paths.
+///
+/// At pos = 0 every angle is zero, so cos = 1, sin = 0, and the output
+/// equals the input. That's our sanity check in the smoke test.
+pub fn applyRope(
+    out: []f32,
+    in: []const f32,
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    theta_base: f32,
+) !void {
+    const total = n_heads * head_dim;
+    if (in.len != total or out.len != total) return error.LengthMismatch;
+    if (head_dim % 2 != 0) return error.OddHeadDim;
+    const half = head_dim / 2;
+
+    const pos_f: f32 = @floatFromInt(pos);
+    const dim_f: f32 = @floatFromInt(head_dim);
+
+    for (0..n_heads) |h| {
+        const off = h * head_dim;
+        for (0..half) |j| {
+            const freq = 1.0 / std.math.pow(f32, theta_base, (2.0 * @as(f32, @floatFromInt(j))) / dim_f);
+            const angle = pos_f * freq;
+            const cos_a = @cos(angle);
+            const sin_a = @sin(angle);
+            const a = in[off + j];
+            const b = in[off + j + half];
+            out[off + j] = a * cos_a - b * sin_a;
+            out[off + j + half] = a * sin_a + b * cos_a;
+        }
+    }
+}
+
 /// Materialise one row of an [N, D] tensor into `dst` as fp32.
 /// `dst.len == D`. Convenience for the per-token embedding lookup that
 /// kicks off every forward pass — could live in a more general "tensor

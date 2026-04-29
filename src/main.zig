@@ -45,10 +45,16 @@ pub fn main() !void {
         try runQprojTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--rope-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runRopeTest(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
     try runMatmulSmoke(allocator);
+    try runRopeIdentitySmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -244,6 +250,30 @@ fn runMatmulSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print("PASS matmul_nt synthetic (2×3 · (4×3)ᵀ → 2×4)\n", .{});
 }
 
+// ── RoPE identity smoke: pos=0 must be a no-op ──────────────────────
+
+fn runRopeIdentitySmoke(allocator: std.mem.Allocator) !void {
+    // Synthetic Q-shaped input. n_heads=8, head_dim=64 — stays small.
+    const n_heads: usize = 8;
+    const head_dim: usize = 64;
+    const total = n_heads * head_dim;
+    const in_v = try allocator.alloc(f32, total);
+    defer allocator.free(in_v);
+    const out_v = try allocator.alloc(f32, total);
+    defer allocator.free(out_v);
+    for (in_v, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i)) * 0.001 - 0.5;
+
+    try cpu_math.applyRope(out_v, in_v, n_heads, head_dim, 0, 10000.0);
+
+    for (in_v, out_v, 0..) |a, b, i| {
+        if (a != b) {
+            std.debug.print("RoPE pos=0 NOT identity at i={d}: in={d} out={d}\n", .{ i, a, b });
+            return error.ParityFailed;
+        }
+    }
+    std.debug.print("PASS RoPE pos=0 identity ({d} heads × {d} dim)\n", .{ n_heads, head_dim });
+}
+
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
 
 fn runRmsnormTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
@@ -372,6 +402,83 @@ fn runQprojTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u3
     try stdout.print("\nq stats: min={d:.6} max={d:.6} rms={d:.6} nan={d} inf={d}\n", .{
         min_v, max_v, q_rms, nan_count, inf_count,
     });
+}
+
+// ── rope-test: produce Q, apply RoPE at pos 0 and pos 1 ─────────────
+
+fn runRopeTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+
+    // Reuse the qproj chain to get Q.
+    const x = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const scale: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+        for (x) |*xi| xi.* *= scale;
+    }
+    const x_norm = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(x_norm);
+    try cpu_math.rmsnorm(x_norm, x, model.layers[0].input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const q_dim = cfg.num_attention_heads * cfg.head_dim;
+    const q = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q);
+    try cpu_math.matmul_nt(q, x_norm, model.layers[0].q_proj, 1, q_dim, cfg.hidden_size);
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("RoPE on Q [n_heads={d}, head_dim={d}] for token {d}\n\n", .{
+        cfg.num_attention_heads, cfg.head_dim, token_id,
+    });
+
+    // pos = 0: must equal Q.
+    const q_pos0 = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q_pos0);
+    try cpu_math.applyRope(q_pos0, q, cfg.num_attention_heads, cfg.head_dim, 0, cfg.rope_theta);
+    var pos0_ok = true;
+    for (q, q_pos0) |a, b| if (a != b) {
+        pos0_ok = false;
+        break;
+    };
+    try stdout.print("pos=0 identity: {s}\n", .{if (pos0_ok) "OK" else "FAIL"});
+
+    // pos = 1: rotated.
+    const q_pos1 = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q_pos1);
+    try cpu_math.applyRope(q_pos1, q, cfg.num_attention_heads, cfg.head_dim, 1, cfg.rope_theta);
+
+    // Print head 0, first 8 dims of each pair, before vs after pos=1.
+    try stdout.print("\nhead 0, pre vs post pos=1 RoPE (first 8 dim pairs):\n", .{});
+    const half = cfg.head_dim / 2;
+    for (0..8) |j| {
+        const a_pre = q[j];
+        const b_pre = q[j + half];
+        const a_post = q_pos1[j];
+        const b_post = q_pos1[j + half];
+        try stdout.print("  pair ({d:>3}, {d:>3}):  pre=({d:.4}, {d:.4})  post=({d:.4}, {d:.4})\n", .{
+            j, j + half, a_pre, b_pre, a_post, b_post,
+        });
+    }
+
+    // Sanity: norm of each (j, j+half) pair must be invariant — RoPE is
+    // a rotation, it preserves length per pair.
+    var max_err: f32 = 0;
+    for (0..cfg.num_attention_heads) |h| {
+        const off = h * cfg.head_dim;
+        for (0..half) |j| {
+            const a0 = q[off + j];
+            const b0 = q[off + j + half];
+            const a1 = q_pos1[off + j];
+            const b1 = q_pos1[off + j + half];
+            const n_pre = a0 * a0 + b0 * b0;
+            const n_post = a1 * a1 + b1 * b1;
+            const err = @abs(n_pre - n_post);
+            if (err > max_err) max_err = err;
+        }
+    }
+    try stdout.print("\nrotation invariant: max ||pair||² delta = {e:.2}  (must be tiny)\n", .{max_err});
 }
 
 // ── vec_add smoke: validates the whole Vulkan compute path ───────────
