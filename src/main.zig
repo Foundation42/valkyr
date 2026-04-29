@@ -14,6 +14,7 @@ const dtype = @import("dtype.zig");
 const cpu_math = @import("cpu/math.zig");
 const cpu_forward = @import("cpu/forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const config_mod = @import("config.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -72,6 +73,11 @@ pub fn main() !void {
         try runGpuQprojTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-rmsnorm-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGpuRmsnormTest(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
@@ -80,6 +86,7 @@ pub fn main() !void {
     try runSoftmaxSmoke(allocator);
     try runGeluSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
+    try runGpuRmsnormSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -373,6 +380,82 @@ fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS GPU matmul_nt synthetic (2×3 · (4×3)ᵀ → 2×4) on {s}\n", .{ctx.deviceName()});
+}
+
+// ── gpu rmsnorm smoke: synthetic vs CPU rmsnorm ────────────────────
+
+const RmsnormPush = extern struct {
+    dim: u32,
+    eps: f32,
+    gemma_quirk: u32,
+};
+
+fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Two cases — Llama (no quirk) and Gemma (1+w quirk) — exercising
+    // both code paths through the same shader.
+    inline for (.{ false, true }) |gemma_quirk| {
+        const dim: usize = 1024;
+        const x = try allocator.alloc(f32, dim);
+        defer allocator.free(x);
+        const w = try allocator.alloc(f32, dim);
+        defer allocator.free(w);
+        for (x, 0..) |*v, i| v.* = 0.5 - @as(f32, @floatFromInt(i & 31)) * 0.03;
+        for (w, 0..) |*v, i| v.* = -0.1 + @as(f32, @floatFromInt(i & 15)) * 0.02;
+
+        // ── CPU oracle ──────────────────────────────────────────────
+        const want = try allocator.alloc(f32, dim);
+        defer allocator.free(want);
+        const fake_w_tensor = safetensors.Tensor{
+            .dtype = .f32,
+            .shape = &.{dim},
+            .bytes = std.mem.sliceAsBytes(w),
+        };
+        const family: config_mod.Family = if (gemma_quirk) .gemma else .llama;
+        try cpu_math.rmsnorm(want, x, fake_w_tensor, 1e-6, family);
+
+        // ── GPU dispatch ────────────────────────────────────────────
+        var buf_a = try buffer.Buffer.initStatic(&ctx, f32, x);
+        defer buf_a.deinit(ctx.device);
+        var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+        defer buf_w.deinit(ctx.device);
+        var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, dim * @sizeOf(f32));
+        defer buf_c.deinit(ctx.device);
+
+        var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+        defer kern.deinit();
+        try kern.bind(&.{ &buf_a, &buf_w, &buf_c });
+
+        const push = RmsnormPush{
+            .dim = @intCast(dim),
+            .eps = 1e-6,
+            .gemma_quirk = if (gemma_quirk) 1 else 0,
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const RmsnormPush,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, 1, 1, 1);
+            }
+        }{ .kern = &kern, .push = &push });
+
+        const got = try allocator.alloc(f32, dim);
+        defer allocator.free(got);
+        try buf_c.readBack(&ctx, f32, got);
+
+        var max_abs: f32 = 0;
+        for (got, want) |g, e| {
+            const d = @abs(g - e);
+            if (d > max_abs) max_abs = d;
+        }
+        if (max_abs > 1e-5) {
+            std.debug.print("GPU rmsnorm gemma_quirk={any}: max |Δ| = {e}\n", .{ gemma_quirk, max_abs });
+            return error.ParityFailed;
+        }
+    }
+    std.debug.print("PASS GPU rmsnorm synthetic (Llama + Gemma variants, dim=1024)\n", .{});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────
@@ -926,6 +1009,97 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
         }
     }
     return out;
+}
+
+// ── gpu-rmsnorm-test: real Gemma layer 0 input_layernorm on GPU ────
+
+fn runGpuRmsnormTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(gpa, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("GPU rmsnorm parity test on layer 0 input_layernorm — token {d}\n", .{token_id});
+    try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
+
+    // Embedding → scale → (rmsnorm)
+    const x = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+        for (x) |*xi| xi.* *= s;
+    }
+
+    // CPU baseline.
+    const want = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(want);
+    const t_cpu0 = std.time.nanoTimestamp();
+    try cpu_math.rmsnorm(want, x, model.layers[0].input_layernorm, cfg.rms_norm_eps, cfg.family);
+    const t_cpu1 = std.time.nanoTimestamp();
+    const cpu_ms = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+    // Materialise weight as fp32 (bf16 on disk).
+    const w_bf16 = dtype.asU16(model.layers[0].input_layernorm.bytes);
+    const w_f32 = try gpa.alloc(f32, w_bf16.len);
+    defer gpa.free(w_f32);
+    dtype.bf16SliceToF32(w_bf16, w_f32);
+
+    // GPU dispatch.
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, x);
+    defer buf_a.deinit(ctx.device);
+    var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w_f32);
+    defer buf_w.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, cfg.hidden_size * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_w, &buf_c });
+
+    const push = RmsnormPush{
+        .dim = @intCast(cfg.hidden_size),
+        .eps = cfg.rms_norm_eps,
+        .gemma_quirk = if (cfg.family == .gemma) 1 else 0,
+    };
+
+    const t_gpu0 = std.time.nanoTimestamp();
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const RmsnormPush,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, 1, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push });
+    const t_gpu1 = std.time.nanoTimestamp();
+    const gpu_ms = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+    const got = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(got);
+    try buf_c.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    var max_idx: usize = 0;
+    for (got, want, 0..) |g, e, i| {
+        const d = @abs(g - e);
+        if (d > max_abs) {
+            max_abs = d;
+            max_idx = i;
+        }
+    }
+
+    try stdout.print("CPU: {d:.2} ms  GPU: {d:.2} ms (incl. submit + queue idle)\n", .{ cpu_ms, gpu_ms });
+    try stdout.print("max |Δ| = {e:.3}  (at idx {d}: cpu={d:.6} gpu={d:.6})\n", .{
+        max_abs, max_idx, want[max_idx], got[max_idx],
+    });
+    if (max_abs > 1e-3) {
+        std.debug.print("FAIL: max |Δ| above tolerance\n", .{});
+        return error.ParityFailed;
+    }
+    try stdout.print("\nPASS GPU rmsnorm matches CPU within {e:.0}\n", .{@as(f32, 1e-3)});
 }
 
 // ── gpu-qproj-test: real Gemma q_proj on GPU vs CPU ────────────────

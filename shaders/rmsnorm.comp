@@ -1,0 +1,86 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// rmsnorm: c[r, i] = (gain[i] * rms_inv) * a[r, i]
+// where:
+//     rms_inv = 1 / sqrt(mean(a[r, :]²) + eps)
+//     gain    = (1 + w[i])   if pc.gemma_quirk != 0
+//             = w[i]         otherwise
+//
+// One workgroup per row. The whole workgroup cooperates on the
+// sum-of-squares reduction (parallel sum across threads), then every
+// thread reuses the broadcast rms_inv to scale and multiply by gain
+// in one fused write.
+//
+// Reduction strategy:
+//   1. Each thread folds in its strided portion of the row.
+//   2. Subgroup reduction (subgroupAdd) collapses each subgroup to one
+//      partial in lane 0.
+//   3. Subgroup-0 reduces those partials again into the workgroup
+//      total, computes rms_inv, and broadcasts via shared memory.
+//
+// Why partial-then-broadcast rather than two passes: a row fits
+// comfortably in registers per thread (dim/local_size = 8 elements
+// for dim=2048 / wg=256), so re-reading the input on the second
+// loop costs nothing — it's already in L1.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A { float a[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer W { float w[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Pc {
+    uint dim;
+    float eps;
+    uint gemma_quirk;
+} pc;
+
+// Up to 32 subgroups per workgroup — enough for any reasonable
+// workgroup size at any subgroup size we'll encounter (NVIDIA=32,
+// AMD=32 or 64, Intel=8/16/32). At wg=256 we use 8 (NVIDIA) or 4 (AMD64).
+shared float subgroup_sums[32];
+shared float rms_inv_shared;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint row_off = row * pc.dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    // ── Phase 1: per-thread partial sum-of-squares ──────────────────
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = a[row_off + i];
+        local_sum += v * v;
+    }
+
+    // ── Phase 2: subgroup reduction ─────────────────────────────────
+    float sg_sum = subgroupAdd(local_sum);
+    if (subgroupElect()) {
+        subgroup_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    // ── Phase 3: subgroup-0 reduces across subgroups, computes rms_inv ──
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sums[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            float mean_sq = total / float(pc.dim);
+            rms_inv_shared = inversesqrt(mean_sq + pc.eps);
+        }
+    }
+    barrier();
+
+    float ri = rms_inv_shared;
+
+    // ── Phase 4: per-thread output write ────────────────────────────
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float gain = w[i];
+        if (pc.gemma_quirk != 0u) gain += 1.0;
+        c[row_off + i] = (gain * ri) * a[row_off + i];
+    }
+}
