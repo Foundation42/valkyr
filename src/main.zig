@@ -126,6 +126,11 @@ pub fn main() !void {
         try runGenTq4V(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-gen-tq4v")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGpuGenTq4V(allocator, args[2], token_id);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--bench")) {
         var n: usize = 64;
         var i: usize = 3;
@@ -2378,7 +2383,7 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
     for (0..n_steps) |step| {
         if (step > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, step, current);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, step, current, null);
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
         const t1 = std.time.nanoTimestamp();
@@ -2643,7 +2648,7 @@ fn chatTurn(
     while (true) {
         if (pos.* > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current);
+        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, null);
         try rec.endAndSubmit();
 
         // Decide what to do at this position.
@@ -2758,6 +2763,17 @@ const ChatKernels = struct {
 ///
 /// On exit the device-side `sc.logits` buffer holds the next-token
 /// distribution for position `pos + 1`.
+/// Optional TQ4 V-cache hooks. When all three fields are non-null
+/// `recordForwardStep` writes V into a packed TQ4 cache and dequants
+/// the whole V history into a scratch buffer just before attention,
+/// instead of using the fp32 V cache passed via `kv`. The K cache
+/// in `kv` is still used for the K-side. K=fp / V=TQ4 (asymmetric).
+const Tq4VHooks = struct {
+    pack: *const pipeline.Kernel,
+    unpack: *const pipeline.Kernel,
+    cache: *const gpu_scratch.GpuKvCacheTq4,
+};
+
 fn recordForwardStep(
     rec: *gpu_recorder.Recorder,
     sc: *const gpu_scratch.GpuScratch,
@@ -2767,6 +2783,7 @@ fn recordForwardStep(
     k: ChatKernels,
     pos: usize,
     token_id: u32,
+    tq4_v: ?Tq4VHooks,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
@@ -2836,7 +2853,16 @@ fn recordForwardStep(
 
         const kv_layer = &kv.layers[layer_idx];
         try recDispatch1D(rec, k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &kv_write_push, kv_dim);
-        try recDispatch1D(rec, k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &kv_write_push, kv_dim);
+
+        // V write: either the legacy kv_write (fp32 raw copy) or the
+        // TQ4 quantising pack-to-cache when Tq4VHooks is supplied.
+        if (tq4_v) |t| {
+            const tq_layer = &t.cache.layers[layer_idx];
+            const pack_push = Tq4PackPush{ .dst_block_idx = @intCast(pos) };
+            try rec.dispatch(t.pack, &.{ &sc.v, &tq_layer.v_cache }, &pack_push, 1, 1, 1);
+        } else {
+            try recDispatch1D(rec, k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &kv_write_push, kv_dim);
+        }
 
         try rec.dispatch(
             k.scores,
@@ -2847,9 +2873,19 @@ fn recordForwardStep(
             1,
         );
         try recDispatchPerRow(rec, k.softmax, &.{ &sc.scores, &sc.scores }, &softmax_push, @intCast(cfg.num_attention_heads));
+
+        // V read for attention output: either reads kv_layer.v_cache
+        // directly (fp32 path) or first dequants the whole TQ4 V
+        // history into the shared dequant_v scratch then reads that.
+        const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
+            const tq_layer = &t.cache.layers[layer_idx];
+            try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, n_pos, 1, 1);
+            break :blk &t.cache.dequant_v;
+        } else &kv_layer.v_cache;
+
         try rec.dispatch(
             k.attn_out,
-            &.{ &sc.scores, &kv_layer.v_cache, &sc.head_out },
+            &.{ &sc.scores, v_for_attn, &sc.head_out },
             &attn_out_push,
             @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
             1,
@@ -3005,7 +3041,7 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
     while (pos < n_tokens) : (pos += 1) {
         if (pos > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, pos, current_token);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, pos, current_token, null);
 
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
@@ -3030,6 +3066,142 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
     try stdout.print("generated {d} tokens in {d:.0} ms total ({d:.1} ms/token, {d:.1} tok/s)\n", .{
         tokens_done, total_gpu_ms, ms_per_tok, 1000.0 / ms_per_tok,
     });
+}
+
+// ── gpu-gen-tq4v: GPU forward with TQ4 V-cache vs fp32 V baseline ──
+//
+// Same input token, two passes through recordForwardStep — once with
+// tq4_v = null (existing fp32 V path), once with the TQ4 hooks set
+// up. Reads back logits for both, prints argmax + top-5 (with decoded
+// text) + max / mean / rms divergence over the full vocab. The
+// signal we want: argmax matches and top-5 IDs are preserved.
+
+fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var cpu = try model_mod.Model.load(gpa, dir_path);
+    defer cpu.deinit();
+    const cfg = cpu.config;
+
+    const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{dir_path});
+    defer gpa.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(gpa, tok_path);
+    defer tok.deinit();
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    try stdout.print("input: id={d}  string={s}\n\n", .{ token_id, tok.decode(token_id) orelse "?" });
+
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .bf16_matmul);
+    defer gm.deinit(ctx.device);
+
+    const max_pos: usize = 8;
+    var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, max_pos);
+    defer sc.deinit(ctx.device);
+    var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
+    defer kv.deinit(ctx.device);
+    var kv_tq4 = try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos);
+    defer kv_tq4.deinit(ctx.device);
+
+    var ks = try buildChatKernels(&ctx, gm.precision);
+    defer ks.embed.deinit();
+    defer ks.rmsnorm.deinit();
+    defer ks.matmul.deinit();
+    defer ks.matmul_lm_head.deinit();
+    defer ks.rope.deinit();
+    defer ks.kv_write.deinit();
+    defer ks.scores.deinit();
+    defer ks.softmax.deinit();
+    defer ks.attn_out.deinit();
+    defer ks.add.deinit();
+    defer ks.geglu.deinit();
+    const k = ChatKernels{
+        .embed = &ks.embed,
+        .rmsnorm = &ks.rmsnorm,
+        .matmul = &ks.matmul,
+        .matmul_lm_head = &ks.matmul_lm_head,
+        .rope = &ks.rope,
+        .kv_write = &ks.kv_write,
+        .scores = &ks.scores,
+        .softmax = &ks.softmax,
+        .attn_out = &ks.attn_out,
+        .add = &ks.add,
+        .geglu = &ks.geglu,
+    };
+
+    var tq_pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(Tq4PackPush));
+    defer tq_pack.deinit();
+    var tq_unpack = try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0);
+    defer tq_unpack.deinit();
+    const tq4_hooks = Tq4VHooks{ .pack = &tq_pack, .unpack = &tq_unpack, .cache = &kv_tq4 };
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
+    defer rec.deinit();
+
+    const logits_a = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(logits_a);
+    const logits_b = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(logits_b);
+
+    // Pass 1: fp32 V baseline.
+    try rec.begin();
+    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, null);
+    try rec.endAndSubmit();
+    try sc.logits.readBack(&ctx, f32, logits_a);
+
+    // Pass 2: TQ4 V.
+    try rec.reset();
+    try rec.begin();
+    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, tq4_hooks);
+    try rec.endAndSubmit();
+    try sc.logits.readBack(&ctx, f32, logits_b);
+
+    const top_a = try topK(gpa, logits_a, 5);
+    defer gpa.free(top_a);
+    const top_b = try topK(gpa, logits_b, 5);
+    defer gpa.free(top_b);
+
+    try stdout.print("            fp32 V baseline                     TQ4 V\n", .{});
+    try stdout.print("rank   id       logit    token              id       logit    token\n", .{});
+    try stdout.print("----   ------   ------   ----------------   ------   ------   ----------------\n", .{});
+    for (0..5) |i| {
+        const ta = top_a[i];
+        const tb = top_b[i];
+        const ta_text = tok.decode(ta.id) orelse "?";
+        const tb_text = tok.decode(tb.id) orelse "?";
+        try stdout.print("{d:>4}   {d:>6}   {d:>6.2}   {s:<16}   {d:>6}   {d:>6.2}   {s:<16}\n", .{
+            i, ta.id, ta.value, truncateStr(ta_text, 16), tb.id, tb.value, truncateStr(tb_text, 16),
+        });
+    }
+
+    var max_abs_delta: f32 = 0;
+    var max_abs_delta_idx: usize = 0;
+    var sum_abs: f64 = 0;
+    var sum_sq: f64 = 0;
+    for (logits_a, logits_b, 0..) |a, b, i| {
+        const d = @abs(a - b);
+        if (d > max_abs_delta) {
+            max_abs_delta = d;
+            max_abs_delta_idx = i;
+        }
+        sum_abs += d;
+        sum_sq += d * d;
+    }
+    const n: f64 = @floatFromInt(logits_a.len);
+    try stdout.print("\nlogit divergence over {d} tokens:\n", .{logits_a.len});
+    try stdout.print("  max |Δ|   = {d:.6}  at id={d}\n", .{ max_abs_delta, max_abs_delta_idx });
+    try stdout.print("  mean |Δ|  = {d:.6}\n", .{sum_abs / n});
+    try stdout.print("  rms  Δ    = {d:.6}\n", .{std.math.sqrt(sum_sq / n)});
+
+    const argmax_a = cpu_forward.argmax(logits_a);
+    const argmax_b = cpu_forward.argmax(logits_b);
+    try stdout.print("\nargmax:  fp32 V → {d}    TQ4 V → {d}    {s}\n", .{
+        argmax_a, argmax_b, if (argmax_a == argmax_b) "(MATCH)" else "(DIVERGE!)",
+    });
+    var top5_match: usize = 0;
+    for (top_a) |a| for (top_b) |b| if (a.id == b.id) { top5_match += 1; break; };
+    try stdout.print("top-5 ID overlap: {d}/5\n", .{top5_match});
 }
 
 // ── gpu-gen: full forward on GPU + parity vs CPU --gen ─────────────
