@@ -116,6 +116,11 @@ pub fn main() !void {
         try runEncode(allocator, args[2], args[3]);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--tq4-kv-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runTq4KvTest(allocator, args[2], token_id);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--bench")) {
         var n: usize = 64;
         var i: usize = 3;
@@ -1478,6 +1483,199 @@ fn runLayer0Test(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u
     defer allocator.free(block_out);
     for (block_out, mid, ffn_out) |*o, m, f| o.* = m + f;
     try printStreamStats(stdout, "layer 0 output", block_out);
+}
+
+// ── tq4-kv-test: real Gemma K/V vectors round-tripped through TQ4 ──
+//
+// Walks the full 18-layer forward pass for one input token, and at
+// every layer captures the (post-RoPE) K vector and the (pre-RoPE) V
+// vector — the two quantities that would actually live in a
+// TurboQuant-compressed KV cache. Each 256-element vector is run
+// through quantizeBlockTQ4 + dequantizeBlockTQ4, and the per-coord
+// MSE / max |Δ| / norm-preservation is reported so we have a real-
+// data reference for what the synthetic Gaussian numbers looked like
+// (MSE 0.00658, norm-rel-err 1.09e-4 from the smoke test).
+//
+// Gemma 2B has n_kv_heads=1 and head_dim=256, so each layer's K and V
+// is exactly one TQ4 block. 18 layers × 2 (K, V) = 36 sample blocks.
+
+fn runTq4KvTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    if (token_id >= cfg.vocab_size) return error.OutOfRange;
+
+    if (cfg.head_dim != turboquant.block_size_tq4) {
+        std.debug.print("head_dim ({d}) != TQ4 block size ({d}); only Gemma 2B supported in chunk 1.4\n", .{ cfg.head_dim, turboquant.block_size_tq4 });
+        return error.HeadDimMismatch;
+    }
+    if (cfg.num_key_value_heads != 1) {
+        std.debug.print("num_kv_heads ({d}) != 1; this test currently assumes Gemma MQA\n", .{cfg.num_key_value_heads});
+        return error.KvHeadCountMismatch;
+    }
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("TQ4 KV round-trip on real Gemma activations — token {d}\n\n", .{token_id});
+
+    const hidden = cfg.hidden_size;
+    const inter = cfg.intermediate_size;
+    const n_heads = cfg.num_attention_heads;
+    const n_kv = cfg.num_key_value_heads;
+    const head_dim = cfg.head_dim;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv * head_dim; // == 256 for Gemma 2B
+    const heads_per_kv = n_heads / n_kv;
+    const pos: usize = 0;
+
+    // Per-layer scratch (mirrors cpu/forward.zig, no shortcuts so we
+    // see real activations at each step).
+    const stream = try allocator.alloc(f32, hidden);
+    defer allocator.free(stream);
+    const x_norm = try allocator.alloc(f32, hidden);
+    defer allocator.free(x_norm);
+    const q = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(v);
+    const q_rot = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q_rot);
+    const k_rot = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(k_rot);
+    const head_out = try allocator.alloc(f32, q_dim);
+    defer allocator.free(head_out);
+    const attn_out = try allocator.alloc(f32, hidden);
+    defer allocator.free(attn_out);
+    const mid_norm = try allocator.alloc(f32, hidden);
+    defer allocator.free(mid_norm);
+    const gate = try allocator.alloc(f32, inter);
+    defer allocator.free(gate);
+    const up = try allocator.alloc(f32, inter);
+    defer allocator.free(up);
+    const fused = try allocator.alloc(f32, inter);
+    defer allocator.free(fused);
+    const ffn_out = try allocator.alloc(f32, hidden);
+    defer allocator.free(ffn_out);
+
+    // Embedding + Gemma sqrt(hidden) scale.
+    try cpu_math.embedRowAsF32(stream, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(hidden)));
+        for (stream) |*xi| xi.* *= s;
+    }
+
+    // Aggregate stats.
+    var k_mse_sum: f64 = 0;
+    var v_mse_sum: f64 = 0;
+    var k_max_err: f32 = 0;
+    var v_max_err: f32 = 0;
+    var k_max_norm_rel: f32 = 0;
+    var v_max_norm_rel: f32 = 0;
+
+    try stdout.print("layer  K MSE      K max|Δ|   K norm-rel  V MSE      V max|Δ|   V norm-rel\n", .{});
+    try stdout.print("-----  ---------  ---------  ----------  ---------  ---------  ----------\n", .{});
+
+    for (model.layers, 0..) |layer, layer_idx| {
+        // Pre-attention rmsnorm.
+        try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+        // Q/K/V projections.
+        try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, hidden);
+        try cpu_math.matmul_nt(k, x_norm, layer.k_proj, 1, kv_dim, hidden);
+        try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, kv_dim, hidden);
+
+        // RoPE on Q and K.
+        try cpu_math.applyRope(q_rot, q, n_heads, head_dim, pos, cfg.rope_theta);
+        try cpu_math.applyRope(k_rot, k, n_kv, head_dim, pos, cfg.rope_theta);
+
+        // ── TQ4 round-trip on K_rot and V ───────────────────────────
+        const k_block_in: *const [256]f32 = @ptrCast(k_rot.ptr);
+        const v_block_in: *const [256]f32 = @ptrCast(v.ptr);
+        var k_blk: turboquant.BlockTQ4 = undefined;
+        var v_blk: turboquant.BlockTQ4 = undefined;
+        turboquant.quantizeBlockTQ4(k_block_in, &k_blk);
+        turboquant.quantizeBlockTQ4(v_block_in, &v_blk);
+
+        var k_recon: [256]f32 = undefined;
+        var v_recon: [256]f32 = undefined;
+        turboquant.dequantizeBlockTQ4(&k_blk, &k_recon);
+        turboquant.dequantizeBlockTQ4(&v_blk, &v_recon);
+
+        const k_stats = blockStats(k_block_in, &k_recon);
+        const v_stats = blockStats(v_block_in, &v_recon);
+
+        try stdout.print("{d:>5}  {d:.6}   {d:.6}   {e:>9.2}   {d:.6}   {d:.6}   {e:>9.2}\n", .{
+            layer_idx,
+            k_stats.mse,        k_stats.max_err, k_stats.norm_rel_err,
+            v_stats.mse,        v_stats.max_err, v_stats.norm_rel_err,
+        });
+
+        k_mse_sum += k_stats.mse;
+        v_mse_sum += v_stats.mse;
+        k_max_err = @max(k_max_err, k_stats.max_err);
+        v_max_err = @max(v_max_err, v_stats.max_err);
+        k_max_norm_rel = @max(k_max_norm_rel, k_stats.norm_rel_err);
+        v_max_norm_rel = @max(v_max_norm_rel, v_stats.norm_rel_err);
+
+        // Continue the forward pass with the *original* (un-quantized)
+        // K_rot / V so subsequent layers see canonical activations.
+        // Quantization-error-propagation is a separate experiment
+        // (chunk 1.5).
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const v_off = kv_h * head_dim;
+            const out_off = h * head_dim;
+            @memcpy(head_out[out_off .. out_off + head_dim], v[v_off .. v_off + head_dim]);
+        }
+        try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+        for (stream, attn_out) |*si, ai| si.* += ai;
+
+        try cpu_math.rmsnorm(mid_norm, stream, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
+        try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, hidden);
+        try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, 1, inter, hidden);
+        try cpu_math.geglu(fused, gate, up);
+        try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, 1, hidden, inter);
+        for (stream, ffn_out) |*si, fi| si.* += fi;
+    }
+
+    const n_layers: f64 = @floatFromInt(model.layers.len);
+    try stdout.print("\n", .{});
+    try stdout.print("aggregate (over {d} layers):\n", .{model.layers.len});
+    try stdout.print("  K mean MSE     = {d:.6}    K max |Δ|  = {d:.6}    K worst norm-rel = {e:.2}\n", .{
+        k_mse_sum / n_layers, k_max_err, k_max_norm_rel,
+    });
+    try stdout.print("  V mean MSE     = {d:.6}    V max |Δ|  = {d:.6}    V worst norm-rel = {e:.2}\n", .{
+        v_mse_sum / n_layers, v_max_err, v_max_norm_rel,
+    });
+}
+
+const BlockStats = struct {
+    mse: f32,
+    max_err: f32,
+    norm_rel_err: f32,
+};
+
+fn blockStats(orig: *const [256]f32, recon: *const [256]f32) BlockStats {
+    var err_sq: f32 = 0;
+    var max_err: f32 = 0;
+    var orig_sq: f32 = 0;
+    var recon_sq: f32 = 0;
+    for (orig, recon) |o, r| {
+        orig_sq += o * o;
+        recon_sq += r * r;
+        const d = o - r;
+        err_sq += d * d;
+        max_err = @max(max_err, @abs(d));
+    }
+    const orig_norm = @sqrt(orig_sq);
+    const recon_norm = @sqrt(recon_sq);
+    const norm_rel = if (orig_norm > 0) @abs(orig_norm - recon_norm) / orig_norm else 0;
+    return .{
+        .mse = err_sq / 256.0,
+        .max_err = max_err,
+        .norm_rel_err = norm_rel,
+    };
 }
 
 // ── gen: full forward + greedy + tokenizer decode ──────────────────
