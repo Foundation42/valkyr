@@ -1,17 +1,17 @@
-# tripvulkan
+# valkyr
 
-**A Vulkan-compute LLM inference engine in Zig — cross-vendor by
-construction, with TurboQuant KV-cache compression.**
+**Cross-vendor LLM inference based on TRiP using Vulkan compute. Zig +
+TurboQuant — no CUDA lock-in.**
 
-Greedy and sampled text generation, multi-turn chat, three-tier parity
+Greedy and sampled text generation, multi-turn chat, four-tier parity
 verified against HuggingFace `transformers`, and (we believe) the first
 publicly-demonstrable [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
 inference on a non-CUDA backend.
 
-This started as a port of the math from [Carlo Valenti's TRiP](https://github.com/)
+valkyr started as a port of the math from [Carlo Valenti's TRiP](https://github.com/)
 ("Transformers in Progress" — see `reference/`) to Zig + Vulkan compute.
 TRiP is a few-files-in-C, single-author transformer engine built for
-clarity. tripvulkan keeps that pedagogical spirit but trades the
+clarity. valkyr keeps that pedagogical spirit but trades the
 OpenMP-on-CPU back end for a Vulkan compute back end that runs the same
 math on any GPU that supports Vulkan 1.3 (AMD / Intel / NVIDIA / Apple
 via MoltenVK / Android — one SPIR-V binary, every vendor).
@@ -77,13 +77,13 @@ phase-3 menu.
 **Try it:**
 
 ```sh
-$ ./zig-out/bin/tripvulkan --chat <gemma-2b-it-dir> --tq4v \
+$ ./zig-out/bin/valkyr --chat <gemma-2b-it-dir> --tq4v \
     "What is the capital of France?"
 
 response: The capital of France is Paris. It is the political,
 cultural, and administrative center of France...
 
-$ ./zig-out/bin/tripvulkan --chat <gemma-2b-it-dir> --tq4v \
+$ ./zig-out/bin/valkyr --chat <gemma-2b-it-dir> --tq4v \
     --temp 0.8 --top-p 0.9 --seed 42 \
     "Write a one-line haiku about Vulkan."
 
@@ -165,41 +165,41 @@ HuggingFace snapshot directory containing `config.json`,
 zig build run
 
 # Inspect a checkpoint (no GPU touched)
-./zig-out/bin/tripvulkan --inspect <model.safetensors>
-./zig-out/bin/tripvulkan --load    <model-dir>
+./zig-out/bin/valkyr --inspect <model.safetensors>
+./zig-out/bin/valkyr --load    <model-dir>
 
 # CPU reference forward + greedy sample (the parity oracle)
-./zig-out/bin/tripvulkan --gen <model-dir> <token-id>
+./zig-out/bin/valkyr --gen <model-dir> <token-id>
 
 # CPU forward with TQ4 V-cache, side-by-side vs fp32 baseline
-./zig-out/bin/tripvulkan --gen-tq4v <model-dir> <token-id>
+./zig-out/bin/valkyr --gen-tq4v <model-dir> <token-id>
 
 # GPU forward + parity check vs the CPU oracle
-./zig-out/bin/tripvulkan --gpu-gen <model-dir> <token-id>
+./zig-out/bin/valkyr --gpu-gen <model-dir> <token-id>
 
 # GPU forward with TQ4 V-cache, side-by-side vs fp32 baseline
-./zig-out/bin/tripvulkan --gpu-gen-tq4v <model-dir> <token-id>
+./zig-out/bin/valkyr --gpu-gen-tq4v <model-dir> <token-id>
 
 # GPU streaming generation (KV cache, multi-position attention)
-./zig-out/bin/tripvulkan --gpu-gen-many <model-dir> <token-id> <n>
+./zig-out/bin/valkyr --gpu-gen-many <model-dir> <token-id> <n>
 
 # Chat (single-turn or multi-turn REPL)
-./zig-out/bin/tripvulkan --chat <model-dir> "What is the capital of France?"
-./zig-out/bin/tripvulkan --chat <model-dir>        # REPL with stdin
+./zig-out/bin/valkyr --chat <model-dir> "What is the capital of France?"
+./zig-out/bin/valkyr --chat <model-dir>        # REPL with stdin
 
 # Chat with TurboQuant V-cache (asymmetric K=fp / V=TQ4)
-./zig-out/bin/tripvulkan --chat <model-dir> --tq4v "..."
+./zig-out/bin/valkyr --chat <model-dir> --tq4v "..."
 
 # Chat with sampling (works with or without --tq4v)
-./zig-out/bin/tripvulkan --chat <model-dir> \
+./zig-out/bin/valkyr --chat <model-dir> \
     --temp 0.8 --top-p 0.9 --seed 42 \
     "Write a one-line haiku about Vulkan."
 
 # Benchmark (warm/cold forward timing, tok/s, p99) — fp32 baseline
-./zig-out/bin/tripvulkan --bench <model-dir> --n 128
+./zig-out/bin/valkyr --bench <model-dir> --n 128
 
 # Real-Gemma TQ4 round-trip diagnostic (per-layer K/V MSE)
-./zig-out/bin/tripvulkan --tq4-kv-test <model-dir> <token-id>
+./zig-out/bin/valkyr --tq4-kv-test <model-dir> <token-id>
 ```
 
 For Gemma 2B IT the snapshot dir is typically inside
