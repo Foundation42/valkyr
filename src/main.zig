@@ -10,6 +10,7 @@ const buffer = @import("gpu/buffer.zig");
 const pipeline = @import("gpu/pipeline.zig");
 const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
+const dtype = @import("dtype.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -26,6 +27,11 @@ pub fn main() !void {
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--load")) {
         try runLoad(allocator, args[2]);
+        return;
+    }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--dump-embed")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runDumpEmbed(allocator, args[2], token_id);
         return;
     }
 
@@ -132,6 +138,68 @@ fn runLoad(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     // a cheap way to force the OS to actually touch each tensor page.
     // Print it so the optimizer can't elide the loop.
     try stdout.print("\nPASS load (touch checksum: 0x{x})\n", .{bytes_touched});
+}
+
+// ── dump-embed: pull a token's row from embed_tokens, bf16 → fp32 ────
+
+fn runDumpEmbed(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+
+    const cfg = model.config;
+    if (token_id >= cfg.vocab_size) {
+        std.debug.print("token id {d} out of range (vocab_size={d})\n", .{ token_id, cfg.vocab_size });
+        return error.OutOfRange;
+    }
+
+    if (model.embed_tokens.dtype != .bf16) {
+        std.debug.print("expected bf16 embed_tokens; got {s}\n", .{@tagName(model.embed_tokens.dtype)});
+        return error.UnexpectedDtype;
+    }
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("token {d}, hidden_size={d} — first values + stats\n", .{ token_id, cfg.hidden_size });
+
+    // Slice the row for this token. embed_tokens is [vocab_size, hidden_size]
+    // row-major, so row `token_id` starts at `token_id * hidden_size *
+    // bytes_per_elem` from the tensor's byte base.
+    const elem_bytes = model.embed_tokens.dtype.elemSize();
+    const row_bytes = cfg.hidden_size * elem_bytes;
+    const row_start = @as(usize, token_id) * row_bytes;
+    const row_bf16 = dtype.asU16(model.embed_tokens.bytes[row_start .. row_start + row_bytes]);
+
+    // Convert into a heap-allocated fp32 buffer.
+    const row_f32 = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(row_f32);
+    dtype.bf16SliceToF32(row_bf16, row_f32);
+
+    // First N for inspection.
+    const n_show: usize = @min(16, row_f32.len);
+    for (row_f32[0..n_show], 0..) |v, i| try stdout.print("  [{d:>4}] {d:.6}\n", .{ i, v });
+
+    // Stats over the whole row.
+    var min_v: f32 = std.math.inf(f32);
+    var max_v: f32 = -std.math.inf(f32);
+    var sum: f64 = 0;
+    var nan_count: usize = 0;
+    var inf_count: usize = 0;
+    for (row_f32) |v| {
+        if (std.math.isNan(v)) {
+            nan_count += 1;
+            continue;
+        }
+        if (std.math.isInf(v)) {
+            inf_count += 1;
+            continue;
+        }
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        sum += v;
+    }
+    const mean = sum / @as(f64, @floatFromInt(row_f32.len - nan_count - inf_count));
+    try stdout.print("\nstats: min={d:.6} max={d:.6} mean={d:.6} nan={d} inf={d}\n", .{
+        min_v, max_v, mean, nan_count, inf_count,
+    });
 }
 
 // ── vec_add smoke: validates the whole Vulkan compute path ───────────
