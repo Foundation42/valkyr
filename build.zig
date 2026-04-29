@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
     const vec_add_spv = compileShader(b, "vec_add");
     const matmul_nt_spv = compileShader(b, "matmul_nt");
     const rmsnorm_spv = compileShader(b, "rmsnorm");
+    const geglu_spv = compileShader(b, "geglu");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -21,10 +22,12 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(vec_add_spv, "vec_add.spv");
     _ = wf.addCopyFile(matmul_nt_spv, "matmul_nt.spv");
     _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
+    _ = wf.addCopyFile(geglu_spv, "geglu.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
         \\pub const rmsnorm align(4) = @embedFile("rmsnorm.spv").*;
+        \\pub const geglu align(4) = @embedFile("geglu.spv").*;
     );
 
     const exe = b.addExecutable(.{

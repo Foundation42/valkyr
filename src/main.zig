@@ -78,6 +78,11 @@ pub fn main() !void {
         try runGpuRmsnormTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-geglu-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGpuGegluTest(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
@@ -87,6 +92,7 @@ pub fn main() !void {
     try runGeluSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuRmsnormSmoke(allocator);
+    try runGpuGegluSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -456,6 +462,70 @@ fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS GPU rmsnorm synthetic (Llama + Gemma variants, dim=1024)\n", .{});
+}
+
+// ── gpu geglu smoke: synthetic vs CPU geglu ─────────────────────────
+
+const GegluPush = extern struct { n: u32 };
+
+fn runGpuGegluSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n: usize = 4096;
+    const gate = try allocator.alloc(f32, n);
+    defer allocator.free(gate);
+    const upv = try allocator.alloc(f32, n);
+    defer allocator.free(upv);
+    // Range [-3, 3] across the array hits both the tanh saturation
+    // tails and the linear region around 0 — exercises the full curve.
+    for (gate, upv, 0..) |*g, *u, i| {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n));
+        g.* = -3.0 + 6.0 * t;
+        u.* = 1.0 - 2.0 * t;
+    }
+
+    const want = try allocator.alloc(f32, n);
+    defer allocator.free(want);
+    try cpu_math.geglu(want, gate, upv);
+
+    var buf_g = try buffer.Buffer.initStatic(&ctx, f32, gate);
+    defer buf_g.deinit(ctx.device);
+    var buf_u = try buffer.Buffer.initStatic(&ctx, f32, upv);
+    defer buf_u.deinit(ctx.device);
+    var buf_o = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
+    defer buf_o.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_g, &buf_u, &buf_o });
+
+    const local: u32 = 256;
+    const groups: u32 = (@as(u32, @intCast(n)) + local - 1) / local;
+    const push = GegluPush{ .n = @intCast(n) };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const GegluPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .groups = groups });
+
+    const got = try allocator.alloc(f32, n);
+    defer allocator.free(got);
+    try buf_o.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    for (got, want) |g, e| {
+        const d = @abs(g - e);
+        if (d > max_abs) max_abs = d;
+    }
+    if (max_abs > 1e-5) {
+        std.debug.print("GPU GeGLU: max |Δ| = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU geglu synthetic ({d} elems, x∈[-3,3])\n", .{n});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────
@@ -1100,6 +1170,128 @@ fn runGpuRmsnormTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32
         return error.ParityFailed;
     }
     try stdout.print("\nPASS GPU rmsnorm matches CPU within {e:.0}\n", .{@as(f32, 1e-3)});
+}
+
+// ── gpu-geglu-test: real Gemma layer 0 GeGLU vs CPU ────────────────
+
+fn runGpuGegluTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(gpa, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    const layer = model.layers[0];
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("GPU GeGLU parity test on layer 0 — token {d}\n", .{token_id});
+    try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
+
+    // Reproduce the FFN inputs on CPU: embed → scale → rmsnorm₁ → attn
+    // (single-position degenerate to V) → o_proj → residual → rmsnorm₂.
+    const inter = cfg.intermediate_size;
+
+    const x = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+        for (x) |*xi| xi.* *= s;
+    }
+    const x_norm = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x_norm);
+    try cpu_math.rmsnorm(x_norm, x, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    // Single-position attention output = V projected through o_proj.
+    const v = try gpa.alloc(f32, cfg.num_key_value_heads * cfg.head_dim);
+    defer gpa.free(v);
+    try cpu_math.matmul_nt(v, x_norm, layer.v_proj, 1, v.len, cfg.hidden_size);
+
+    const head_out = try gpa.alloc(f32, cfg.num_attention_heads * cfg.head_dim);
+    defer gpa.free(head_out);
+    const heads_per_kv = cfg.num_attention_heads / cfg.num_key_value_heads;
+    for (0..cfg.num_attention_heads) |h| {
+        const kv_h = h / heads_per_kv;
+        const v_off = kv_h * cfg.head_dim;
+        const out_off = h * cfg.head_dim;
+        @memcpy(head_out[out_off .. out_off + cfg.head_dim], v[v_off .. v_off + cfg.head_dim]);
+    }
+    const attn_out = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(attn_out);
+    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, cfg.hidden_size, head_out.len);
+
+    const mid = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(mid);
+    for (mid, x, attn_out) |*m, xi, ai| m.* = xi + ai;
+    const mid_norm = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(mid_norm);
+    try cpu_math.rmsnorm(mid_norm, mid, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const gate = try gpa.alloc(f32, inter);
+    defer gpa.free(gate);
+    const upv = try gpa.alloc(f32, inter);
+    defer gpa.free(upv);
+    try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, cfg.hidden_size);
+    try cpu_math.matmul_nt(upv, mid_norm, layer.up_proj, 1, inter, cfg.hidden_size);
+
+    const want = try gpa.alloc(f32, inter);
+    defer gpa.free(want);
+    const t_cpu0 = std.time.nanoTimestamp();
+    try cpu_math.geglu(want, gate, upv);
+    const t_cpu1 = std.time.nanoTimestamp();
+    const cpu_ms = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+    var buf_g = try buffer.Buffer.initStatic(&ctx, f32, gate);
+    defer buf_g.deinit(ctx.device);
+    var buf_u = try buffer.Buffer.initStatic(&ctx, f32, upv);
+    defer buf_u.deinit(ctx.device);
+    var buf_o = try buffer.Buffer.initDeviceOnly(&ctx, inter * @sizeOf(f32));
+    defer buf_o.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_g, &buf_u, &buf_o });
+
+    const local: u32 = 256;
+    const n_u32: u32 = @intCast(inter);
+    const groups: u32 = (n_u32 + local - 1) / local;
+    const push = GegluPush{ .n = n_u32 };
+
+    const t_gpu0 = std.time.nanoTimestamp();
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const GegluPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .groups = groups });
+    const t_gpu1 = std.time.nanoTimestamp();
+    const gpu_ms = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+    const got = try gpa.alloc(f32, inter);
+    defer gpa.free(got);
+    try buf_o.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    var max_idx: usize = 0;
+    for (got, want, 0..) |g, e, i| {
+        const d = @abs(g - e);
+        if (d > max_abs) {
+            max_abs = d;
+            max_idx = i;
+        }
+    }
+
+    try stdout.print("CPU: {d:.2} ms  GPU: {d:.2} ms (incl. submit + queue idle)\n", .{ cpu_ms, gpu_ms });
+    try stdout.print("max |Δ| = {e:.3}  (at idx {d}: cpu={d:.6} gpu={d:.6})\n", .{
+        max_abs, max_idx, want[max_idx], got[max_idx],
+    });
+    if (max_abs > 1e-3) {
+        std.debug.print("FAIL: max |Δ| above tolerance\n", .{});
+        return error.ParityFailed;
+    }
+    try stdout.print("\nPASS GPU geglu matches CPU within {e:.0}\n", .{@as(f32, 1e-3)});
 }
 
 // ── gpu-qproj-test: real Gemma q_proj on GPU vs CPU ────────────────
