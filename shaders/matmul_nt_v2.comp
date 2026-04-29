@@ -1,0 +1,77 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// matmul_nt, take 2: one workgroup per output element, threads
+// cooperate over the K dimension via subgroup reduction.
+//
+// Why this beats the naive "1 thread per output cell" layout for
+// M = 1 (the single-token case that dominates inference):
+//
+//   - Naive shader had 16×16 workgroups dispatched over (M, N). With
+//     M = 1 only the first row of x-threads did useful work, and
+//     within each warp the 32 threads read 32 different rows of B —
+//     each K elements apart, completely uncoalesced. We were leaving
+//     the memory subsystem unable to merge transactions.
+//
+//   - Here, each WG owns one (i, j) cell of output. The 256 threads
+//     in the WG stride together over K with stride local_size_x,
+//     so within a warp 32 consecutive threads read 32 *consecutive*
+//     elements of B[j]. The memory controller coalesces those into
+//     one transaction. Same for A.
+//
+// Reduction is the standard two-stage pattern we already use for
+// rmsnorm and softmax: per-thread partial → subgroupAdd → shared
+// memory → subgroup-0 reduces across subgroups → lane 0 writes the
+// output.
+//
+// For M = 1, N = 2048, K = 2048 (q_proj), this is 2048 WGs of 256
+// threads, each thread does 8 MACs. Plenty of WGs to fill the GPU,
+// and the coalesced B reads should drop the matmul to memory-bound.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A { float a[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer B { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared float sg_partials[32];
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint i = cell / pc.N;
+    uint j = cell - i * pc.N;
+    if (i >= pc.M) return;
+
+    uint a_off = i * pc.K;
+    uint b_off = j * pc.K;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Each thread accumulates its strided slice of the dot product.
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += gl_WorkGroupSize.x) {
+        acc += a[a_off + k] * b[b_off + k];
+    }
+
+    // Subgroup reduction.
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    // Subgroup-0 reduces partials and writes the output.
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            c[i * pc.N + j] = total;
+        }
+    }
+}

@@ -113,6 +113,7 @@ pub fn main() !void {
     try runSoftmaxSmoke(allocator);
     try runGeluSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
+    try runGpuMatmulV2Smoke(allocator);
     try runGpuRmsnormSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
@@ -410,6 +411,58 @@ fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS GPU matmul_nt synthetic (2×3 · (4×3)ᵀ → 2×4) on {s}\n", .{ctx.deviceName()});
+}
+
+// ── gpu matmul_nt_v2 smoke: cooperative-K kernel vs hand-checked ───
+
+fn runGpuMatmulV2Smoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Same problem as runGpuMatmulSmoke: 2x3 · (4x3)ᵀ → 2x4.
+    // Note v2 needs K large enough that the cooperative reduction
+    // exercises something — but correctness with tiny K is also a
+    // useful sanity check (most threads get nothing to do, the result
+    // should still be right).
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const b = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 };
+    const want = [_]f32{ 1, 2, 3, 6, 4, 5, 6, 15 };
+    const m: u32 = 2;
+    const n: u32 = 4;
+    const k: u32 = 3;
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, &a);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, f32, &b);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+    // v2 dispatches one WG per output cell — total = M*N WGs.
+    const groups: u32 = m * n;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const MatmulPush,
+        gx: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .gx = groups });
+
+    var out: [8]f32 = undefined;
+    try buf_c.readBack(&ctx, f32, &out);
+    for (out, want, 0..) |got, w, i| {
+        if (got != w) {
+            std.debug.print("GPU matmul_v2 MISMATCH at {d}: got {d}, expected {d}\n", .{ i, got, w });
+            return error.ParityFailed;
+        }
+    }
+    std.debug.print("PASS GPU matmul_nt_v2 synthetic (cooperative-K, 2×3 · (4×3)ᵀ → 2×4)\n", .{});
 }
 
 // ── gpu rmsnorm smoke: synthetic vs CPU rmsnorm ────────────────────
@@ -1287,7 +1340,7 @@ fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void 
     defer k_embed.deinit();
     var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
     defer k_rmsnorm.deinit();
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
     defer k_matmul.deinit();
     var k_rope = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
     defer k_rope.deinit();
@@ -1734,11 +1787,12 @@ fn recDispatchMatmul(
     n: u32,
     k: u32,
 ) !void {
-    const local_xy: u32 = 16;
-    const gx: u32 = (m + local_xy - 1) / local_xy;
-    const gy: u32 = (n + local_xy - 1) / local_xy;
+    // matmul_nt_v2 dispatch: one WG per output cell, 256 threads each
+    // cooperate over K with subgroup reduction. Workgroup count is
+    // M*N which is well within the 65535 per-dim limit even at our
+    // largest matmul (M=1, N=vocab_size=256000).
     const push = MatmulPush{ .m = m, .n = n, .k = k };
-    try rec.dispatch(kern, bufs, &push, gx, gy, 1);
+    try rec.dispatch(kern, bufs, &push, m * n, 1, 1);
 }
 
 fn recDispatchRope(
