@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     const fwht256_spv = compileShader(b, "fwht256");
     const rht_pre256_spv = compileShader(b, "rht_pre256");
     const rht_post256_spv = compileShader(b, "rht_post256");
+    const tq4_pack256_spv = compileShader(b, "tq4_pack256");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -49,6 +50,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(fwht256_spv, "fwht256.spv");
     _ = wf.addCopyFile(rht_pre256_spv, "rht_pre256.spv");
     _ = wf.addCopyFile(rht_post256_spv, "rht_post256.spv");
+    _ = wf.addCopyFile(tq4_pack256_spv, "tq4_pack256.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -67,6 +69,7 @@ pub fn build(b: *std.Build) void {
         \\pub const fwht256 align(4) = @embedFile("fwht256.spv").*;
         \\pub const rht_pre256 align(4) = @embedFile("rht_pre256.spv").*;
         \\pub const rht_post256 align(4) = @embedFile("rht_post256.spv").*;
+        \\pub const tq4_pack256 align(4) = @embedFile("tq4_pack256.spv").*;
     );
 
     const exe = b.addExecutable(.{

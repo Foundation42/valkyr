@@ -186,6 +186,7 @@ pub fn main() !void {
     try runGpuRhtPreSmoke(allocator);
     try runGpuRhtRoundTripSmoke(allocator);
     try runGpuRhtFusedRoundTripSmoke(allocator);
+    try runGpuTq4PackSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -993,6 +994,73 @@ fn runGpuRhtFusedRoundTripSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU rht fused round-trip (recorder + auto-barrier, max |Δ| = {e:.2})\n", .{max_err});
+}
+
+// ── gpu tq4_pack smoke: full TQ4 quantize on GPU vs CPU oracle ─────
+//
+// Same deterministic ramp as the YATQ bit-exact test: x[i] =
+// (i/128) - 1 for i in [0, 256). Quantize on GPU and compare:
+//   - 256 Lloyd-Max indices: bit-exact vs CPU quantizeBlockTQ4
+//   - γ (norm-correction): within 1e-3 relative tolerance vs CPU
+//     (CPU stores f16 γ; GPU stores f32. The truncation tolerance
+//     of f16 mantissa is ~5e-4, so 1e-3 is comfortable.)
+//
+// GPU output is 33 u32s per block: [0] = γ as f32 bits, [1..33] = 32
+// LE u32s holding the same byte-stream layout as BlockTQ4.indices.
+
+fn runGpuTq4PackSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var input: [256]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i)) / 128.0) - 1.0;
+
+    var cpu_blk: turboquant.BlockTQ4 = undefined;
+    turboquant.quantizeBlockTQ4(&input, &cpu_blk);
+    const cpu_gamma_f32: f32 = @floatCast(cpu_blk.gamma);
+
+    var input_buf = try buffer.Buffer.initStatic(&ctx, f32, &input);
+    defer input_buf.deinit(ctx.device);
+    var output_buf = try buffer.Buffer.initDeviceOnly(&ctx, 33 * @sizeOf(u32));
+    defer output_buf.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack256, 2, 0);
+    defer kern.deinit();
+    try kern.bind(&.{ &input_buf, &output_buf });
+
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, null, 1, 1, 1);
+        }
+    }{ .kern = &kern });
+
+    var out: [33]u32 = undefined;
+    try output_buf.readBack(&ctx, f32, @ptrCast(&out));
+    const gpu_gamma: f32 = @bitCast(out[0]);
+
+    const gamma_rel = @abs(gpu_gamma - cpu_gamma_f32) / cpu_gamma_f32;
+    if (gamma_rel > 1e-3) {
+        std.debug.print("γ mismatch: gpu={d} cpu(f16)={d} rel={e}\n", .{ gpu_gamma, cpu_gamma_f32, gamma_rel });
+        return error.ParityFailed;
+    }
+
+    // Compare indices bit-exact. GPU u32[k] = bytes [4k..4k+4] LE; each
+    // byte holds two 4-bit indices (low nibble even, high nibble odd).
+    // CPU BlockTQ4.indices[k] holds element 2k in low nibble and 2k+1 in
+    // high — so CPU indices[k] should equal byte (k % 4) of out[1 + k/4].
+    for (0..128) |byte_idx| {
+        const word = out[1 + byte_idx / 4];
+        const shift: u5 = @intCast((byte_idx % 4) * 8);
+        const gpu_byte: u8 = @intCast((word >> shift) & 0xff);
+        const cpu_byte = cpu_blk.indices[byte_idx];
+        if (gpu_byte != cpu_byte) {
+            std.debug.print("idx mismatch at byte {d}: gpu={x:0>2} cpu={x:0>2}\n", .{ byte_idx, gpu_byte, cpu_byte });
+            return error.ParityFailed;
+        }
+    }
+
+    std.debug.print("PASS GPU tq4_pack256 (256 indices bit-exact, γ rel-err {e:.2} vs CPU)\n", .{gamma_rel});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────
