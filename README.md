@@ -8,7 +8,7 @@ verified against HuggingFace `transformers`, and (we believe) the first
 publicly-demonstrable [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
 inference on a non-CUDA backend.
 
-valkyr started as a port of the math from [Carlo Valenti's TRiP](https://github.com/)
+valkyr started as a port of the math from [Carlo Valenti's TRiP](https://github.com/carlovalenti/TRiP)
 ("Transformers in Progress" — see `reference/`) to Zig + Vulkan compute.
 TRiP is a few-files-in-C, single-author transformer engine built for
 clarity. valkyr keeps that pedagogical spirit but trades the
@@ -333,7 +333,7 @@ The two big arcs:
 
 This was a real team effort:
 
-- **Carlo Valenti** — for [TRiP](https://github.com/) (Transformers in
+- **Carlo Valenti** — for [TRiP](https://github.com/carlovalenti/TRiP) (Transformers in
   Progress), the C reference whose math we ported and whose paired
   forward/backward layout we kept in spirit. Carlo's pedagogical
   clarity made the whole port tractable, and his enthusiasm carried
