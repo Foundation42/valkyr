@@ -182,6 +182,7 @@ pub fn main() !void {
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuSoftmaxSmoke(allocator);
+    try runGpuFwhtSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -814,6 +815,47 @@ fn runGpuSoftmaxSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU softmax synthetic (dim=2048, sum=1±1e-5, vs CPU 1e-5)\n", .{});
+}
+
+// ── gpu fwht256 smoke: in-place FWHT on a 256-vec vs CPU oracle ────
+
+fn runGpuFwhtSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Deterministic input + CPU reference.
+    var input: [256]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xFEED_F00D);
+    const r = prng.random();
+    for (&input) |*v| v.* = r.floatNorm(f32);
+    var expected = input;
+    turboquant.fwht(&expected);
+
+    // Round-trip through GPU.
+    var buf = try buffer.Buffer.initStatic(&ctx, f32, &input);
+    defer buf.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.fwht256, 1, 0);
+    defer kern.deinit();
+    try kern.bind(&.{&buf});
+
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, null, 1, 1, 1);
+        }
+    }{ .kern = &kern });
+
+    var got: [256]f32 = undefined;
+    try buf.readBack(&ctx, f32, &got);
+
+    var max_err: f32 = 0;
+    for (got, expected) |g, w| max_err = @max(max_err, @abs(g - w));
+    if (max_err > 1e-3) {
+        std.debug.print("GPU fwht max |Δ| vs CPU = {e}\n", .{max_err});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU fwht256 (256-elem in-place butterfly, max |Δ| vs CPU = {e:.2})\n", .{max_err});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────

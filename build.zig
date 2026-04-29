@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     const attn_scores_spv = compileShader(b, "attn_scores");
     const attn_output_spv = compileShader(b, "attn_output");
     const kv_write_spv = compileShader(b, "kv_write");
+    const fwht256_spv = compileShader(b, "fwht256");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -43,6 +44,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(attn_scores_spv, "attn_scores.spv");
     _ = wf.addCopyFile(attn_output_spv, "attn_output.spv");
     _ = wf.addCopyFile(kv_write_spv, "kv_write.spv");
+    _ = wf.addCopyFile(fwht256_spv, "fwht256.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -58,6 +60,7 @@ pub fn build(b: *std.Build) void {
         \\pub const attn_scores align(4) = @embedFile("attn_scores.spv").*;
         \\pub const attn_output align(4) = @embedFile("attn_output.spv").*;
         \\pub const kv_write align(4) = @embedFile("kv_write.spv").*;
+        \\pub const fwht256 align(4) = @embedFile("fwht256.spv").*;
     );
 
     const exe = b.addExecutable(.{
