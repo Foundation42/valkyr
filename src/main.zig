@@ -1337,8 +1337,8 @@ fn runChat(gpa: std.mem.Allocator, dir_path: []const u8, single_msg: ?[]const u8
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    try stdout.print("uploading weights...\n", .{});
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    try stdout.print("uploading weights (bf16 matmul path)...\n", .{});
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .bf16_matmul);
     defer gm.deinit(ctx.device);
 
     // KV cache sized for a generous chat. 2048 positions ≈ 18 layers ×
@@ -1349,10 +1349,11 @@ fn runChat(gpa: std.mem.Allocator, dir_path: []const u8, single_msg: ?[]const u8
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx);
+    var ks = try buildChatKernels(&ctx, gm.precision);
     defer ks.embed.deinit();
     defer ks.rmsnorm.deinit();
     defer ks.matmul.deinit();
+    defer ks.matmul_lm_head.deinit();
     defer ks.rope.deinit();
     defer ks.kv_write.deinit();
     defer ks.scores.deinit();
@@ -1364,6 +1365,7 @@ fn runChat(gpa: std.mem.Allocator, dir_path: []const u8, single_msg: ?[]const u8
         .embed = &ks.embed,
         .rmsnorm = &ks.rmsnorm,
         .matmul = &ks.matmul,
+        .matmul_lm_head = &ks.matmul_lm_head,
         .rope = &ks.rope,
         .kv_write = &ks.kv_write,
         .scores = &ks.scores,
@@ -1591,7 +1593,13 @@ fn runEncode(gpa: std.mem.Allocator, dir_path: []const u8, text: []const u8) !vo
 const ChatKernels = struct {
     embed: *const pipeline.Kernel,
     rmsnorm: *const pipeline.Kernel,
+    /// Matmul kernel used for the seven big projections per layer.
+    /// Picks the bf16 variant when the model was uploaded with
+    /// `precision = .bf16_matmul`.
     matmul: *const pipeline.Kernel,
+    /// Matmul kernel for the LM head — always fp32 because lm_head
+    /// stays fp32 even when layer matmul weights are bf16.
+    matmul_lm_head: *const pipeline.Kernel,
     rope: *const pipeline.Kernel,
     kv_write: *const pipeline.Kernel,
     scores: *const pipeline.Kernel,
@@ -1720,13 +1728,19 @@ fn recordForwardStep(
     }
 
     try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    try recDispatchMatmul(rec, k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
 }
 
-fn buildChatKernels(ctx: *const vk.Context) !struct {
+/// Build the kernel set for chat/gen-many. `matmul_for_layers` picks
+/// whether the per-layer projection matmuls run on fp32 or bf16
+/// weights — must agree with the precision the model was uploaded
+/// with. The LM head matmul is always fp32 since lm_head never goes
+/// bf16 in the current scheme.
+fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision) !struct {
     embed: pipeline.Kernel,
     rmsnorm: pipeline.Kernel,
     matmul: pipeline.Kernel,
+    matmul_lm_head: pipeline.Kernel,
     rope: pipeline.Kernel,
     kv_write: pipeline.Kernel,
     scores: pipeline.Kernel,
@@ -1735,10 +1749,15 @@ fn buildChatKernels(ctx: *const vk.Context) !struct {
     add: pipeline.Kernel,
     geglu: pipeline.Kernel,
 } {
+    const matmul_spv: []align(4) const u8 = switch (precision) {
+        .fp32_all => &shaders.matmul_nt_v2,
+        .bf16_matmul => &shaders.matmul_nt_v2_bf16,
+    };
     return .{
         .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
         .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
-        .matmul = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+        .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
+        .matmul_lm_head = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
         .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
         .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
         .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
@@ -1791,7 +1810,10 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
     const stdout = std.io.getStdOut().writer();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
     try stdout.print("uploading weights...\n", .{});
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    // gen-many still uses its own inline kernel set + the fp32 matmul
+    // shader, so it must upload fp32 weights. Migrating it to the
+    // recordForwardStep helper + bf16 path is a follow-up.
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .fp32_all);
     defer gm.deinit(ctx.device);
 
     // KV cache sized for the requested run + a bit of headroom.
@@ -2019,7 +2041,7 @@ fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void 
     try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
 
     const t_up0 = std.time.nanoTimestamp();
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .fp32_all);
     defer gm.deinit(ctx.device);
     const t_up1 = std.time.nanoTimestamp();
     const upload_ms = @as(f64, @floatFromInt(t_up1 - t_up0)) / 1_000_000.0;
@@ -2234,7 +2256,7 @@ fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32)
     try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
 
     try stdout.print("uploading weights...\n", .{});
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .fp32_all);
     defer gm.deinit(ctx.device);
 
     var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, 1);
@@ -2596,7 +2618,7 @@ fn runGpuLoad(gpa: std.mem.Allocator, dir_path: []const u8) !void {
     });
 
     const t0 = std.time.nanoTimestamp();
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu);
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .fp32_all);
     defer gm.deinit(ctx.device);
     const t1 = std.time.nanoTimestamp();
     const upload_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;

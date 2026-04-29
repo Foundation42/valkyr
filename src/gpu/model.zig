@@ -24,6 +24,20 @@ const config_mod = @import("../config.zig");
 const dtype = @import("../dtype.zig");
 const model_mod = @import("../model.zig");
 
+/// How weights are stored on the device.
+///
+///   `fp32_all` — every weight is uploaded as fp32 (bf16 sources get
+///   converted on the host side). The kernel set is the simple fp32
+///   path. This is the original phase-1 layout, kept for parity tests.
+///
+///   `bf16_matmul` — the seven big weight matrices per layer (Q/K/V/O
+///   and the three FFN projections) stay as raw bf16 on device, halving
+///   their footprint and matmul memory bandwidth. The corresponding
+///   matmul shader bit-shifts each bf16 to fp32 in-register. Layernorms,
+///   embeddings, and lm_head stay fp32 — they're either tiny or read
+///   through kernels that haven't grown a bf16 path yet.
+pub const Precision = enum { fp32_all, bf16_matmul };
+
 pub const GpuLayer = struct {
     input_layernorm: buffer.Buffer,
     q_proj: buffer.Buffer,
@@ -50,6 +64,7 @@ pub const GpuLayer = struct {
 
 pub const GpuModel = struct {
     config: config_mod.Config,
+    precision: Precision,
     embed_tokens: buffer.Buffer,
     layers: []GpuLayer,
     final_norm: buffer.Buffer,
@@ -68,8 +83,13 @@ pub const GpuModel = struct {
         gpa: std.mem.Allocator,
         ctx: *const vk.Context,
         cpu: *const model_mod.Model,
+        precision: Precision,
     ) !GpuModel {
         const cfg = cpu.config;
+        const matmul_path: TensorPath = switch (precision) {
+            .fp32_all => .fp32,
+            .bf16_matmul => .bf16_raw_if_bf16,
+        };
 
         var embed = try uploadTensor(gpa, ctx, cpu.embed_tokens);
         errdefer embed.deinit(ctx.device);
@@ -94,20 +114,21 @@ pub const GpuModel = struct {
         for (cpu.layers, 0..) |layer, i| {
             layers[i] = .{
                 .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm),
-                .q_proj = try uploadTensor(gpa, ctx, layer.q_proj),
-                .k_proj = try uploadTensor(gpa, ctx, layer.k_proj),
-                .v_proj = try uploadTensor(gpa, ctx, layer.v_proj),
-                .o_proj = try uploadTensor(gpa, ctx, layer.o_proj),
+                .q_proj = try uploadByPath(gpa, ctx, layer.q_proj, matmul_path),
+                .k_proj = try uploadByPath(gpa, ctx, layer.k_proj, matmul_path),
+                .v_proj = try uploadByPath(gpa, ctx, layer.v_proj, matmul_path),
+                .o_proj = try uploadByPath(gpa, ctx, layer.o_proj, matmul_path),
                 .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm),
-                .gate_proj = try uploadTensor(gpa, ctx, layer.gate_proj),
-                .up_proj = try uploadTensor(gpa, ctx, layer.up_proj),
-                .down_proj = try uploadTensor(gpa, ctx, layer.down_proj),
+                .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path),
+                .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path),
+                .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path),
             };
             uploaded_layers = i + 1;
         }
 
         return .{
             .config = cfg,
+            .precision = precision,
             .embed_tokens = embed,
             .layers = layers,
             .final_norm = final_norm,
@@ -125,6 +146,37 @@ pub const GpuModel = struct {
         self.lm_head.deinit(device);
     }
 };
+
+/// Two upload strategies the bf16-aware path can pick between.
+const TensorPath = enum { fp32, bf16_raw_if_bf16 };
+
+fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, path: TensorPath) !buffer.Buffer {
+    if (path == .bf16_raw_if_bf16 and t.dtype == .bf16) {
+        return uploadTensorBf16Raw(gpa, ctx, t);
+    }
+    return uploadTensor(gpa, ctx, t);
+}
+
+/// Upload a bf16 tensor as raw bytes — no conversion. The buffer is
+/// sized to fit the bf16 data (numel × 2 bytes) and is meant to be
+/// read through a bf16-aware shader (e.g. matmul_nt_v2_bf16) that
+/// reinterprets each pair of bf16 elements as one std430 uint and
+/// converts to fp32 inline. Halves the upload time and on-device
+/// footprint compared to the fp32 path.
+fn uploadTensorBf16Raw(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor) !buffer.Buffer {
+    std.debug.assert(t.dtype == .bf16);
+    const numel = t.numel();
+    if (numel % 2 != 0) return error.OddElementCountForU32Pack;
+    // The shader reads `uint b_pack[]`, each uint holding two bf16.
+    // Buffer.initStatic wants natural alignment, and the mmap source
+    // is align(1), so we copy through an aligned host buffer.
+    const u32_count = numel / 2;
+    const src = @as([*]align(1) const u32, @ptrCast(t.bytes.ptr))[0..u32_count];
+    const aligned = try gpa.alloc(u32, u32_count);
+    defer gpa.free(aligned);
+    @memcpy(aligned, src);
+    return buffer.Buffer.initStatic(ctx, u32, aligned);
+}
 
 /// Materialise a Tensor as fp32 in a fresh device-local Buffer.
 /// Allocates a host scratch buffer the size of the tensor's fp32

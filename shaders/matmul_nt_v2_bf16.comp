@@ -1,0 +1,68 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// matmul_nt with bf16-on-device weights. Same cooperative-K reduction
+// as matmul_nt_v2; the only twist is how B is read.
+//
+// bf16 layout: each value is 2 bytes, identical to the upper 16 bits
+// of an fp32. We pack two consecutive bf16 elements per uint (4 bytes)
+// in the SSBO, with the *first* of each pair in the LOW 16 bits and
+// the *second* in the HIGH 16 bits — matches std430 little-endian
+// memory order. Conversion to fp32 is just a shift-left-16:
+//
+//     bf16_to_f32(x) = uintBitsToFloat(uint(x) << 16);
+//
+// The K dimension must be even (so the packing aligns); for our
+// transformer shapes it always is — K is hidden_size or
+// intermediate_size, both multiples of 64.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A     { float a[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Bbf16 { uint b_pack[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C     { float c[]; };
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared float sg_partials[32];
+
+float bf16_load(uint idx) {
+    uint packed = b_pack[idx >> 1];
+    uint half16 = ((idx & 1u) == 0u) ? (packed & 0xFFFFu) : (packed >> 16);
+    return uintBitsToFloat(half16 << 16);
+}
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint i = cell / pc.N;
+    uint j = cell - i * pc.N;
+    if (i >= pc.M) return;
+
+    uint a_off = i * pc.K;
+    uint b_off = j * pc.K;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += gl_WorkGroupSize.x) {
+        acc += a[a_off + k] * bf16_load(b_off + k);
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            c[i * pc.N + j] = total;
+        }
+    }
+}
