@@ -1029,8 +1029,8 @@ fn runGpuTq4PackSmoke(allocator: std.mem.Allocator) !void {
     var input: [256]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i)) / 128.0) - 1.0;
 
-    var cpu_blk: turboquant.BlockTQ4 = undefined;
-    turboquant.quantizeBlockTQ4(&input, &cpu_blk);
+    var cpu_blk: turboquant.BlockTQ4(256) = undefined;
+    turboquant.quantizeBlockTQ4(256, &input, &cpu_blk);
     const cpu_gamma_f32: f32 = @floatCast(cpu_blk.gamma);
 
     var input_buf = try buffer.Buffer.initStatic(&ctx, f32, &input);
@@ -1086,10 +1086,10 @@ fn runGpuTq4UnpackSmoke(allocator: std.mem.Allocator) !void {
     var input: [256]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i)) / 128.0) - 1.0;
 
-    var cpu_blk: turboquant.BlockTQ4 = undefined;
-    turboquant.quantizeBlockTQ4(&input, &cpu_blk);
+    var cpu_blk: turboquant.BlockTQ4(256) = undefined;
+    turboquant.quantizeBlockTQ4(256, &input, &cpu_blk);
     var cpu_dequant: [256]f32 = undefined;
-    turboquant.dequantizeBlockTQ4(&cpu_blk, &cpu_dequant);
+    turboquant.dequantizeBlockTQ4(256, &cpu_blk, &cpu_dequant);
 
     // Build the 33-u32 GPU input: word[0] = γ as f32 bits, words[1..33] =
     // 128 bytes of cpu_blk.indices viewed as 32 LE u32s.
@@ -1136,10 +1136,10 @@ fn runGpuTq4RoundTripSmoke(allocator: std.mem.Allocator) !void {
     const r = prng.random();
     for (&input) |*v| v.* = r.floatNorm(f32);
 
-    var cpu_blk: turboquant.BlockTQ4 = undefined;
-    turboquant.quantizeBlockTQ4(&input, &cpu_blk);
+    var cpu_blk: turboquant.BlockTQ4(256) = undefined;
+    turboquant.quantizeBlockTQ4(256, &input, &cpu_blk);
     var cpu_dequant: [256]f32 = undefined;
-    turboquant.dequantizeBlockTQ4(&cpu_blk, &cpu_dequant);
+    turboquant.dequantizeBlockTQ4(256, &cpu_blk, &cpu_dequant);
 
     // GPU: pack input, then unpack the GPU-packed block — chained
     // through the Recorder so both dispatches share a command buffer
@@ -1207,9 +1207,9 @@ fn runGpuTq4PackToCacheSmoke(allocator: std.mem.Allocator) !void {
     // CPU oracle: pack+dequant each block.
     var cpu_dequants: [n_blocks][256]f32 = undefined;
     for (&inputs, &cpu_dequants) |*x, *y| {
-        var blk: turboquant.BlockTQ4 = undefined;
-        turboquant.quantizeBlockTQ4(x, &blk);
-        turboquant.dequantizeBlockTQ4(&blk, y);
+        var blk: turboquant.BlockTQ4(256) = undefined;
+        turboquant.quantizeBlockTQ4(256, x, &blk);
+        turboquant.dequantizeBlockTQ4(256, &blk, y);
     }
 
     // GPU side: a single 256-vec staging buffer for the input, a
@@ -1404,10 +1404,10 @@ fn runTurboquantSmoke(allocator: std.mem.Allocator) !void {
         for (x) |v| raw_sq += v * v;
         const raw_norm = @sqrt(raw_sq);
 
-        var blk: turboquant.BlockTQ4 = undefined;
-        turboquant.quantizeBlockTQ4(&x, &blk);
+        var blk: turboquant.BlockTQ4(256) = undefined;
+        turboquant.quantizeBlockTQ4(256, &x, &blk);
         var y: [256]f32 = undefined;
-        turboquant.dequantizeBlockTQ4(&blk, &y);
+        turboquant.dequantizeBlockTQ4(256, &blk, &y);
 
         var rec_sq: f32 = 0;
         var err_sq: f32 = 0;
@@ -1460,8 +1460,8 @@ fn runTurboquantSmoke(allocator: std.mem.Allocator) !void {
         };
         const yatq_raw_norm: f32 = 9.23774529;
 
-        var blk: turboquant.BlockTQ4 = undefined;
-        turboquant.quantizeBlockTQ4(&x, &blk);
+        var blk: turboquant.BlockTQ4(256) = undefined;
+        turboquant.quantizeBlockTQ4(256, &x, &blk);
 
         // (a) raw L2 norm of input (independent of quantization) must
         //     agree with what numpy computed.
@@ -2059,15 +2059,15 @@ fn runTq4KvTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u3
         // ── TQ4 round-trip on K_rot and V ───────────────────────────
         const k_block_in: *const [256]f32 = @ptrCast(k_rot.ptr);
         const v_block_in: *const [256]f32 = @ptrCast(v.ptr);
-        var k_blk: turboquant.BlockTQ4 = undefined;
-        var v_blk: turboquant.BlockTQ4 = undefined;
-        turboquant.quantizeBlockTQ4(k_block_in, &k_blk);
-        turboquant.quantizeBlockTQ4(v_block_in, &v_blk);
+        var k_blk: turboquant.BlockTQ4(256) = undefined;
+        var v_blk: turboquant.BlockTQ4(256) = undefined;
+        turboquant.quantizeBlockTQ4(256, k_block_in, &k_blk);
+        turboquant.quantizeBlockTQ4(256, v_block_in, &v_blk);
 
         var k_recon: [256]f32 = undefined;
         var v_recon: [256]f32 = undefined;
-        turboquant.dequantizeBlockTQ4(&k_blk, &k_recon);
-        turboquant.dequantizeBlockTQ4(&v_blk, &v_recon);
+        turboquant.dequantizeBlockTQ4(256, &k_blk, &k_recon);
+        turboquant.dequantizeBlockTQ4(256, &v_blk, &v_recon);
 
         const k_stats = blockStats(k_block_in, &k_recon);
         const v_stats = blockStats(v_block_in, &v_recon);
@@ -2634,15 +2634,25 @@ fn runChat(
         .geglu = &ks.geglu,
     };
 
-    // TQ4 pack/unpack kernels — only built in tq4v mode but kept
-    // allocated for the lifetime of the chat session.
+    // TQ4 pack/unpack kernels — picked by head_dim, only built in
+    // tq4v mode, kept allocated for the lifetime of the chat session.
+    // 256 (Gemma 2B) and 128 (Qwen3) shader pairs are wired up; other
+    // sizes would need their own .comp files and a new branch here.
+    const tq_pack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+        &shaders.tq4_pack_to_cache128
+    else
+        &shaders.tq4_pack_to_cache;
+    const tq_unpack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+        &shaders.tq4_unpack128
+    else
+        &shaders.tq4_unpack256;
     var tq_pack: ?pipeline.Kernel = if (tq4v)
-        try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(Tq4PackPush))
+        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(Tq4PackPush))
     else
         null;
     defer if (tq_pack) |*kk| kk.deinit();
     var tq_unpack: ?pipeline.Kernel = if (tq4v)
-        try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0)
+        try pipeline.Kernel.init(&ctx, tq_unpack_spv, 2, 0)
     else
         null;
     defer if (tq_unpack) |*kk| kk.deinit();
@@ -3022,10 +3032,15 @@ fn recordForwardStep(
 
         // V write: either the legacy kv_write (fp32 raw copy) or the
         // TQ4 quantising pack-to-cache when Tq4VHooks is supplied.
+        // For multi-block-per-pos shapes (Qwen3: kv_heads=8), we
+        // dispatch one workgroup per kv-head; the shader picks the
+        // input slice from gl_WorkGroupID.x and the cache slot from
+        // dst_block_idx + gl_WorkGroupID.x.
         if (tq4_v) |t| {
             const tq_layer = &t.cache.layers[layer_idx];
-            const pack_push = Tq4PackPush{ .dst_block_idx = @intCast(pos) };
-            try rec.dispatch(t.pack, &.{ &sc.v, &tq_layer.v_cache }, &pack_push, 1, 1, 1);
+            const n_blocks: u32 = @intCast(t.cache.n_blocks_per_pos);
+            const pack_push = Tq4PackPush{ .dst_block_idx = @intCast(pos * t.cache.n_blocks_per_pos) };
+            try rec.dispatch(t.pack, &.{ &sc.v, &tq_layer.v_cache }, &pack_push, n_blocks, 1, 1);
         } else {
             try recDispatch1D(rec, k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &kv_write_push, kv_dim);
         }
@@ -3043,9 +3058,12 @@ fn recordForwardStep(
         // V read for attention output: either reads kv_layer.v_cache
         // directly (fp32 path) or first dequants the whole TQ4 V
         // history into the shared dequant_v scratch then reads that.
+        // Unpack dispatches one WG per block; for multi-block layouts
+        // (Qwen3) that's `n_pos * n_blocks_per_pos`.
         const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
             const tq_layer = &t.cache.layers[layer_idx];
-            try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, n_pos, 1, 1);
+            const total_blocks: u32 = n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
+            try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, total_blocks, 1, 1);
             break :blk &t.cache.dequant_v;
         } else &kv_layer.v_cache;
 

@@ -1,0 +1,171 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// 128-block cache-write counterpart to tq4_pack_to_cache.comp. For
+// architectures with kv_dim > head_dim (e.g. Qwen3-4B: num_kv_heads=8 ×
+// head_dim=128 = 1024) this kernel is dispatched with n_blocks
+// workgroups per position; each workgroup quantises one 128-element
+// block and writes it to a unique cache slot.
+//
+//   input_data : tightly-packed float[kv_dim] for ONE position
+//   output_data: u32[ ... ] cache buffer (max_pos × n_blocks × 17 u32s)
+//
+//   per workgroup:
+//     base_in  = gl_WorkGroupID.x * 128
+//     base_out = (pc.dst_block_idx + gl_WorkGroupID.x) * 17
+//
+//   So `dst_block_idx` is the absolute block index of the FIRST block
+//   for this position (i.e. pos * n_blocks_per_pos), and the WG index
+//   within the dispatch picks which kv-head we're writing.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Input  { float input_data[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint  output_data[]; };
+
+layout(push_constant) uniform Pc {
+    uint dst_block_idx;
+} pc;
+
+shared float buf[128];
+shared uint  indices_packed[16];
+shared float subgroup_sums[8];
+shared float raw_norm_shared;
+shared float recon_norm_shared;
+
+const uint TBQ_SIGN_WORDS[4] = uint[4](
+    0xf4913ba7u, 0x0e58c26du, 0xd6247fb3u, 0x1cea4589u
+);
+
+float rhtSign(uint i) {
+    uint bit = (TBQ_SIGN_WORDS[i >> 5u] >> (i & 31u)) & 1u;
+    return bit == 1u ? -1.0 : 1.0;
+}
+
+const float LM_BOUNDARIES_B4[15] = float[15](
+    -2.4008, -1.8435, -1.4371, -1.0993,
+    -0.7995, -0.5224, -0.2582,  0.0000,
+     0.2582,  0.5224,  0.7995,  1.0993,
+     1.4371,  1.8435,  2.4008
+);
+
+const float LM_CENTROIDS_B4[16] = float[16](
+    -2.7326, -2.0690, -1.6180, -1.2562,
+    -0.9423, -0.6568, -0.3880, -0.1284,
+     0.1284,  0.3880,  0.6568,  0.9423,
+     1.2562,  1.6180,  2.0690,  2.7326
+);
+
+uint lloydMaxIndexB4(float x) {
+    uint idx = 0u;
+    for (uint k = 0u; k < 15u; k++) {
+        if (x >= LM_BOUNDARIES_B4[k]) idx += 1u;
+    }
+    return idx;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint base_in  = gl_WorkGroupID.x * 128u;
+    uint base_out = (pc.dst_block_idx + gl_WorkGroupID.x) * 17u;
+
+    uint i0 = 2u * tid;
+    uint i1 = i0 + 1u;
+
+    if (tid < 16u) indices_packed[tid] = 0u;
+
+    float x0 = input_data[base_in + i0];
+    float x1 = input_data[base_in + i1];
+    buf[i0] = x0;
+    buf[i1] = x1;
+    barrier();
+
+    {
+        float local_sum = x0 * x0 + x1 * x1;
+        float sg_sum = subgroupAdd(local_sum);
+        if (subgroupElect()) subgroup_sums[gl_SubgroupID] = sg_sum;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? subgroup_sums[gl_SubgroupInvocationID]
+                        : 0.0;
+            float total = subgroupAdd(v);
+            if (subgroupElect()) raw_norm_shared = sqrt(total);
+        }
+        barrier();
+    }
+    float raw_norm = raw_norm_shared;
+
+    if (raw_norm == 0.0) {
+        if (tid == 0u) output_data[base_out] = floatBitsToUint(0.0);
+        if (tid < 16u) output_data[base_out + 1u + tid] = 0u;
+        return;
+    }
+
+    float inv_norm = 1.0 / raw_norm;
+    buf[i0] = x0 * inv_norm * rhtSign(i0);
+    buf[i1] = x1 * inv_norm * rhtSign(i1);
+    barrier();
+    for (uint length = 1u; length < 128u; length <<= 1u) {
+        uint block = tid / length;
+        uint pos   = tid % length;
+        uint i = block * (2u * length) + pos;
+        uint j = i + length;
+        float u = buf[i];
+        float v = buf[j];
+        buf[i] = u + v;
+        buf[j] = u - v;
+        barrier();
+    }
+
+    uint idx0 = lloydMaxIndexB4(buf[i0]);
+    uint idx1 = lloydMaxIndexB4(buf[i1]);
+    buf[i0] = LM_CENTROIDS_B4[idx0];
+    buf[i1] = LM_CENTROIDS_B4[idx1];
+
+    uint byte_val = (idx0 & 0xfu) | ((idx1 & 0xfu) << 4u);
+    uint word_idx   = tid >> 2u;
+    uint byte_shift = (tid & 3u) << 3u;
+    atomicOr(indices_packed[word_idx], byte_val << byte_shift);
+    barrier();
+
+    for (uint length = 1u; length < 128u; length <<= 1u) {
+        uint block = tid / length;
+        uint pos   = tid % length;
+        uint i = block * (2u * length) + pos;
+        uint j = i + length;
+        float u = buf[i];
+        float v = buf[j];
+        buf[i] = u + v;
+        buf[j] = u - v;
+        barrier();
+    }
+    const float inv_d = 1.0 / 128.0;
+    buf[i0] *= inv_d;
+    buf[i1] *= inv_d;
+    barrier();
+
+    {
+        float local_rss = buf[i0] * buf[i0] + buf[i1] * buf[i1];
+        float sg_rss = subgroupAdd(local_rss);
+        if (subgroupElect()) subgroup_sums[gl_SubgroupID] = sg_rss;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? subgroup_sums[gl_SubgroupInvocationID]
+                        : 0.0;
+            float total = subgroupAdd(v);
+            if (subgroupElect()) recon_norm_shared = sqrt(total);
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float gamma_raw = raw_norm / recon_norm_shared;
+        uint gamma_h = packHalf2x16(vec2(gamma_raw, 0.0));
+        float gamma_f16 = unpackHalf2x16(gamma_h).x;
+        output_data[base_out] = floatBitsToUint(gamma_f16);
+    }
+    if (tid < 16u) output_data[base_out + 1u + tid] = indices_packed[tid];
+}

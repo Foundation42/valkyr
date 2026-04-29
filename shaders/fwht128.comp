@@ -1,0 +1,37 @@
+#version 460
+// In-place naturally-ordered Fast Walsh-Hadamard Transform on a single
+// 128-element vector. Unnormalised. 7 stages (log2(128)).
+//
+// 64 threads per workgroup, each owns one butterfly pair per stage.
+// Drop-in counterpart to fwht256.comp; only the dimension differs.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer Data { float data[]; };
+
+shared float buf[128];
+
+void main() {
+    uint tid    = gl_LocalInvocationID.x;
+    uint blkIdx = gl_WorkGroupID.x;
+    uint base   = blkIdx * 128u;
+
+    buf[2u * tid]      = data[base + 2u * tid];
+    buf[2u * tid + 1u] = data[base + 2u * tid + 1u];
+    barrier();
+
+    for (uint length = 1u; length < 128u; length <<= 1u) {
+        uint block = tid / length;
+        uint pos   = tid % length;
+        uint i = block * (2u * length) + pos;
+        uint j = i + length;
+        float u = buf[i];
+        float v = buf[j];
+        buf[i] = u + v;
+        buf[j] = u - v;
+        barrier();
+    }
+
+    data[base + 2u * tid]      = buf[2u * tid];
+    data[base + 2u * tid + 1u] = buf[2u * tid + 1u];
+}

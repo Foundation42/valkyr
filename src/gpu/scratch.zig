@@ -174,17 +174,23 @@ pub const GpuKvCache = struct {
 ///   plus dequant_v: 2048 × 256 × 4      = 2 MiB (one shared scratch)
 ///   net:            ~6.6 MiB vs 36 MiB → ~5.5× cache compression.
 ///
-/// Block size is hardcoded to 256 (head_dim for Gemma 2B). Other
-/// architectures would need a parameterised BLOCK_SIZE in the shaders.
+/// Block size is selected at init time based on the model's head_dim.
+/// Currently 128 (Qwen3) and 256 (Gemma 2B) are wired up; both have
+/// matching shader pairs (fwht{N}, rht_pre{N}, rht_post{N}, tq4_pack{N},
+/// tq4_unpack{N}, tq4_pack_to_cache{N}). Other power-of-two sizes
+/// would need their own shader files.
 pub const GpuKvCacheTq4 = struct {
     layers: []LayerKv,
     dequant_v: buffer.Buffer,
     max_pos: usize,
     kv_dim: usize,
-    /// Number of 256-element TQ4 blocks per token's V vector. For
-    /// Gemma 2B this is 1 (kv_dim == 256). For other shapes this is
-    /// the number of full blocks in kv_dim (we currently assert
-    /// kv_dim is a multiple of 256).
+    /// Quantisation block size (= head_dim for the supported families).
+    block_size: usize,
+    /// 1 (γ word) + block_size/8 (one u32 per 8 packed 4-bit indices).
+    u32s_per_block: usize,
+    /// Number of TQ4 blocks per token's V vector (= num_kv_heads). For
+    /// Gemma 2B with kv=1, head_dim=256 → 1 block. For Qwen3-4B with
+    /// kv=8, head_dim=128 → 8 blocks.
     n_blocks_per_pos: usize,
     allocator: std.mem.Allocator,
 
@@ -198,9 +204,6 @@ pub const GpuKvCacheTq4 = struct {
         }
     };
 
-    pub const block_size_tq4: usize = 256;
-    pub const u32s_per_block: usize = 33;
-
     pub fn init(
         gpa: std.mem.Allocator,
         ctx: *const vk.Context,
@@ -208,8 +211,13 @@ pub const GpuKvCacheTq4 = struct {
         max_pos: usize,
     ) !GpuKvCacheTq4 {
         const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-        if (kv_dim % block_size_tq4 != 0) return error.KvDimNotMultipleOfBlockSize;
-        const n_blocks_per_pos = kv_dim / block_size_tq4;
+        // Pick block size = head_dim. The matching shader pair must
+        // exist; only 128 and 256 are wired up today.
+        const block_size = cfg.head_dim;
+        if (block_size != 128 and block_size != 256) return error.UnsupportedTq4BlockSize;
+        if (kv_dim % block_size != 0) return error.KvDimNotMultipleOfBlockSize;
+        const n_blocks_per_pos = kv_dim / block_size;
+        const u32s_per_block = 1 + block_size / 8;
 
         const layers = try gpa.alloc(LayerKv, cfg.num_hidden_layers);
         var done: usize = 0;
@@ -233,6 +241,8 @@ pub const GpuKvCacheTq4 = struct {
             .dequant_v = dequant_v,
             .max_pos = max_pos,
             .kv_dim = kv_dim,
+            .block_size = block_size,
+            .u32s_per_block = u32s_per_block,
             .n_blocks_per_pos = n_blocks_per_pos,
             .allocator = gpa,
         };

@@ -1,0 +1,76 @@
+#version 460
+// TQ4 unpacking kernel for 128-element blocks. Drop-in counterpart to
+// tq4_unpack256.comp.
+//
+// Input layout per block: 17 u32s.
+//   word[0]      = γ as fp32 (host-set f16, then bit-cast back).
+//   word[1..17]  = 16 LE u32s, each holding 8 packed 4-bit indices.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Input  { uint  input_data[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Output { float output_data[]; };
+
+shared float buf[128];
+
+const uint TBQ_SIGN_WORDS[4] = uint[4](
+    0xf4913ba7u, 0x0e58c26du, 0xd6247fb3u, 0x1cea4589u
+);
+
+float rhtSign(uint i) {
+    uint bit = (TBQ_SIGN_WORDS[i >> 5u] >> (i & 31u)) & 1u;
+    return bit == 1u ? -1.0 : 1.0;
+}
+
+const float LM_CENTROIDS_B4[16] = float[16](
+    -2.7326, -2.0690, -1.6180, -1.2562,
+    -0.9423, -0.6568, -0.3880, -0.1284,
+     0.1284,  0.3880,  0.6568,  0.9423,
+     1.2562,  1.6180,  2.0690,  2.7326
+);
+
+void main() {
+    uint tid    = gl_LocalInvocationID.x;
+    uint blkIdx = gl_WorkGroupID.x;
+    uint base_in  = blkIdx * 17u;
+    uint base_out = blkIdx * 128u;
+
+    uint i0 = 2u * tid;
+    uint i1 = i0 + 1u;
+
+    float gamma = uintBitsToFloat(input_data[base_in]);
+
+    if (gamma == 0.0) {
+        output_data[base_out + i0] = 0.0;
+        output_data[base_out + i1] = 0.0;
+        return;
+    }
+
+    uint word_idx   = 1u + (tid >> 2u);
+    uint byte_shift = (tid & 3u) << 3u;
+    uint byte_val = (input_data[base_in + word_idx] >> byte_shift) & 0xffu;
+    uint idx0 = byte_val & 0xfu;
+    uint idx1 = (byte_val >> 4u) & 0xfu;
+
+    buf[i0] = LM_CENTROIDS_B4[idx0];
+    buf[i1] = LM_CENTROIDS_B4[idx1];
+    barrier();
+
+    for (uint length = 1u; length < 128u; length <<= 1u) {
+        uint block = tid / length;
+        uint pos   = tid % length;
+        uint i = block * (2u * length) + pos;
+        uint j = i + length;
+        float u = buf[i];
+        float v = buf[j];
+        buf[i] = u + v;
+        buf[j] = u - v;
+        barrier();
+    }
+    const float inv_d = 1.0 / 128.0;
+    float v0 = buf[i0] * inv_d;
+    float v1 = buf[i1] * inv_d;
+
+    output_data[base_out + i0] = v0 * rhtSign(i0) * gamma;
+    output_data[base_out + i1] = v1 * rhtSign(i1) * gamma;
+}

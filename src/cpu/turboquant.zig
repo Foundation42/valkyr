@@ -180,16 +180,29 @@ pub inline fn lloydMaxCentroid(i: u8, comptime b: Bits) f32 {
 // this alone takes TQ3/TQ4 from "close to q8_0" to "actually beats
 // q8_0" on PPL.
 
+/// Default TQ4 block size (Gemma 2B head_dim). Held for backwards
+/// compatibility — call sites that need a different size (Qwen3:
+/// head_dim=128) instantiate `BlockTQ4(N)` and the functions
+/// `quantizeBlockTQ4(N, ...)` / `dequantizeBlockTQ4(N, ...)` with the
+/// matching N. The sign-flip table (`tbq_signs`, 32 bytes = 256 bits)
+/// covers any block size up to 256 — for smaller blocks we just read
+/// the leading prefix.
 pub const block_size_tq4: usize = 256;
 
-pub const BlockTQ4 = extern struct {
-    gamma: f16,
-    indices: [block_size_tq4 / 2]u8, // 128 bytes, two 4-bit indices per byte
-};
+/// Generic TQ4-packed block. `BlockSize` must be a power of two ≤ 256.
+/// Contains a fp16 norm-correction γ and two 4-bit Lloyd-Max indices
+/// per byte, so the on-disk size is `2 + BlockSize/2` bytes.
+pub fn BlockTQ4(comptime BlockSize: usize) type {
+    return extern struct {
+        gamma: f16,
+        indices: [BlockSize / 2]u8,
+    };
+}
 
 comptime {
-    // Pack guard: 2 + 128 = 130 bytes.
-    std.debug.assert(@sizeOf(BlockTQ4) == 130);
+    // Pack guard for the default size: 2 + 128 = 130 bytes.
+    std.debug.assert(@sizeOf(BlockTQ4(256)) == 130);
+    std.debug.assert(@sizeOf(BlockTQ4(128)) == 66);
 }
 
 inline fn packNibbles(lo: u8, hi: u8) u8 {
@@ -204,7 +217,7 @@ inline fn unpackHi(byte: u8) u8 {
     return (byte >> 4) & 0x0f;
 }
 
-/// Quantize a 256-element block into TQ4 packed form. Pipeline:
+/// Quantize a `BlockSize`-element block into TQ4 packed form. Pipeline:
 ///   1. raw_norm = ‖x‖
 ///   2. x_norm = x / raw_norm                       (or all zeros)
 ///   3. y = FWHT(signs · x_norm)                    (rhtForward, in place)
@@ -212,7 +225,7 @@ inline fn unpackHi(byte: u8) u8 {
 ///   5. y_recon[i] = lloydMaxCentroid(indices[i], b=4)
 ///   6. x_recon = signs · IFWHT(y_recon)            (rhtInverse, in place)
 ///   7. γ = raw_norm / ‖x_recon‖                    (norm-correction)
-pub fn quantizeBlockTQ4(input: *const [block_size_tq4]f32, out: *BlockTQ4) void {
+pub fn quantizeBlockTQ4(comptime BlockSize: usize, input: *const [BlockSize]f32, out: *BlockTQ4(BlockSize)) void {
     var raw_norm_sq: f32 = 0;
     for (input) |v| raw_norm_sq += v * v;
     const raw_norm = @sqrt(raw_norm_sq);
@@ -223,47 +236,41 @@ pub fn quantizeBlockTQ4(input: *const [block_size_tq4]f32, out: *BlockTQ4) void 
         return;
     }
 
-    // Normalize + rhtForward in one buffer.
-    var y: [block_size_tq4]f32 = undefined;
+    var y: [BlockSize]f32 = undefined;
     const inv_norm = 1.0 / raw_norm;
     for (input, 0..) |v, i| y[i] = v * inv_norm;
     rhtForward(&y);
 
-    // Lloyd-Max quantize → indices, and build WHT-domain reconstruction.
-    var indices: [block_size_tq4]u8 = undefined;
-    var y_recon: [block_size_tq4]f32 = undefined;
+    var indices: [BlockSize]u8 = undefined;
+    var y_recon: [BlockSize]f32 = undefined;
     for (y, 0..) |v, i| {
         const idx = lloydMaxIndex(v, .b4);
         indices[i] = idx;
         y_recon[i] = lloydMaxCentroid(idx, .b4);
     }
 
-    // Inverse RHT to get the spatial-domain reconstruction, then take
-    // its norm to compute the correction factor.
     rhtInverse(&y_recon);
     var recon_norm_sq: f32 = 0;
     for (y_recon) |v| recon_norm_sq += v * v;
     const recon_norm = @sqrt(recon_norm_sq);
     out.gamma = @floatCast(raw_norm / recon_norm);
 
-    // Pack two 4-bit indices per byte.
     var k: usize = 0;
-    while (k < block_size_tq4 / 2) : (k += 1) {
+    while (k < BlockSize / 2) : (k += 1) {
         out.indices[k] = packNibbles(indices[2 * k], indices[2 * k + 1]);
     }
 }
 
 /// Dequantize a TQ4 packed block back to fp32.
-pub fn dequantizeBlockTQ4(in: *const BlockTQ4, out: *[block_size_tq4]f32) void {
+pub fn dequantizeBlockTQ4(comptime BlockSize: usize, in: *const BlockTQ4(BlockSize), out: *[BlockSize]f32) void {
     const gamma: f32 = @floatCast(in.gamma);
     if (gamma == 0) {
         @memset(out, 0);
         return;
     }
 
-    // Unpack indices → centroid lookups in the WHT domain.
     var k: usize = 0;
-    while (k < block_size_tq4 / 2) : (k += 1) {
+    while (k < BlockSize / 2) : (k += 1) {
         out[2 * k] = lloydMaxCentroid(unpackLo(in.indices[k]), .b4);
         out[2 * k + 1] = lloydMaxCentroid(unpackHi(in.indices[k]), .b4);
     }
@@ -396,10 +403,10 @@ test "TQ4 round-trip preserves L2 norm exactly" {
     for (x) |v| raw_sq += v * v;
     const raw_norm = @sqrt(raw_sq);
 
-    var blk: BlockTQ4 = undefined;
-    quantizeBlockTQ4(&x, &blk);
+    var blk: BlockTQ4(block_size_tq4) = undefined;
+    quantizeBlockTQ4(block_size_tq4, &x, &blk);
     var y: [block_size_tq4]f32 = undefined;
-    dequantizeBlockTQ4(&blk, &y);
+    dequantizeBlockTQ4(block_size_tq4, &blk, &y);
 
     var rec_sq: f32 = 0;
     for (y) |v| rec_sq += v * v;
@@ -412,10 +419,31 @@ test "TQ4 round-trip preserves L2 norm exactly" {
 
 test "TQ4 zero vector round-trips to zero" {
     var x: [block_size_tq4]f32 = .{0} ** block_size_tq4;
-    var blk: BlockTQ4 = undefined;
-    quantizeBlockTQ4(&x, &blk);
+    var blk: BlockTQ4(block_size_tq4) = undefined;
+    quantizeBlockTQ4(block_size_tq4, &x, &blk);
     try std.testing.expectEqual(@as(f16, 0), blk.gamma);
     var y: [block_size_tq4]f32 = undefined;
-    dequantizeBlockTQ4(&blk, &y);
+    dequantizeBlockTQ4(block_size_tq4, &blk, &y);
     for (y) |v| try std.testing.expectEqual(@as(f32, 0), v);
+}
+
+test "TQ4 round-trip at block_size=128 preserves L2 norm" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE42);
+    const r = prng.random();
+    var x: [128]f32 = undefined;
+    for (&x) |*v| v.* = r.floatNorm(f32);
+
+    var raw_sq: f32 = 0;
+    for (x) |v| raw_sq += v * v;
+    const raw_norm = @sqrt(raw_sq);
+
+    var blk: BlockTQ4(128) = undefined;
+    quantizeBlockTQ4(128, &x, &blk);
+    var y: [128]f32 = undefined;
+    dequantizeBlockTQ4(128, &blk, &y);
+
+    var rec_sq: f32 = 0;
+    for (y) |v| rec_sq += v * v;
+    const rec_norm = @sqrt(rec_sq);
+    try std.testing.expectApproxEqRel(raw_norm, rec_norm, 1e-3);
 }

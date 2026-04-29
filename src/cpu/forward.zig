@@ -198,11 +198,11 @@ pub fn forwardTq4V(
 
         // V-cache write+read through TQ4. With a single KV head and
         // head_dim==block_size, V is exactly one packed block.
-        var v_blk: turboquant.BlockTQ4 = undefined;
+        var v_blk: turboquant.BlockTQ4(256) = undefined;
         const v_in: *const [256]f32 = @ptrCast(v.ptr);
-        turboquant.quantizeBlockTQ4(v_in, &v_blk);
+        turboquant.quantizeBlockTQ4(256, v_in, &v_blk);
         var v_recon: [256]f32 = undefined;
-        turboquant.dequantizeBlockTQ4(&v_blk, &v_recon);
+        turboquant.dequantizeBlockTQ4(256, &v_blk, &v_recon);
 
         for (0..n_heads) |h| {
             const kv_h = h / heads_per_kv;

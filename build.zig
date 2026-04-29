@@ -30,6 +30,12 @@ pub fn build(b: *std.Build) void {
     const tq4_pack256_spv = compileShader(b, "tq4_pack256");
     const tq4_unpack256_spv = compileShader(b, "tq4_unpack256");
     const tq4_pack_to_cache_spv = compileShader(b, "tq4_pack_to_cache");
+    const fwht128_spv = compileShader(b, "fwht128");
+    const rht_pre128_spv = compileShader(b, "rht_pre128");
+    const rht_post128_spv = compileShader(b, "rht_post128");
+    const tq4_pack128_spv = compileShader(b, "tq4_pack128");
+    const tq4_unpack128_spv = compileShader(b, "tq4_unpack128");
+    const tq4_pack_to_cache128_spv = compileShader(b, "tq4_pack_to_cache128");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -57,6 +63,12 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(tq4_pack256_spv, "tq4_pack256.spv");
     _ = wf.addCopyFile(tq4_unpack256_spv, "tq4_unpack256.spv");
     _ = wf.addCopyFile(tq4_pack_to_cache_spv, "tq4_pack_to_cache.spv");
+    _ = wf.addCopyFile(fwht128_spv, "fwht128.spv");
+    _ = wf.addCopyFile(rht_pre128_spv, "rht_pre128.spv");
+    _ = wf.addCopyFile(rht_post128_spv, "rht_post128.spv");
+    _ = wf.addCopyFile(tq4_pack128_spv, "tq4_pack128.spv");
+    _ = wf.addCopyFile(tq4_unpack128_spv, "tq4_unpack128.spv");
+    _ = wf.addCopyFile(tq4_pack_to_cache128_spv, "tq4_pack_to_cache128.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -79,6 +91,12 @@ pub fn build(b: *std.Build) void {
         \\pub const tq4_pack256 align(4) = @embedFile("tq4_pack256.spv").*;
         \\pub const tq4_unpack256 align(4) = @embedFile("tq4_unpack256.spv").*;
         \\pub const tq4_pack_to_cache align(4) = @embedFile("tq4_pack_to_cache.spv").*;
+        \\pub const fwht128 align(4) = @embedFile("fwht128.spv").*;
+        \\pub const rht_pre128 align(4) = @embedFile("rht_pre128.spv").*;
+        \\pub const rht_post128 align(4) = @embedFile("rht_post128.spv").*;
+        \\pub const tq4_pack128 align(4) = @embedFile("tq4_pack128.spv").*;
+        \\pub const tq4_unpack128 align(4) = @embedFile("tq4_unpack128.spv").*;
+        \\pub const tq4_pack_to_cache128 align(4) = @embedFile("tq4_pack_to_cache128.spv").*;
     );
 
     const exe = b.addExecutable(.{
