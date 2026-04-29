@@ -1,0 +1,57 @@
+#version 460
+// In-place inverse RHT on a 256-element vector:
+//   FWHT(x);              // naturally-ordered, unnormalised
+//   x[i] *= 1/256;        // normalisation (H · H = d · I)
+//   x[i] *= rhtSign(i);   // signs cancel because sign² = 1
+//
+// Composition with rht_pre256 recovers the original vector exactly:
+//   rht_post(rht_pre(x)) = signs · IFWHT(FWHT(signs · x))
+//                       = signs · (signs · x)
+//                       = x
+//
+// Workgroup is 128 threads × 8 butterfly stages, same shape as the
+// forward kernel. Sign pattern is the identical 8-u32 packing.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) buffer Data { float data[]; };
+
+shared float buf[256];
+
+const uint TBQ_SIGN_WORDS[8] = uint[8](
+    0xf4913ba7u, 0x0e58c26du, 0xd6247fb3u, 0x1cea4589u,
+    0x52d8af63u, 0x3de10b97u, 0xfe19c476u, 0xdb2c854au
+);
+
+float rhtSign(uint i) {
+    uint bit = (TBQ_SIGN_WORDS[i >> 5u] >> (i & 31u)) & 1u;
+    return bit == 1u ? -1.0 : 1.0;
+}
+
+void main() {
+    uint tid    = gl_LocalInvocationID.x;
+    uint blkIdx = gl_WorkGroupID.x;
+    uint base   = blkIdx * 256u;
+
+    uint i0 = 2u * tid;
+    uint i1 = i0 + 1u;
+    buf[i0] = data[base + i0];
+    buf[i1] = data[base + i1];
+    barrier();
+
+    for (uint length = 1u; length < 256u; length <<= 1u) {
+        uint block = tid / length;
+        uint pos   = tid % length;
+        uint i = block * (2u * length) + pos;
+        uint j = i + length;
+        float u = buf[i];
+        float v = buf[j];
+        buf[i] = u + v;
+        buf[j] = u - v;
+        barrier();
+    }
+
+    const float inv_d = 1.0 / 256.0;
+    data[base + i0] = buf[i0] * inv_d * rhtSign(i0);
+    data[base + i1] = buf[i1] * inv_d * rhtSign(i1);
+}

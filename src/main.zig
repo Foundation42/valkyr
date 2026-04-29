@@ -184,6 +184,7 @@ pub fn main() !void {
     try runGpuSoftmaxSmoke(allocator);
     try runGpuFwhtSmoke(allocator);
     try runGpuRhtPreSmoke(allocator);
+    try runGpuRhtRoundTripSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -896,6 +897,55 @@ fn runGpuRhtPreSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU rht_pre256 (signs · x then FWHT, max |Δ| vs CPU = {e:.2})\n", .{max_err});
+}
+
+// ── gpu rht round-trip smoke: rht_post(rht_pre(x)) ≈ x on device ──
+
+fn runGpuRhtRoundTripSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var input: [256]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    const r = prng.random();
+    for (&input) |*v| v.* = r.floatNorm(f32);
+
+    var buf = try buffer.Buffer.initStatic(&ctx, f32, &input);
+    defer buf.deinit(ctx.device);
+
+    var pre = try pipeline.Kernel.init(&ctx, &shaders.rht_pre256, 1, 0);
+    defer pre.deinit();
+    try pre.bind(&.{&buf});
+
+    var post = try pipeline.Kernel.init(&ctx, &shaders.rht_post256, 1, 0);
+    defer post.deinit();
+    try post.bind(&.{&buf});
+
+    // Two dispatches; submitOneShot waits for queue idle between them
+    // so the second read-after-write has hard ordering.
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, null, 1, 1, 1);
+        }
+    }{ .kern = &pre });
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, null, 1, 1, 1);
+        }
+    }{ .kern = &post });
+
+    var got: [256]f32 = undefined;
+    try buf.readBack(&ctx, f32, &got);
+
+    var max_err: f32 = 0;
+    for (got, input) |g, w| max_err = @max(max_err, @abs(g - w));
+    if (max_err > 1e-4) {
+        std.debug.print("GPU rht round-trip max |Δ| = {e}\n", .{max_err});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU rht round-trip (rht_post ∘ rht_pre = id, max |Δ| = {e:.2})\n", .{max_err});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────
