@@ -2709,7 +2709,7 @@ fn runChat(
     }
 
     // ── REPL ────────────────────────────────────────────────────────
-    try stdout.print("\n{s} chat (Ctrl-D to exit)\n", .{tmpl.banner()});
+    try stdout.print("\n{s} (Ctrl-D to exit)\n", .{tmpl.banner()});
     const stdin = std.io.getStdIn().reader();
     var line_buf: [4096]u8 = undefined;
     while (true) {
