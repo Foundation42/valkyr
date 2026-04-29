@@ -1,0 +1,53 @@
+#version 460
+// Rotary positional embeddings, HuggingFace half-split convention:
+// pairs are (j, j + head_dim/2) for j ∈ [0, head_dim/2).
+//
+// One thread per pair. Total work is `n_heads * head_dim/2` rotations,
+// independent across pairs and heads, so this is the simplest possible
+// dispatch — flat 1D grid, each thread reads two inputs, writes two
+// outputs. No shared memory, no reductions.
+//
+// At pos = 0 every angle is zero, cos = 1, sin = 0, and the output
+// equals the input. We rely on this in the smoke test.
+//
+// Convention note: HF Gemma was trained with half-split RoPE (paired
+// dims `j` and `j + D/2`). Our standard matmul produces Q/K in this
+// layout directly, so this shader is the natural match. (TRiP uses
+// the pairwise-interleaved variant with a custom permuting matmul
+// upstream; we explicitly chose not to follow that path.)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_heads;
+    uint head_dim;
+    uint pos;
+    float theta_base;
+} pc;
+
+void main() {
+    uint pair_idx = gl_GlobalInvocationID.x;
+    uint half_dim = pc.head_dim / 2;
+    uint total = pc.n_heads * half_dim;
+    if (pair_idx >= total) return;
+
+    uint h = pair_idx / half_dim;
+    uint j = pair_idx % half_dim;
+
+    uint off = h * pc.head_dim;
+    uint idx_a = off + j;
+    uint idx_b = off + j + half_dim;
+
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(j)) / float(pc.head_dim));
+    float angle = float(pc.pos) * freq;
+    float c_a = cos(angle);
+    float s_a = sin(angle);
+
+    float a = in_v[idx_a];
+    float b = in_v[idx_b];
+    out_v[idx_a] = a * c_a - b * s_a;
+    out_v[idx_b] = a * s_a + b * c_a;
+}

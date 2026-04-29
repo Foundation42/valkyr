@@ -83,6 +83,11 @@ pub fn main() !void {
         try runGpuGegluTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-rope-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGpuRopeTest(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
@@ -93,6 +98,7 @@ pub fn main() !void {
     try runGpuMatmulSmoke(allocator);
     try runGpuRmsnormSmoke(allocator);
     try runGpuGegluSmoke(allocator);
+    try runGpuRopeSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -526,6 +532,92 @@ fn runGpuGegluSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU geglu synthetic ({d} elems, x∈[-3,3])\n", .{n});
+}
+
+// ── gpu rope smoke: pos=0 identity + pos=1 vs CPU ───────────────────
+
+const RopePush = extern struct {
+    n_heads: u32,
+    head_dim: u32,
+    pos: u32,
+    theta_base: f32,
+};
+
+fn runGpuRopeSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_heads: usize = 8;
+    const head_dim: usize = 64;
+    const total = n_heads * head_dim;
+
+    const in_v = try allocator.alloc(f32, total);
+    defer allocator.free(in_v);
+    for (in_v, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i)) * 0.001 - 0.5;
+
+    var buf_in = try buffer.Buffer.initStatic(&ctx, f32, in_v);
+    defer buf_in.deinit(ctx.device);
+    var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
+    defer buf_out.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_in, &buf_out });
+
+    // pos=0: must be identity.
+    const local: u32 = 256;
+    const pairs: u32 = @intCast(n_heads * (head_dim / 2));
+    const groups: u32 = (pairs + local - 1) / local;
+
+    const push0 = RopePush{ .n_heads = @intCast(n_heads), .head_dim = @intCast(head_dim), .pos = 0, .theta_base = 10000.0 };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const RopePush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push0, .groups = groups });
+
+    const got0 = try allocator.alloc(f32, total);
+    defer allocator.free(got0);
+    try buf_out.readBack(&ctx, f32, got0);
+    for (got0, in_v, 0..) |g, e, i| {
+        if (g != e) {
+            std.debug.print("GPU RoPE pos=0 NOT identity at {d}: in={d} out={d}\n", .{ i, e, g });
+            return error.ParityFailed;
+        }
+    }
+
+    // pos=1: parity vs CPU.
+    const want = try allocator.alloc(f32, total);
+    defer allocator.free(want);
+    try cpu_math.applyRope(want, in_v, n_heads, head_dim, 1, 10000.0);
+
+    const push1 = RopePush{ .n_heads = @intCast(n_heads), .head_dim = @intCast(head_dim), .pos = 1, .theta_base = 10000.0 };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const RopePush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push1, .groups = groups });
+
+    const got1 = try allocator.alloc(f32, total);
+    defer allocator.free(got1);
+    try buf_out.readBack(&ctx, f32, got1);
+
+    var max_abs: f32 = 0;
+    for (got1, want) |g, e| {
+        const d = @abs(g - e);
+        if (d > max_abs) max_abs = d;
+    }
+    if (max_abs > 1e-5) {
+        std.debug.print("GPU RoPE pos=1: max |Δ| = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU rope (pos=0 identity + pos=1 vs CPU within 1e-5)\n", .{});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────
@@ -1170,6 +1262,100 @@ fn runGpuRmsnormTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32
         return error.ParityFailed;
     }
     try stdout.print("\nPASS GPU rmsnorm matches CPU within {e:.0}\n", .{@as(f32, 1e-3)});
+}
+
+// ── gpu-rope-test: real Gemma Q at pos=1 vs CPU ────────────────────
+
+fn runGpuRopeTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(gpa, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    const layer = model.layers[0];
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("GPU RoPE parity test on layer 0 Q at pos=1 — token {d}\n", .{token_id});
+    try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
+
+    // Reproduce Q via the verified CPU pipeline.
+    const x = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+        for (x) |*xi| xi.* *= s;
+    }
+    const x_norm = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x_norm);
+    try cpu_math.rmsnorm(x_norm, x, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const q_dim = cfg.num_attention_heads * cfg.head_dim;
+    const q = try gpa.alloc(f32, q_dim);
+    defer gpa.free(q);
+    try cpu_math.matmul_nt(q, x_norm, layer.q_proj, 1, q_dim, cfg.hidden_size);
+
+    // CPU baseline at pos=1.
+    const want = try gpa.alloc(f32, q_dim);
+    defer gpa.free(want);
+    try cpu_math.applyRope(want, q, cfg.num_attention_heads, cfg.head_dim, 1, cfg.rope_theta);
+
+    // GPU dispatch.
+    var buf_in = try buffer.Buffer.initStatic(&ctx, f32, q);
+    defer buf_in.deinit(ctx.device);
+    var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, q_dim * @sizeOf(f32));
+    defer buf_out.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_in, &buf_out });
+
+    const local: u32 = 256;
+    const pairs: u32 = @intCast(cfg.num_attention_heads * (cfg.head_dim / 2));
+    const groups: u32 = (pairs + local - 1) / local;
+    const push = RopePush{
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .pos = 1,
+        .theta_base = cfg.rope_theta,
+    };
+
+    const t_gpu0 = std.time.nanoTimestamp();
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const RopePush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .groups = groups });
+    const t_gpu1 = std.time.nanoTimestamp();
+    const gpu_ms = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+    const got = try gpa.alloc(f32, q_dim);
+    defer gpa.free(got);
+    try buf_out.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    var max_idx: usize = 0;
+    for (got, want, 0..) |g, e, i| {
+        const d = @abs(g - e);
+        if (d > max_abs) {
+            max_abs = d;
+            max_idx = i;
+        }
+    }
+
+    try stdout.print("GPU: {d:.2} ms (incl. submit + queue idle)\n", .{gpu_ms});
+    try stdout.print("max |Δ| = {e:.3}  (at idx {d}: cpu={d:.6} gpu={d:.6})\n", .{
+        max_abs, max_idx, want[max_idx], got[max_idx],
+    });
+    if (max_abs > 1e-3) {
+        std.debug.print("FAIL: max |Δ| above tolerance\n", .{});
+        return error.ParityFailed;
+    }
+    try stdout.print("\nPASS GPU rope matches CPU within {e:.0}\n", .{@as(f32, 1e-3)});
 }
 
 // ── gpu-geglu-test: real Gemma layer 0 GeGLU vs CPU ────────────────
