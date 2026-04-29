@@ -164,6 +164,116 @@ pub inline fn lloydMaxCentroid(i: u8, comptime b: Bits) f32 {
     return centroidsOf(b)[i];
 }
 
+// ── TQ4 packed-block format (256 elements / block) ──────────────────
+//
+// Memory layout matches llama.cpp `block_tbq4_0`: one fp16 norm
+// scalar (γ) followed by 128 bytes holding 256 × 4-bit Lloyd-Max
+// indices, two per byte — element 2k in the low nibble, 2k+1 in the
+// high nibble. 130 bytes per 256-element block, 4× compression vs
+// fp32 K-cache, ~2× vs fp16 K-cache.
+//
+// The γ scalar is the *norm-correction* factor (TheTom / spiritbuun
+// trick): it is `original_L2 / ‖spatial-reconstruction‖`, not the raw
+// L2 norm. Storing the corrected scalar guarantees the reconstructed
+// vector has *exactly* the original L2 norm, which removes one source
+// of bias per block at zero decode cost. Practitioner reports show
+// this alone takes TQ3/TQ4 from "close to q8_0" to "actually beats
+// q8_0" on PPL.
+
+pub const block_size_tq4: usize = 256;
+
+pub const BlockTQ4 = extern struct {
+    gamma: f16,
+    indices: [block_size_tq4 / 2]u8, // 128 bytes, two 4-bit indices per byte
+};
+
+comptime {
+    // Pack guard: 2 + 128 = 130 bytes.
+    std.debug.assert(@sizeOf(BlockTQ4) == 130);
+}
+
+inline fn packNibbles(lo: u8, hi: u8) u8 {
+    return (lo & 0x0f) | ((hi & 0x0f) << 4);
+}
+
+inline fn unpackLo(byte: u8) u8 {
+    return byte & 0x0f;
+}
+
+inline fn unpackHi(byte: u8) u8 {
+    return (byte >> 4) & 0x0f;
+}
+
+/// Quantize a 256-element block into TQ4 packed form. Pipeline:
+///   1. raw_norm = ‖x‖
+///   2. x_norm = x / raw_norm                       (or all zeros)
+///   3. y = FWHT(signs · x_norm)                    (rhtForward, in place)
+///   4. indices[i] = lloydMaxIndex(y[i], b=4)
+///   5. y_recon[i] = lloydMaxCentroid(indices[i], b=4)
+///   6. x_recon = signs · IFWHT(y_recon)            (rhtInverse, in place)
+///   7. γ = raw_norm / ‖x_recon‖                    (norm-correction)
+pub fn quantizeBlockTQ4(input: *const [block_size_tq4]f32, out: *BlockTQ4) void {
+    var raw_norm_sq: f32 = 0;
+    for (input) |v| raw_norm_sq += v * v;
+    const raw_norm = @sqrt(raw_norm_sq);
+
+    if (raw_norm == 0) {
+        out.gamma = 0;
+        @memset(&out.indices, 0);
+        return;
+    }
+
+    // Normalize + rhtForward in one buffer.
+    var y: [block_size_tq4]f32 = undefined;
+    const inv_norm = 1.0 / raw_norm;
+    for (input, 0..) |v, i| y[i] = v * inv_norm;
+    rhtForward(&y);
+
+    // Lloyd-Max quantize → indices, and build WHT-domain reconstruction.
+    var indices: [block_size_tq4]u8 = undefined;
+    var y_recon: [block_size_tq4]f32 = undefined;
+    for (y, 0..) |v, i| {
+        const idx = lloydMaxIndex(v, .b4);
+        indices[i] = idx;
+        y_recon[i] = lloydMaxCentroid(idx, .b4);
+    }
+
+    // Inverse RHT to get the spatial-domain reconstruction, then take
+    // its norm to compute the correction factor.
+    rhtInverse(&y_recon);
+    var recon_norm_sq: f32 = 0;
+    for (y_recon) |v| recon_norm_sq += v * v;
+    const recon_norm = @sqrt(recon_norm_sq);
+    out.gamma = @floatCast(raw_norm / recon_norm);
+
+    // Pack two 4-bit indices per byte.
+    var k: usize = 0;
+    while (k < block_size_tq4 / 2) : (k += 1) {
+        out.indices[k] = packNibbles(indices[2 * k], indices[2 * k + 1]);
+    }
+}
+
+/// Dequantize a TQ4 packed block back to fp32.
+pub fn dequantizeBlockTQ4(in: *const BlockTQ4, out: *[block_size_tq4]f32) void {
+    const gamma: f32 = @floatCast(in.gamma);
+    if (gamma == 0) {
+        @memset(out, 0);
+        return;
+    }
+
+    // Unpack indices → centroid lookups in the WHT domain.
+    var k: usize = 0;
+    while (k < block_size_tq4 / 2) : (k += 1) {
+        out[2 * k] = lloydMaxCentroid(unpackLo(in.indices[k]), .b4);
+        out[2 * k + 1] = lloydMaxCentroid(unpackHi(in.indices[k]), .b4);
+    }
+
+    // Inverse RHT lifts back to the original (normalized) domain, then
+    // γ rescales to the original L2 norm exactly.
+    rhtInverse(out);
+    for (out) |*v| v.* *= gamma;
+}
+
 // ── Self-tests ──────────────────────────────────────────────────────
 
 test "rhtSign decodes first byte 0xa7 LSB-first" {
@@ -274,4 +384,38 @@ test "rht round-trip recovers the original vector" {
     rhtForward(&y);
     rhtInverse(&y);
     for (x, y) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
+}
+
+test "TQ4 round-trip preserves L2 norm exactly" {
+    var prng = std.Random.DefaultPrng.init(0x5EED1234);
+    const r = prng.random();
+    var x: [block_size_tq4]f32 = undefined;
+    for (&x) |*v| v.* = r.floatNorm(f32);
+
+    var raw_sq: f32 = 0;
+    for (x) |v| raw_sq += v * v;
+    const raw_norm = @sqrt(raw_sq);
+
+    var blk: BlockTQ4 = undefined;
+    quantizeBlockTQ4(&x, &blk);
+    var y: [block_size_tq4]f32 = undefined;
+    dequantizeBlockTQ4(&blk, &y);
+
+    var rec_sq: f32 = 0;
+    for (y) |v| rec_sq += v * v;
+    const rec_norm = @sqrt(rec_sq);
+
+    // Norm-correction trick should give recon_norm == raw_norm to within
+    // f16-truncation tolerance on γ.
+    try std.testing.expectApproxEqRel(raw_norm, rec_norm, 1e-3);
+}
+
+test "TQ4 zero vector round-trips to zero" {
+    var x: [block_size_tq4]f32 = .{0} ** block_size_tq4;
+    var blk: BlockTQ4 = undefined;
+    quantizeBlockTQ4(&x, &blk);
+    try std.testing.expectEqual(@as(f16, 0), blk.gamma);
+    var y: [block_size_tq4]f32 = undefined;
+    dequantizeBlockTQ4(&blk, &y);
+    for (y) |v| try std.testing.expectEqual(@as(f32, 0), v);
 }

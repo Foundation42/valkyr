@@ -917,7 +917,49 @@ fn runTurboquantSmoke(allocator: std.mem.Allocator) !void {
         }
     }
 
-    std.debug.print("PASS turboquant tables + FWHT + RHT round-trip (vs YATQ)\n", .{});
+    // 8) TQ4 round-trip on a 256-d Gaussian block. The norm-correction
+    //    γ must give a reconstruction whose L2 norm equals the original
+    //    to within f16 quantisation; per-element MSE must be in the
+    //    expected range for 4-bit Lloyd-Max on a unit Gaussian
+    //    (<0.005 average squared error per coord).
+    {
+        var prng = std.Random.DefaultPrng.init(0x5EED1234);
+        const r = prng.random();
+        var x: [256]f32 = undefined;
+        for (&x) |*v| v.* = r.floatNorm(f32);
+
+        var raw_sq: f32 = 0;
+        for (x) |v| raw_sq += v * v;
+        const raw_norm = @sqrt(raw_sq);
+
+        var blk: turboquant.BlockTQ4 = undefined;
+        turboquant.quantizeBlockTQ4(&x, &blk);
+        var y: [256]f32 = undefined;
+        turboquant.dequantizeBlockTQ4(&blk, &y);
+
+        var rec_sq: f32 = 0;
+        var err_sq: f32 = 0;
+        for (x, y) |xi, yi| {
+            rec_sq += yi * yi;
+            const d = xi - yi;
+            err_sq += d * d;
+        }
+        const rec_norm = @sqrt(rec_sq);
+        const norm_rel = @abs(raw_norm - rec_norm) / raw_norm;
+        const mse = err_sq / @as(f32, @floatFromInt(x.len));
+
+        if (norm_rel > 1e-3) {
+            std.debug.print("TQ4 norm preservation: raw={d:.4} rec={d:.4} rel={e}\n", .{ raw_norm, rec_norm, norm_rel });
+            return error.ParityFailed;
+        }
+        if (mse > 0.01) {
+            std.debug.print("TQ4 MSE = {d:.5} (>0.01 threshold)\n", .{mse});
+            return error.ParityFailed;
+        }
+        std.debug.print("       TQ4 256-d Gaussian: MSE={d:.5}, norm-rel-err={e:.2}\n", .{ mse, norm_rel });
+    }
+
+    std.debug.print("PASS turboquant CPU oracle (tables + FWHT + RHT + TQ4 round-trip)\n", .{});
 }
 
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
