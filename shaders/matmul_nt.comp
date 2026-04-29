@@ -1,0 +1,44 @@
+#version 460
+// matmul_nt: c[M, N] = a[M, K] · b[N, K]ᵀ
+//
+// Layout (all row-major, contiguous):
+//     a[i, k] = a[i * K + k]
+//     b[j, k] = b[j * K + k]   (read as if transposed → row j of b is column j of bᵀ)
+//     c[i, j] = c[i * N + j]
+//
+// One thread per output element. The (M, N) iteration space tiles into
+// 16×16 workgroups; threads outside the (M, N) bound early-out so we
+// don't have to dispatch exactly the right thread count. Performance
+// is intentionally naive — no shared memory, no register tiling — so
+// we have a known-correct GPU baseline to parity-test against the CPU
+// reference. Optimisation lands once that baseline is solid.
+//
+// All inputs are fp32. bf16 weights live on the host side until we
+// write a bf16-aware variant of this kernel.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A { float a[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer B { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;  // output row    (0..M)
+    uint j = gl_GlobalInvocationID.y;  // output column (0..N)
+    if (i >= pc.M || j >= pc.N) return;
+
+    uint a_off = i * pc.K;
+    uint b_off = j * pc.K;
+
+    float acc = 0.0;
+    for (uint k = 0; k < pc.K; k++) {
+        acc += a[a_off + k] * b[b_off + k];
+    }
+    c[i * pc.N + j] = acc;
+}

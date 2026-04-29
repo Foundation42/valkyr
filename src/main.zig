@@ -67,6 +67,11 @@ pub fn main() !void {
         try runGen(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--gpu-qproj-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runGpuQprojTest(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
@@ -74,6 +79,7 @@ pub fn main() !void {
     try runRopeIdentitySmoke(allocator);
     try runSoftmaxSmoke(allocator);
     try runGeluSmoke(allocator);
+    try runGpuMatmulSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -314,6 +320,59 @@ fn runSoftmaxSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS softmax stable form (handles +100 without overflow)\n", .{});
+}
+
+// ── gpu matmul_nt smoke: synthetic A·Bᵀ on the GPU vs CPU expected ──
+
+const MatmulPush = extern struct { m: u32, n: u32, k: u32 };
+
+fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Same problem as runMatmulSmoke (CPU): 2x3 · (4x3)ᵀ → 2x4.
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const b = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 };
+    const want = [_]f32{ 1, 2, 3, 6, 4, 5, 6, 15 };
+    const m: u32 = 2;
+    const n: u32 = 4;
+    const k: u32 = 3;
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, &a);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, f32, &b);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+    const local_xy: u32 = 16;
+    const groups_x: u32 = (m + local_xy - 1) / local_xy;
+    const groups_y: u32 = (n + local_xy - 1) / local_xy;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const MatmulPush,
+        gx: u32,
+        gy: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, s.gy, 1);
+        }
+    }{ .kern = &kern, .push = &push, .gx = groups_x, .gy = groups_y });
+
+    var out: [8]f32 = undefined;
+    try buf_c.readBack(&ctx, f32, &out);
+    for (out, want, 0..) |got, w, i| {
+        if (got != w) {
+            std.debug.print("GPU matmul MISMATCH at {d}: got {d}, expected {d}\n", .{ i, got, w });
+            return error.ParityFailed;
+        }
+    }
+    std.debug.print("PASS GPU matmul_nt synthetic (2×3 · (4×3)ᵀ → 2×4) on {s}\n", .{ctx.deviceName()});
 }
 
 // ── gelu_tanh smoke: scalar against PyTorch reference values ────────
@@ -867,6 +926,118 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
         }
     }
     return out;
+}
+
+// ── gpu-qproj-test: real Gemma q_proj on GPU vs CPU ────────────────
+
+fn runGpuQprojTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(gpa, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("GPU matmul_nt parity test on layer 0 q_proj — token {d}\n", .{token_id});
+    try stdout.print("device: {s}\n\n", .{ctx.deviceName()});
+
+    // ── Reproduce the qproj-test inputs on the host ─────────────────
+    const x = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+        for (x) |*xi| xi.* *= s;
+    }
+    const x_norm = try gpa.alloc(f32, cfg.hidden_size);
+    defer gpa.free(x_norm);
+    try cpu_math.rmsnorm(x_norm, x, model.layers[0].input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const q_dim = cfg.num_attention_heads * cfg.head_dim;
+
+    // ── CPU baseline (existing path) ────────────────────────────────
+    const q_cpu = try gpa.alloc(f32, q_dim);
+    defer gpa.free(q_cpu);
+    const t_cpu0 = std.time.nanoTimestamp();
+    try cpu_math.matmul_nt(q_cpu, x_norm, model.layers[0].q_proj, 1, q_dim, cfg.hidden_size);
+    const t_cpu1 = std.time.nanoTimestamp();
+    const cpu_ms = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+    // ── Materialise q_proj as fp32 for GPU upload ───────────────────
+    // The GPU kernel is fp32-only for now; we'll add a bf16-aware
+    // variant once the fp32 path is parity-clean. The conversion is
+    // O(numel) so it doesn't dominate setup, but it does double host
+    // memory while we hold both copies — fine for this kernel
+    // (32 MiB), would want an in-place stream once we do all weights.
+    const w_bf16 = dtype.asU16(model.layers[0].q_proj.bytes);
+    const w_f32 = try gpa.alloc(f32, w_bf16.len);
+    defer gpa.free(w_f32);
+    dtype.bf16SliceToF32(w_bf16, w_f32);
+
+    // ── GPU upload + dispatch ───────────────────────────────────────
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, x_norm);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, f32, w_f32);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, q_dim * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+    const local_xy: u32 = 16;
+    const m: u32 = 1;
+    const n: u32 = @intCast(q_dim);
+    const k: u32 = @intCast(cfg.hidden_size);
+    const groups_x: u32 = (m + local_xy - 1) / local_xy;
+    const groups_y: u32 = (n + local_xy - 1) / local_xy;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+
+    const t_gpu0 = std.time.nanoTimestamp();
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const MatmulPush,
+        gx: u32,
+        gy: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, s.gy, 1);
+        }
+    }{ .kern = &kern, .push = &push, .gx = groups_x, .gy = groups_y });
+    const t_gpu1 = std.time.nanoTimestamp();
+    const gpu_ms = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+    const q_gpu = try gpa.alloc(f32, q_dim);
+    defer gpa.free(q_gpu);
+    try buf_c.readBack(&ctx, f32, q_gpu);
+
+    // ── Parity ──────────────────────────────────────────────────────
+    var max_abs_err: f32 = 0;
+    var max_rel_err: f32 = 0;
+    var max_idx: usize = 0;
+    for (q_cpu, q_gpu, 0..) |c, g, i| {
+        const abs_err = @abs(c - g);
+        const denom = @max(@abs(c), 1e-30);
+        const rel_err = abs_err / denom;
+        if (abs_err > max_abs_err) {
+            max_abs_err = abs_err;
+            max_idx = i;
+        }
+        if (rel_err > max_rel_err) max_rel_err = rel_err;
+    }
+
+    try stdout.print("CPU: {d:.2} ms  GPU: {d:.2} ms (incl. submit + queue idle)\n", .{ cpu_ms, gpu_ms });
+    try stdout.print("max |Δ| = {e:.3}  (at idx {d}: cpu={d:.6} gpu={d:.6})\n", .{
+        max_abs_err, max_idx, q_cpu[max_idx], q_gpu[max_idx],
+    });
+    try stdout.print("max relative error = {e:.3}\n", .{max_rel_err});
+
+    if (max_abs_err > 1e-3) {
+        std.debug.print("FAIL: max |Δ| above tolerance\n", .{});
+        return error.ParityFailed;
+    }
+    try stdout.print("\nPASS GPU q_proj matches CPU within {e:.0}\n", .{@as(f32, 1e-3)});
 }
 
 fn printStreamStats(w: anytype, label: []const u8, x: []const f32) !void {

@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     // recompile of every downstream shader — without it only direct edits
     // to the top file would invalidate the cached SPIR-V.
     const vec_add_spv = compileShader(b, "vec_add");
+    const matmul_nt_spv = compileShader(b, "matmul_nt");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -17,8 +18,10 @@ pub fn build(b: *std.Build) void {
     // data at a u32-aligned address.
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(vec_add_spv, "vec_add.spv");
+    _ = wf.addCopyFile(matmul_nt_spv, "matmul_nt.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
+        \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
     );
 
     const exe = b.addExecutable(.{
