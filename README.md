@@ -18,24 +18,38 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
 
 ## What works today
 
-- **Gemma 1 family** (`google/gemma-2b-it` is the primary test model):
-  18-layer transformer with multi-query attention, GeGLU FFN, RoPE,
-  RMSNorm, tied LM head.
-- **End-to-end forward pass on GPU** — embed → 18 × (rmsnorm → Q/K/V →
-  RoPE → attention with KV cache → o_proj → residual → rmsnorm → GeGLU
-  FFN → residual) → final norm → LM head → logits.
+- **Two model families end-to-end on GPU**:
+  - **Gemma 1** (`google/gemma-2b-it`): 18-layer transformer, multi-
+    query attention, GeGLU FFN, RoPE, RMSNorm with `(1+w)`, tied LM
+    head, SentencePiece tokenizer, `<bos>`/`<start_of_turn>` chat
+    template.
+  - **Qwen3** (`Qwen/Qwen3-4B-Instruct-2507`): 36-layer transformer,
+    4:1 grouped-query attention, SwiGLU FFN, RoPE (θ=5M), plain
+    RMSNorm, per-head q_norm/k_norm before RoPE, tied LM head, byte-
+    level BPE tokenizer, ChatML (`<|im_start|>` / `<|im_end|>`)
+    template.
+- **End-to-end forward pass on GPU** — embed → N × (rmsnorm → Q/K/V →
+  [q_norm/k_norm if present] → RoPE → attention with KV cache → o_proj
+  → residual → rmsnorm → gated FFN → residual) → final norm → LM head
+  → logits. Family-specific differences (RMSNorm style, FFN
+  activation, embedding scale, q_norm/k_norm) are gated cleanly so
+  Gemma and Qwen3 share the same recorder.
 - **Multi-turn chat** with prompt prefill, KV cache persistence across
-  turns, and `<end_of_turn>` stop detection.
-- **TurboQuant TQ4 V-cache** — opt in with `--tq4v`. ~5.5× memory
-  reduction on the V cache (Gemma 2B 18-layer at max_pos = 2048: 36 MiB
-  → 4.6 MiB) with the algorithm verified bit-exact against the YATQ
-  Python reference at every level.
+  turns, family-dispatched chat templates, and per-family stop tokens.
+- **TurboQuant TQ4 V-cache** on both families — opt in with `--tq4v`.
+  ~5.5× memory reduction on the V cache. Two block-size paths (256
+  for Gemma, 128 for Qwen3) share the same CPU oracle and ship six
+  paired GLSL shaders each.
 - **bf16 matmul weights on device** — halves both upload time and
   steady-state matmul memory bandwidth versus fp32.
 - **Sampling**: greedy, temperature, top-K, top-P, with `--seed` for
-  reproducible runs.
-- **HuggingFace tokenizer** — both decode and BPE encode (token-for-
-  token parity with `tokenizers` on Gemma's 256k-entry vocab).
+  reproducible sampled runs. (Greedy decoding is non-deterministic
+  across runs at the last digit due to GPU subgroup reduction order;
+  the CPU oracle is bit-deterministic.)
+- **HuggingFace tokenizer** — auto-detects SentencePiece (Gemma) vs
+  GPT-2-style byte-level BPE (Qwen3 / Llama 3) at load time. Both
+  encode paths verified bit-exact against the HF `tokenizers`
+  reference on every prompt we've thrown at them.
 
 ## How fast it goes (fp32 V-cache, baseline)
 
@@ -98,23 +112,45 @@ Every layer is parity-verified against the layer above. For TurboQuant
 the chain extends one tier deeper:
 
 ```
-HuggingFace transformers (Python, bf16)         argmax = 229711 (▁increa)
-   │                                            ↑ for "<bos>" → next token
+HuggingFace transformers (Python, fp32)         Gemma:  argmax = 229711  (▁increa)
+   │                                            Qwen3:  argmax =    220  (' ')
    ▼
-CPU forward (Zig, fp32, lazy bf16 conv)         argmax = 229711  ✓ matches HF
+CPU forward (Zig, fp32, lazy bf16 conv)         Gemma:  ✓ matches HF, max |Δ| < 1e-3
+                                                Qwen3:  ✓ matches HF, max |Δ| < 1e-3
    │
    ▼
-GPU forward (Vulkan, ~291 dispatches)           argmax = 229711  ✓ matches CPU
+GPU forward (Vulkan SPIR-V, family-gated)       Gemma:  ✓ matches CPU
+                                                Qwen3:  ✓ matches CPU
    │
    ▼
-GPU TurboQuant V-cache (Vulkan + TQ4)           argmax = 229711  ✓ top-5 match
-                                                max logit |Δ| = 1.68
+GPU TurboQuant V-cache (Vulkan + TQ4)           Gemma (256-block): top-5 match
+                                                Qwen3 (128-block): coherent generation
 ```
 
-For TQ4 specifically, the pack kernel is **256/256 indices bit-exact**
-versus both the CPU oracle and the YATQ Python reference. The norm-
-correction γ falls within fp16 ULP. The end-to-end logit divergence on
-Gemma 2B `<bos>` is 1.68 absolute, with all top-5 token IDs preserved.
+The Qwen3 parity result is dramatic: HF top-5 logits are
+`[8.2430, 8.0167, 7.9441, 7.8595, 7.6558]` for token ids
+`[220, 151643, 334, 198, 13]`; Zig CPU lands
+`[8.2430, 8.0166, 7.9441, 7.8595, 7.6558]` on the same ids. Three of
+the five logits match to four decimal places after 36 transformer
+layers, q_norm/k_norm, SwiGLU, and the byte-level BPE tokenizer. Run
+it yourself: `python3 scripts/cross_validate_qwen3.py`.
+
+For TurboQuant specifically, the 256-block pack kernel is **256/256
+indices bit-exact** versus both the CPU oracle and the YATQ Python
+reference; the norm-correction γ falls within fp16 ULP. The 128-block
+variant uses the same algorithm at half the dimension and ships
+end-to-end on Qwen3-4B with `--tq4v`.
+
+### A note on greedy determinism
+
+Greedy decoding under `--temp 0` produces argmax-stable output but is
+*not bit-identical* across repeated GPU runs of the same prompt. The
+cause is `subgroupAdd` reduction order in cooperative-K matmul / norm
+kernels — last-token logits land within ~1e-7 of each other, which is
+enough for the very last decimal of `argmax` to flip on creative
+prompts where multiple candidates have nearly equal scores. The CPU
+oracle is fully deterministic. Use `--seed` for reproducible *sampled*
+generation; pin to CPU if you need bit-deterministic greedy output.
 
 ## Hardware
 
