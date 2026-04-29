@@ -97,6 +97,78 @@ pub fn rmsnorm(
     }
 }
 
+/// out[i, j] = sum_k a[i, k] * b[j, k]
+/// Shapes: a is [M, K] row-major, b is [N, K] row-major (HuggingFace
+/// linear-layer storage), out is [M, N] row-major.
+///
+/// "nt" because b is read as if transposed: each output column j comes
+/// from row j of b. This is the canonical layout for transformer linear
+/// layers — `y = W·x` with W in HF's [out_dim, in_dim] becomes a single
+/// matmul_nt call with no extra copy.
+///
+/// Inner accumulation order matches TRiP/math.c matmulf_nt (sequential
+/// over k, scalar fp32 add) so the future C-vs-Zig parity test compares
+/// bit-close. Performance is deliberately not optimised; this is the
+/// correctness oracle, with the GPU kernel being where speed lives.
+pub fn matmul_nt(
+    out: []f32,
+    a: []const f32,
+    b: Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) !void {
+    if (a.len != m * k) return error.LengthMismatch;
+    if (out.len != m * n) return error.LengthMismatch;
+    if (b.shape.len != 2 or b.shape[0] != n or b.shape[1] != k) return error.WeightShapeMismatch;
+
+    switch (b.dtype) {
+        .f32 => {
+            const bf = @as([*]align(1) const f32, @ptrCast(b.bytes.ptr))[0 .. n * k];
+            for (0..m) |i| {
+                const a_row_off = i * k;
+                for (0..n) |j| {
+                    const b_row_off = j * k;
+                    var acc: f32 = 0;
+                    for (0..k) |kk| acc += a[a_row_off + kk] * bf[b_row_off + kk];
+                    out[i * n + j] = acc;
+                }
+            }
+        },
+        .bf16 => {
+            const bu = dtype.asU16(b.bytes);
+            for (0..m) |i| {
+                const a_row_off = i * k;
+                for (0..n) |j| {
+                    const b_row_off = j * k;
+                    var acc: f32 = 0;
+                    for (0..k) |kk| {
+                        const bk = dtype.bf16ToF32(bu[b_row_off + kk]);
+                        acc += a[a_row_off + kk] * bk;
+                    }
+                    out[i * n + j] = acc;
+                }
+            }
+        },
+        .f16 => {
+            const bu = dtype.asU16(b.bytes);
+            for (0..m) |i| {
+                const a_row_off = i * k;
+                for (0..n) |j| {
+                    const b_row_off = j * k;
+                    var acc: f32 = 0;
+                    for (0..k) |kk| {
+                        const bk = dtype.f16ToF32(bu[b_row_off + kk]);
+                        acc += a[a_row_off + kk] * bk;
+                    }
+                    out[i * n + j] = acc;
+                }
+            }
+        },
+        else => return error.UnsupportedWeightDtype,
+    }
+}
+
 /// Materialise one row of an [N, D] tensor into `dst` as fp32.
 /// `dst.len == D`. Convenience for the per-token embedding lookup that
 /// kicks off every forward pass — could live in a more general "tensor

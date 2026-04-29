@@ -40,9 +40,15 @@ pub fn main() !void {
         try runRmsnormTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--qproj-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runQprojTest(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
+    try runMatmulSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -208,6 +214,36 @@ fn runDumpEmbed(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u3
     });
 }
 
+// ── matmul smoke: synthetic A·B^T, hand-checked oracle ──────────────
+
+fn runMatmulSmoke(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    // A = [[1, 2, 3], [4, 5, 6]]                M=2, K=3
+    // B = [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]]   N=4, K=3
+    // A · Bᵀ = [[1, 2, 3, 6], [4, 5, 6, 15]]    M=2, N=4
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const b_data = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 };
+    const want = [_]f32{ 1, 2, 3, 6, 4, 5, 6, 15 };
+
+    const b_shape = [_]usize{ 4, 3 };
+    const b: safetensors.Tensor = .{
+        .dtype = .f32,
+        .shape = &b_shape,
+        .bytes = std.mem.sliceAsBytes(b_data[0..]),
+    };
+
+    var out: [8]f32 = undefined;
+    try cpu_math.matmul_nt(&out, &a, b, 2, 4, 3);
+
+    for (out, want, 0..) |got, w, i| {
+        if (got != w) {
+            std.debug.print("matmul MISMATCH at {d}: got {d}, expected {d}\n", .{ i, got, w });
+            return error.ParityFailed;
+        }
+    }
+    std.debug.print("PASS matmul_nt synthetic (2×3 · (4×3)ᵀ → 2×4)\n", .{});
+}
+
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
 
 fn runRmsnormTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
@@ -270,6 +306,71 @@ fn runRmsnormTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: 
     const post_rms = std.math.sqrt(sum_sq / @as(f64, @floatFromInt(y.len)));
     try stdout.print("\noutput stats: min={d:.6} max={d:.6} rms={d:.6} nan={d} inf={d}\n", .{
         min_v, max_v, post_rms, nan_count, inf_count,
+    });
+}
+
+// ── qproj-test: rmsnorm → matmul against layer 0's q_proj ───────────
+
+fn runQprojTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    if (token_id >= cfg.vocab_size) return error.OutOfRange;
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("qproj test on layer 0 — token {d}\n\n", .{token_id});
+
+    // Embedding → scale → rmsnorm → q_proj.
+    const x = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const scale: f32 = @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+        for (x) |*xi| xi.* *= scale;
+    }
+
+    const x_norm = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(x_norm);
+    try cpu_math.rmsnorm(x_norm, x, model.layers[0].input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    // Q has dimension n_heads × head_dim.
+    const q_dim = cfg.num_attention_heads * cfg.head_dim;
+    const q = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q);
+
+    const t0 = std.time.nanoTimestamp();
+    try cpu_math.matmul_nt(q, x_norm, model.layers[0].q_proj, 1, q_dim, cfg.hidden_size);
+    const t1 = std.time.nanoTimestamp();
+    const ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+
+    try stdout.print("matmul_nt [1, {d}] = [1, {d}] · [{d}, {d}]ᵀ — {d:.2} ms\n\n", .{
+        cfg.hidden_size, q_dim, q_dim, cfg.hidden_size, ms,
+    });
+
+    const n_show: usize = @min(16, q.len);
+    for (q[0..n_show], 0..) |v, i| try stdout.print("  q[{d:>4}] {d:.6}\n", .{ i, v });
+
+    var min_v: f32 = std.math.inf(f32);
+    var max_v: f32 = -std.math.inf(f32);
+    var sum_sq: f64 = 0;
+    var nan_count: usize = 0;
+    var inf_count: usize = 0;
+    for (q) |v| {
+        if (std.math.isNan(v)) {
+            nan_count += 1;
+            continue;
+        }
+        if (std.math.isInf(v)) {
+            inf_count += 1;
+            continue;
+        }
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        sum_sq += @as(f64, v) * @as(f64, v);
+    }
+    const q_rms = std.math.sqrt(sum_sq / @as(f64, @floatFromInt(q.len)));
+    try stdout.print("\nq stats: min={d:.6} max={d:.6} rms={d:.6} nan={d} inf={d}\n", .{
+        min_v, max_v, q_rms, nan_count, inf_count,
     });
 }
 
