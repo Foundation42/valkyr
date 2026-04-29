@@ -237,6 +237,32 @@ pub fn softmax(x: []f32) void {
     for (x) |*v| v.* *= inv;
 }
 
+/// GELU with the tanh approximation:
+///     0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+///
+/// This is the variant Gemma 1 was trained with (TRiP NL_GELU_TANH;
+/// HuggingFace `gelu_pytorch_tanh`). Despite Gemma's `hidden_act:
+/// "gelu"` config string, the modeling code routes to this approx —
+/// using the exact erf form here would silently shift every activation
+/// and drift logits.
+pub inline fn gelu_tanh(x: f32) f32 {
+    const sqrt_2_over_pi: f32 = 0.7978845608028654;
+    const c: f32 = 0.044715;
+    const inner = sqrt_2_over_pi * (x + c * x * x * x);
+    return 0.5 * x * (1.0 + std.math.tanh(inner));
+}
+
+/// GeGLU activation for the gated FFN:
+///     out[i] = gelu_tanh(gate[i]) * up[i]
+///
+/// `out` may alias `gate` or `up` for in-place evaluation. Sizes must
+/// match. This is the entire "activation" step of Gemma's FFN; the
+/// gate/up matmuls and the down matmul live at the call site.
+pub fn geglu(out: []f32, gate: []const f32, up: []const f32) !void {
+    if (out.len != gate.len or out.len != up.len) return error.LengthMismatch;
+    for (out, gate, up) |*o, g, u| o.* = gelu_tanh(g) * u;
+}
+
 /// Materialise one row of an [N, D] tensor into `dst` as fp32.
 /// `dst.len == D`. Convenience for the per-token embedding lookup that
 /// kicks off every forward pass — could live in a more general "tensor

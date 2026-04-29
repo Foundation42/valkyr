@@ -55,12 +55,18 @@ pub fn main() !void {
         try runAttentionTest(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--layer0-test")) {
+        const token_id = try std.fmt.parseInt(u32, args[3], 10);
+        try runLayer0Test(allocator, args[2], token_id);
+        return;
+    }
 
     try runVecAddSmoke(allocator);
     try runSafeTensorsSmoke(allocator);
     try runMatmulSmoke(allocator);
     try runRopeIdentitySmoke(allocator);
     try runSoftmaxSmoke(allocator);
+    try runGeluSmoke(allocator);
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──
@@ -301,6 +307,30 @@ fn runSoftmaxSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS softmax stable form (handles +100 without overflow)\n", .{});
+}
+
+// ── gelu_tanh smoke: scalar against PyTorch reference values ────────
+
+fn runGeluSmoke(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    // Reference values from torch.nn.functional.gelu(approximate="tanh")
+    // (which matches HF's gelu_pytorch_tanh, which Gemma uses).
+    const cases = [_]struct { x: f32, want: f32 }{
+        .{ .x = 0.0, .want = 0.0 },
+        .{ .x = 1.0, .want = 0.8411919876 },
+        .{ .x = -1.0, .want = -0.15880800784 },
+        .{ .x = 2.0, .want = 1.9545976400 },
+        .{ .x = -2.0, .want = -0.04540234059 },
+    };
+    for (cases) |tc| {
+        const got = cpu_math.gelu_tanh(tc.x);
+        const err = @abs(got - tc.want);
+        if (err > 1e-5) {
+            std.debug.print("gelu_tanh({d}): got {d}, want {d} (err {e})\n", .{ tc.x, got, tc.want, err });
+            return error.ParityFailed;
+        }
+    }
+    std.debug.print("PASS gelu_tanh (5 ref values within 1e-5)\n", .{});
 }
 
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
@@ -652,6 +682,144 @@ fn runAttentionTest(allocator: std.mem.Allocator, dir_path: []const u8, token_id
             });
         }
     }
+}
+
+// ── layer0-test: complete transformer block (attn + FFN + residuals) ──
+
+fn runLayer0Test(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+    const cfg = model.config;
+    const layer = model.layers[0];
+
+    const n_heads = cfg.num_attention_heads;
+    const n_kv = cfg.num_key_value_heads;
+    const head_dim = cfg.head_dim;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv * head_dim;
+    const heads_per_kv = n_heads / n_kv;
+    const inter = cfg.intermediate_size;
+    const hidden = cfg.hidden_size;
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print(
+        \\full layer 0 forward — token {d}, position 0 (single token, no history)
+        \\config: hidden={d}, intermediate={d}, n_heads={d}, kv_heads={d}, head_dim={d}
+        \\
+        \\
+    , .{ token_id, hidden, inter, n_heads, n_kv, head_dim });
+
+    // ── Stage 0: residual stream init from embedding ────────────────
+    const x = try allocator.alloc(f32, hidden);
+    defer allocator.free(x);
+    try cpu_math.embedRowAsF32(x, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(hidden)));
+        for (x) |*xi| xi.* *= s;
+    }
+    try printStreamStats(stdout, "embed (post-scale)", x);
+
+    // ── Stage 1: rmsnorm₁ → Q/K/V → RoPE → attention → o_proj ───────
+    const x_norm1 = try allocator.alloc(f32, hidden);
+    defer allocator.free(x_norm1);
+    try cpu_math.rmsnorm(x_norm1, x, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const q = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(v);
+    try cpu_math.matmul_nt(q, x_norm1, layer.q_proj, 1, q_dim, hidden);
+    try cpu_math.matmul_nt(k, x_norm1, layer.k_proj, 1, kv_dim, hidden);
+    try cpu_math.matmul_nt(v, x_norm1, layer.v_proj, 1, kv_dim, hidden);
+
+    const q_rot = try allocator.alloc(f32, q_dim);
+    defer allocator.free(q_rot);
+    const k_rot = try allocator.alloc(f32, kv_dim);
+    defer allocator.free(k_rot);
+    try cpu_math.applyRope(q_rot, q, n_heads, head_dim, 0, cfg.rope_theta);
+    try cpu_math.applyRope(k_rot, k, n_kv, head_dim, 0, cfg.rope_theta);
+
+    // Single-position attention: softmax over 1 score is 1.0 → head_out
+    // is exactly v (broadcast across query heads sharing the kv head).
+    const head_out = try allocator.alloc(f32, q_dim);
+    defer allocator.free(head_out);
+    for (0..n_heads) |h| {
+        const kv_h = h / heads_per_kv;
+        const v_off = kv_h * head_dim;
+        const out_off = h * head_dim;
+        @memcpy(head_out[out_off .. out_off + head_dim], v[v_off .. v_off + head_dim]);
+    }
+    // (q_rot and k_rot computed above are unused at pos 0 since the
+    // softmax collapses to 1.0 — kept for symmetry with the multi-
+    // position path we'll wire when we have an actual prompt.)
+
+    const attn_out = try allocator.alloc(f32, hidden);
+    defer allocator.free(attn_out);
+    try cpu_math.matmul_nt(attn_out, head_out, layer.o_proj, 1, hidden, q_dim);
+    try printStreamStats(stdout, "attn output (pre-residual)", attn_out);
+
+    // ── Stage 2: residual add ───────────────────────────────────────
+    const mid = try allocator.alloc(f32, hidden);
+    defer allocator.free(mid);
+    for (mid, x, attn_out) |*m, xi, ai| m.* = xi + ai;
+    try printStreamStats(stdout, "residual after attn", mid);
+
+    // ── Stage 3: rmsnorm₂ → GeGLU FFN → down_proj ──────────────────
+    const mid_norm = try allocator.alloc(f32, hidden);
+    defer allocator.free(mid_norm);
+    try cpu_math.rmsnorm(mid_norm, mid, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
+
+    const gate = try allocator.alloc(f32, inter);
+    defer allocator.free(gate);
+    const up = try allocator.alloc(f32, inter);
+    defer allocator.free(up);
+    try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, hidden);
+    try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, 1, inter, hidden);
+
+    const fused = try allocator.alloc(f32, inter);
+    defer allocator.free(fused);
+    try cpu_math.geglu(fused, gate, up);
+    try printStreamStats(stdout, "geglu(gate)·up (intermediate)", fused);
+
+    const ffn_out = try allocator.alloc(f32, hidden);
+    defer allocator.free(ffn_out);
+    try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, 1, hidden, inter);
+    try printStreamStats(stdout, "ffn output (pre-residual)", ffn_out);
+
+    // ── Stage 4: residual add → block output ────────────────────────
+    const block_out = try allocator.alloc(f32, hidden);
+    defer allocator.free(block_out);
+    for (block_out, mid, ffn_out) |*o, m, f| o.* = m + f;
+    try printStreamStats(stdout, "layer 0 output", block_out);
+}
+
+fn printStreamStats(w: anytype, label: []const u8, x: []const f32) !void {
+    var min_v: f32 = std.math.inf(f32);
+    var max_v: f32 = -std.math.inf(f32);
+    var sum_sq: f64 = 0;
+    var nan_count: usize = 0;
+    var inf_count: usize = 0;
+    for (x) |v| {
+        if (std.math.isNan(v)) {
+            nan_count += 1;
+            continue;
+        }
+        if (std.math.isInf(v)) {
+            inf_count += 1;
+            continue;
+        }
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        sum_sq += @as(f64, v) * @as(f64, v);
+    }
+    const rms = std.math.sqrt(sum_sq / @as(f64, @floatFromInt(x.len)));
+    try w.print("  {s:<32} min={d:>10.4}  max={d:>10.4}  rms={d:>10.4}", .{ label, min_v, max_v, rms });
+    if (nan_count > 0 or inf_count > 0) {
+        try w.print("  nan={d} inf={d}", .{ nan_count, inf_count });
+    }
+    try w.print("\n", .{});
 }
 
 // ── vec_add smoke: validates the whole Vulkan compute path ───────────
