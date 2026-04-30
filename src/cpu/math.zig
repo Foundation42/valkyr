@@ -53,7 +53,7 @@ pub fn rmsnorm(
     const mean_sq = sum_sq / @as(f32, @floatFromInt(dim));
     const rms_inv = 1.0 / @sqrt(mean_sq + eps);
 
-    const apply_gemma_quirk = family == .gemma;
+    const apply_gemma_quirk = family.rmsnormAddOne();
 
     // ── per-element scale ──────────────────────────────────────────
     switch (weight.dtype) {
@@ -225,18 +225,42 @@ pub fn applyRope(
     pos: usize,
     theta_base: f32,
 ) !void {
+    return applyRopePartial(out, in, n_heads, head_dim, head_dim, pos, theta_base);
+}
+
+/// Partial-rotation RoPE: rotate only the first `rotary_dim` of each
+/// `head_dim`-sized head; the trailing `head_dim - rotary_dim` entries
+/// pass through unchanged. Qwen3.5 uses `rotary_dim = head_dim / 4`
+/// (partial_rotary_factor = 0.25). The rotation pattern within
+/// `rotary_dim` matches HF's GPT-NeoX form: pair index `j` with index
+/// `j + rotary_dim/2`, rotate by `pos * theta_base ^ (-2j/rotary_dim)`.
+///
+/// Crucially the wavelength denominator is `rotary_dim`, NOT `head_dim`
+/// — HF builds its inv_freq table with `dim = int(head_dim *
+/// partial_rotary_factor)`. Get that wrong and the cos/sin tables drift
+/// by a factor of `partial_rotary_factor` and parity collapses.
+pub fn applyRopePartial(
+    out: []f32,
+    in: []const f32,
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    theta_base: f32,
+) !void {
     const total = n_heads * head_dim;
     if (in.len != total or out.len != total) return error.LengthMismatch;
-    if (head_dim % 2 != 0) return error.OddHeadDim;
-    const half = head_dim / 2;
+    if (rotary_dim > head_dim) return error.RotaryDimTooLarge;
+    if (rotary_dim % 2 != 0) return error.OddRotaryDim;
+    const half = rotary_dim / 2;
 
     const pos_f: f32 = @floatFromInt(pos);
-    const dim_f: f32 = @floatFromInt(head_dim);
+    const rdim_f: f32 = @floatFromInt(rotary_dim);
 
     for (0..n_heads) |h| {
         const off = h * head_dim;
         for (0..half) |j| {
-            const freq = 1.0 / std.math.pow(f32, theta_base, (2.0 * @as(f32, @floatFromInt(j))) / dim_f);
+            const freq = 1.0 / std.math.pow(f32, theta_base, (2.0 * @as(f32, @floatFromInt(j))) / rdim_f);
             const angle = pos_f * freq;
             const cos_a = @cos(angle);
             const sin_a = @sin(angle);
@@ -244,6 +268,10 @@ pub fn applyRope(
             const b = in[off + j + half];
             out[off + j] = a * cos_a - b * sin_a;
             out[off + j + half] = a * sin_a + b * cos_a;
+        }
+        // Pass-through tail.
+        if (rotary_dim < head_dim) {
+            for (rotary_dim..head_dim) |i| out[off + i] = in[off + i];
         }
     }
 }

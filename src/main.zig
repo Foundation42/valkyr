@@ -14,6 +14,7 @@ const dtype = @import("dtype.zig");
 const cpu_math = @import("cpu/math.zig");
 const cpu_forward = @import("cpu/forward.zig");
 const cpu_gated_delta = @import("cpu/gated_delta.zig");
+const cpu_full_attn = @import("cpu/full_attn.zig");
 const turboquant = @import("cpu/turboquant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
@@ -285,27 +286,27 @@ fn runQwen35LayerTest(
         std.debug.print("expected qwen3.5 model, got {s}\n", .{@tagName(cfg.family)});
         return error.WrongFamily;
     }
-    if (model.layers[0].layer_type != .linear_attention) {
-        std.debug.print("expected layer 0 to be .linear_attention, got {s}\n", .{@tagName(model.layers[0].layer_type)});
-        return error.WrongLayerType;
-    }
 
     // ── Read reference dump ─────────────────────────────────────────
-    // Format: header (3 × i32) followed by hidden_size fp32 (input) and
-    // hidden_size fp32 (expected output). The header is a sanity check
-    // against silent shape drift between the Python dumper and Zig.
+    // Format: header (4 × i32: magic, hidden_size, layer_idx,
+    // layer_type_kind) followed by hidden_size fp32 (input) and
+    // hidden_size fp32 (expected output). `layer_type_kind` is 0 for
+    // linear_attention, 1 for full_attention — lets the Zig side cross-
+    // check that Python dumped the layer it thinks Zig is testing.
     const file = try std.fs.cwd().openFile(dump_path, .{ .mode = .read_only });
     defer file.close();
-    const want_header = [3]i32{ 0x515E_3503, @intCast(cfg.hidden_size), @intCast(cfg.linear_value_head_dim) };
-    var got_header: [3]i32 = undefined;
+    var got_header: [4]i32 = undefined;
     const hdr_bytes_read = try file.read(std.mem.sliceAsBytes(got_header[0..]));
     if (hdr_bytes_read != @sizeOf(@TypeOf(got_header))) return error.DumpHeaderTruncated;
-    for (want_header, got_header, 0..) |w, g, i| {
-        if (w != g) {
-            std.debug.print("dump header mismatch at field {d}: want {d}, got {d}\n", .{ i, w, g });
-            return error.DumpHeaderMismatch;
-        }
-    }
+    if (got_header[0] != 0x515E_3503) return error.DumpMagicMismatch;
+    if (got_header[1] != @as(i32, @intCast(cfg.hidden_size))) return error.DumpHiddenSizeMismatch;
+    const layer_idx: usize = @intCast(got_header[2]);
+    if (layer_idx >= cfg.num_hidden_layers) return error.LayerIndexOutOfRange;
+    const want_kind: i32 = switch (model.layers[layer_idx].layer_type) {
+        .linear_attention => 0,
+        .full_attention => 1,
+    };
+    if (got_header[3] != want_kind) return error.DumpLayerTypeMismatch;
 
     const x = try gpa.alloc(f32, cfg.hidden_size);
     defer gpa.free(x);
@@ -314,18 +315,26 @@ fn runQwen35LayerTest(
     if (try file.read(std.mem.sliceAsBytes(x)) != cfg.hidden_size * @sizeOf(f32)) return error.DumpInputTruncated;
     if (try file.read(std.mem.sliceAsBytes(expected)) != cfg.hidden_size * @sizeOf(f32)) return error.DumpOutputTruncated;
 
-    // ── Run the Zig CPU layer-0 step ────────────────────────────────
-    // Ref Python: x_in is post-input_layernorm. We get x_in directly
-    // from the dump, so skip the layernorm and feed straight into the
-    // Gated DeltaNet kernel. The HF reference returns the layer's
-    // ATTN-PATH output (i.e. `out_proj(...)`), not `x + out` — the
-    // residual add stays in the calling code. Same here.
-    var state = try cpu_gated_delta.State.init(gpa, cfg);
-    defer state.deinit(gpa);
-
+    // ── Run the Zig CPU layer-N step ────────────────────────────────
+    // Ref Python returns the layer's ATTENTION-PATH output (post
+    // out_proj, pre residual add). We don't add the residual either.
     const got = try gpa.alloc(f32, cfg.hidden_size);
     defer gpa.free(got);
-    try cpu_gated_delta.decodeStep(gpa, cfg, model.layers[0], &state, x, got);
+    const layer = model.layers[layer_idx];
+    switch (layer.layer_type) {
+        .linear_attention => {
+            var state = try cpu_gated_delta.State.init(gpa, cfg);
+            defer state.deinit(gpa);
+            try cpu_gated_delta.decodeStep(gpa, cfg, layer, &state, x, got);
+        },
+        .full_attention => {
+            // Single-token decode at pos=0 with empty cache. Cache is
+            // sized for one position — that's all we need.
+            var kv = try cpu_full_attn.KvCache.init(gpa, cfg, 1);
+            defer kv.deinit(gpa);
+            try cpu_full_attn.decodeStep(gpa, cfg, layer, &kv, x, got, 0);
+        },
+    }
 
     // ── Compare ─────────────────────────────────────────────────────
     var max_abs: f32 = 0.0;
@@ -339,7 +348,7 @@ fn runQwen35LayerTest(
     }
     const rel = if (sum_sq_ref > 0) @sqrt(sum_sq_diff / sum_sq_ref) else 0.0;
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("layer 0 (linear_attn) parity:\n", .{});
+    try stdout.print("layer {d} ({s}) parity:\n", .{ layer_idx, @tagName(layer.layer_type) });
     try stdout.print("  hidden_size  = {d}\n", .{cfg.hidden_size});
     try stdout.print("  max |Δ|      = {e}\n", .{max_abs});
     try stdout.print("  ‖Δ‖ / ‖ref‖ = {e}\n", .{rel});
@@ -351,7 +360,7 @@ fn runQwen35LayerTest(
         try stdout.print("FAIL: |Δ| > 1e-3\n", .{});
         return error.ParityFailed;
     }
-    try stdout.print("PASS qwen35 layer 0 (linear_attn) — max |Δ| = {e}\n", .{max_abs});
+    try stdout.print("PASS qwen35 layer {d} ({s}) — max |Δ| = {e}\n", .{ layer_idx, @tagName(layer.layer_type), max_abs });
 }
 
 fn runConfig(allocator: std.mem.Allocator, dir_path: []const u8) !void {
@@ -2399,7 +2408,16 @@ fn runGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
     defer gpa.free(logits);
 
     const t0 = std.time.nanoTimestamp();
-    try cpu_forward.forward(&model, token_id, 0, scratch, logits);
+    if (cfg.family.isHybrid()) {
+        // Qwen3.5 hybrid: per-layer SSM + KV state. Single-token gen
+        // means max_pos=1. The state is constructed fresh and torn down
+        // at the end of this call.
+        var state = try cpu_forward.HybridState.init(gpa, &model, 1);
+        defer state.deinit();
+        try cpu_forward.forwardHybrid(&model, token_id, 0, &state, scratch, logits);
+    } else {
+        try cpu_forward.forward(&model, token_id, 0, scratch, logits);
+    }
     const t1 = std.time.nanoTimestamp();
     const ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
     try stdout.print("forward (CPU, scalar, bf16 weights): {d:.0} ms\n", .{ms});

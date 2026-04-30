@@ -22,6 +22,8 @@ const std = @import("std");
 const model_mod = @import("../model.zig");
 const cpu_math = @import("math.zig");
 const turboquant = @import("turboquant.zig");
+const gated_delta = @import("gated_delta.zig");
+const full_attn = @import("full_attn.zig");
 
 /// Run the full forward pass and write the logits over the vocabulary
 /// to `logits` (length must equal `model.config.vocab_size`).
@@ -130,6 +132,127 @@ pub fn forward(
 
     // Logits: matmul against the LM head (which for Gemma is tied to
     // the embedding matrix [vocab_size, hidden_size]).
+    try cpu_math.matmul_nt(logits, final_norm, model.lm_head, 1, cfg.vocab_size, hidden);
+}
+
+/// Per-call state for the hybrid forward — owns one Gated DeltaNet
+/// state per linear layer and one KV cache per full-attention layer.
+/// Lifetime: caller constructs once and reuses across forward steps,
+/// since both kinds of state grow with the conversation. `init` zeroes
+/// both buffers (fresh start).
+pub const HybridState = struct {
+    /// Per-layer Gated-DeltaNet `(conv_state, recurrent_state)`. Slot
+    /// `i` is `null` if layer `i` is `.full_attention` rather than
+    /// linear. Owned.
+    ssm: []?gated_delta.State,
+    /// Per-layer K/V cache, sized for `max_pos` positions. Slot `i` is
+    /// `null` if layer `i` is `.linear_attention`. Owned.
+    kv: []?full_attn.KvCache,
+    allocator: std.mem.Allocator,
+
+    pub fn init(gpa: std.mem.Allocator, model: *const model_mod.Model, max_pos: usize) !HybridState {
+        const cfg = model.config;
+        const ssm = try gpa.alloc(?gated_delta.State, cfg.num_hidden_layers);
+        @memset(ssm, null);
+        errdefer gpa.free(ssm);
+        const kv = try gpa.alloc(?full_attn.KvCache, cfg.num_hidden_layers);
+        @memset(kv, null);
+        errdefer gpa.free(kv);
+
+        // Cleanup-on-failure walks the whole slice — `null` slots are
+        // safely skipped, so we don't need a separate "allocated up to"
+        // counter the way the loader's per-tensor errdefer does.
+        errdefer {
+            for (ssm) |*s| if (s.*) |*v| v.deinit(gpa);
+            for (kv) |*c| if (c.*) |*v| v.deinit(gpa);
+        }
+        for (model.layers, 0..) |layer, i| {
+            switch (layer.layer_type) {
+                .linear_attention => ssm[i] = try gated_delta.State.init(gpa, cfg),
+                .full_attention => kv[i] = try full_attn.KvCache.init(gpa, cfg, max_pos),
+            }
+        }
+        return .{ .ssm = ssm, .kv = kv, .allocator = gpa };
+    }
+
+    pub fn deinit(self: *HybridState) void {
+        for (self.ssm) |*s| if (s.*) |*v| v.deinit(self.allocator);
+        for (self.kv) |*c| if (c.*) |*v| v.deinit(self.allocator);
+        self.allocator.free(self.ssm);
+        self.allocator.free(self.kv);
+    }
+};
+
+/// Hybrid forward step — used for Qwen3.5. Each layer dispatches on
+/// `cfg.layer_types[i]` to either the GatedDeltaNet decode (for linear-
+/// attention layers) or the full-attention decode (for full-attention
+/// layers). MLP / norms are shared. Caller owns `state` across steps.
+pub fn forwardHybrid(
+    model: *const model_mod.Model,
+    token_id: u32,
+    pos: usize,
+    state: *HybridState,
+    scratch: std.mem.Allocator,
+    logits: []f32,
+) !void {
+    const cfg = model.config;
+    if (cfg.family != .qwen35) return error.NotHybridFamily;
+    if (logits.len != cfg.vocab_size) return error.LogitsSizeMismatch;
+    if (token_id >= cfg.vocab_size) return error.TokenOutOfRange;
+
+    const hidden = cfg.hidden_size;
+    const inter = cfg.intermediate_size;
+
+    // ── Residual stream init ────────────────────────────────────────
+    const stream = try scratch.alloc(f32, hidden);
+    try cpu_math.embedRowAsF32(stream, model.embed_tokens, token_id);
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(hidden)));
+        for (stream) |*xi| xi.* *= s;
+    }
+
+    // ── Per-layer scratch (shared across iterations) ────────────────
+    const x_norm = try scratch.alloc(f32, hidden);
+    const attn_out = try scratch.alloc(f32, hidden);
+    const mid_norm = try scratch.alloc(f32, hidden);
+    const gate = try scratch.alloc(f32, inter);
+    const up = try scratch.alloc(f32, inter);
+    const fused = try scratch.alloc(f32, inter);
+    const ffn_out = try scratch.alloc(f32, hidden);
+
+    for (model.layers, 0..) |layer, i| {
+        // Pre-attention norm.
+        try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+
+        // Attention path: dispatch on layer type.
+        switch (layer.layer_type) {
+            .linear_attention => {
+                try gated_delta.decodeStep(scratch, cfg, layer, &state.ssm[i].?, x_norm, attn_out);
+            },
+            .full_attention => {
+                try full_attn.decodeStep(scratch, cfg, layer, &state.kv[i].?, x_norm, attn_out, pos);
+            },
+        }
+
+        // First residual.
+        for (stream, attn_out) |*si, ai| si.* += ai;
+
+        // Post-attention norm.
+        try cpu_math.rmsnorm(mid_norm, stream, layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
+
+        // SwiGLU FFN.
+        try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, 1, inter, hidden);
+        try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, 1, inter, hidden);
+        try cpu_math.gatedFfn(fused, gate, up, cfg.family);
+        try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, 1, hidden, inter);
+
+        // Second residual.
+        for (stream, ffn_out) |*si, fi| si.* += fi;
+    }
+
+    // ── Final norm + LM head ────────────────────────────────────────
+    const final_norm = try scratch.alloc(f32, hidden);
+    try cpu_math.rmsnorm(final_norm, stream, model.final_norm, cfg.rms_norm_eps, cfg.family);
     try cpu_math.matmul_nt(logits, final_norm, model.lm_head, 1, cfg.vocab_size, hidden);
 }
 

@@ -80,6 +80,16 @@ pub const Family = enum {
         return self == .qwen35;
     }
 
+    /// `(1 + weight)` form of RMSNorm. Gemma uses it everywhere; Qwen3.5
+    /// uses it for the standard RMSNorm class (input_layernorm,
+    /// post_attention_layernorm, q_norm, k_norm, final norm) — but the
+    /// `RMSNormGated` inside the GatedDeltaNet stays plain `weight * x`,
+    /// so that path takes its own dedicated route in cpu/gated_delta.zig.
+    /// Llama and Qwen3 use plain `weight * x`.
+    pub fn rmsnormAddOne(self: Family) bool {
+        return self == .gemma or self == .qwen35;
+    }
+
     /// Tensor namespace prefix. Qwen3.5 wraps its language model under
     /// `model.language_model.*`; the others use `model.*`. Empty string
     /// means no extra wrapping. Trailing dot included.
