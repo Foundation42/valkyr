@@ -1,0 +1,135 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Recurrent Gated DeltaNet decode step (Qwen3.5).  One workgroup per
+// V-head, `head_v` threads per workgroup.  For each V-head h:
+//
+//   beta_h = sigmoid(b_raw[h])
+//   g_t_h  = exp( -exp(A_log[h]) * softplus(a_raw[h] + dt_bias[h]) )
+//   kv_mem[v]   = sum_d S[d, v] * k[d]              # = Sᵀ k
+//   delta[v]    = (v_in[v] - kv_mem[v]) * beta_h
+//   S[d, v]     = g_t_h * S[d, v] + k[d] * delta[v] # in-place update
+//   y[v]        = sum_d S_new[d, v] * q[d]          # readout
+//
+// Algebraic identity used: y[v] = g_t_h * Sq_old[v] + delta[v] * <k,q>,
+// so we don't need to read S twice; we read S_old once for both Sq[v]
+// and Sk[v], compute kq via a workgroup reduction, then write S_new
+// while computing y. K and Q are repeated across V-heads via implicit
+// GQA: V-head h maps to K-head h / (num_v_heads / num_k_heads). All
+// arithmetic is fp32 per `mamba_ssm_dtype: float32`.
+//
+// Layout (row-major):
+//   state : [num_v_heads, head_k, head_v]
+//   q, k  : [num_k_heads, head_k]      (pre-l2-normed, q pre-scaled)
+//   v     : [num_v_heads, head_v]
+//   beta, g_t inputs (b_raw, a_raw, A_log, dt_bias) : [num_v_heads]
+//   y     : [num_v_heads, head_v]
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430)           buffer State    { float state_v[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Q        { float q_v[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer K        { float k_v[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer V        { float v_v[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BRaw     { float b_raw_v[]; };
+layout(set = 0, binding = 5, std430) readonly  buffer ARaw     { float a_raw_v[]; };
+layout(set = 0, binding = 6, std430) readonly  buffer ALog     { float a_log_v[]; };
+layout(set = 0, binding = 7, std430) readonly  buffer DtBias   { float dt_bias_v[]; };
+layout(set = 0, binding = 8, std430) writeonly buffer Y        { float y_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint num_k_heads;
+    uint num_v_heads;
+    uint head_k;
+    uint head_v;
+} pc;
+
+shared float k_s[256];
+shared float q_s[256];
+shared float subgroup_sum[32];
+shared float kq_shared;
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+// Numerically stable softplus: for very positive x, softplus(x) ≈ x
+// (within ULP of fp32 once x > 20).
+float softplus(float x) {
+    if (x > 20.0) return x;
+    return log(1.0 + exp(x));
+}
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint t   = gl_LocalInvocationID.x;
+    uint hk  = pc.head_k;
+    uint hv  = pc.head_v;
+    uint heads_per_k = pc.num_v_heads / pc.num_k_heads;
+    uint h_k = h / heads_per_k;
+
+    // Load this V-head's K and Q (post-l2norm, post-q-scale) into
+    // shared memory.  head_k ≤ workgroup size in supported configs.
+    if (t < hk) {
+        uint off = h_k * hk + t;
+        k_s[t] = k_v[off];
+        q_s[t] = q_v[off];
+    }
+    barrier();
+
+    // Compute scalar <k, q> via workgroup reduction.
+    float my_kq = (t < hk) ? (k_s[t] * q_s[t]) : 0.0;
+    float sg_sum = subgroupAdd(my_kq);
+    if (subgroupElect()) subgroup_sum[gl_SubgroupID] = sg_sum;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sum[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) kq_shared = total;
+    }
+    barrier();
+    float kq = kq_shared;
+
+    // Per-V-head gates.  Cheap enough to recompute in every thread.
+    float beta_h = sigmoid(b_raw_v[h]);
+    float g_h    = -exp(a_log_v[h]) * softplus(a_raw_v[h] + dt_bias_v[h]);
+    float g_t_h  = exp(g_h);
+
+    // Each thread owns column `t` of the [head_k, head_v] state.
+    // state[h, d, t] = state_v[h*hk*hv + d*hv + t]; stride is `head_v`.
+    if (t >= hv) return;
+    uint S_base = h * hk * hv + t;
+
+    float Sq_t = 0.0;
+    float Sk_t = 0.0;
+    for (uint d = 0; d < hk; ++d) {
+        float s_dt = state_v[S_base + d * hv];
+        Sq_t += s_dt * q_s[d];
+        Sk_t += s_dt * k_s[d];
+    }
+    // kv_mem in the HF reference is computed from the DECAYED state
+    // (`state *= g_t`) before delta:
+    //   state_dec     = g_t * state_old
+    //   kv_mem        = state_dec^T k = g_t * Sk_old
+    //   delta         = (v_in - kv_mem) * beta
+    // We then update `state_new = state_dec + k ⊗ delta`. The readout
+    // identity `y = g_t * Sq_old + delta * kq` still holds (the Sq side
+    // happens to absorb its own g_t factor algebraically), but the
+    // delta side needs the decayed Sk explicitly.
+    Sk_t *= g_t_h;
+
+    float v_in    = v_v[h * hv + t];
+    float delta_t = (v_in - Sk_t) * beta_h;
+
+    // Output:  y[v] = g_t * Sq[v] + delta[v] * <k, q>.
+    y_v[h * hv + t] = g_t_h * Sq_t + delta_t * kq;
+
+    // Update state column t in place: g_t * S_old + k ⊗ delta.
+    for (uint d = 0; d < hk; ++d) {
+        uint idx = S_base + d * hv;
+        state_v[idx] = g_t_h * state_v[idx] + k_s[d] * delta_t;
+    }
+}

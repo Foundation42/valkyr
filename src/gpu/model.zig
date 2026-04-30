@@ -39,32 +39,51 @@ const model_mod = @import("../model.zig");
 pub const Precision = enum { fp32_all, bf16_matmul };
 
 pub const GpuLayer = struct {
+    layer_type: config_mod.LayerType,
     input_layernorm: buffer.Buffer,
-    q_proj: buffer.Buffer,
-    k_proj: buffer.Buffer,
-    v_proj: buffer.Buffer,
-    o_proj: buffer.Buffer,
     post_attention_layernorm: buffer.Buffer,
     gate_proj: buffer.Buffer,
     up_proj: buffer.Buffer,
     down_proj: buffer.Buffer,
-    /// Qwen3-only: per-head RMSNorm gain on Q and K post-projection,
-    /// pre-RoPE. `null` for Gemma / Llama.
-    q_norm: ?buffer.Buffer,
-    k_norm: ?buffer.Buffer,
+
+    // ── Full-attention buffers (.full_attention only) ───────────────
+    q_proj: ?buffer.Buffer = null,
+    k_proj: ?buffer.Buffer = null,
+    v_proj: ?buffer.Buffer = null,
+    o_proj: ?buffer.Buffer = null,
+    /// Qwen3 / Qwen3.5: per-head RMSNorm gain on Q and K. `null` for
+    /// Gemma / Llama.
+    q_norm: ?buffer.Buffer = null,
+    k_norm: ?buffer.Buffer = null,
+
+    // ── Linear-attention buffers (.linear_attention only) ───────────
+    /// Gated DeltaNet (Qwen3.5 hybrid layers). All eight tensors must
+    /// be present together — see `cpu/gated_delta.zig` for the math.
+    in_proj_qkv: ?buffer.Buffer = null,
+    in_proj_z: ?buffer.Buffer = null,
+    in_proj_b: ?buffer.Buffer = null,
+    in_proj_a: ?buffer.Buffer = null,
+    conv1d_weight: ?buffer.Buffer = null,
+    A_log: ?buffer.Buffer = null,
+    dt_bias: ?buffer.Buffer = null,
+    ssm_norm_weight: ?buffer.Buffer = null,
+    out_proj: ?buffer.Buffer = null,
 
     pub fn deinit(self: *GpuLayer, device: vk.c.VkDevice) void {
         self.input_layernorm.deinit(device);
-        self.q_proj.deinit(device);
-        self.k_proj.deinit(device);
-        self.v_proj.deinit(device);
-        self.o_proj.deinit(device);
         self.post_attention_layernorm.deinit(device);
         self.gate_proj.deinit(device);
         self.up_proj.deinit(device);
         self.down_proj.deinit(device);
-        if (self.q_norm) |*b| b.deinit(device);
-        if (self.k_norm) |*b| b.deinit(device);
+        inline for (.{
+            "q_proj",     "k_proj", "v_proj",        "o_proj",
+            "q_norm",     "k_norm",
+            "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+            "conv1d_weight", "A_log",  "dt_bias",
+            "ssm_norm_weight", "out_proj",
+        }) |fname| {
+            if (@field(self, fname)) |*b| b.deinit(device);
+        }
     }
 };
 
@@ -118,19 +137,42 @@ pub const GpuModel = struct {
         }
 
         for (cpu.layers, 0..) |layer, i| {
+            // Shared bits: norms + FFN trio.
             layers[i] = .{
+                .layer_type = layer.layer_type,
                 .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm),
-                .q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path),
-                .k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path),
-                .v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path),
-                .o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path),
                 .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm),
                 .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path),
                 .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path),
                 .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path),
-                .q_norm = if (layer.q_norm) |t| try uploadTensor(gpa, ctx, t) else null,
-                .k_norm = if (layer.k_norm) |t| try uploadTensor(gpa, ctx, t) else null,
             };
+
+            switch (layer.layer_type) {
+                .full_attention => {
+                    layers[i].q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path);
+                    layers[i].k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path);
+                    layers[i].v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path);
+                    layers[i].o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path);
+                    if (layer.q_norm) |t| layers[i].q_norm = try uploadTensor(gpa, ctx, t);
+                    if (layer.k_norm) |t| layers[i].k_norm = try uploadTensor(gpa, ctx, t);
+                },
+                .linear_attention => {
+                    // Gated DeltaNet: in-projections + conv + per-head
+                    // gates + ssm-rmsnorm + out_proj. The four in-proj
+                    // matrices and out_proj go through the bf16-aware
+                    // path; the rest are tiny scalars/per-head tables
+                    // and stay fp32.
+                    layers[i].in_proj_qkv = try uploadByPath(gpa, ctx, layer.in_proj_qkv.?, matmul_path);
+                    layers[i].in_proj_z   = try uploadByPath(gpa, ctx, layer.in_proj_z.?, matmul_path);
+                    layers[i].in_proj_b   = try uploadByPath(gpa, ctx, layer.in_proj_b.?, matmul_path);
+                    layers[i].in_proj_a   = try uploadByPath(gpa, ctx, layer.in_proj_a.?, matmul_path);
+                    layers[i].out_proj    = try uploadByPath(gpa, ctx, layer.out_proj.?, matmul_path);
+                    layers[i].conv1d_weight   = try uploadTensor(gpa, ctx, layer.conv1d_weight.?);
+                    layers[i].A_log           = try uploadTensor(gpa, ctx, layer.A_log.?);
+                    layers[i].dt_bias         = try uploadTensor(gpa, ctx, layer.dt_bias.?);
+                    layers[i].ssm_norm_weight = try uploadTensor(gpa, ctx, layer.ssm_norm_weight.?);
+                },
+            }
             uploaded_layers = i + 1;
         }
 

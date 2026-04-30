@@ -1,0 +1,25 @@
+#version 460
+// Elementwise `out[i] = a[i] * sigmoid(b[i])`. Used to apply the
+// Qwen3.5 attn_output_gate (`attn_out *= sigmoid(gate)` before o_proj)
+// and any other gated-multiply pattern. A and B and out have the same
+// length.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A   { float a_v[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer B   { float b_v[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_elem;
+} pc;
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n_elem) return;
+    out_v[g] = a_v[g] * sigmoid(b_v[g]);
+}

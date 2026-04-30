@@ -220,7 +220,17 @@ pub fn forwardHybrid(
     const fused = try scratch.alloc(f32, inter);
     const ffn_out = try scratch.alloc(f32, hidden);
 
+    // Diagnostic knob (parity-paired with the GPU runner): stop after
+    // this many layers. -1 / unset = full forward. Used during chunk-3
+    // GPU integration debugging to layer-bisect divergences.
+    const stop_after: i32 = blk: {
+        const env_val = std.process.getEnvVarOwned(scratch, "QWEN35_STOP") catch break :blk -1;
+        defer scratch.free(env_val);
+        break :blk std.fmt.parseInt(i32, env_val, 10) catch -1;
+    };
+
     for (model.layers, 0..) |layer, i| {
+        if (stop_after >= 0 and @as(i32, @intCast(i)) >= stop_after) break;
         // Pre-attention norm.
         try cpu_math.rmsnorm(x_norm, stream, layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
 
@@ -233,6 +243,7 @@ pub fn forwardHybrid(
                 try full_attn.decodeStep(scratch, cfg, layer, &state.kv[i].?, x_norm, attn_out, pos);
             },
         }
+
 
         // First residual.
         for (stream, attn_out) |*si, ai| si.* += ai;

@@ -1,0 +1,40 @@
+#version 460
+// Split a 2×wide q_proj output into q and gate buffers, per Qwen3.5's
+// `attn_output_gate=True` convention.
+//
+// On disk q_proj has shape `[2*num_heads*head_dim, hidden]`. After
+// `q_proj @ x` the output is laid out as
+// `[h0_q, h0_gate, h1_q, h1_gate, …, h_{H-1}_q, h_{H-1}_gate]`
+// where each `h_h_q` and `h_h_gate` is `head_dim` floats. We want
+// two flat output buffers each of size `num_heads * head_dim` with the
+// per-head ordering preserved.
+//
+// One thread per output element (each thread reads one input and writes
+// one output). The same dispatch handles both q and gate via a single
+// kernel — q_out goes to binding 1, gate_out to binding 2.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In   { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Q    { float q_v[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Gate { float gate_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint num_heads;
+    uint head_dim;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint total = pc.num_heads * pc.head_dim;
+    if (g >= total) return;
+
+    uint h = g / pc.head_dim;
+    uint d = g % pc.head_dim;
+
+    uint q_in_off    = h * 2 * pc.head_dim + d;
+    uint gate_in_off = h * 2 * pc.head_dim + pc.head_dim + d;
+
+    q_v[g]    = in_v[q_in_off];
+    gate_v[g] = in_v[gate_in_off];
+}

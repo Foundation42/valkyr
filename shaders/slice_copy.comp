@@ -1,0 +1,22 @@
+#version 460
+// Copy a contiguous slice from one buffer to another with arbitrary
+// source/destination byte offsets and length. Used by the Qwen3.5
+// hybrid forward to extract q/k/v sub-buffers from the post-conv
+// `mixed_qkv` block (which holds q | k | v concatenated).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Src { float src_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Dst { float dst_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint src_off;   // start index in `src` (in float-elements, not bytes)
+    uint dst_off;   // start index in `dst`
+    uint n_elem;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n_elem) return;
+    dst_v[pc.dst_off + g] = src_v[pc.src_off + g];
+}

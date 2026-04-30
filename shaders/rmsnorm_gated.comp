@@ -1,0 +1,76 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Per-head RMSNorm + sigmoid-gated multiply. For each V-head h:
+//
+//     var      = mean(x[h, :]²)
+//     inv      = 1 / sqrt(var + eps)
+//     out[h, i] = norm_w[i] * (x[h, i] * inv) * silu(z[h, i])
+//
+// Used at the end of the Qwen3.5 GatedDeltaNet decode (`self.norm`).
+// Note this is the PLAIN-`weight` form (the Qwen3-Next RMSNormGated
+// class), NOT the `(1 + weight)` form of the surrounding RMSNorms —
+// see modeling_qwen3_next.py:67-82.
+//
+// One workgroup per head. Threads cooperate on the sum-of-squares
+// reduction, then each thread writes its portion of the gated output.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer X    { float x_v[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Z    { float z_v[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer W    { float w_v[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Out  { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint head_dim;
+    float eps;
+} pc;
+
+shared float subgroup_sums[32];
+shared float inv_shared;
+
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint head_off = h * pc.head_dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    // ── Phase 1: per-thread partial sum-of-squares ──────────────────
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += gl_WorkGroupSize.x) {
+        float v = x_v[head_off + i];
+        local_sum += v * v;
+    }
+
+    // ── Phase 2: subgroup reduction → workgroup total → inv ─────────
+    float sg_sum = subgroupAdd(local_sum);
+    if (subgroupElect()) {
+        subgroup_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sums[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            float mean_sq = total / float(pc.head_dim);
+            inv_shared = inversesqrt(mean_sq + pc.eps);
+        }
+    }
+    barrier();
+
+    float inv = inv_shared;
+
+    // ── Phase 3: write gated output ─────────────────────────────────
+    for (uint i = tid; i < pc.head_dim; i += gl_WorkGroupSize.x) {
+        float normed = w_v[i] * (x_v[head_off + i] * inv);
+        out_v[head_off + i] = normed * silu(z_v[head_off + i]);
+    }
+}

@@ -1,0 +1,59 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Per-head L2 normalisation for the Qwen3.5 GatedDeltaNet's Q and K
+// vectors. For each head h:
+//
+//     out[h, i] = in[h, i] / sqrt(sum(in[h, :]²) + eps)
+//
+// One workgroup per head; threads cooperate on the sum-of-squares
+// reduction. Eps follows the FLA library's convention of 1e-6 (passed
+// in via push constants for symmetry with rmsnorm).
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint head_dim;
+    float eps;
+} pc;
+
+shared float subgroup_sums[32];
+shared float inv_shared;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint head_off = h * pc.head_dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += gl_WorkGroupSize.x) {
+        float v = in_v[head_off + i];
+        local_sum += v * v;
+    }
+
+    float sg_sum = subgroupAdd(local_sum);
+    if (subgroupElect()) {
+        subgroup_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sums[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            inv_shared = inversesqrt(total + pc.eps);
+        }
+    }
+    barrier();
+
+    float inv = inv_shared;
+    for (uint i = tid; i < pc.head_dim; i += gl_WorkGroupSize.x) {
+        out_v[head_off + i] = in_v[head_off + i] * inv;
+    }
+}

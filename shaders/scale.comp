@@ -1,0 +1,19 @@
+#version 460
+// Elementwise `out[i] = in[i] * scale`. Used by the Qwen3.5 hybrid
+// forward to apply the 1/sqrt(head_k_dim) scaling to Q after L2-norm.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_elem;
+    float scale;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n_elem) return;
+    out_v[g] = in_v[g] * pc.scale;
+}

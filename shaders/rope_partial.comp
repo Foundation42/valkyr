@@ -1,0 +1,61 @@
+#version 460
+// Partial-rotation RoPE (Qwen3.5). Rotates only the first `rotary_dim`
+// elements of each `head_dim`-sized head; the trailing tail passes
+// through unchanged.
+//
+// Pairing convention matches HF's GPT-NeoX form: index j in [0, R/2)
+// pairs with index j + R/2 within each head, where R = rotary_dim.
+// Frequencies are computed with the rotary_dim denominator — *not*
+// the full head_dim — because HF builds inv_freq with `dim = int(
+// head_dim * partial_rotary_factor)`. Get that wrong and the cos/sin
+// table drifts by a factor of `partial_rotary_factor` and parity dies.
+//
+// One thread per output element. Threads in the rotary range read two
+// inputs (their pair partner and themselves) and write one output;
+// threads in the tail range just copy through. No shared memory, no
+// reductions — flat 1D grid.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint pos;
+    float theta_base;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint total = pc.n_heads * pc.head_dim;
+    if (g >= total) return;
+
+    uint i = g % pc.head_dim;
+
+    // Pass-through tail.
+    if (i >= pc.rotary_dim) {
+        out_v[g] = in_v[g];
+        return;
+    }
+
+    uint half_r = pc.rotary_dim / 2;
+    // freq depends only on (i mod half_r): pair partners share the angle.
+    uint freq_idx = (i < half_r) ? i : (i - half_r);
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
+    float angle = float(pc.pos) * freq;
+    float c_a = cos(angle);
+    float s_a = sin(angle);
+
+    if (i < half_r) {
+        float a = in_v[g];
+        float b = in_v[g + half_r];
+        out_v[g] = a * c_a - b * s_a;
+    } else {
+        float a = in_v[g - half_r];
+        float b = in_v[g];
+        out_v[g] = a * s_a + b * c_a;
+    }
+}

@@ -1,0 +1,60 @@
+#version 460
+// Single-step depthwise causal 1D conv update for the Qwen3.5
+// GatedDeltaNet's `conv1d`. Each forward step:
+//
+//   1. Shift `state[c, 0..K-1]` left by one column (drop oldest).
+//   2. Append `mixed_qkv[c]` in column K-1.
+//   3. out[c] = SiLU( sum_{k=0..K-1} state[c, k] * weight[c, 0, k] )
+//
+// One thread per channel c. Each thread reads 4 state values + 1 input
+// + 4 weights, writes 4 new state values + 1 output. State and weight
+// share the same row-major [conv_dim, K] layout. Kernel size K is
+// passed as a push constant so this shader works for any K up to a
+// small bound (Qwen3.5 uses 4); the loops are unrolled by the driver.
+
+// 256 threads per workgroup matches the convention assumed by
+// `recDispatch1D` in main.zig (groups = ceil(N / 256)). Anything smaller
+// causes partial coverage of conv_dim and silently zeros the tail —
+// this bit me hard during the GPU integration.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In    { float in_v[]; };       // mixed_qkv: [conv_dim]
+layout(set = 0, binding = 1, std430) readonly  buffer W     { float w_v[]; };        // weight:    [conv_dim * K]
+layout(set = 0, binding = 2, std430)           buffer State { float state_v[]; };    // state:     [conv_dim * K]
+layout(set = 0, binding = 3, std430) writeonly buffer Out   { float out_v[]; };      // mixed_qkv': [conv_dim]
+
+layout(push_constant) uniform Pc {
+    uint conv_dim;
+    uint kernel_size;
+} pc;
+
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.conv_dim) return;
+
+    uint base = c * pc.kernel_size;
+    uint K = pc.kernel_size;
+
+    // Read the new column once.
+    float new_v = in_v[c];
+
+    // Shift left, append, and accumulate the convolution in one pass.
+    // Position 0 = oldest after shift = state[c, 1] before update.
+    // Position K-1 = newest = `new_v`.
+    float acc = 0.0;
+    for (uint k = 0; k < K; ++k) {
+        float s_new;
+        if (k + 1 < K) {
+            s_new = state_v[base + k + 1];      // shift in old state[k+1]
+        } else {
+            s_new = new_v;                      // append new column
+        }
+        acc += s_new * w_v[base + k];
+        state_v[base + k] = s_new;              // commit new state in place
+    }
+    out_v[c] = silu(acc);
+}
