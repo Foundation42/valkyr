@@ -365,9 +365,12 @@ sense).
   peak. Most of the warm forward time is the FFN matmuls reading bf16
   weights memory-bandwidth-bound — proper shared-memory tiling, fused
   attention (FlashAttention-style), and a bf16 embedding kernel are
-  obvious wins. The Qwen3.5 chat path currently runs through fp32
-  matmul only (~2.5 tok/s on 4B); wiring its new linear-attn shaders
-  through `matmul_nt_v2_bf16` is the next cheap speedup.
+  obvious wins. The Qwen3.5 chat path now runs through
+  `matmul_nt_v2_bf16` for all per-layer projections (Q/K/V/O on
+  full-attn layers, the four in-projs + out_proj on linear-attn
+  layers, and the FFN trio): ~29 tok/s on the 4B and ~43 tok/s on the
+  0.8B at the same parity. The lm_head and embeddings stay fp32 (same
+  policy as Gemma).
 - TurboQuant TQ4 ships two block sizes (256 for Gemma, 128 for
   Qwen3); other head dims need a new shader pair. The Qwen3.5
   hybrid's full-attention layers could be retrofitted to TQ4-V but

@@ -4884,11 +4884,18 @@ const HybridChatKernels = struct {
     slice_copy: pipeline.Kernel,
     scale: pipeline.Kernel,
 
-    fn init(ctx: *const vk.Context) !HybridChatKernels {
+    fn init(ctx: *const vk.Context, precision: gpu_model.Precision) !HybridChatKernels {
+        // Mirrors `buildChatKernels`: bf16-aware matmul for the per-layer
+        // projections (q/k/v/o, in-projs, out_proj, FFN trio), but the
+        // lm_head stays fp32 because we upload it as fp32 unconditionally.
+        const matmul_spv: []align(4) const u8 = switch (precision) {
+            .fp32_all => &shaders.matmul_nt_v2,
+            .bf16_matmul => &shaders.matmul_nt_v2_bf16,
+        };
         return .{
             .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
             .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
-            .matmul = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+            .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
             .matmul_lm_head = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
             .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
             .swiglu = try pipeline.Kernel.init(ctx, &shaders.swiglu, 3, @sizeOf(GegluPush)),
@@ -5255,8 +5262,8 @@ fn runChatQwen35(
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    try stdout.print("uploading weights (fp32 path — bf16 not yet wired for hybrid kernels)...\n", .{});
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .fp32_all);
+    try stdout.print("uploading weights (bf16 path)...\n", .{});
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .bf16_matmul);
     defer gm.deinit(ctx.device);
 
     const max_pos: u32 = 2048;
@@ -5264,7 +5271,7 @@ fn runChatQwen35(
     defer sc.deinit(ctx.device);
     var state = try HybridChatState.init(gpa, &ctx, cfg, max_pos);
     defer state.deinit(ctx.device);
-    var ks = try HybridChatKernels.init(&ctx);
+    var ks = try HybridChatKernels.init(&ctx, gm.precision);
     defer ks.deinit();
 
     // Recorder pool sized for one full forward step. ~30 dispatches per
@@ -5362,6 +5369,11 @@ fn chatTurnHybrid(
     var prompt_idx: usize = 0;
     var generated: usize = 0;
 
+    // Time decode-only throughput: clock starts after prefill consumes
+    // the prompt, so the number reflects steady-state generation speed.
+    var t_decode_start: i128 = 0;
+    var decode_started = false;
+
     while (true) {
         if (pos.* > 0) try rec.reset();
         try rec.begin();
@@ -5374,6 +5386,11 @@ fn chatTurnHybrid(
         if (prompt_idx < prompt.items.len) {
             current = prompt.items[prompt_idx];
             continue;
+        }
+
+        if (!decode_started) {
+            t_decode_start = std.time.nanoTimestamp();
+            decode_started = true;
         }
 
         try sc.logits.readBack(ctx, f32, logits);
@@ -5389,6 +5406,13 @@ fn chatTurnHybrid(
         current = @intCast(next);
     }
     try stdout.print("\n", .{});
+
+    if (decode_started and generated > 0) {
+        const t_end = std.time.nanoTimestamp();
+        const ms_total = @as(f64, @floatFromInt(t_end - t_decode_start)) / 1_000_000.0;
+        const tokps = @as(f64, @floatFromInt(generated)) * 1000.0 / ms_total;
+        try stdout.print("[{d} tok in {d:.0} ms, {d:.1} tok/s]\n", .{ generated, ms_total, tokps });
+    }
 }
 
 // ── gpu-layer0-test: full layer 0 forward on GPU vs CPU ────────────
