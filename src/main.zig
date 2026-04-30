@@ -193,7 +193,17 @@ pub fn main() !void {
                 i += 1;
             }
         }
-        try runChat(allocator, args[2], user_msg, sp, seed, tq4v);
+        // Hybrid families need a different kernel set + per-layer
+        // SSM state plumbing — dispatch to the dedicated path.
+        const cfg_path = try std.fs.path.join(allocator, &.{ args[2], "config.json" });
+        defer allocator.free(cfg_path);
+        const cfg = try config_mod.Config.loadFromFile(allocator, cfg_path);
+        if (cfg.family.isHybrid()) {
+            if (tq4v) std.debug.print("note: --tq4v ignored on hybrid families (Qwen3.5)\n", .{});
+            try runChatQwen35(allocator, args[2], user_msg, sp, seed);
+        } else {
+            try runChat(allocator, args[2], user_msg, sp, seed, tq4v);
+        }
         return;
     }
 
@@ -4839,6 +4849,546 @@ fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) 
         return error.ParityFailed;
     }
     try stdout.print("\nPASS GPU --gpu-gen-qwen35 argmax matches CPU --gen ({d} → {s})\n", .{ sampled, out_str });
+}
+
+// ── chat REPL on Qwen3.5 (multi-position GPU hybrid forward) ──────
+//
+// Multi-token generation with the same shader set as `--gpu-gen-qwen35`,
+// extended to grow the KV cache + carry SSM state across decode steps.
+// Per token:
+//   - reset recorder, re-record forward with updated `pos`-dependent
+//     push constants (RoPE position, kv_write offset, attention n_pos)
+//   - submit, read back logits, sample, stream the decoded token
+//   - SSM state buffers (conv + recurrent) are not touched by us at
+//     this layer — the gated_delta_step shader updates them in place,
+//     so the next decode step naturally sees the previous step's state.
+
+const HybridChatKernels = struct {
+    embed: pipeline.Kernel,
+    rmsnorm: pipeline.Kernel,
+    matmul: pipeline.Kernel,
+    matmul_lm_head: pipeline.Kernel,
+    add: pipeline.Kernel,
+    swiglu: pipeline.Kernel,
+    rope_partial: pipeline.Kernel,
+    split_q_gate: pipeline.Kernel,
+    sigmoid_mul: pipeline.Kernel,
+    l2norm_per_head: pipeline.Kernel,
+    conv1d_update: pipeline.Kernel,
+    rmsnorm_gated: pipeline.Kernel,
+    gated_delta_step: pipeline.Kernel,
+    kv_write: pipeline.Kernel,
+    scores: pipeline.Kernel,
+    softmax: pipeline.Kernel,
+    attn_out: pipeline.Kernel,
+    slice_copy: pipeline.Kernel,
+    scale: pipeline.Kernel,
+
+    fn init(ctx: *const vk.Context) !HybridChatKernels {
+        return .{
+            .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
+            .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
+            .matmul = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+            .matmul_lm_head = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+            .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
+            .swiglu = try pipeline.Kernel.init(ctx, &shaders.swiglu, 3, @sizeOf(GegluPush)),
+            .rope_partial = try pipeline.Kernel.init(ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush)),
+            .split_q_gate = try pipeline.Kernel.init(ctx, &shaders.split_q_gate, 3, @sizeOf(SplitQGatePush)),
+            .sigmoid_mul = try pipeline.Kernel.init(ctx, &shaders.sigmoid_mul, 3, @sizeOf(SigmoidMulPush)),
+            .l2norm_per_head = try pipeline.Kernel.init(ctx, &shaders.l2norm_per_head, 2, @sizeOf(L2normPush)),
+            .conv1d_update = try pipeline.Kernel.init(ctx, &shaders.conv1d_update, 4, @sizeOf(Conv1dUpdatePush)),
+            .rmsnorm_gated = try pipeline.Kernel.init(ctx, &shaders.rmsnorm_gated, 4, @sizeOf(RmsnormGatedPush)),
+            .gated_delta_step = try pipeline.Kernel.init(ctx, &shaders.gated_delta_step, 9, @sizeOf(GatedDeltaStepPush)),
+            .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
+            .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
+            .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
+            .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
+            .slice_copy = try pipeline.Kernel.init(ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush)),
+            .scale = try pipeline.Kernel.init(ctx, &shaders.scale, 2, @sizeOf(ScalePush)),
+        };
+    }
+
+    fn deinit(self: *HybridChatKernels) void {
+        inline for (.{
+            "embed",            "rmsnorm",        "matmul",           "matmul_lm_head", "add",
+            "swiglu",           "rope_partial",   "split_q_gate",     "sigmoid_mul",    "l2norm_per_head",
+            "conv1d_update",    "rmsnorm_gated",  "gated_delta_step", "kv_write",       "scores",
+            "softmax",          "attn_out",       "slice_copy",       "scale",
+        }) |fname| {
+            @field(self, fname).deinit();
+        }
+    }
+};
+
+const HybridChatScratch = struct {
+    stream: buffer.Buffer,
+    x_norm: buffer.Buffer,
+    mid_norm: buffer.Buffer,
+    attn_out: buffer.Buffer,
+    gate: buffer.Buffer,
+    up: buffer.Buffer,
+    fused: buffer.Buffer,
+    ffn_out: buffer.Buffer,
+    final_norm_out: buffer.Buffer,
+    logits: buffer.Buffer,
+    // Linear-attn scratch
+    mixed_qkv: buffer.Buffer,
+    mixed_qkv_post: buffer.Buffer,
+    z: buffer.Buffer,
+    b_raw: buffer.Buffer,
+    a_raw: buffer.Buffer,
+    q_lin: buffer.Buffer,
+    k_lin: buffer.Buffer,
+    v_lin: buffer.Buffer,
+    q_lin_n: buffer.Buffer,
+    k_lin_n: buffer.Buffer,
+    y: buffer.Buffer,
+    post_norm: buffer.Buffer,
+    // Full-attn scratch
+    q_gate: buffer.Buffer,
+    q: buffer.Buffer,
+    gate_attn: buffer.Buffer,
+    k: buffer.Buffer,
+    v: buffer.Buffer,
+    qrot: buffer.Buffer,
+    krot: buffer.Buffer,
+    head_out: buffer.Buffer,
+    head_out_gated: buffer.Buffer,
+    scores: buffer.Buffer,
+
+    fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32) !HybridChatScratch {
+        const f = @sizeOf(f32);
+        const hidden = cfg.hidden_size;
+        const inter = cfg.intermediate_size;
+        const head_dim = cfg.head_dim;
+        const n_q = cfg.num_attention_heads;
+        const n_kv = cfg.num_key_value_heads;
+        const q_dim = n_q * head_dim;
+        const kv_dim = n_kv * head_dim;
+        const q_proj_rows = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
+        const conv_dim = cfg.linearAttnConvDim();
+        const value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+        const key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+        return .{
+            .stream          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .x_norm          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .mid_norm        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .attn_out        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .gate            = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
+            .up              = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
+            .fused           = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
+            .ffn_out         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .final_norm_out  = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .logits          = try buffer.Buffer.initDeviceOnly(ctx, cfg.vocab_size * f),
+            .mixed_qkv       = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
+            .mixed_qkv_post  = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
+            .z               = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
+            .b_raw           = try buffer.Buffer.initDeviceOnly(ctx, cfg.linear_num_value_heads * f),
+            .a_raw           = try buffer.Buffer.initDeviceOnly(ctx, cfg.linear_num_value_heads * f),
+            .q_lin           = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
+            .k_lin           = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
+            .v_lin           = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
+            .q_lin_n         = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
+            .k_lin_n         = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
+            .y               = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
+            .post_norm       = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
+            .q_gate          = try buffer.Buffer.initDeviceOnly(ctx, q_proj_rows * f),
+            .q               = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .gate_attn       = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .k               = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
+            .v               = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
+            .qrot            = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .krot            = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
+            .head_out        = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .head_out_gated  = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
+            .scores          = try buffer.Buffer.initDeviceOnly(ctx, n_q * max_pos * f),
+        };
+    }
+
+    fn deinit(self: *HybridChatScratch, device: vk.c.VkDevice) void {
+        inline for (.{
+            "stream", "x_norm", "mid_norm", "attn_out",
+            "gate", "up", "fused", "ffn_out",
+            "final_norm_out", "logits",
+            "mixed_qkv", "mixed_qkv_post", "z", "b_raw", "a_raw",
+            "q_lin", "k_lin", "v_lin", "q_lin_n", "k_lin_n",
+            "y", "post_norm",
+            "q_gate", "q", "gate_attn", "k", "v", "qrot", "krot",
+            "head_out", "head_out_gated", "scores",
+        }) |fname| {
+            @field(self, fname).deinit(device);
+        }
+    }
+};
+
+const HybridChatState = struct {
+    /// `[num_layers]` per-layer Gated DeltaNet conv state. Slots for
+    /// full-attention layers are `null`.
+    ssm_conv: []?buffer.Buffer,
+    /// `[num_layers]` per-layer Gated DeltaNet recurrent state.
+    ssm_rec: []?buffer.Buffer,
+    /// `[num_layers]` per-layer KV-cache K. Slots for linear layers
+    /// are `null`. Sized for `max_pos` positions.
+    kv_k: []?buffer.Buffer,
+    /// `[num_layers]` per-layer KV-cache V.
+    kv_v: []?buffer.Buffer,
+    allocator: std.mem.Allocator,
+
+    fn init(gpa: std.mem.Allocator, ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32) !HybridChatState {
+        const f = @sizeOf(f32);
+        const conv_dim = cfg.linearAttnConvDim();
+        const conv_kernel = cfg.linear_conv_kernel_dim;
+        const head_k = cfg.linear_key_head_dim;
+        const head_v = cfg.linear_value_head_dim;
+        const n_v_heads = cfg.linear_num_value_heads;
+        const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+
+        var ssm_conv = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
+        @memset(ssm_conv, null);
+        var ssm_rec = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
+        @memset(ssm_rec, null);
+        var kv_k = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
+        @memset(kv_k, null);
+        var kv_v = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
+        @memset(kv_v, null);
+
+        for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| switch (lt) {
+            .linear_attention => {
+                ssm_conv[i] = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * conv_kernel * f);
+                ssm_rec[i] = try buffer.Buffer.initDeviceOnly(ctx, n_v_heads * head_k * head_v * f);
+            },
+            .full_attention => {
+                kv_k[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
+                kv_v[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
+            },
+        };
+        return .{ .ssm_conv = ssm_conv, .ssm_rec = ssm_rec, .kv_k = kv_k, .kv_v = kv_v, .allocator = gpa };
+    }
+
+    fn deinit(self: *HybridChatState, device: vk.c.VkDevice) void {
+        for (self.ssm_conv) |*b| if (b.*) |*v| v.deinit(device);
+        for (self.ssm_rec) |*b| if (b.*) |*v| v.deinit(device);
+        for (self.kv_k) |*b| if (b.*) |*v| v.deinit(device);
+        for (self.kv_v) |*b| if (b.*) |*v| v.deinit(device);
+        self.allocator.free(self.ssm_conv);
+        self.allocator.free(self.ssm_rec);
+        self.allocator.free(self.kv_k);
+        self.allocator.free(self.kv_v);
+    }
+};
+
+/// Record one decode step into the recorder. `pos` is the position
+/// being written this step (0-based); `n_pos = pos + 1` is the number
+/// of cached K/V slots that the attention reads. SSM state buffers are
+/// updated in place by the gated_delta_step shader; we don't pass `pos`
+/// to the linear path because it has no notion of position.
+fn recordHybridForwardStep(
+    rec: *gpu_recorder.Recorder,
+    sc: *const HybridChatScratch,
+    state: *const HybridChatState,
+    gm: *const gpu_model.GpuModel,
+    cfg: config_mod.Config,
+    k: *const HybridChatKernels,
+    pos: usize,
+    token_id: u32,
+    max_pos: u32,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const vocab: u32 = @intCast(cfg.vocab_size);
+    const head_dim: u32 = @intCast(cfg.head_dim);
+    const n_q_heads: u32 = @intCast(cfg.num_attention_heads);
+    const n_kv_heads: u32 = @intCast(cfg.num_key_value_heads);
+    const heads_per_kv: u32 = n_q_heads / n_kv_heads;
+    const q_dim: u32 = n_q_heads * head_dim;
+    const q_proj_rows: u32 = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
+    const kv_dim: u32 = n_kv_heads * head_dim;
+    const rotary_dim: u32 = @intFromFloat(@as(f32, @floatFromInt(head_dim)) * cfg.partial_rotary_factor);
+
+    const conv_dim: u32 = @intCast(cfg.linearAttnConvDim());
+    const value_dim: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_value_head_dim);
+    const key_dim: u32 = @intCast(cfg.linear_num_key_heads * cfg.linear_key_head_dim);
+    const n_v_heads: u32 = @intCast(cfg.linear_num_value_heads);
+    const n_k_heads_lin: u32 = @intCast(cfg.linear_num_key_heads);
+    const head_k: u32 = @intCast(cfg.linear_key_head_dim);
+    const head_v: u32 = @intCast(cfg.linear_value_head_dim);
+    const conv_kernel: u32 = @intCast(cfg.linear_conv_kernel_dim);
+    const q_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.linear_key_head_dim)));
+
+    const gemma_quirk: u32 = if (cfg.family.rmsnormAddOne()) 1 else 0;
+    const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    const qkn_push = RmsnormPush{ .dim = head_dim, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    const add_push = AddInPlacePush{ .n = hidden };
+    const embed_push = EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
+    const swiglu_push = GegluPush{ .n = inter };
+    const conv1d_push = Conv1dUpdatePush{ .conv_dim = conv_dim, .kernel_size = conv_kernel };
+    const l2_push = L2normPush{ .head_dim = head_k, .eps = 1e-6 };
+    const rms_gated_push = RmsnormGatedPush{ .head_dim = head_v, .eps = cfg.rms_norm_eps };
+    const gds_push = GatedDeltaStepPush{
+        .num_k_heads = n_k_heads_lin,
+        .num_v_heads = n_v_heads,
+        .head_k = head_k,
+        .head_v = head_v,
+    };
+    const split_push = SplitQGatePush{ .num_heads = n_q_heads, .head_dim = head_dim };
+    const sigmul_push = SigmoidMulPush{ .n_elem = q_dim };
+    const rope_q_push = RopePartialPush{
+        .n_heads = n_q_heads,
+        .head_dim = head_dim,
+        .rotary_dim = rotary_dim,
+        .pos = @intCast(pos),
+        .theta_base = cfg.rope_theta,
+    };
+    const rope_k_push = RopePartialPush{
+        .n_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .rotary_dim = rotary_dim,
+        .pos = @intCast(pos),
+        .theta_base = cfg.rope_theta,
+    };
+    const kv_write_push = KvWritePush{ .n = kv_dim, .dst_off = @as(u32, @intCast(pos)) * kv_dim };
+    const n_pos: u32 = @intCast(pos + 1);
+    const scores_push = AttnScoresPush{
+        .n_heads = n_q_heads,
+        .heads_per_kv = heads_per_kv,
+        .head_dim = head_dim,
+        .n_pos = n_pos,
+        .kv_stride = kv_dim,
+        .scores_stride = max_pos,
+        .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+    };
+    const softmax_push = SoftmaxPush{ .dim = n_pos, .stride = max_pos };
+    const attn_out_push = AttnOutputPush{
+        .n_heads = n_q_heads,
+        .heads_per_kv = heads_per_kv,
+        .head_dim = head_dim,
+        .n_pos = n_pos,
+        .kv_stride = kv_dim,
+        .scores_stride = max_pos,
+    };
+
+    // Embed lookup → residual stream.
+    try recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+
+    for (gm.layers, 0..) |*layer, i| {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
+
+        switch (layer.layer_type) {
+            .linear_attention => {
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_qkv.?, &sc.mixed_qkv }, 1, conv_dim, hidden);
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_z.?, &sc.z }, 1, value_dim, hidden);
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_b.?, &sc.b_raw }, 1, n_v_heads, hidden);
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_a.?, &sc.a_raw }, 1, n_v_heads, hidden);
+                try recDispatch1D(rec, &k.conv1d_update, &.{ &sc.mixed_qkv, &layer.conv1d_weight.?, &state.ssm_conv[i].?, &sc.mixed_qkv_post }, &conv1d_push, conv_dim);
+
+                const slice_q_push = SliceCopyPush{ .src_off = 0,           .dst_off = 0, .n_elem = key_dim };
+                const slice_k_push = SliceCopyPush{ .src_off = key_dim,     .dst_off = 0, .n_elem = key_dim };
+                const slice_v_push = SliceCopyPush{ .src_off = 2 * key_dim, .dst_off = 0, .n_elem = value_dim };
+                try recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.q_lin }, &slice_q_push, key_dim);
+                try recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.k_lin }, &slice_k_push, key_dim);
+                try recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.v_lin }, &slice_v_push, value_dim);
+
+                try rec.dispatch(&k.l2norm_per_head, &.{ &sc.q_lin, &sc.q_lin_n }, &l2_push, n_k_heads_lin, 1, 1);
+                try rec.dispatch(&k.l2norm_per_head, &.{ &sc.k_lin, &sc.k_lin_n }, &l2_push, n_k_heads_lin, 1, 1);
+                const scale_push = ScalePush{ .n = key_dim, .scale = q_scale };
+                try recDispatch1D(rec, &k.scale, &.{ &sc.q_lin_n, &sc.q_lin }, &scale_push, key_dim);
+
+                try rec.dispatch(&k.gated_delta_step, &.{
+                    &state.ssm_rec[i].?, &sc.q_lin, &sc.k_lin_n, &sc.v_lin,
+                    &sc.b_raw, &sc.a_raw, &layer.A_log.?, &layer.dt_bias.?,
+                    &sc.y,
+                }, &gds_push, n_v_heads, 1, 1);
+                try rec.dispatch(&k.rmsnorm_gated, &.{ &sc.y, &sc.z, &layer.ssm_norm_weight.?, &sc.post_norm }, &rms_gated_push, n_v_heads, 1, 1);
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.post_norm, &layer.out_proj.?, &sc.attn_out }, 1, hidden, value_dim);
+            },
+            .full_attention => {
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q_gate }, 1, q_proj_rows, hidden);
+                try recDispatch1D(rec, &k.split_q_gate, &.{ &sc.q_gate, &sc.q, &sc.gate_attn }, &split_push, q_dim);
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
+                try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.q, &layer.q_norm.?, &sc.q }, &qkn_push, n_q_heads);
+                try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.k, &layer.k_norm.?, &sc.k }, &qkn_push, n_kv_heads);
+                try recDispatch1D(rec, &k.rope_partial, &.{ &sc.q, &sc.qrot }, &rope_q_push, n_q_heads * head_dim);
+                try recDispatch1D(rec, &k.rope_partial, &.{ &sc.k, &sc.krot }, &rope_k_push, n_kv_heads * head_dim);
+                try recDispatch1D(rec, &k.kv_write, &.{ &sc.krot, &state.kv_k[i].? }, &kv_write_push, kv_dim);
+                try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &state.kv_v[i].? }, &kv_write_push, kv_dim);
+                try rec.dispatch(&k.scores, &.{ &sc.qrot, &state.kv_k[i].?, &sc.scores }, &scores_push, n_q_heads * n_pos, 1, 1);
+                try recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &softmax_push, n_q_heads);
+                try rec.dispatch(&k.attn_out, &.{ &sc.scores, &state.kv_v[i].?, &sc.head_out }, &attn_out_push, n_q_heads * head_dim, 1, 1);
+                try recDispatch1D(rec, &k.sigmoid_mul, &.{ &sc.head_out, &sc.gate_attn, &sc.head_out_gated }, &sigmul_push, q_dim);
+                try recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out_gated, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
+            },
+        }
+
+        try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
+        try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+        try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
+        try recDispatch1D(rec, &k.swiglu, &.{ &sc.gate, &sc.up, &sc.fused }, &swiglu_push, inter);
+        try recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
+        try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
+    }
+
+    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+    try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+}
+
+fn runChatQwen35(
+    gpa: std.mem.Allocator,
+    dir_path: []const u8,
+    single_msg: ?[]const u8,
+    sample_params: cpu_forward.SampleParams,
+    seed: u64,
+) !void {
+    var cpu = try model_mod.Model.load(gpa, dir_path);
+    defer cpu.deinit();
+    const cfg = cpu.config;
+    if (!cfg.family.isHybrid()) return error.NotHybridFamily;
+
+    const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{dir_path});
+    defer gpa.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(gpa, tok_path);
+    defer tok.deinit();
+
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    try stdout.print("uploading weights (fp32 path — bf16 not yet wired for hybrid kernels)...\n", .{});
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+
+    const max_pos: u32 = 2048;
+    var sc = try HybridChatScratch.init(&ctx, cfg, max_pos);
+    defer sc.deinit(ctx.device);
+    var state = try HybridChatState.init(gpa, &ctx, cfg, max_pos);
+    defer state.deinit(ctx.device);
+    var ks = try HybridChatKernels.init(&ctx);
+    defer ks.deinit();
+
+    // Recorder pool sized for one full forward step. ~30 dispatches per
+    // linear layer + ~16 per full layer + ~3 head/tail = up to ~30*32 +
+    // 3 ≈ 1k sets. Round generously.
+    const sets_per_step: u32 = @intCast(@max(@as(usize, 1024), cfg.num_hidden_layers * 40));
+    var rec = try gpu_recorder.Recorder.init(&ctx, sets_per_step, sets_per_step * 4);
+    defer rec.deinit();
+
+    const tmpl = try ChatTemplate.resolve(cfg.family, &tok);
+
+    const logits = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(logits);
+    const sample_scratch = try gpa.alloc(f32, cfg.vocab_size * 2);
+    defer gpa.free(sample_scratch);
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+
+    if (sample_params.temperature == 0.0 or sample_params.top_k == 1 or
+        (sample_params.top_p >= 1.0 and sample_params.top_k == 0 and sample_params.temperature == 1.0))
+    {
+        try stdout.print("sampling: greedy\n", .{});
+    } else {
+        try stdout.print("sampling: temp={d} top_k={d} top_p={d} seed={d}\n", .{
+            sample_params.temperature, sample_params.top_k, sample_params.top_p, seed,
+        });
+    }
+
+    var pos: usize = 0;
+
+    if (single_msg) |m| {
+        try chatTurnHybrid(gpa, &ctx, &rec, &sc, &state, &gm, cfg, &ks, &tok, m, &pos, logits, sample_scratch, sample_params, rng, tmpl, false, max_pos);
+        return;
+    }
+
+    try stdout.print("\n{s} (Ctrl-D to exit)\n", .{tmpl.banner()});
+    const stdin = std.io.getStdIn().reader();
+    var line_buf: [4096]u8 = undefined;
+    while (true) {
+        try stdout.print("\nuser> ", .{});
+        const maybe_line = try stdin.readUntilDelimiterOrEof(&line_buf, '\n');
+        const line = maybe_line orelse {
+            try stdout.print("\n", .{});
+            break;
+        };
+        if (line.len == 0) continue;
+        try chatTurnHybrid(gpa, &ctx, &rec, &sc, &state, &gm, cfg, &ks, &tok, line, &pos, logits, sample_scratch, sample_params, rng, tmpl, true, max_pos);
+        if (pos >= max_pos - 64) {
+            try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
+            break;
+        }
+    }
+}
+
+fn chatTurnHybrid(
+    gpa: std.mem.Allocator,
+    ctx: *const vk.Context,
+    rec: *gpu_recorder.Recorder,
+    sc: *const HybridChatScratch,
+    state: *const HybridChatState,
+    gm: *const gpu_model.GpuModel,
+    cfg: config_mod.Config,
+    ks: *const HybridChatKernels,
+    tok: *const tokenizer_mod.Tokenizer,
+    user_msg: []const u8,
+    pos: *usize,
+    logits: []f32,
+    sample_scratch: []f32,
+    sample_params: cpu_forward.SampleParams,
+    rng: std.Random,
+    tmpl: ChatTemplate,
+    is_repl: bool,
+    max_pos: u32,
+) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    var prompt = std.ArrayList(u32).init(gpa);
+    defer prompt.deinit();
+    try tmpl.composePrompt(gpa, tok, user_msg, pos.* == 0, &prompt);
+
+    if (!is_repl) {
+        try stdout.print("\nprompt ({d} tokens, starting at pos {d}):\n  ", .{ prompt.items.len, pos.* });
+        for (prompt.items) |id| try printTokenForDisplay(gpa, stdout, tok, id);
+        try stdout.print("\n\nresponse: ", .{});
+    } else {
+        try stdout.print("model> ", .{});
+    }
+
+    const eos: ?u32 = cfg.eos_token_id;
+    const eot: u32 = tmpl.end_of_turn;
+    const max_response: usize = 256;
+
+    var current: u32 = prompt.items[0];
+    var prompt_idx: usize = 0;
+    var generated: usize = 0;
+
+    while (true) {
+        if (pos.* > 0) try rec.reset();
+        try rec.begin();
+        try recordHybridForwardStep(rec, sc, state, gm, cfg, ks, pos.*, current, max_pos);
+        try rec.endAndSubmit();
+
+        prompt_idx += 1;
+        pos.* += 1;
+
+        if (prompt_idx < prompt.items.len) {
+            current = prompt.items[prompt_idx];
+            continue;
+        }
+
+        try sc.logits.readBack(ctx, f32, logits);
+        const next = try cpu_forward.sample(logits, sample_params, rng, sample_scratch);
+
+        if (next == eot) break;
+        if (eos != null and next == eos.?) break;
+
+        try printTokenForDisplay(gpa, stdout, tok, @intCast(next));
+
+        generated += 1;
+        if (generated >= max_response) break;
+        current = @intCast(next);
+    }
+    try stdout.print("\n", .{});
 }
 
 // ── gpu-layer0-test: full layer 0 forward on GPU vs CPU ────────────

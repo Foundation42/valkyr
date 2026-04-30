@@ -18,7 +18,7 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
 
 ## What works today
 
-- **Two model families end-to-end on GPU**:
+- **Three model families end-to-end on GPU**:
   - **Gemma 1** (`google/gemma-2b-it`): 18-layer transformer, multi-
     query attention, GeGLU FFN, RoPE, RMSNorm with `(1+w)`, tied LM
     head, SentencePiece tokenizer, `<bos>`/`<start_of_turn>` chat
@@ -28,12 +28,30 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
     RMSNorm, per-head q_norm/k_norm before RoPE, tied LM head, byte-
     level BPE tokenizer, ChatML (`<|im_start|>` / `<|im_end|>`)
     template.
+  - **Qwen3.5** (`Qwen/Qwen3.5-{0.8B,2B,4B}`): 24- to 32-layer
+    **hybrid Gated DeltaNet + full-attention** model. Three out of
+    every four layers are linear-attention (Gated DeltaNet, Yang et
+    al. 2024 — discounted linear-attn with delta-rule writes); every
+    fourth is a full-attention block with a 2×-wide `q_proj`
+    `attn_output_gate` and **partial RoPE** (rotary_dim = head_dim /
+    4). Per-head `q_norm` / `k_norm` use the `(1 + w)` form. Hybrid
+    state plumbing is two flavors: full layers grow a standard KV
+    cache; linear layers carry a constant-size `(conv_state,
+    recurrent_state)` regardless of context length. Same ChatML
+    tokenizer family as Qwen3 but with a different vocab (248320
+    tokens, includes vision and tool-call specials we ignore). The
+    multimodal vision tower and the multi-token-prediction head are
+    skipped at load time.
 - **End-to-end forward pass on GPU** — embed → N × (rmsnorm → Q/K/V →
   [q_norm/k_norm if present] → RoPE → attention with KV cache → o_proj
   → residual → rmsnorm → gated FFN → residual) → final norm → LM head
   → logits. Family-specific differences (RMSNorm style, FFN
   activation, embedding scale, q_norm/k_norm) are gated cleanly so
-  Gemma and Qwen3 share the same recorder.
+  Gemma and Qwen3 share the same recorder. The Qwen3.5 hybrid path
+  uses a parallel recorder with nine extra GLSL shaders for the Gated
+  DeltaNet primitives (causal `conv1d_update`, `l2norm_per_head`,
+  `gated_delta_step`, `rmsnorm_gated`, `rope_partial`, `split_q_gate`,
+  `sigmoid_mul`, `slice_copy`, `scale`).
 - **Multi-turn chat** with prompt prefill, KV cache persistence across
   turns, family-dispatched chat templates, and per-family stop tokens.
 - **TurboQuant TQ4 V-cache** on both families — opt in with `--tq4v`.
@@ -47,9 +65,9 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
   across runs at the last digit due to GPU subgroup reduction order;
   the CPU oracle is bit-deterministic.)
 - **HuggingFace tokenizer** — auto-detects SentencePiece (Gemma) vs
-  GPT-2-style byte-level BPE (Qwen3 / Llama 3) at load time. Both
-  encode paths verified bit-exact against the HF `tokenizers`
-  reference on every prompt we've thrown at them.
+  GPT-2-style byte-level BPE (Qwen3 / Qwen3.5 / Llama 3) at load
+  time. Both encode paths verified bit-exact against the HF
+  `tokenizers` reference on every prompt we've thrown at them.
 
 ## How fast it goes (fp32 V-cache, baseline)
 
@@ -112,19 +130,25 @@ Every layer is parity-verified against the layer above. For TurboQuant
 the chain extends one tier deeper:
 
 ```
-HuggingFace transformers (Python, fp32)         Gemma:  argmax = 229711  (▁increa)
-   │                                            Qwen3:  argmax =    220  (' ')
+HuggingFace transformers (Python, fp32)         Gemma:    argmax = 229711  (▁increa)
+   │                                            Qwen3:    argmax =    220  (' ')
+   │                                            Qwen3.5:  argmax =    266  ('at')
    ▼
-CPU forward (Zig, fp32, lazy bf16 conv)         Gemma:  ✓ matches HF, max |Δ| < 1e-3
-                                                Qwen3:  ✓ matches HF, max |Δ| < 1e-3
+CPU forward (Zig, fp32, lazy bf16 conv)         Gemma:    ✓ matches HF, max |Δ| < 1e-3
+                                                Qwen3:    ✓ matches HF, max |Δ| < 1e-3
+                                                Qwen3.5:  ✓ matches HF, max |Δ| ≤ 1e-4
    │
    ▼
-GPU forward (Vulkan SPIR-V, family-gated)       Gemma:  ✓ matches CPU
-                                                Qwen3:  ✓ matches CPU
+GPU forward (Vulkan SPIR-V, family-gated)       Gemma:    ✓ matches CPU
+                                                Qwen3:    ✓ matches CPU
+                                                Qwen3.5:  ✓ matches CPU, max |Δ| ≤ 3e-4
    │
    ▼
 GPU TurboQuant V-cache (Vulkan + TQ4)           Gemma (256-block): top-5 match
                                                 Qwen3 (128-block): coherent generation
+                                                Qwen3.5: not yet — full-attn-only
+                                                  layers compress fine, linear-attn
+                                                  state is already small.
 ```
 
 The Qwen3 parity result is dramatic: HF top-5 logits are
@@ -134,6 +158,14 @@ The Qwen3 parity result is dramatic: HF top-5 logits are
 the five logits match to four decimal places after 36 transformer
 layers, q_norm/k_norm, SwiGLU, and the byte-level BPE tokenizer. Run
 it yourself: `python3 scripts/cross_validate_qwen3.py`.
+
+Qwen3.5 (24- or 32-layer hybrid) is the harder result: per-layer
+parity vs HF on layer 0 (Gated DeltaNet) lands at max |Δ| = 1.86e-8
+(single fp32 ULP); on layer 3 (full-attention with attn_output_gate +
+partial RoPE) max |Δ| = 2.25e-7; end-to-end the GPU↔CPU diff over the
+248320-element vocab is max |Δ| ≤ 3e-4 — fp32 noise. Run it yourself:
+`python3 scripts/cross_validate_qwen35.py` and
+`./valkyr --gpu-gen-qwen35 <Qwen3.5 dir> 248044`.
 
 For TurboQuant specifically, the 256-block pack kernel is **256/256
 indices bit-exact** versus both the CPU oracle and the YATQ Python
@@ -212,6 +244,9 @@ zig build run
 
 # GPU forward + parity check vs the CPU oracle
 ./zig-out/bin/valkyr --gpu-gen <model-dir> <token-id>
+
+# GPU forward + parity for Qwen3.5 hybrid (linear + full attention)
+./zig-out/bin/valkyr --gpu-gen-qwen35 <Qwen3.5-dir> 248044
 
 # GPU forward with TQ4 V-cache, side-by-side vs fp32 baseline
 ./zig-out/bin/valkyr --gpu-gen-tq4v <model-dir> <token-id>
