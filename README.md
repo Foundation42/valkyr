@@ -357,16 +357,21 @@ sense).
 
 ## Limitations
 
-- **Gemma 1 only** today. Llama 2 / 3 / Mistral / Qwen should mostly
-  fall out from the `Family` enum + a SwiGLU shader, but isn't
-  validated yet.
+- **Gemma 1, Qwen3, and Qwen3.5 today.** Llama 2 / 3 / Mistral are
+  expected to fall out cheaply from the existing `Family` enum +
+  SwiGLU shader path; Gemma 2 / 3 (sliding-window attention) and the
+  Qwen3.5 multimodal vision tower are larger lifts.
 - The naive `matmul_nt_v2` kernel hits roughly 0.1% of the 3090's fp32
   peak. Most of the warm forward time is the FFN matmuls reading bf16
   weights memory-bandwidth-bound — proper shared-memory tiling, fused
   attention (FlashAttention-style), and a bf16 embedding kernel are
-  obvious wins.
-- TurboQuant TQ4 head_dim is hardcoded to 256 (Gemma 2B). Other
-  architectures need a parameterised `BLOCK_SIZE` in the shaders.
+  obvious wins. The Qwen3.5 chat path currently runs through fp32
+  matmul only (~2.5 tok/s on 4B); wiring its new linear-attn shaders
+  through `matmul_nt_v2_bf16` is the next cheap speedup.
+- TurboQuant TQ4 ships two block sizes (256 for Gemma, 128 for
+  Qwen3); other head dims need a new shader pair. The Qwen3.5
+  hybrid's full-attention layers could be retrofitted to TQ4-V but
+  the linear-attn layers have no growing KV cache to compress.
 - TurboQuant TQ3 (3-bit) is not yet implemented.
 - TurboQuant K-side compression (symmetric K=TQ / V=TQ) is not yet
   implemented.
