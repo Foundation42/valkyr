@@ -18,11 +18,25 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
 
 ## What works today
 
-- **Four model families end-to-end on GPU**:
+- **Five model families end-to-end on GPU**:
   - **Gemma 1** (`google/gemma-2b-it`): 18-layer transformer, multi-
     query attention, GeGLU FFN, RoPE, RMSNorm with `(1+w)`, tied LM
     head, SentencePiece tokenizer, `<bos>`/`<start_of_turn>` chat
     template.
+  - **Llama 3 / Llama 3.2** (`meta-llama/Llama-3.2-3B-Instruct`):
+    28-layer transformer, 3:1 grouped-query attention (24 heads /
+    8 KV heads × head_dim 128), SwiGLU FFN, RoPE (θ=500K), plain
+    RMSNorm, tied LM head, byte-level BPE tokenizer (vocab 128 K),
+    Llama 3 header-id chat template
+    (`<|start_header_id|>` / `<|end_header_id|>` / `<|eot_id|>`).
+    `rope_scaling` (yarn-style) is silently ignored — fine for the
+    8K trained context, would need work for the full 128K.
+  - **Llama 2-arch chat fine-tunes** (`TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+    and analogous): same Llama-arch loader (SiLU, plain RMSNorm,
+    untied lm_head, Llama-style RoPE, GQA), 32 K SentencePiece vocab,
+    with the auto-detected Zephyr-style chat template
+    (`<s><|user|>\n{msg}</s>\n<|assistant|>\n` — markers as text,
+    not specials).
   - **Qwen3** (`Qwen/Qwen3-4B-Instruct-2507`): 36-layer transformer,
     4:1 grouped-query attention, SwiGLU FFN, RoPE (θ=5M), plain
     RMSNorm, per-head q_norm/k_norm before RoPE, tied LM head, byte-
@@ -139,6 +153,9 @@ greedy at `--temp 0`:
 | model | precision | tok/s |
 |---|---|---|
 | Gemma 2B IT | bf16 (layers) + fp32 (embed/lm_head) | ~143 |
+| Llama 3.2 3B Instruct | bf16 | ~71 |
+| Llama 3.2 3B Instruct | `--q4k` | ~89 |
+| TinyLlama 1.1B Chat | bf16 | ~171 |
 | Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~55 |
 | Qwen3.5 0.8B | bf16 | ~113 |
 | Qwen3.5 0.8B | `--q4` | ~104 |
