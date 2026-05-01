@@ -217,6 +217,7 @@ pub fn main() !void {
     try runQ4_0Smoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
+    try runGpuMatmulQ4_0Smoke(allocator);
     try runGpuRmsnormSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
@@ -707,6 +708,104 @@ fn runGpuMatmulV2Smoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS GPU matmul_nt_v2 synthetic (cooperative-K, 2×3 · (4×3)ᵀ → 2×4)\n", .{});
+}
+
+// ── gpu matmul_nt_v2_q4_0 smoke: int4 weights vs CPU dequant oracle ─
+//
+// Round-trips fp32 weights through the CPU q4_0 quantizer + GPU-layout
+// repack, dispatches the q4_0 matmul kernel, and compares its result
+// against `A · dequant(B)^T` computed entirely on the CPU. The GPU
+// shader and the CPU dequant share the same code path here (both
+// decode (idx-8)*d), so the two should agree to within fp32 reduction
+// rounding (max |Δ| ≲ 1e-3 at K=128). Per-element MSE on Gaussian
+// inputs is dominated by the q4_0 quantization itself, not by GPU
+// arithmetic — we measure GPU↔CPU agreement, not q4_0 quality.
+
+fn runGpuMatmulQ4_0Smoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const m: u32 = 2;
+    const n: u32 = 4;
+    const k: u32 = 128; // multiple of 32
+
+    var prng = std.Random.DefaultPrng.init(0xC0DECAFEBABE);
+    const r = prng.random();
+
+    const a_f32 = try allocator.alloc(f32, m * k);
+    defer allocator.free(a_f32);
+    const b_f32 = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_f32);
+    for (a_f32) |*v| v.* = r.floatNorm(f32);
+    for (b_f32) |*v| v.* = r.floatNorm(f32);
+
+    // Quantize each row of B independently. With K=128, each row is
+    // 4 blocks of 32. Total blocks = n * 4.
+    const blocks_per_row = k / q4_0.BLOCK_SIZE;
+    const total_blocks = n * blocks_per_row;
+    const b_blocks = try allocator.alloc(q4_0.Block, total_blocks);
+    defer allocator.free(b_blocks);
+    for (0..n) |row| {
+        const src_row = b_f32[row * k .. (row + 1) * k];
+        const dst_row = b_blocks[row * blocks_per_row .. (row + 1) * blocks_per_row];
+        q4_0.quantizeRow(src_row, dst_row);
+    }
+
+    // CPU oracle: A · dequant(B)^T.
+    const b_deq = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_deq);
+    for (0..n) |row| {
+        const src_row = b_blocks[row * blocks_per_row .. (row + 1) * blocks_per_row];
+        const dst_row = b_deq[row * k .. (row + 1) * k];
+        q4_0.dequantizeRow(src_row, dst_row);
+    }
+    const want = try allocator.alloc(f32, m * n);
+    defer allocator.free(want);
+    for (0..m) |i| for (0..n) |j| {
+        var s: f64 = 0;
+        for (0..k) |kk| s += @as(f64, a_f32[i * k + kk]) * @as(f64, b_deq[j * k + kk]);
+        want[i * n + j] = @floatCast(s);
+    };
+
+    // Repack CPU blocks into the GPU's 5-u32-per-block layout.
+    const b_packed = try allocator.alloc(u32, total_blocks * q4_0.GPU_U32S_PER_BLOCK);
+    defer allocator.free(b_packed);
+    q4_0.packForGpu(b_blocks, b_packed);
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a_f32);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, u32, b_packed);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_0, 3, @sizeOf(MatmulPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+    const groups: u32 = m * n;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const MatmulPush,
+        gx: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .gx = groups });
+
+    const got = try allocator.alloc(f32, m * n);
+    defer allocator.free(got);
+    try buf_c.readBack(&ctx, f32, got);
+
+    var max_err: f32 = 0;
+    for (got, want) |g, w| max_err = @max(max_err, @abs(g - w));
+    if (max_err > 1e-3) {
+        std.debug.print("GPU q4_0 matmul: max |Δ| = {e} (>1e-3)\n", .{max_err});
+        for (0..m * n) |idx| std.debug.print("  cell {d}: got {d:.5}, want {d:.5}\n", .{ idx, got[idx], want[idx] });
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU matmul_nt_v2_q4_0 (M={d} N={d} K={d}, max |Δ| vs CPU dequant = {e:.2})\n", .{ m, n, k, max_err });
 }
 
 // ── gpu rmsnorm smoke: synthetic vs CPU rmsnorm ────────────────────

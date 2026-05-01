@@ -105,6 +105,53 @@ pub fn dequantizeRow(src: []const Block, dst: []f32) void {
     }
 }
 
+/// Number of u32 words per block in the on-device GPU layout.
+pub const GPU_U32S_PER_BLOCK: usize = 5;
+
+/// Repack canonical `Block` (18 bytes, llama.cpp-compatible split
+/// nibble layout) into the GPU's sequential 5-u32-per-block layout.
+/// Output layout per block:
+///   word 0       = scale: fp16 d in low 16 bits, upper 16 bits zero.
+///   words 1..5   = 32 4-bit unsigned indices, 8 per u32, sequential.
+///                  Element k of the block lives in qs[k/8] at bit
+///                  shift (k%8) * 4.
+/// This matches `shaders/matmul_nt_v2_q4_0.comp`'s decoder.
+pub fn packForGpu(blocks: []const Block, dst: []u32) void {
+    std.debug.assert(dst.len == blocks.len * GPU_U32S_PER_BLOCK);
+    for (blocks, 0..) |blk, b| {
+        const base = b * GPU_U32S_PER_BLOCK;
+        const d_bits: u16 = @bitCast(blk.d);
+        dst[base] = @as(u32, d_bits);
+        var w0: u32 = 0;
+        var w1: u32 = 0;
+        var w2: u32 = 0;
+        var w3: u32 = 0;
+        // CPU layout: qs[j] = idx[j] | (idx[j+16] << 4). Translate to
+        // sequential nibbles 0..31 → words 0..3 with 8 nibbles each.
+        for (0..16) |j| {
+            const lo: u32 = blk.qs[j] & 0x0F;
+            const hi: u32 = (blk.qs[j] >> 4) & 0x0F;
+            // Element j is at sequential position j; element j+16 at j+16.
+            const seq_lo: u32 = lo << @intCast(@as(u32, @intCast(j % 8)) * 4);
+            const seq_hi: u32 = hi << @intCast(@as(u32, @intCast((j + 16) % 8)) * 4);
+            switch (j / 8) {
+                0 => w0 |= seq_lo,
+                1 => w1 |= seq_lo,
+                else => unreachable,
+            }
+            switch ((j + 16) / 8) {
+                2 => w2 |= seq_hi,
+                3 => w3 |= seq_hi,
+                else => unreachable,
+            }
+        }
+        dst[base + 1] = w0;
+        dst[base + 2] = w1;
+        dst[base + 3] = w2;
+        dst[base + 4] = w3;
+    }
+}
+
 /// Cosine similarity between `a` and `b`. Returns 1.0 for identical
 /// directions, -1.0 for opposite, NaN if either is the zero vector.
 pub fn cosineSim(a: []const f32, b: []const f32) f32 {

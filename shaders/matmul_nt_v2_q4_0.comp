@@ -1,0 +1,81 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// matmul_nt with Q4_0-quantized weights on device. Same cooperative-K
+// reduction as matmul_nt_v2 / _bf16; the difference is how B is read.
+//
+// Q4_0 layout (matches src/cpu/q4_0.zig + the GPU-side repack in
+// gpu/model.zig): each row of K elements is laid out as K/32 blocks;
+// each block is 5 contiguous u32s.
+//
+//   word 0  = scale: fp16 d in the low 16 bits, upper 16 bits zero
+//             (reserved for Q4_1-style asymmetric min later).
+//   word 1..4 = 32 4-bit unsigned indices, 8 per u32, sequential.
+//               Element k of the block lives in
+//                   qs[k/8]  at bit shift  (k%8) * 4
+//               and decodes to  (idx - 8) * d  (signed q ∈ [-8, 7]).
+//
+// K must be a multiple of 32 — true for every transformer shape we
+// run (hidden_size and intermediate_size are multiples of 64+).
+//
+// The row's per-block scales are read once per element here, which
+// is wasteful for adjacent threads sharing a block; the L1/L2 cache
+// hides most of that for now. A future optimisation would have each
+// thread own a whole block (loops in 32-element strides) so the
+// scale + four index words are loaded once per 32-element chunk.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A    { float a[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Bq4  { uint  b_pack[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C    { float c[]; };
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared float sg_partials[32];
+
+float q4_0_load(uint b_off_blocks, uint k) {
+    uint block_idx = b_off_blocks + (k >> 5u);
+    uint base = block_idx * 5u;
+    float d = unpackHalf2x16(b_pack[base]).x;
+    uint slot = k & 31u;
+    uint qs = b_pack[base + 1u + (slot >> 3u)];
+    uint shift = (slot & 7u) << 2u;
+    int idx = int((qs >> shift) & 0xFu);
+    return float(idx - 8) * d;
+}
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint i = cell / pc.N;
+    uint j = cell - i * pc.N;
+    if (i >= pc.M) return;
+
+    uint a_off = i * pc.K;
+    uint b_off_blocks = j * (pc.K >> 5u);
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += gl_WorkGroupSize.x) {
+        acc += a[a_off + k] * q4_0_load(b_off_blocks, k);
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            c[i * pc.N + j] = total;
+        }
+    }
+}
