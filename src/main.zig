@@ -3589,8 +3589,11 @@ fn runChat(
         .bf16_matmul => "bf16",
         .q4_0_matmul => "Q4_0",
     }});
+    const t_up0_g = std.time.nanoTimestamp();
     var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, precision);
     defer gm.deinit(ctx.device);
+    const t_up1_g = std.time.nanoTimestamp();
+    try stdout.print("  upload took {d:.0} ms\n", .{@as(f64, @floatFromInt(t_up1_g - t_up0_g)) / 1_000_000.0});
 
     // KV cache sized for a generous chat. 2048 positions ≈ 18 layers ×
     // 2 (K + V) × 2048 × 256 × 4 bytes ≈ 72 MiB on disk space — fine.
@@ -5559,8 +5562,11 @@ fn runChatQwen35(
     } else {
         try stdout.print("uploading weights ({s} path)...\n", .{prec_label});
     }
+    const t_up0 = std.time.nanoTimestamp();
     var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, precision);
     defer gm.deinit(ctx.device);
+    const t_up1 = std.time.nanoTimestamp();
+    try stdout.print("  upload took {d:.0} ms\n", .{@as(f64, @floatFromInt(t_up1 - t_up0)) / 1_000_000.0});
 
     // TQ4-V is only wired for head_dim ∈ {128, 256}. Both Qwen3.5 sizes
     // (0.8B, 4B) are 128, so this is mostly a guard against future

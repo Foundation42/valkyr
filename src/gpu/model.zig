@@ -24,6 +24,7 @@ const config_mod = @import("../config.zig");
 const dtype = @import("../dtype.zig");
 const model_mod = @import("../model.zig");
 const q4_0 = @import("../cpu/q4_0.zig");
+const jobs = @import("../jobs.zig");
 
 /// How weights are stored on the device.
 ///
@@ -132,16 +133,24 @@ pub const GpuModel = struct {
             .q4_0_matmul => .q4_0_quantize,
         };
 
-        var embed = try uploadTensor(gpa, ctx, cpu.embed_tokens);
+        // Spawn a worker pool for the upload's CPU-bound inner loops:
+        // bf16/fp16 → fp32 conversion (per-element) and Q4_0 row-wise
+        // quantize (per-row) parallelize trivially. The pool's lifetime
+        // is bound to this scope — torn down before we return. Cost of
+        // spawn/join is ~10 ms vs. multi-second uploads, well worth it.
+        const js = try jobs.JobSystem.init(gpa, 0); // 0 = auto (CPU - 2)
+        defer js.deinit();
+
+        var embed = try uploadTensor(gpa, ctx, cpu.embed_tokens, js);
         errdefer embed.deinit(ctx.device);
 
-        var final_norm = try uploadTensor(gpa, ctx, cpu.final_norm);
+        var final_norm = try uploadTensor(gpa, ctx, cpu.final_norm, js);
         errdefer final_norm.deinit(ctx.device);
 
         // For the tied case we still upload a fresh copy — the bytes
         // come from the same source so the device-side data is the
         // same; only the host-side allocation pattern differs.
-        var lm_head = try uploadTensor(gpa, ctx, cpu.lm_head);
+        var lm_head = try uploadTensor(gpa, ctx, cpu.lm_head, js);
         errdefer lm_head.deinit(ctx.device);
 
         const layers = try gpa.alloc(GpuLayer, cpu.layers.len);
@@ -156,21 +165,21 @@ pub const GpuModel = struct {
             // Shared bits: norms + FFN trio.
             layers[i] = .{
                 .layer_type = layer.layer_type,
-                .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm),
-                .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm),
-                .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path),
-                .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path),
-                .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path),
+                .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm, js),
+                .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm, js),
+                .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path, js),
+                .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path, js),
+                .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path, js),
             };
 
             switch (layer.layer_type) {
                 .full_attention => {
-                    layers[i].q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path);
-                    layers[i].k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path);
-                    layers[i].v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path);
-                    layers[i].o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path);
-                    if (layer.q_norm) |t| layers[i].q_norm = try uploadTensor(gpa, ctx, t);
-                    if (layer.k_norm) |t| layers[i].k_norm = try uploadTensor(gpa, ctx, t);
+                    layers[i].q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path, js);
+                    layers[i].k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path, js);
+                    layers[i].v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path, js);
+                    layers[i].o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path, js);
+                    if (layer.q_norm) |t| layers[i].q_norm = try uploadTensor(gpa, ctx, t, js);
+                    if (layer.k_norm) |t| layers[i].k_norm = try uploadTensor(gpa, ctx, t, js);
                 },
                 .linear_attention => {
                     // Gated DeltaNet: in-projections + conv + per-head
@@ -178,15 +187,15 @@ pub const GpuModel = struct {
                     // matrices and out_proj go through the bf16-aware
                     // path; the rest are tiny scalars/per-head tables
                     // and stay fp32.
-                    layers[i].in_proj_qkv = try uploadByPath(gpa, ctx, layer.in_proj_qkv.?, matmul_path);
-                    layers[i].in_proj_z   = try uploadByPath(gpa, ctx, layer.in_proj_z.?, matmul_path);
-                    layers[i].in_proj_b   = try uploadByPath(gpa, ctx, layer.in_proj_b.?, matmul_path);
-                    layers[i].in_proj_a   = try uploadByPath(gpa, ctx, layer.in_proj_a.?, matmul_path);
-                    layers[i].out_proj    = try uploadByPath(gpa, ctx, layer.out_proj.?, matmul_path);
-                    layers[i].conv1d_weight   = try uploadTensor(gpa, ctx, layer.conv1d_weight.?);
-                    layers[i].A_log           = try uploadTensor(gpa, ctx, layer.A_log.?);
-                    layers[i].dt_bias         = try uploadTensor(gpa, ctx, layer.dt_bias.?);
-                    layers[i].ssm_norm_weight = try uploadTensor(gpa, ctx, layer.ssm_norm_weight.?);
+                    layers[i].in_proj_qkv = try uploadByPath(gpa, ctx, layer.in_proj_qkv.?, matmul_path, js);
+                    layers[i].in_proj_z   = try uploadByPath(gpa, ctx, layer.in_proj_z.?, matmul_path, js);
+                    layers[i].in_proj_b   = try uploadByPath(gpa, ctx, layer.in_proj_b.?, matmul_path, js);
+                    layers[i].in_proj_a   = try uploadByPath(gpa, ctx, layer.in_proj_a.?, matmul_path, js);
+                    layers[i].out_proj    = try uploadByPath(gpa, ctx, layer.out_proj.?, matmul_path, js);
+                    layers[i].conv1d_weight   = try uploadTensor(gpa, ctx, layer.conv1d_weight.?, js);
+                    layers[i].A_log           = try uploadTensor(gpa, ctx, layer.A_log.?, js);
+                    layers[i].dt_bias         = try uploadTensor(gpa, ctx, layer.dt_bias.?, js);
+                    layers[i].ssm_norm_weight = try uploadTensor(gpa, ctx, layer.ssm_norm_weight.?, js);
                 },
             }
             uploaded_layers = i + 1;
@@ -216,14 +225,14 @@ pub const GpuModel = struct {
 /// Upload strategies the matmul-aware path can pick between.
 const TensorPath = enum { fp32, bf16_raw_if_bf16, q4_0_quantize };
 
-fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, path: TensorPath) !buffer.Buffer {
+fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, path: TensorPath, js: *jobs.JobSystem) !buffer.Buffer {
     if (path == .bf16_raw_if_bf16 and t.dtype == .bf16) {
         return uploadTensorBf16Raw(gpa, ctx, t);
     }
     if (path == .q4_0_quantize) {
-        return uploadTensorQ4_0(gpa, ctx, t);
+        return uploadTensorQ4_0(gpa, ctx, t, js);
     }
-    return uploadTensor(gpa, ctx, t);
+    return uploadTensor(gpa, ctx, t, js);
 }
 
 /// Upload a bf16 tensor as raw bytes — no conversion. The buffer is
@@ -247,6 +256,56 @@ fn uploadTensorBf16Raw(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safete
     return buffer.Buffer.initStatic(ctx, u32, aligned);
 }
 
+// ── Parallel inner-loop helpers ────────────────────────────────────
+//
+// Job contexts must outlive the parallelFor call but their lifetimes
+// are bound to the surrounding helper function — they live on the
+// stack and waitFor returns before the helper does. The `*const
+// anyopaque` round trip through jobs.BatchRange is opaque to the
+// compiler; we recover the typed pointer in the worker.
+
+const Bf16ConvCtx = struct { src: []align(1) const u16, dst: []f32 };
+
+fn bf16ConvJob(j: *jobs.Job) void {
+    const range = j.getData(jobs.BatchRange);
+    const c: *const Bf16ConvCtx = @ptrCast(@alignCast(range.context));
+    for (range.start..range.end) |i| c.dst[i] = dtype.bf16ToF32(c.src[i]);
+}
+
+const Fp16ConvCtx = struct { src: []align(1) const u16, dst: []f32 };
+
+fn fp16ConvJob(j: *jobs.Job) void {
+    const range = j.getData(jobs.BatchRange);
+    const c: *const Fp16ConvCtx = @ptrCast(@alignCast(range.context));
+    for (range.start..range.end) |i| c.dst[i] = dtype.f16ToF32(c.src[i]);
+}
+
+const Q4QuantCtx = struct {
+    src: []const f32,
+    dst: []q4_0.Block,
+    k: usize,
+    blocks_per_row: usize,
+};
+
+fn q4QuantizeJob(j: *jobs.Job) void {
+    const range = j.getData(jobs.BatchRange);
+    const c: *const Q4QuantCtx = @ptrCast(@alignCast(range.context));
+    for (range.start..range.end) |row| {
+        const src_row = c.src[row * c.k .. (row + 1) * c.k];
+        const dst_row = c.dst[row * c.blocks_per_row .. (row + 1) * c.blocks_per_row];
+        q4_0.quantizeRow(src_row, dst_row);
+    }
+}
+
+/// Pick a batch size that gives roughly 4× as many batches as worker
+/// threads — small enough that work-stealing balances naturally,
+/// large enough that scheduling overhead doesn't dominate.
+fn batchSize(total: usize, worker_count: u32) u32 {
+    const target_batches: u32 = @max(worker_count * 4, 8);
+    const bs = (total + target_batches - 1) / target_batches;
+    return @intCast(@max(@as(usize, 1), bs));
+}
+
 /// Quantize a 2-D weight tensor row-wise to Q4_0 (block-32, fp16
 /// scale per block) and upload as a flat u32 buffer in the
 /// 5-u32-per-block GPU layout consumed by `matmul_nt_v2_q4_0`.
@@ -259,7 +318,7 @@ fn uploadTensorBf16Raw(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safete
 /// scratch + one canonical-Block scratch); both are freed before the
 /// next tensor is processed. For Qwen3.6-27B's 17.4 GiB FFN matmul
 /// at K=17408 that's ~1 GiB peak host scratch — fine.
-fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor) !buffer.Buffer {
+fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, js: *jobs.JobSystem) !buffer.Buffer {
     const numel = t.numel();
     if (t.shape.len < 2) return error.Q4_0NeedsAtLeast2D;
     const k = t.shape[t.shape.len - 1];
@@ -268,7 +327,9 @@ fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetenso
     const blocks_per_row = k / q4_0.BLOCK_SIZE;
     const total_blocks = rows * blocks_per_row;
 
-    // Materialise the tensor as fp32 into a host scratch buffer.
+    // Materialise the tensor as fp32 into a host scratch buffer
+    // (parallel for bf16/fp16; plain memcpy for fp32 since it's
+    // already memory-bandwidth-bound and threading wouldn't help).
     const f = try gpa.alloc(f32, numel);
     defer gpa.free(f);
     switch (t.dtype) {
@@ -278,28 +339,37 @@ fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetenso
         },
         .bf16 => {
             const u = dtype.asU16(t.bytes);
-            dtype.bf16SliceToF32(u, f);
+            const ctxc = Bf16ConvCtx{ .src = u, .dst = f };
+            var counter = jobs.Counter.init(0);
+            js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), bf16ConvJob, @ptrCast(&ctxc), &counter);
+            js.waitFor(&counter);
         },
         .f16 => {
             const u = dtype.asU16(t.bytes);
-            dtype.f16SliceToF32(u, f);
+            const ctxc = Fp16ConvCtx{ .src = u, .dst = f };
+            var counter = jobs.Counter.init(0);
+            js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), fp16ConvJob, @ptrCast(&ctxc), &counter);
+            js.waitFor(&counter);
         },
         else => return error.UnsupportedWeightDtype,
     }
 
-    // Row-wise Q4_0 quantize through the canonical Block layout.
+    // Row-wise Q4_0 quantize through the canonical Block layout —
+    // each row is independent so we parallelise across rows.
     const blocks = try gpa.alloc(q4_0.Block, total_blocks);
     defer gpa.free(blocks);
-    var row_i: usize = 0;
-    while (row_i < rows) : (row_i += 1) {
-        const src_row = f[row_i * k .. (row_i + 1) * k];
-        const dst_row = blocks[row_i * blocks_per_row .. (row_i + 1) * blocks_per_row];
-        q4_0.quantizeRow(src_row, dst_row);
+    {
+        const ctxc = Q4QuantCtx{ .src = f, .dst = blocks, .k = k, .blocks_per_row = blocks_per_row };
+        var counter = jobs.Counter.init(0);
+        js.parallelFor(@intCast(rows), batchSize(rows, js.worker_count), q4QuantizeJob, @ptrCast(&ctxc), &counter);
+        js.waitFor(&counter);
     }
 
     // Repack to the GPU's sequential 5-u32-per-block layout. This is
     // also the storage we hand to the device — Buffer.initStatic
-    // uploads a tightly-packed u32 slice via staging.
+    // uploads a tightly-packed u32 slice via staging. (packForGpu is
+    // serial; it's small relative to the per-row quantize and on most
+    // tensors finishes faster than a thread spawn anyway.)
     const packed_words = total_blocks * q4_0.GPU_U32S_PER_BLOCK;
     const packed_buf = try gpa.alloc(u32, packed_words);
     defer gpa.free(packed_buf);
@@ -312,15 +382,13 @@ fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetenso
 /// Allocates a host scratch buffer the size of the tensor's fp32
 /// representation, fills it via the dtype converter, hands it to
 /// Buffer.initStatic (which staging-uploads it), then frees the host
-/// copy. Peak host memory = one tensor's worth.
-fn uploadTensor(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor) !buffer.Buffer {
+/// copy. Peak host memory = one tensor's worth. The bf16/fp16
+/// conversion loops are parallelised across the upload pool; fp32
+/// just memcpys through (already memory-bandwidth-bound).
+fn uploadTensor(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, js: *jobs.JobSystem) !buffer.Buffer {
     const numel = t.numel();
     switch (t.dtype) {
         .f32 => {
-            // Buffer.initStatic wants a naturally-aligned slice; the
-            // mmap'd f32 view is align(1) (SafeTensors makes no
-            // alignment guarantee about the data section), so we copy
-            // through a host buffer of proper alignment.
             const src = @as([*]align(1) const f32, @ptrCast(t.bytes.ptr))[0..numel];
             const f = try gpa.alloc(f32, numel);
             defer gpa.free(f);
@@ -331,14 +399,20 @@ fn uploadTensor(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.T
             const u = dtype.asU16(t.bytes);
             const f = try gpa.alloc(f32, numel);
             defer gpa.free(f);
-            dtype.bf16SliceToF32(u, f);
+            const ctxc = Bf16ConvCtx{ .src = u, .dst = f };
+            var counter = jobs.Counter.init(0);
+            js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), bf16ConvJob, @ptrCast(&ctxc), &counter);
+            js.waitFor(&counter);
             return buffer.Buffer.initStatic(ctx, f32, f);
         },
         .f16 => {
             const u = dtype.asU16(t.bytes);
             const f = try gpa.alloc(f32, numel);
             defer gpa.free(f);
-            dtype.f16SliceToF32(u, f);
+            const ctxc = Fp16ConvCtx{ .src = u, .dst = f };
+            var counter = jobs.Counter.init(0);
+            js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), fp16ConvJob, @ptrCast(&ctxc), &counter);
+            js.waitFor(&counter);
             return buffer.Buffer.initStatic(ctx, f32, f);
         },
         else => return error.UnsupportedWeightDtype,
