@@ -123,7 +123,7 @@ greedy at `--temp 0`:
 |---|---|---|
 | Gemma 2B IT | bf16 (layers) + fp32 (embed/lm_head) | ~143 |
 | Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~55 |
-| Qwen3.5 0.8B | bf16 | ~102 |
+| Qwen3.5 0.8B | bf16 | ~113 |
 | Qwen3.5 0.8B | `--q4` | ~104 |
 | Qwen3.5 4B | bf16 | ~55 |
 | Qwen3.5 4B | `--q4` | ~59 |
@@ -451,7 +451,7 @@ sense).
   weights memory-bandwidth-bound — proper shared-memory tiling and
   fused attention (FlashAttention-style) are obvious wins. The
   Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~55 tok/s on
-  the 4B, ~102 tok/s on the 0.8B) by default, and
+  the 4B, ~113 tok/s on the 0.8B) by default, and
   `matmul_nt_v2_q4_0` with `--q4` (~59 tok/s on the 4B, ~104 tok/s
   on the 0.8B). When any
   non-fp32 path is active the lm_head and embed_tokens both ride

@@ -30,7 +30,16 @@
 //   - A's a_off (= i × K floats) is a multiple of 4. M = 1 in
 //     decode → i = 0 → a_off = 0.
 
-layout(local_size_x = 256) in;
+// Picked WG=128 from a {256, 128, 64} sweep on 2026-05-02. Smaller
+// model paths (0.8B bf16) gained ~9.7% — likely a register-pressure
+// or per-WG occupancy effect (cf. matryoshka's NEE/sun-shadow
+// separable-pass wins from less-fat shaders). Larger models stayed
+// flat: they're memory-bandwidth-bound at any WG size in this range.
+// WG=64 plateaued — same numbers as 128 — so the smallest WG that
+// avoids leaving cycles on the table is 128. (sg_partials[32] still
+// covers the worst-case subgroup count: WG=128 / subgroup=32 = 4
+// subgroups, well under 32.)
+layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer A     { vec4  a4[];     };
 layout(set = 0, binding = 1, std430) readonly  buffer Bbf16 { uvec4 b_pack[]; };
