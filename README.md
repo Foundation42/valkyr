@@ -16,6 +16,63 @@ OpenMP-on-CPU back end for a Vulkan compute back end that runs the same
 math on any GPU that supports Vulkan 1.3 (AMD / Intel / NVIDIA / Apple
 via MoltenVK / Android — one SPIR-V binary, every vendor).
 
+## Why valkyr?
+
+valkyr is small (the matmul shader fits on a screen), young (months not
+years), and intentionally *less* than llama.cpp. So why pick it up?
+
+- **One backend, every GPU.** A single Vulkan/SPIR-V kernel set runs on
+  NVIDIA, AMD, Intel Arc, Apple Silicon (via MoltenVK), and Android
+  Adreno / Mali. llama.cpp has separate CUDA / ROCm / Metal / Vulkan /
+  SYCL backends; each has its own kernel set, its own quirks, and its
+  own performance ceiling. If your hardware mix is heterogeneous, or
+  you don't want to bet on CUDA being on every machine forever, the
+  one-Vulkan-binary story matters.
+
+- **Composes with your engine.** If you're already running Vulkan —
+  game engine, real-time graphics, AR/VR, Android app, embedded GPU —
+  valkyr lives on the same `VkDevice`, the same command buffers, the
+  same queues. No parallel CUDA runtime, no shared-memory split, no
+  extra GB of dynamic libraries. **The natural fit if you want
+  inference inside an app that already has a Vulkan graphics stack.**
+
+- **Pedagogically transparent.** Every GPU shader has a CPU reference
+  in `src/cpu/*.zig` that gets parity-checked against. The full
+  inference path is a few thousand lines of Zig you can read top to
+  bottom — no decades of accretion to navigate. If you want to
+  *understand* what a transformer kernel is doing, or modify one for
+  research, this is a friendlier surface.
+
+- **Zero lock-in, zero Python.** One Zig binary, no torch, no
+  llama.cpp build system, no GGUF dependency for the basic path (we
+  read safetensors + repack at upload time). `zig build` cross-compiles
+  to most targets without extra toolchain. Drop into an embedded
+  device, a CI runner, or a single static binary deployment without
+  dragging a Python stack.
+
+- **Modern architectures, built clean.** Qwen3.5 hybrid (Gated
+  DeltaNet + full-attention), TurboQuant Q4 KV cache, llama.cpp-
+  compatible Q4_0 and Q4_K_M weights — all built fresh from CPU
+  references, not bolted onto an older core. The architectural
+  diversity stays legible because nothing's grandfathered.
+
+- **Training is on the menu.** TRiP ships paired `*_backward`
+  functions for every primitive in `reference/math.c` — built-in
+  gradient oracles. The plan is an Unsloth-class training port on top
+  of the same Vulkan kernels, with bit-close parity vs. TRiP's CPU
+  reference. Not yet shipped (see roadmap), but the architecture
+  supports it.
+
+**Honest framing.** valkyr is younger and smaller than llama.cpp. On
+raw decode tok/s on a single CUDA card, llama.cpp's CUDA path is
+faster than ours today (~1.5× on Qwen3.6 27B with `--q4k` last we
+measured). What valkyr offers is **reach** (every Vulkan GPU),
+**cleanliness** (CPU oracles for every kernel), and **composability**
+(lives inside your existing Vulkan app). If you need maximum
+throughput on a single NVIDIA box, llama.cpp is the right tool. If you
+want one inference engine that runs everywhere your game or app
+already runs, valkyr is.
+
 ## What works today
 
 - **Five model families end-to-end on GPU**:
