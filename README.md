@@ -84,6 +84,23 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
   oracle is byte-clean against llama.cpp's `block_q4_0`. Drops the
   per-layer weight footprint to 0.625 B/elem — the path that lets
   27B-class models actually fit on a 24 GiB card.
+- **Q4_K_M matmul weights on device** (`--q4k`) — llama.cpp-compatible
+  super-block-256 with 8 sub-blocks of 32, each carrying its own
+  6-bit scale and 6-bit min, plus two fp16 super-scales per super-
+  block. Asymmetric dequant `d * sc * q − dmin * m` plus
+  `make_qkx2_quants` iterative fit — ~32% lower MSE than Q4_0 on
+  unit-Gaussian oracle round-trip, comparable visible chat quality.
+  4.5 bits/elem on device (vs. ~5 for our padded Q4_0), so ~10%
+  smaller and the path that closes the on-device-size gap to GGUF
+  Q4_K_M. **Decode is currently 10–50% slower than Q4_0** on these
+  shapes — regression scales with model size: 0.8B 9%, Gemma 29%,
+  4B 33%, 27B 51%. Per-element decode is heavier (3 byte-extracts
+  + bit-pack to recover sub-block scale + min vs. Q4_0's one nibble
+  + scale) and we haven't amortized it across consecutive K elements
+  yet. Upload also runs ~4–6× slower than Q4_0 because of the
+  iterative refinement (21 candidate iscales × 8 sub-blocks per
+  super-block). The fix — vectorize 8 K's per iteration so the
+  sub-block decode amortizes 8× — is queued as the next perf chunk.
 - **Lazy LM head during prefill** — chat skips the `vocab × hidden`
   LM head matmul on every prompt token except the last. Pure
   time-to-first-token win: scales with prompt length, no cost to
@@ -125,9 +142,12 @@ greedy at `--temp 0`:
 | Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~55 |
 | Qwen3.5 0.8B | bf16 | ~113 |
 | Qwen3.5 0.8B | `--q4` | ~104 |
+| Qwen3.5 0.8B | `--q4k` | ~78 |
 | Qwen3.5 4B | bf16 | ~55 |
 | Qwen3.5 4B | `--q4` | ~59 |
+| Qwen3.5 4B | `--q4k` | ~35 |
 | **Qwen3.6 27B** | `--q4` | **~16.5** |
+| **Qwen3.6 27B** | `--q4k` | **~7.8** |
 
 bf16 matmul reads use vectorized `uvec4` (16-byte) loads — 4× fewer
 SSBO transactions on the weight side, decoded inline as eight bf16
@@ -328,6 +348,11 @@ zig build run
 ./zig-out/bin/valkyr --chat <model-dir> --q4 "..."
 ./zig-out/bin/valkyr --chat <model-dir> --q4 --tq4v "..."
 
+# Chat with Q4_K_M 4-bit weights (super-block-256, asymmetric — same
+# format llama.cpp ships as Q4_K_M.gguf; better quality than --q4 but
+# ~10–30% slower decode on these shapes; mutually exclusive with --q4)
+./zig-out/bin/valkyr --chat <model-dir> --q4k "..."
+
 # Chat with sampling (works with or without --tq4v)
 ./zig-out/bin/valkyr --chat <model-dir> \
     --temp 0.8 --top-p 0.9 --seed 42 \
@@ -364,9 +389,12 @@ src/
 │   │                    + forwardTq4V (TQ4 V-cache variant)
 │   ├── turboquant.zig   Lloyd-Max codebooks + RHT (FWHT + sign flips)
 │   │                    + BlockTQ4 + quantize/dequantize — the oracle
-│   └── q4_0.zig         Llama.cpp-compatible Q4_0 quantize/dequantize
-│                        (block-32, fp16 scale, signed nibbles); parity
-│                        oracle for the GPU matmul shader
+│   ├── q4_0.zig         Llama.cpp-compatible Q4_0 quantize/dequantize
+│   │                    (block-32, fp16 scale, signed nibbles); parity
+│   │                    oracle for the GPU matmul shader
+│   └── q4_k.zig         Llama.cpp-compatible Q4_K_M quantize/dequantize
+│                        (super-block-256, 6-bit per-sub-block scale+min,
+│                        asymmetric); parity oracle for matmul_nt_v2_q4_k
 └── gpu/
     ├── vk.zig           Headless Vulkan compute context
     ├── buffer.zig       Static / dynamic / device-only buffer abstraction
@@ -383,6 +411,9 @@ shaders/
 ├── matmul_nt_v2_bf16.comp   bf16 weights, packed u32 reads
 ├── matmul_nt_v2_q4_0.comp   Q4_0 weights, in-shader dequant
 │                            (block-32, fp16 scale, signed nibbles)
+├── matmul_nt_v2_q4_k.comp   Q4_K_M weights, in-shader dequant
+│                            (super-block-256, 6-bit sub-scales+mins,
+│                            asymmetric d*sc*q − dmin*m)
 ├── embed_lookup_bf16.comp   bf16 embed_tokens (halves upload-peak +
 │                            on-device footprint of vocab × hidden)
 ├── rmsnorm.comp             subgroup-reduced sum-of-squares + Gemma quirk
@@ -451,14 +482,16 @@ sense).
   weights memory-bandwidth-bound — proper shared-memory tiling and
   fused attention (FlashAttention-style) are obvious wins. The
   Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~55 tok/s on
-  the 4B, ~113 tok/s on the 0.8B) by default, and
+  the 4B, ~113 tok/s on the 0.8B) by default,
   `matmul_nt_v2_q4_0` with `--q4` (~59 tok/s on the 4B, ~104 tok/s
-  on the 0.8B). When any
+  on the 0.8B), and `matmul_nt_v2_q4_k` with `--q4k` (~35 tok/s on
+  the 4B, ~78 tok/s on the 0.8B — Q4_K's heavier per-element decode
+  isn't yet amortized across consecutive K's). When any
   non-fp32 path is active the lm_head and embed_tokens both ride
   bf16 — they're the single biggest matmul reads in the model
   (`N = vocab_size`, up to 248 K) and bf16 is the simplest safe
-  halving (Q4_0 here would risk shifting the sample argmax). On
-  Qwen3.6 27B that bf16 demotion is what makes the model fit a
+  halving (Q4_0 / Q4_K here would risk shifting the sample argmax).
+  On Qwen3.6 27B that bf16 demotion is what makes the model fit a
   24 GiB card at all: the staging-buffer peak during embed_tokens
   upload halves from ~10 GiB to ~5 GiB.
 - TurboQuant TQ4 ships two block sizes (256 for Gemma + Qwen3.5,
@@ -553,9 +586,15 @@ The two big arcs:
      for themselves at long context.
    - **bf16 LM head + bf16 embedding** kernels — currently fp32, the
      LM head matmul is the single biggest dispatch we do.
-   - **Quantized weights** (q4_K-style or TQ4-on-weights) — orthogonal
-     to TurboQuant KV; combining them gets Gemma 2B into a few hundred
-     MiB total.
+   - **Q4_K_M decode amortization.** The shader currently re-decodes
+     `(d, dmin, sc, m)` per K-element; vectorizing 8 (or 32) consecutive
+     K's per iteration so the sub-block decode amortizes is the obvious
+     fix and would close the 10–30% perf gap to Q4_0 (and possibly
+     overshoot, since Q4_K's super-block is 8× larger than Q4_0's
+     and its on-device bytes-per-elem is ~10% smaller).
+   - **TQ4-on-weights** — TurboQuant applied to the matmul weight
+     side, orthogonal to Q4_0/Q4_K. Combined with `--tq4v` gets
+     Gemma 2B into a few hundred MiB total.
    - **Training port**, the Unsloth-alternative ambition. TRiP carries
      paired forward/backward in `reference/math.c` — every op has a
      `_backward` immediately below it, a built-in correctness oracle

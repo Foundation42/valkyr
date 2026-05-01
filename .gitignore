@@ -9,3 +9,7 @@ reference/
 
 # Local Claude Code state (memory, scheduled tasks, settings).
 .claude/
+
+# Per-run perf bench logs (scripts/bench.sh writes timestamped dirs here).
+# The script itself is checked in; the artifacts are local-only.
+bench/

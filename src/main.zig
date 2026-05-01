@@ -4044,6 +4044,13 @@ fn chatTurn(
     var prompt_idx: usize = 0;
     var generated: usize = 0;
 
+    // Decode-only throughput timer: clock starts after prefill so the
+    // tok/s we report reflects steady-state generation, not warm-up.
+    // Mirrors the Qwen path's measurement so bench script numbers are
+    // apples-to-apples across model families.
+    var t_decode_start: i128 = 0;
+    var decode_started = false;
+
     while (true) {
         // We only need logits at the LAST prefill position (to sample
         // the first response token) and for every step of the sample
@@ -4066,6 +4073,11 @@ fn chatTurn(
             continue;
         }
 
+        if (!decode_started) {
+            t_decode_start = std.time.nanoTimestamp();
+            decode_started = true;
+        }
+
         // Past the last prompt token: sample.
         try sc.logits.readBack(ctx, f32, logits);
         const next = try cpu_forward.sample(logits, sample_params, rng, sample_scratch);
@@ -4081,6 +4093,13 @@ fn chatTurn(
         current = @intCast(next);
     }
     try stdout.print("\n", .{});
+
+    if (decode_started and generated > 0) {
+        const t_end = std.time.nanoTimestamp();
+        const ms_total = @as(f64, @floatFromInt(t_end - t_decode_start)) / 1_000_000.0;
+        const tokps = @as(f64, @floatFromInt(generated)) * 1000.0 / ms_total;
+        try stdout.print("[{d} tok in {d:.0} ms, {d:.1} tok/s]\n", .{ generated, ms_total, tokps });
+    }
 }
 
 /// Print a single token id to `w` after applying the decoder rule for
