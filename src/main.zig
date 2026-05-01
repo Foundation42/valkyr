@@ -164,18 +164,23 @@ pub fn main() !void {
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
         // Parse optional sampling flags + final user_msg. Format:
         //   --chat <dir> [--temp T] [--top-k K] [--top-p P] [--seed S]
-        //                [--tq4v] [--q4] [user_msg]
+        //                [--tq4v] [--q4|--q4k] [user_msg]
         // --tq4v switches the V cache to TurboQuant TQ4 (asymmetric:
         //   K stays full precision).
         // --q4   switches the per-layer projections to Q4_0 (4-bit weights,
         //   block-32 with fp16 scale per block). Mutually exclusive with
-        //   bf16; lm_head + embeddings stay fp32.
+        //   bf16; lm_head + embeddings stay bf16.
+        // --q4k  switches the per-layer projections to Q4_K_M (super-block
+        //   of 256 with 8 sub-blocks, 6-bit per-sub-block scale + min,
+        //   asymmetric dequant). Mutually exclusive with --q4. Quality
+        //   ~30% lower MSE vs Q4_0 on Gaussian data; same on-device cost.
         // The user_msg, if given, is the last positional arg.
         var sp = cpu_forward.SampleParams{};
         var seed: u64 = @intCast(std.time.milliTimestamp());
         var user_msg: ?[]const u8 = null;
         var tq4v: bool = false;
         var q4: bool = false;
+        var q4k: bool = false;
         var i: usize = 3;
         while (i < args.len) {
             const a = args[i];
@@ -197,12 +202,19 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--q4")) {
                 q4 = true;
                 i += 1;
+            } else if (std.mem.eql(u8, a, "--q4k")) {
+                q4k = true;
+                i += 1;
             } else {
                 user_msg = a;
                 i += 1;
             }
         }
-        const precision: gpu_model.Precision = if (q4) .q4_0_matmul else .bf16_matmul;
+        if (q4 and q4k) {
+            std.debug.print("--q4 and --q4k are mutually exclusive\n", .{});
+            return;
+        }
+        const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
         // Hybrid families need a different kernel set + per-layer
         // SSM state plumbing — dispatch to the dedicated path.
         const cfg_path = try std.fs.path.join(allocator, &.{ args[2], "config.json" });
@@ -228,6 +240,7 @@ pub fn main() !void {
     try runGpuMatmulSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runGpuMatmulQ4_0Smoke(allocator);
+    try runGpuMatmulQ4_KSmoke(allocator);
     try runGpuRmsnormSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
@@ -816,6 +829,99 @@ fn runGpuMatmulQ4_0Smoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU matmul_nt_v2_q4_0 (M={d} N={d} K={d}, max |Δ| vs CPU dequant = {e:.2})\n", .{ m, n, k, max_err });
+}
+
+// ── gpu matmul_nt_v2_q4_k smoke: Q4_K_M weights vs CPU dequant oracle ─
+//
+// Same shape as the q4_0 smoke but at K=256 (the smallest legal Q4_K_M
+// row — one super-block per row of B). Compares the GPU Q4_K_M matmul
+// kernel against `A · dequant(B)^T` computed entirely on the CPU. As
+// with q4_0, this measures GPU↔CPU agreement over the shared dequant
+// formula, not Q4_K_M quality (which is tested in the CPU oracle smoke).
+
+fn runGpuMatmulQ4_KSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const m: u32 = 2;
+    const n: u32 = 4;
+    const k: u32 = @intCast(q4_k.QK_K); // 256, smallest legal Q4_K row
+
+    var prng = std.Random.DefaultPrng.init(0xBADCAFE0DEFACE);
+    const r = prng.random();
+
+    const a_f32 = try allocator.alloc(f32, m * k);
+    defer allocator.free(a_f32);
+    const b_f32 = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_f32);
+    for (a_f32) |*v| v.* = r.floatNorm(f32);
+    for (b_f32) |*v| v.* = r.floatNorm(f32);
+
+    const supers_per_row = k / q4_k.QK_K;
+    const total_supers = n * supers_per_row;
+    const b_blocks = try allocator.alloc(q4_k.Block, total_supers);
+    defer allocator.free(b_blocks);
+    for (0..n) |row| {
+        const src_row = b_f32[row * k .. (row + 1) * k];
+        const dst_row = b_blocks[row * supers_per_row .. (row + 1) * supers_per_row];
+        q4_k.quantizeRow(src_row, dst_row);
+    }
+
+    // CPU oracle: A · dequant(B)^T.
+    const b_deq = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_deq);
+    for (0..n) |row| {
+        const src_row = b_blocks[row * supers_per_row .. (row + 1) * supers_per_row];
+        const dst_row = b_deq[row * k .. (row + 1) * k];
+        q4_k.dequantizeRow(src_row, dst_row);
+    }
+    const want = try allocator.alloc(f32, m * n);
+    defer allocator.free(want);
+    for (0..m) |i| for (0..n) |j| {
+        var s: f64 = 0;
+        for (0..k) |kk| s += @as(f64, a_f32[i * k + kk]) * @as(f64, b_deq[j * k + kk]);
+        want[i * n + j] = @floatCast(s);
+    };
+
+    // Repack CPU blocks into the GPU's 36-u32-per-super-block layout.
+    const b_packed = try allocator.alloc(u32, total_supers * q4_k.GPU_U32S_PER_SUPERBLOCK);
+    defer allocator.free(b_packed);
+    q4_k.packForGpu(b_blocks, b_packed);
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a_f32);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, u32, b_packed);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_k, 3, @sizeOf(MatmulPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+    const groups: u32 = m * n;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const MatmulPush,
+        gx: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .gx = groups });
+
+    const got = try allocator.alloc(f32, m * n);
+    defer allocator.free(got);
+    try buf_c.readBack(&ctx, f32, got);
+
+    var max_err: f32 = 0;
+    for (got, want) |g, w| max_err = @max(max_err, @abs(g - w));
+    if (max_err > 1e-3) {
+        std.debug.print("GPU q4_k matmul: max |Δ| = {e} (>1e-3)\n", .{max_err});
+        for (0..m * n) |idx| std.debug.print("  cell {d}: got {d:.5}, want {d:.5}\n", .{ idx, got[idx], want[idx] });
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS GPU matmul_nt_v2_q4_k (M={d} N={d} K={d}, max |Δ| vs CPU dequant = {e:.2})\n", .{ m, n, k, max_err });
 }
 
 // ── gpu rmsnorm smoke: synthetic vs CPU rmsnorm ────────────────────
@@ -3738,6 +3844,7 @@ fn runChat(
         .fp32_all => "fp32",
         .bf16_matmul => "bf16",
         .q4_0_matmul => "Q4_0",
+        .q4_k_matmul => "Q4_K_M",
     }});
     const t_up0_g = std.time.nanoTimestamp();
     var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, precision);
@@ -4291,18 +4398,20 @@ fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision, fami
         .fp32_all => &shaders.matmul_nt_v2,
         .bf16_matmul => &shaders.matmul_nt_v2_bf16,
         .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
+        .q4_k_matmul => &shaders.matmul_nt_v2_q4_k,
     };
     // The LM head stays bf16 (or fp32 in the all-fp32 path) — never
-    // Q4_0, because logits are sampled from and quantizing them risks
-    // shifting argmax. The upload side mirrors this in `gpu/model.zig`.
+    // Q4_0/Q4_K, because logits are sampled from and quantizing them
+    // risks shifting argmax. The upload side mirrors this in
+    // `gpu/model.zig`.
     const lm_head_spv: []align(4) const u8 = switch (precision) {
         .fp32_all => &shaders.matmul_nt_v2,
-        .bf16_matmul, .q4_0_matmul => &shaders.matmul_nt_v2_bf16,
+        .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.matmul_nt_v2_bf16,
     };
     // embed_tokens follows the same bf16-when-non-fp32 rule as lm_head.
     const embed_spv: []align(4) const u8 = switch (precision) {
         .fp32_all => &shaders.embed_lookup,
-        .bf16_matmul, .q4_0_matmul => &shaders.embed_lookup_bf16,
+        .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.embed_lookup_bf16,
     };
     const ffn_spv: []align(4) const u8 = switch (family.activation()) {
         .gelu => &shaders.geglu,
@@ -5290,14 +5399,15 @@ const HybridChatKernels = struct {
             .fp32_all => &shaders.matmul_nt_v2,
             .bf16_matmul => &shaders.matmul_nt_v2_bf16,
             .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
+            .q4_k_matmul => &shaders.matmul_nt_v2_q4_k,
         };
         const lm_head_spv: []align(4) const u8 = switch (precision) {
             .fp32_all => &shaders.matmul_nt_v2,
-            .bf16_matmul, .q4_0_matmul => &shaders.matmul_nt_v2_bf16,
+            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.matmul_nt_v2_bf16,
         };
         const embed_spv: []align(4) const u8 = switch (precision) {
             .fp32_all => &shaders.embed_lookup,
-            .bf16_matmul, .q4_0_matmul => &shaders.embed_lookup_bf16,
+            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.embed_lookup_bf16,
         };
         return .{
             .embed = try pipeline.Kernel.init(ctx, embed_spv, 2, @sizeOf(EmbedLookupPush)),
@@ -5743,6 +5853,7 @@ fn runChatQwen35(
         .fp32_all => "fp32",
         .bf16_matmul => "bf16",
         .q4_0_matmul => "Q4_0",
+        .q4_k_matmul => "Q4_K_M",
     };
     if (tq4v) {
         try stdout.print("uploading weights ({s} + TQ4-V on full-attn layers)...\n", .{prec_label});

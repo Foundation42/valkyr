@@ -274,6 +274,44 @@ pub fn quantizeRow(src: []const f32, dst: []Block) void {
     }
 }
 
+/// Number of u32 words per super-block in the on-device GPU layout.
+/// 144 bytes / 4 = 36 words, no padding.
+pub const GPU_U32S_PER_SUPERBLOCK: usize = 36;
+
+/// Repack canonical `Block` (144 bytes, llama.cpp-compatible) into the
+/// GPU's contiguous 36-u32-per-super-block layout. Output per super-
+/// block:
+///   word 0     = d (low 16 bits, fp16) | dmin (high 16 bits, fp16)
+///   words 1..3 = scales[12], little-endian byte-packed (4 bytes/word)
+///   words 4..35= qs[128],     little-endian byte-packed (4 bytes/word)
+///
+/// This matches `shaders/matmul_nt_v2_q4_k.comp`'s decoder.
+pub fn packForGpu(blocks: []const Block, dst: []u32) void {
+    std.debug.assert(dst.len == blocks.len * GPU_U32S_PER_SUPERBLOCK);
+    for (blocks, 0..) |blk, b| {
+        const base = b * GPU_U32S_PER_SUPERBLOCK;
+        const d_bits: u32 = @as(u16, @bitCast(blk.d));
+        const dmin_bits: u32 = @as(u16, @bitCast(blk.dmin));
+        dst[base] = d_bits | (dmin_bits << 16);
+        for (0..3) |w| {
+            const off = w * 4;
+            dst[base + 1 + w] =
+                @as(u32, blk.scales[off]) |
+                (@as(u32, blk.scales[off + 1]) << 8) |
+                (@as(u32, blk.scales[off + 2]) << 16) |
+                (@as(u32, blk.scales[off + 3]) << 24);
+        }
+        for (0..32) |w| {
+            const off = w * 4;
+            dst[base + 4 + w] =
+                @as(u32, blk.qs[off]) |
+                (@as(u32, blk.qs[off + 1]) << 8) |
+                (@as(u32, blk.qs[off + 2]) << 16) |
+                (@as(u32, blk.qs[off + 3]) << 24);
+        }
+    }
+}
+
 /// Dequantize `src.len` super-blocks into `src.len * 256` floats. Mirrors
 /// llama.cpp's `dequantize_row_q4_K`.
 pub fn dequantizeRow(src: []const Block, dst: []f32) void {

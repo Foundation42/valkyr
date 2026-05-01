@@ -24,6 +24,7 @@ const config_mod = @import("../config.zig");
 const dtype = @import("../dtype.zig");
 const model_mod = @import("../model.zig");
 const q4_0 = @import("../cpu/q4_0.zig");
+const q4_k = @import("../cpu/q4_k.zig");
 const jobs = @import("../jobs.zig");
 
 /// How weights are stored on the device.
@@ -52,6 +53,16 @@ pub const Precision = enum {
     /// memory vs. fp32 (or 1.8× vs. bf16) — the only path that
     /// realistically fits 27B-class models on a 24 GiB consumer card.
     q4_0_matmul,
+    /// Q4_K_M-style 4-bit weights: super-blocks of 256 elements with
+    /// 8 sub-blocks (32 elem each) carrying their own 6-bit (scale, min)
+    /// pair, two fp16 super-scales (`d`, `dmin`). Asymmetric dequant
+    /// `d * sc * q - dmin * m` gives ~30% lower MSE than Q4_0's
+    /// symmetric scheme on Gaussian data, and the iterative
+    /// make_qkx2_quants fit beats Q4_0's max-magnitude direct.
+    /// Effective 4.5 bits/elem on device (vs. ~5 for our padded Q4_0
+    /// layout). The on-device form is 36 u32 per super-block consumed
+    /// by `matmul_nt_v2_q4_k`. Same lm_head/embedding policy as Q4_0.
+    q4_k_matmul,
 };
 
 pub const GpuLayer = struct {
@@ -136,6 +147,7 @@ pub const GpuModel = struct {
             .fp32_all => .fp32,
             .bf16_matmul => .bf16_raw_if_bf16,
             .q4_0_matmul => .q4_0_quantize,
+            .q4_k_matmul => .q4_k_quantize,
         };
 
         // Spawn a worker pool for the upload's CPU-bound inner loops:
@@ -157,7 +169,7 @@ pub const GpuModel = struct {
         // shift the argmax.
         const lm_head_path: TensorPath = switch (precision) {
             .fp32_all => .fp32,
-            .bf16_matmul, .q4_0_matmul => .bf16_raw_if_bf16,
+            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => .bf16_raw_if_bf16,
         };
 
         // Pre-pass: walk every tensor once to size the device pool and
@@ -309,7 +321,7 @@ pub const GpuModel = struct {
 };
 
 /// Upload strategies the matmul-aware path can pick between.
-const TensorPath = enum { fp32, bf16_raw_if_bf16, q4_0_quantize };
+const TensorPath = enum { fp32, bf16_raw_if_bf16, q4_0_quantize, q4_k_quantize };
 
 /// Bytes the device-side buffer will hold for `t` under `path`. Used
 /// by the upload pre-pass to size the BufferPool's VkDeviceMemory and
@@ -323,6 +335,11 @@ fn targetBytes(t: safetensors.Tensor, path: TensorPath) usize {
         const blocks = (t.numel() / k) * (k / q4_0.BLOCK_SIZE);
         return blocks * q4_0.GPU_U32S_PER_BLOCK * 4;
     }
+    if (path == .q4_k_quantize) {
+        const k = t.shape[t.shape.len - 1];
+        const supers = (t.numel() / k) * (k / q4_k.QK_K);
+        return supers * q4_k.GPU_U32S_PER_SUPERBLOCK * 4;
+    }
     return t.numel() * 4; // fp32 destination
 }
 
@@ -332,6 +349,9 @@ fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.T
     }
     if (path == .q4_0_quantize) {
         return uploadTensorQ4_0(gpa, ctx, t, js, pool);
+    }
+    if (path == .q4_k_quantize) {
+        return uploadTensorQ4_K(gpa, ctx, t, js, pool);
     }
     return uploadTensor(gpa, ctx, t, js, pool);
 }
@@ -393,6 +413,23 @@ fn q4QuantizeJob(j: *jobs.Job) void {
         const src_row = c.src[row * c.k .. (row + 1) * c.k];
         const dst_row = c.dst[row * c.blocks_per_row .. (row + 1) * c.blocks_per_row];
         q4_0.quantizeRow(src_row, dst_row);
+    }
+}
+
+const Q4KQuantCtx = struct {
+    src: []const f32,
+    dst: []q4_k.Block,
+    k: usize,
+    supers_per_row: usize,
+};
+
+fn q4KQuantizeJob(j: *jobs.Job) void {
+    const range = j.getData(jobs.BatchRange);
+    const c: *const Q4KQuantCtx = @ptrCast(@alignCast(range.context));
+    for (range.start..range.end) |row| {
+        const src_row = c.src[row * c.k .. (row + 1) * c.k];
+        const dst_row = c.dst[row * c.supers_per_row .. (row + 1) * c.supers_per_row];
+        q4_k.quantizeRow(src_row, dst_row);
     }
 }
 
@@ -472,6 +509,77 @@ fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetenso
     const packed_buf = try gpa.alloc(u32, packed_words);
     defer gpa.free(packed_buf);
     q4_0.packForGpu(blocks, packed_buf);
+
+    return pool.commit(ctx, std.mem.sliceAsBytes(packed_buf));
+}
+
+/// Quantize a 2-D weight tensor row-wise to Q4_K_M (super-block of 256
+/// elem with 8 sub-blocks of 32, per-sub-block 6-bit (scale, min), 2
+/// fp16 super-scales) and upload as a flat u32 buffer in the
+/// 36-u32-per-super-block GPU layout consumed by `matmul_nt_v2_q4_k`.
+///
+/// Same row-major [N, K] convention as Q4_0; last dim must be a multiple
+/// of 256 (vs. 32 for Q4_0). Holds across every supported model: every
+/// projection's K dim is hidden_size or intermediate_size, both
+/// multiples of 256 on Gemma 2B / Qwen3.5 / Qwen3.6 27B.
+///
+/// Per-row quantize cost is higher than Q4_0 — make_qkx2_quants does 21
+/// candidate iscales per sub-block — so the parallel-loader matters more
+/// here. Host peak during upload is roughly 2.4× tensor_size_fp32 (one
+/// fp32 scratch + one canonical Block scratch at 144 B per 256 floats =
+/// 1.125× fp32 footprint + the packed-u32 scratch).
+fn uploadTensorQ4_K(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, js: *jobs.JobSystem, pool: *buffer.BufferPool) !buffer.Buffer {
+    const numel = t.numel();
+    if (t.shape.len < 2) return error.Q4_KNeedsAtLeast2D;
+    const k = t.shape[t.shape.len - 1];
+    if (k % q4_k.QK_K != 0) return error.Q4_KLastDimNotMultipleOf256;
+    const rows = numel / k;
+    const supers_per_row = k / q4_k.QK_K;
+    const total_supers = rows * supers_per_row;
+
+    // Materialise the tensor as fp32 into host scratch (parallel for
+    // bf16/fp16; plain memcpy for fp32). Identical to the Q4_0 path.
+    const f = try gpa.alloc(f32, numel);
+    defer gpa.free(f);
+    switch (t.dtype) {
+        .f32 => {
+            const src = @as([*]align(1) const f32, @ptrCast(t.bytes.ptr))[0..numel];
+            @memcpy(f, src);
+        },
+        .bf16 => {
+            const u = dtype.asU16(t.bytes);
+            const ctxc = Bf16ConvCtx{ .src = u, .dst = f };
+            var counter = jobs.Counter.init(0);
+            js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), bf16ConvJob, @ptrCast(&ctxc), &counter);
+            js.waitFor(&counter);
+        },
+        .f16 => {
+            const u = dtype.asU16(t.bytes);
+            const ctxc = Fp16ConvCtx{ .src = u, .dst = f };
+            var counter = jobs.Counter.init(0);
+            js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), fp16ConvJob, @ptrCast(&ctxc), &counter);
+            js.waitFor(&counter);
+        },
+        else => return error.UnsupportedWeightDtype,
+    }
+
+    // Row-wise quantize through the canonical Block layout, parallel
+    // across rows. Each super-block needs ~6 KB of scratch in the inner
+    // function; that's per-thread stack so no contention.
+    const blocks = try gpa.alloc(q4_k.Block, total_supers);
+    defer gpa.free(blocks);
+    {
+        const ctxc = Q4KQuantCtx{ .src = f, .dst = blocks, .k = k, .supers_per_row = supers_per_row };
+        var counter = jobs.Counter.init(0);
+        js.parallelFor(@intCast(rows), batchSize(rows, js.worker_count), q4KQuantizeJob, @ptrCast(&ctxc), &counter);
+        js.waitFor(&counter);
+    }
+
+    // Repack to the GPU's contiguous 36-u32-per-super-block layout.
+    const packed_words = total_supers * q4_k.GPU_U32S_PER_SUPERBLOCK;
+    const packed_buf = try gpa.alloc(u32, packed_words);
+    defer gpa.free(packed_buf);
+    q4_k.packForGpu(blocks, packed_buf);
 
     return pool.commit(ctx, std.mem.sliceAsBytes(packed_buf));
 }

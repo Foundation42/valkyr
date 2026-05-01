@@ -1,0 +1,128 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// matmul_nt with Q4_K_M-quantized weights on device. Same cooperative-K
+// reduction as matmul_nt_v2 / _bf16 / _q4_0; the difference is how B is
+// read.
+//
+// Q4_K layout (matches src/cpu/q4_k.zig + the GPU repack in gpu/model.zig):
+// each row of K elements is laid out as K/256 super-blocks; each super-
+// block is 36 contiguous u32s = 144 bytes. Per super-block:
+//
+//   word 0       = d (fp16, low 16 bits) | dmin (fp16, high 16 bits)
+//   words 1..3   = scales[12], little-endian byte-packed.
+//                  Encodes 8 sub-blocks × (6-bit scale + 6-bit min)
+//                  via the get_scale_min_k4 nibble layout (top 2 bits
+//                  of sub-blocks 4..7 borrowed from bytes 0..7).
+//   words 4..35  = qs[128], little-endian byte-packed.
+//                  256 4-bit unsigned weights paired by sub-block:
+//                  bytes 0..31 hold pair (sub-block 0 low | sub-block 1
+//                  high) at the same intra-sub-block index; bytes 32..63
+//                  hold pair (2,3); 64..95 hold (4,5); 96..127 hold (6,7).
+//
+// Per element the dequant formula is asymmetric:
+//
+//   x = d * sc[j] * q[i] - dmin * m[j]
+//
+// where j = sub-block index, i = element index. This is the load-bearing
+// quality difference vs. Q4_0's symmetric (q-8)*scale.
+//
+// K must be a multiple of 256 — true for every supported transformer
+// matmul shape (hidden_size and intermediate_size are multiples of 256
+// across Gemma 2B / Qwen3.5 / Qwen3.6 27B, the largest models we run).
+//
+// WG=128 matches matmul_nt_v2_bf16's tuning. Scalar K-stride iteration
+// here (not the bf16 8-wide vectorization): per-element decode for q4_K
+// is heavier (3 byte-extracts + bit-pack to recover sc, m), so the
+// vectorization arithmetic-density tradeoff isn't free. Revisit later
+// if profiling shows headroom — shape is correct on cache-line locality
+// (one super-block = 144 B = ~1.1 NVIDIA cache lines, contiguous).
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A    { float a[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Bq4k { uint  b_pack[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C    { float c[]; };
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared float sg_partials[32];
+
+const uint U32S_PER_SUPER = 36u;
+
+float q4_k_load(uint b_off_supers, uint k) {
+    uint super_idx = b_off_supers + (k >> 8u);     // k / 256
+    uint base = super_idx * U32S_PER_SUPER;
+    uint pos = k & 255u;                            // k % 256
+    uint sub_idx = pos >> 5u;                       // pos / 32  ∈ [0, 8)
+    uint elem_in_sub = pos & 31u;                   // pos % 32
+
+    // Super-block scales d, dmin packed in word 0.
+    vec2 d_dmin = unpackHalf2x16(b_pack[base]);
+    float d = d_dmin.x;
+    float dmin = d_dmin.y;
+
+    // 6-bit (sc, m) decode via get_scale_min_k4. The 12 scale bytes
+    // live in words 1..3 (word 1 holds bytes 0..3, word 2 bytes 4..7,
+    // word 3 bytes 8..11), little-endian byte order within each word.
+    uint sc, m;
+    if (sub_idx < 4u) {
+        uint b_j   = (b_pack[base + 1u] >> (sub_idx * 8u)) & 0xFFu; // bytes 0..3
+        uint b_jp4 = (b_pack[base + 2u] >> (sub_idx * 8u)) & 0xFFu; // bytes 4..7
+        sc = b_j   & 63u;
+        m  = b_jp4 & 63u;
+    } else {
+        uint local = sub_idx - 4u;                  // ∈ [0, 4)
+        uint b_jp4 = (b_pack[base + 3u] >> (local * 8u)) & 0xFFu;   // bytes 8..11
+        uint b_jm4 = (b_pack[base + 1u] >> (local * 8u)) & 0xFFu;   // bytes 0..3
+        uint b_j   = (b_pack[base + 2u] >> (local * 8u)) & 0xFFu;   // bytes 4..7
+        sc = (b_jp4 & 0xFu) | ((b_jm4 >> 6u) << 4u);
+        m  = (b_jp4 >> 4u)  | ((b_j   >> 6u) << 4u);
+    }
+
+    // 4-bit q decode. qs pairs sub-blocks (2k, 2k+1): low nibble of
+    // qs-byte (pair*32 + elem_in_sub) is sub-block 2k's element, high
+    // nibble is sub-block 2k+1's element. Word 4 starts the qs region.
+    uint pair  = sub_idx >> 1u;                     // 0..3
+    uint which = sub_idx & 1u;                      // 0 = low, 1 = high
+    uint qs_byte = pair * 32u + elem_in_sub;        // 0..127
+    uint qs_word = (b_pack[base + 4u + (qs_byte >> 2u)] >> ((qs_byte & 3u) * 8u)) & 0xFFu;
+    uint q = (which == 0u) ? (qs_word & 0xFu) : (qs_word >> 4u);
+
+    return d * float(sc) * float(q) - dmin * float(m);
+}
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint i = cell / pc.N;
+    uint j = cell - i * pc.N;
+    if (i >= pc.M) return;
+
+    uint a_off = i * pc.K;
+    uint b_off_supers = j * (pc.K >> 8u);            // K / 256 super-blocks per row
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += gl_WorkGroupSize.x) {
+        acc += a[a_off + k] * q4_k_load(b_off_supers, k);
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            c[i * pc.N + j] = total;
+        }
+    }
+}

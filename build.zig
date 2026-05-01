@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     const matmul_nt_v2_spv = compileShader(b, "matmul_nt_v2");
     const matmul_nt_v2_bf16_spv = compileShader(b, "matmul_nt_v2_bf16");
     const matmul_nt_v2_q4_0_spv = compileShader(b, "matmul_nt_v2_q4_0");
+    const matmul_nt_v2_q4_k_spv = compileShader(b, "matmul_nt_v2_q4_k");
     const rmsnorm_spv = compileShader(b, "rmsnorm");
     const geglu_spv = compileShader(b, "geglu");
     const swiglu_spv = compileShader(b, "swiglu");
@@ -58,6 +59,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matmul_nt_v2_spv, "matmul_nt_v2.spv");
     _ = wf.addCopyFile(matmul_nt_v2_bf16_spv, "matmul_nt_v2_bf16.spv");
     _ = wf.addCopyFile(matmul_nt_v2_q4_0_spv, "matmul_nt_v2_q4_0.spv");
+    _ = wf.addCopyFile(matmul_nt_v2_q4_k_spv, "matmul_nt_v2_q4_k.spv");
     _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
     _ = wf.addCopyFile(geglu_spv, "geglu.spv");
     _ = wf.addCopyFile(swiglu_spv, "swiglu.spv");
@@ -97,6 +99,7 @@ pub fn build(b: *std.Build) void {
         \\pub const matmul_nt_v2 align(4) = @embedFile("matmul_nt_v2.spv").*;
         \\pub const matmul_nt_v2_bf16 align(4) = @embedFile("matmul_nt_v2_bf16.spv").*;
         \\pub const matmul_nt_v2_q4_0 align(4) = @embedFile("matmul_nt_v2_q4_0.spv").*;
+        \\pub const matmul_nt_v2_q4_k align(4) = @embedFile("matmul_nt_v2_q4_k.spv").*;
         \\pub const rmsnorm align(4) = @embedFile("rmsnorm.spv").*;
         \\pub const geglu align(4) = @embedFile("geglu.spv").*;
         \\pub const swiglu align(4) = @embedFile("swiglu.spv").*;
