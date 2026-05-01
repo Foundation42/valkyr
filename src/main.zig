@@ -3386,7 +3386,7 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
     for (0..n_steps) |step| {
         if (step > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, step, current, null);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, step, current, null, true);
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
         const t1 = std.time.nanoTimestamp();
@@ -3788,9 +3788,15 @@ fn chatTurn(
     var generated: usize = 0;
 
     while (true) {
+        // We only need logits at the LAST prefill position (to sample
+        // the first response token) and for every step of the sample
+        // loop. Skipping the LM head matmul on intermediate prefill
+        // tokens is a free ~10% startup win on short prompts and
+        // scales linearly with prompt length on long ones.
+        const is_last_prefill_or_decoding = (prompt_idx + 1 >= prompt.items.len);
         if (pos.* > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, tq4_v);
+        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, tq4_v, is_last_prefill_or_decoding);
         try rec.endAndSubmit();
 
         // Decide what to do at this position.
@@ -3952,6 +3958,7 @@ fn recordForwardStep(
     pos: usize,
     token_id: u32,
     tq4_v: ?Tq4VHooks,
+    compute_logits: bool,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
@@ -4096,8 +4103,14 @@ fn recordForwardStep(
         try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
     }
 
-    try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
-    try recDispatchMatmul(rec, k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    // Final norm + LM head: skip when the caller doesn't need logits
+    // (chat prefill skips them on every prompt token except the last —
+    // we only need the logits to sample the first response token, and
+    // the LM head matmul is by far the largest in the model).
+    if (compute_logits) {
+        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+        try recDispatchMatmul(rec, k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    }
 }
 
 /// Build the kernel set for chat/gen-many. `matmul_for_layers` picks
@@ -4243,7 +4256,7 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
     while (pos < n_tokens) : (pos += 1) {
         if (pos > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, pos, current_token, null);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, pos, current_token, null, true);
 
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
@@ -4348,14 +4361,14 @@ fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
 
     // Pass 1: fp32 V baseline.
     try rec.begin();
-    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, null);
+    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, null, true);
     try rec.endAndSubmit();
     try sc.logits.readBack(&ctx, f32, logits_a);
 
     // Pass 2: TQ4 V.
     try rec.reset();
     try rec.begin();
-    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, tq4_hooks);
+    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, tq4_hooks, true);
     try rec.endAndSubmit();
     try sc.logits.readBack(&ctx, f32, logits_b);
 
@@ -5367,6 +5380,7 @@ fn recordHybridForwardStep(
     token_id: u32,
     max_pos: u32,
     tq4_v: ?HybridTq4VHooks,
+    compute_logits: bool,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
@@ -5524,8 +5538,10 @@ fn recordHybridForwardStep(
         try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
     }
 
-    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
-    try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    if (compute_logits) {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+        try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    }
 }
 
 fn runChatQwen35(
@@ -5713,9 +5729,12 @@ fn chatTurnHybrid(
     var decode_started = false;
 
     while (true) {
+        // Skip the LM head matmul (the largest in the model) on every
+        // prefill token except the last — see chatTurn for the rationale.
+        const is_last_prefill_or_decoding = (prompt_idx + 1 >= prompt.items.len);
         if (pos.* > 0) try rec.reset();
         try rec.begin();
-        try recordHybridForwardStep(rec, sc, state, gm, cfg, ks, pos.*, current, max_pos, tq4_v);
+        try recordHybridForwardStep(rec, sc, state, gm, cfg, ks, pos.*, current, max_pos, tq4_v, is_last_prefill_or_decoding);
         try rec.endAndSubmit();
 
         prompt_idx += 1;
