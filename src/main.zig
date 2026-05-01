@@ -4149,12 +4149,17 @@ fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision, fami
         .fp32_all => &shaders.matmul_nt_v2,
         .bf16_matmul, .q4_0_matmul => &shaders.matmul_nt_v2_bf16,
     };
+    // embed_tokens follows the same bf16-when-non-fp32 rule as lm_head.
+    const embed_spv: []align(4) const u8 = switch (precision) {
+        .fp32_all => &shaders.embed_lookup,
+        .bf16_matmul, .q4_0_matmul => &shaders.embed_lookup_bf16,
+    };
     const ffn_spv: []align(4) const u8 = switch (family.activation()) {
         .gelu => &shaders.geglu,
         .silu => &shaders.swiglu,
     };
     return .{
-        .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
+        .embed = try pipeline.Kernel.init(ctx, embed_spv, 2, @sizeOf(EmbedLookupPush)),
         .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
         .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
         .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
@@ -5140,8 +5145,12 @@ const HybridChatKernels = struct {
             .fp32_all => &shaders.matmul_nt_v2,
             .bf16_matmul, .q4_0_matmul => &shaders.matmul_nt_v2_bf16,
         };
+        const embed_spv: []align(4) const u8 = switch (precision) {
+            .fp32_all => &shaders.embed_lookup,
+            .bf16_matmul, .q4_0_matmul => &shaders.embed_lookup_bf16,
+        };
         return .{
-            .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
+            .embed = try pipeline.Kernel.init(ctx, embed_spv, 2, @sizeOf(EmbedLookupPush)),
             .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
             .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
             .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),

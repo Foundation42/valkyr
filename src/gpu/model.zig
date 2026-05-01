@@ -141,7 +141,20 @@ pub const GpuModel = struct {
         const js = try jobs.JobSystem.init(gpa, 0); // 0 = auto (CPU - 2)
         defer js.deinit();
 
-        var embed = try uploadTensor(gpa, ctx, cpu.embed_tokens, js);
+        // The biggest tensors (embed_tokens + lm_head) follow a shared
+        // bf16-when-non-fp32 rule. They're the single biggest reads in
+        // the steady-state forward, and at Qwen3.6 27B's vocab=248320
+        // each is ~5 GiB at fp32 → 2.5 GiB at bf16, halving both the
+        // on-device footprint AND the staging-buffer peak during upload
+        // (the latter being what decides whether 27B-class models
+        // actually fit on a 24 GiB card). lm_head deliberately skips
+        // Q4_0: logits are sampled from, and 4-bit quantization could
+        // shift the argmax.
+        const lm_head_path: TensorPath = switch (precision) {
+            .fp32_all => .fp32,
+            .bf16_matmul, .q4_0_matmul => .bf16_raw_if_bf16,
+        };
+        var embed = try uploadByPath(gpa, ctx, cpu.embed_tokens, lm_head_path, js);
         errdefer embed.deinit(ctx.device);
 
         var final_norm = try uploadTensor(gpa, ctx, cpu.final_norm, js);
@@ -149,17 +162,7 @@ pub const GpuModel = struct {
 
         // For the tied case we still upload a fresh copy — the bytes
         // come from the same source so the device-side data is the
-        // same; only the host-side allocation pattern differs. The
-        // lm_head goes through `bf16_raw_if_bf16` whenever precision
-        // is non-fp32 (bf16 or q4_0): it's the single biggest matmul
-        // in the model (N = vocab_size, up to 248 K) and bf16 is the
-        // simplest safe halving — we deliberately skip Q4_0 here
-        // since lm_head logits are sampled from and quantization
-        // could shift the argmax.
-        const lm_head_path: TensorPath = switch (precision) {
-            .fp32_all => .fp32,
-            .bf16_matmul, .q4_0_matmul => .bf16_raw_if_bf16,
-        };
+        // same; only the host-side allocation pattern differs.
         var lm_head = try uploadByPath(gpa, ctx, cpu.lm_head, lm_head_path, js);
         errdefer lm_head.deinit(ctx.device);
 

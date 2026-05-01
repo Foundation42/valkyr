@@ -1,0 +1,41 @@
+#version 460
+// Embedding row lookup, bf16-on-device variant of embed_lookup.comp.
+//
+// Same math:
+//     out[i] = embed[token_id * dim + i] * scale
+//
+// Storage difference: each embedding element is one bf16 (the upper
+// 16 bits of an fp32). Two consecutive bf16 elements pack into a u32
+// in std430 little-endian order — first in low 16 bits, second in
+// high 16 bits — exactly like the matmul_nt_v2_bf16 weight layout.
+//
+// Halves the embed_tokens footprint: for Qwen3.6 27B (vocab=248320,
+// dim=5120) that's 5.07 GB → 2.54 GB on device, plus the same
+// halving on the staging-buffer peak during upload — which is the
+// transient pressure that decides whether the model fits at all.
+//
+// `dim` must be even (always true for transformer hidden_size).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Embed { uint  embed_pack[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out   { float outv[]; };
+
+layout(push_constant) uniform Pc {
+    uint token_id;
+    uint dim;
+    float scale;
+} pc;
+
+float bf16_load(uint idx) {
+    uint packed = embed_pack[idx >> 1];
+    uint half16 = ((idx & 1u) == 0u) ? (packed & 0xFFFFu) : (packed >> 16);
+    return uintBitsToFloat(half16 << 16);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.dim) return;
+    uint src = pc.token_id * pc.dim + i;
+    outv[i] = bf16_load(src) * pc.scale;
+}
