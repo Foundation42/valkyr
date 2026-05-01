@@ -371,10 +371,12 @@ sense).
   layers, and the FFN trio): ~29 tok/s on the 4B and ~43 tok/s on the
   0.8B at the same parity. The lm_head and embeddings stay fp32 (same
   policy as Gemma).
-- TurboQuant TQ4 ships two block sizes (256 for Gemma, 128 for
-  Qwen3); other head dims need a new shader pair. The Qwen3.5
-  hybrid's full-attention layers could be retrofitted to TQ4-V but
-  the linear-attn layers have no growing KV cache to compress.
+- TurboQuant TQ4 ships two block sizes (256 for Gemma + Qwen3.5,
+  128 for Qwen3); other head dims need a new shader pair. The
+  Qwen3.5 hybrid path supports `--tq4v` on its full-attention layers
+  (1-in-4 layers under the linear-attn × 3, full-attn × 1 schedule);
+  linear-attn layers have a fixed-size SSM state with no growing KV
+  cache, so TQ4 doesn't apply to them.
 - TurboQuant TQ3 (3-bit) is not yet implemented.
 - TurboQuant K-side compression (symmetric K=TQ / V=TQ) is not yet
   implemented.

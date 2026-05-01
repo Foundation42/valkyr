@@ -199,8 +199,7 @@ pub fn main() !void {
         defer allocator.free(cfg_path);
         const cfg = try config_mod.Config.loadFromFile(allocator, cfg_path);
         if (cfg.family.isHybrid()) {
-            if (tq4v) std.debug.print("note: --tq4v ignored on hybrid families (Qwen3.5)\n", .{});
-            try runChatQwen35(allocator, args[2], user_msg, sp, seed);
+            try runChatQwen35(allocator, args[2], user_msg, sp, seed, tq4v);
         } else {
             try runChat(allocator, args[2], user_msg, sp, seed, tq4v);
         }
@@ -4962,8 +4961,12 @@ const HybridChatScratch = struct {
     head_out: buffer.Buffer,
     head_out_gated: buffer.Buffer,
     scores: buffer.Buffer,
+    /// Shared TQ4-V dequant scratch — sized for one full V history at
+    /// `max_pos`, reused across all full-attn layers. Only allocated
+    /// when --tq4v is on; otherwise `null`.
+    dequant_v: ?buffer.Buffer,
 
-    fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32) !HybridChatScratch {
+    fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32, tq4v: bool) !HybridChatScratch {
         const f = @sizeOf(f32);
         const hidden = cfg.hidden_size;
         const inter = cfg.intermediate_size;
@@ -5009,6 +5012,7 @@ const HybridChatScratch = struct {
             .head_out        = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
             .head_out_gated  = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
             .scores          = try buffer.Buffer.initDeviceOnly(ctx, n_q * max_pos * f),
+            .dequant_v       = if (tq4v) try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f) else null,
         };
     }
 
@@ -5025,6 +5029,7 @@ const HybridChatScratch = struct {
         }) |fname| {
             @field(self, fname).deinit(device);
         }
+        if (self.dequant_v) |*b| b.deinit(device);
     }
 };
 
@@ -5037,18 +5042,31 @@ const HybridChatState = struct {
     /// `[num_layers]` per-layer KV-cache K. Slots for linear layers
     /// are `null`. Sized for `max_pos` positions.
     kv_k: []?buffer.Buffer,
-    /// `[num_layers]` per-layer KV-cache V.
+    /// `[num_layers]` per-layer KV-cache V (fp32 path). When `--tq4v`
+    /// is on this stays `null` for every layer and `kv_v_tq4` is used
+    /// instead.
     kv_v: []?buffer.Buffer,
+    /// `[num_layers]` per-layer TQ4-packed V cache. Allocated only for
+    /// `.full_attention` slots when `--tq4v` is on; `null` otherwise.
+    kv_v_tq4: []?buffer.Buffer,
     allocator: std.mem.Allocator,
 
-    fn init(gpa: std.mem.Allocator, ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32) !HybridChatState {
+    fn init(gpa: std.mem.Allocator, ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32, tq4v: bool) !HybridChatState {
         const f = @sizeOf(f32);
+        const u = @sizeOf(u32);
         const conv_dim = cfg.linearAttnConvDim();
         const conv_kernel = cfg.linear_conv_kernel_dim;
         const head_k = cfg.linear_key_head_dim;
         const head_v = cfg.linear_value_head_dim;
         const n_v_heads = cfg.linear_num_value_heads;
         const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        // TQ4 sizing — same convention as GpuKvCacheTq4: block_size =
+        // head_dim (must be 128 or 256 to hit the existing shader pair),
+        // n_blocks_per_pos = num_kv_heads, and each block is one γ word
+        // plus head_dim/8 packed-index words.
+        const block_size = cfg.head_dim;
+        const n_blocks_per_pos = cfg.num_key_value_heads;
+        const u32s_per_block = 1 + block_size / 8;
 
         var ssm_conv = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
         @memset(ssm_conv, null);
@@ -5058,6 +5076,8 @@ const HybridChatState = struct {
         @memset(kv_k, null);
         var kv_v = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
         @memset(kv_v, null);
+        var kv_v_tq4 = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
+        @memset(kv_v_tq4, null);
 
         for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| switch (lt) {
             .linear_attention => {
@@ -5066,10 +5086,21 @@ const HybridChatState = struct {
             },
             .full_attention => {
                 kv_k[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
-                kv_v[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
+                if (tq4v) {
+                    kv_v_tq4[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * n_blocks_per_pos * u32s_per_block * u);
+                } else {
+                    kv_v[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
+                }
             },
         };
-        return .{ .ssm_conv = ssm_conv, .ssm_rec = ssm_rec, .kv_k = kv_k, .kv_v = kv_v, .allocator = gpa };
+        return .{
+            .ssm_conv = ssm_conv,
+            .ssm_rec = ssm_rec,
+            .kv_k = kv_k,
+            .kv_v = kv_v,
+            .kv_v_tq4 = kv_v_tq4,
+            .allocator = gpa,
+        };
     }
 
     fn deinit(self: *HybridChatState, device: vk.c.VkDevice) void {
@@ -5077,11 +5108,23 @@ const HybridChatState = struct {
         for (self.ssm_rec) |*b| if (b.*) |*v| v.deinit(device);
         for (self.kv_k) |*b| if (b.*) |*v| v.deinit(device);
         for (self.kv_v) |*b| if (b.*) |*v| v.deinit(device);
+        for (self.kv_v_tq4) |*b| if (b.*) |*v| v.deinit(device);
         self.allocator.free(self.ssm_conv);
         self.allocator.free(self.ssm_rec);
         self.allocator.free(self.kv_k);
         self.allocator.free(self.kv_v);
+        self.allocator.free(self.kv_v_tq4);
     }
+};
+
+/// TQ4-V hooks for the hybrid forward step. Differs from the Gemma
+/// `Tq4VHooks` because the hybrid model already owns its per-layer V
+/// buffers via `HybridChatState`, so we don't need a separate
+/// `GpuKvCacheTq4`. The shared `dequant_v` lives on `HybridChatScratch`.
+const HybridTq4VHooks = struct {
+    pack: *const pipeline.Kernel,
+    unpack: *const pipeline.Kernel,
+    n_blocks_per_pos: u32,
 };
 
 /// Record one decode step into the recorder. `pos` is the position
@@ -5099,6 +5142,7 @@ fn recordHybridForwardStep(
     pos: usize,
     token_id: u32,
     max_pos: u32,
+    tq4_v: ?HybridTq4VHooks,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
@@ -5218,10 +5262,30 @@ fn recordHybridForwardStep(
                 try recDispatch1D(rec, &k.rope_partial, &.{ &sc.q, &sc.qrot }, &rope_q_push, n_q_heads * head_dim);
                 try recDispatch1D(rec, &k.rope_partial, &.{ &sc.k, &sc.krot }, &rope_k_push, n_kv_heads * head_dim);
                 try recDispatch1D(rec, &k.kv_write, &.{ &sc.krot, &state.kv_k[i].? }, &kv_write_push, kv_dim);
-                try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &state.kv_v[i].? }, &kv_write_push, kv_dim);
+
+                // V write: legacy fp32 raw copy, or TQ4 quantising
+                // pack-to-cache when tq4_v is supplied. Same shader pair
+                // as the Gemma TQ4 path; only the per-layer destination
+                // buffer differs.
+                if (tq4_v) |t| {
+                    const pack_push = Tq4PackPush{ .dst_block_idx = @as(u32, @intCast(pos)) * t.n_blocks_per_pos };
+                    try rec.dispatch(t.pack, &.{ &sc.v, &state.kv_v_tq4[i].? }, &pack_push, t.n_blocks_per_pos, 1, 1);
+                } else {
+                    try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &state.kv_v[i].? }, &kv_write_push, kv_dim);
+                }
+
                 try rec.dispatch(&k.scores, &.{ &sc.qrot, &state.kv_k[i].?, &sc.scores }, &scores_push, n_q_heads * n_pos, 1, 1);
                 try recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &softmax_push, n_q_heads);
-                try rec.dispatch(&k.attn_out, &.{ &sc.scores, &state.kv_v[i].?, &sc.head_out }, &attn_out_push, n_q_heads * head_dim, 1, 1);
+
+                // V read for attn output: either kv_v[i] (fp32 path) or
+                // dequant the entire TQ4 history into the shared
+                // dequant_v scratch, then read that.
+                const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
+                    const total_blocks: u32 = n_pos * t.n_blocks_per_pos;
+                    try rec.dispatch(t.unpack, &.{ &state.kv_v_tq4[i].?, &sc.dequant_v.? }, null, total_blocks, 1, 1);
+                    break :blk &sc.dequant_v.?;
+                } else &state.kv_v[i].?;
+                try rec.dispatch(&k.attn_out, &.{ &sc.scores, v_for_attn, &sc.head_out }, &attn_out_push, n_q_heads * head_dim, 1, 1);
                 try recDispatch1D(rec, &k.sigmoid_mul, &.{ &sc.head_out, &sc.gate_attn, &sc.head_out_gated }, &sigmul_push, q_dim);
                 try recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out_gated, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
             },
@@ -5246,6 +5310,7 @@ fn runChatQwen35(
     single_msg: ?[]const u8,
     sample_params: cpu_forward.SampleParams,
     seed: u64,
+    tq4v: bool,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -5262,17 +5327,56 @@ fn runChatQwen35(
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    try stdout.print("uploading weights (bf16 path)...\n", .{});
+    if (tq4v) {
+        try stdout.print("uploading weights (bf16 + TQ4-V on full-attn layers)...\n", .{});
+    } else {
+        try stdout.print("uploading weights (bf16 path)...\n", .{});
+    }
     var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .bf16_matmul);
     defer gm.deinit(ctx.device);
 
+    // TQ4-V is only wired for head_dim ∈ {128, 256}. Both Qwen3.5 sizes
+    // (0.8B, 4B) are 128, so this is mostly a guard against future
+    // hybrids with odd head_dim landing on this path.
+    if (tq4v and cfg.head_dim != 128 and cfg.head_dim != 256) {
+        try stdout.print("note: --tq4v ignored — head_dim={d} has no TQ4 shader pair (only 128/256 wired)\n", .{cfg.head_dim});
+    }
+    const tq4v_active = tq4v and (cfg.head_dim == 128 or cfg.head_dim == 256);
+
     const max_pos: u32 = 2048;
-    var sc = try HybridChatScratch.init(&ctx, cfg, max_pos);
+    var sc = try HybridChatScratch.init(&ctx, cfg, max_pos, tq4v_active);
     defer sc.deinit(ctx.device);
-    var state = try HybridChatState.init(gpa, &ctx, cfg, max_pos);
+    var state = try HybridChatState.init(gpa, &ctx, cfg, max_pos, tq4v_active);
     defer state.deinit(ctx.device);
     var ks = try HybridChatKernels.init(&ctx, gm.precision);
     defer ks.deinit();
+
+    // TQ4 pack/unpack kernels — picked by head_dim, only built when
+    // active. Mirrors the Gemma TQ4 path. Number of blocks per token =
+    // num_kv_heads (8 for Qwen3.5).
+    const tq_pack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+        &shaders.tq4_pack_to_cache128
+    else
+        &shaders.tq4_pack_to_cache;
+    const tq_unpack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+        &shaders.tq4_unpack128
+    else
+        &shaders.tq4_unpack256;
+    var tq_pack: ?pipeline.Kernel = if (tq4v_active)
+        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(Tq4PackPush))
+    else
+        null;
+    defer if (tq_pack) |*kk| kk.deinit();
+    var tq_unpack: ?pipeline.Kernel = if (tq4v_active)
+        try pipeline.Kernel.init(&ctx, tq_unpack_spv, 2, 0)
+    else
+        null;
+    defer if (tq_unpack) |*kk| kk.deinit();
+    const tq4_hooks: ?HybridTq4VHooks = if (tq4v_active) HybridTq4VHooks{
+        .pack = &tq_pack.?,
+        .unpack = &tq_unpack.?,
+        .n_blocks_per_pos = @intCast(cfg.num_key_value_heads),
+    } else null;
 
     // Recorder pool sized for one full forward step. ~30 dispatches per
     // linear layer + ~16 per full layer + ~3 head/tail = up to ~30*32 +
@@ -5304,7 +5408,7 @@ fn runChatQwen35(
     var pos: usize = 0;
 
     if (single_msg) |m| {
-        try chatTurnHybrid(gpa, &ctx, &rec, &sc, &state, &gm, cfg, &ks, &tok, m, &pos, logits, sample_scratch, sample_params, rng, tmpl, false, max_pos);
+        try chatTurnHybrid(gpa, &ctx, &rec, &sc, &state, &gm, cfg, &ks, &tok, m, &pos, logits, sample_scratch, sample_params, rng, tmpl, false, max_pos, tq4_hooks);
         return;
     }
 
@@ -5319,7 +5423,7 @@ fn runChatQwen35(
             break;
         };
         if (line.len == 0) continue;
-        try chatTurnHybrid(gpa, &ctx, &rec, &sc, &state, &gm, cfg, &ks, &tok, line, &pos, logits, sample_scratch, sample_params, rng, tmpl, true, max_pos);
+        try chatTurnHybrid(gpa, &ctx, &rec, &sc, &state, &gm, cfg, &ks, &tok, line, &pos, logits, sample_scratch, sample_params, rng, tmpl, true, max_pos, tq4_hooks);
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
             break;
@@ -5346,6 +5450,7 @@ fn chatTurnHybrid(
     tmpl: ChatTemplate,
     is_repl: bool,
     max_pos: u32,
+    tq4_v: ?HybridTq4VHooks,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -5377,7 +5482,7 @@ fn chatTurnHybrid(
     while (true) {
         if (pos.* > 0) try rec.reset();
         try rec.begin();
-        try recordHybridForwardStep(rec, sc, state, gm, cfg, ks, pos.*, current, max_pos);
+        try recordHybridForwardStep(rec, sc, state, gm, cfg, ks, pos.*, current, max_pos, tq4_v);
         try rec.endAndSubmit();
 
         prompt_idx += 1;

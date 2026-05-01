@@ -2,15 +2,25 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic      : require
 
-// Same as tq4_pack256.comp, but writes the resulting 33-u32 packed
-// block at a caller-specified slot in the output buffer rather than
-// `gl_WorkGroupID.x`. Used for the V-cache write side: a single
-// 256-element V vector is computed by v_proj into a small staging
-// buffer, then this kernel quantises it and writes the packed form
-// directly into the per-layer V cache at position `dst_block_idx`.
+// 256-block cache-write counterpart to tq4_pack_to_cache128.comp.
+// Same in-shader algorithm as tq4_pack256.comp, but uses
+// `gl_WorkGroupID.x` to pick the input slice + cache slot so callers
+// with kv_dim > head_dim (e.g. Qwen3.5 4B: num_kv_heads=4 ×
+// head_dim=256 = 1024) can dispatch n_blocks_per_pos workgroups per
+// position. Each workgroup quantises one 256-element block.
 //
-// Dispatch: (1, 1, 1) per call. Workgroup is 128 threads × 2
-// elements, identical layout to tq4_pack256.
+//   input_data : tightly-packed float[kv_dim] for ONE position
+//   output_data: u32[ ... ] cache buffer (max_pos × n_blocks × 33 u32s)
+//
+//   per workgroup:
+//     base_in  = gl_WorkGroupID.x * 256
+//     base_out = (pc.dst_block_idx + gl_WorkGroupID.x) * 33
+//
+// Backwards-compatible with the legacy single-block Gemma path
+// (kv_dim == head_dim == 256, n_blocks_per_pos = 1): with one WG
+// dispatched, gl_WorkGroupID.x == 0 collapses to the original
+// base_in = 0, base_out = dst_block_idx * 33. Workgroup is 128
+// threads × 2 elements, identical layout to tq4_pack256.
 
 layout(local_size_x = 128) in;
 
@@ -61,8 +71,8 @@ uint lloydMaxIndexB4(float x) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint base_in  = 0u;
-    uint base_out = pc.dst_block_idx * 33u;
+    uint base_in  = gl_WorkGroupID.x * 256u;
+    uint base_out = (pc.dst_block_idx + gl_WorkGroupID.x) * 33u;
 
     uint i0 = 2u * tid;
     uint i1 = i0 + 1u;
