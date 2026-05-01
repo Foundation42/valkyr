@@ -2,26 +2,39 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic      : require
 
-// matmul_nt with bf16-on-device weights. Same cooperative-K reduction
-// as matmul_nt_v2; the only twist is how B is read.
+// matmul_nt with bf16-on-device weights, vectorized 8 elements per
+// memory request.
+//
+// Each thread reads:
+//   - one uvec4 from B (= 8 bf16 values = 16 bytes)
+//   - two vec4s  from A (= 8 fp32 values = 32 bytes)
+// per iteration, accumulating 8 MACs. Compared to the scalar version
+// this is 4× fewer SSBO transactions on B (the bandwidth-dominant
+// side, since B is the weight matrix re-read every token) and 8×
+// fewer on A.
 //
 // bf16 layout: each value is 2 bytes, identical to the upper 16 bits
-// of an fp32. We pack two consecutive bf16 elements per uint (4 bytes)
-// in the SSBO, with the *first* of each pair in the LOW 16 bits and
-// the *second* in the HIGH 16 bits — matches std430 little-endian
-// memory order. Conversion to fp32 is just a shift-left-16:
+// of an fp32. We pack two consecutive bf16 elements per uint, with
+// the *first* in the LOW 16 bits and the *second* in the HIGH 16
+// bits — matches std430 little-endian memory order. Decoding is just
+// a shift-into-high:
 //
-//     bf16_to_f32(x) = uintBitsToFloat(uint(x) << 16);
+//     elem n+0  =  uintBitsToFloat( bp.x << 16          )
+//     elem n+1  =  uintBitsToFloat( bp.x & 0xFFFF0000u  )
 //
-// The K dimension must be even (so the packing aligns); for our
-// transformer shapes it always is — K is hidden_size or
-// intermediate_size, both multiples of 64.
+// Constraints (all hold for our supported transformer shapes):
+//   - K is a multiple of 8. hidden_size and intermediate_size are
+//     always multiples of 64 in supported models.
+//   - B's row stride (= K bytes × 2) is a multiple of 16. With K
+//     a multiple of 8 this gives multiples of 16 → uvec4-aligned.
+//   - A's a_off (= i × K floats) is a multiple of 4. M = 1 in
+//     decode → i = 0 → a_off = 0.
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0, std430) readonly  buffer A     { float a[]; };
-layout(set = 0, binding = 1, std430) readonly  buffer Bbf16 { uint b_pack[]; };
-layout(set = 0, binding = 2, std430) writeonly buffer C     { float c[]; };
+layout(set = 0, binding = 0, std430) readonly  buffer A     { vec4  a4[];     };
+layout(set = 0, binding = 1, std430) readonly  buffer Bbf16 { uvec4 b_pack[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C     { float c[];      };
 
 layout(push_constant) uniform Pc {
     uint M;
@@ -31,25 +44,34 @@ layout(push_constant) uniform Pc {
 
 shared float sg_partials[32];
 
-float bf16_load(uint idx) {
-    uint packed = b_pack[idx >> 1];
-    uint half16 = ((idx & 1u) == 0u) ? (packed & 0xFFFFu) : (packed >> 16);
-    return uintBitsToFloat(half16 << 16);
-}
-
 void main() {
     uint cell = gl_WorkGroupID.x;
     uint i = cell / pc.N;
     uint j = cell - i * pc.N;
     if (i >= pc.M) return;
 
-    uint a_off = i * pc.K;
-    uint b_off = j * pc.K;
+    uint a_off = i * pc.K;   // fp32 element offset
+    uint b_off = j * pc.K;   // bf16 element offset
     uint tid = gl_LocalInvocationID.x;
 
     float acc = 0.0;
-    for (uint k = tid; k < pc.K; k += gl_WorkGroupSize.x) {
-        acc += a[a_off + k] * bf16_load(b_off + k);
+    // Stride 8 elements (one uvec4 of B = 8 bf16) per thread per iter.
+    for (uint k = tid * 8u; k < pc.K; k += gl_WorkGroupSize.x * 8u) {
+        uvec4 bp  = b_pack[(b_off + k) >> 3];
+        vec4  av0 = a4    [(a_off + k) >> 2];
+        vec4  av1 = a4    [(a_off + k + 4u) >> 2];
+
+        float b0 = uintBitsToFloat( bp.x << 16          );
+        float b1 = uintBitsToFloat( bp.x & 0xFFFF0000u  );
+        float b2 = uintBitsToFloat( bp.y << 16          );
+        float b3 = uintBitsToFloat( bp.y & 0xFFFF0000u  );
+        float b4 = uintBitsToFloat( bp.z << 16          );
+        float b5 = uintBitsToFloat( bp.z & 0xFFFF0000u  );
+        float b6 = uintBitsToFloat( bp.w << 16          );
+        float b7 = uintBitsToFloat( bp.w & 0xFFFF0000u  );
+
+        acc += av0.x * b0 + av0.y * b1 + av0.z * b2 + av0.w * b3
+             + av1.x * b4 + av1.y * b5 + av1.z * b6 + av1.w * b7;
     }
 
     float sg_sum = subgroupAdd(acc);

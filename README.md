@@ -111,18 +111,18 @@ greedy at `--temp 0`:
 
 | model | precision | tok/s |
 |---|---|---|
-| Gemma 2B IT | bf16 (layers) + fp32 (embed/lm_head) | ~120 |
-| Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~50 |
-| Qwen3.5 0.8B | bf16 | ~81 |
-| Qwen3.5 0.8B | bf16 `--tq4v` | ~81 |
-| Qwen3.5 0.8B | `--q4` | ~82 |
-| Qwen3.5 0.8B | `--q4 --tq4v` | ~82 |
-| Qwen3.5 4B | bf16 | ~46 |
-| Qwen3.5 4B | bf16 `--tq4v` | ~46 |
-| Qwen3.5 4B | `--q4` | ~50 |
-| Qwen3.5 4B | `--q4 --tq4v` | ~49 |
-| **Qwen3.6 27B** | `--q4` | **~15** |
-| **Qwen3.6 27B** | `--q4 --tq4v` | **~15** |
+| Gemma 2B IT | bf16 (layers) + fp32 (embed/lm_head) | ~143 |
+| Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~55 |
+| Qwen3.5 0.8B | bf16 | ~102 |
+| Qwen3.5 0.8B | `--q4` | ~104 |
+| Qwen3.5 4B | bf16 | ~55 |
+| Qwen3.5 4B | `--q4` | ~59 |
+| **Qwen3.6 27B** | `--q4` | **~16.5** |
+
+bf16 matmul reads use vectorized `uvec4` (16-byte) loads — 4× fewer
+SSBO transactions on the weight side, decoded inline as eight bf16
+values per request. That's the headline 1.10–1.27× win over the
+last reported numbers; see `shaders/matmul_nt_v2_bf16.comp`.
 
 All numbers measured at 96-token decode horizon. The Qwen3.6 27B
 figure is on the same 3090 the smaller models run on. `--tq4v` is
@@ -440,9 +440,9 @@ sense).
   peak. Most of the warm forward time is the FFN matmuls reading
   weights memory-bandwidth-bound — proper shared-memory tiling and
   fused attention (FlashAttention-style) are obvious wins. The
-  Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~46 tok/s on
-  the 4B, ~80 tok/s on the 0.8B) by default, and
-  `matmul_nt_v2_q4_0` with `--q4` (~50 tok/s on the 4B, ~82 tok/s
+  Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~55 tok/s on
+  the 4B, ~102 tok/s on the 0.8B) by default, and
+  `matmul_nt_v2_q4_0` with `--q4` (~59 tok/s on the 4B, ~104 tok/s
   on the 0.8B). When any
   non-fp32 path is active the lm_head and embed_tokens both ride
   bf16 — they're the single biggest matmul reads in the model
