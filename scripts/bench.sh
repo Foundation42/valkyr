@@ -18,17 +18,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# ── HF cache snapshot paths ────────────────────────────────────────
-# Hardcoded for now; swap to env vars or a config file once we have
-# more than one machine to run this on.
+# ── Model id table ─────────────────────────────────────────────────
+# Short keys map to HF model ids (`org/name`). valkyr resolves them
+# at run time via hf_cache.zig — no snapshot hashes hardcoded.
 HF_HUB="${HF_HUB:-$HOME/.cache/huggingface/hub}"
-declare -A MODEL_DIR=(
-    [gemma]="$HF_HUB/models--google--gemma-2b-it/snapshots/96988410cbdaeb8d5093d1ebdc5a8fb563e02bad"
-    [0.8b]="$HF_HUB/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17"
-    [4b]="$HF_HUB/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
-    [27b]="$HF_HUB/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
+declare -A MODEL_ID=(
+    [gemma]="google/gemma-2b-it"
+    [tinyllama]="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    [llama32]="meta-llama/Llama-3.2-3B-Instruct"
+    [mistral7b]="mistralai/Mistral-7B-Instruct-v0.3"
+    [0.8b]="Qwen/Qwen3.5-0.8B"
+    [4b]="Qwen/Qwen3.5-4B"
+    [27b]="Qwen/Qwen3.6-27B"
 )
-DEFAULT_MODELS="gemma 0.8b 4b 27b"
+DEFAULT_MODELS="gemma tinyllama llama32 mistral7b 0.8b 4b 27b"
 DEFAULT_PRECISIONS="bf16 q4 q4k"
 
 # ── Args ────────────────────────────────────────────────────────────
@@ -82,7 +85,7 @@ SUMMARY=$OUT/SUMMARY.md
 # Returns 0 on success (writes a row to SUMMARY); 1 on parse failure.
 run_pair() {
     local model_key=$1 prec=$2
-    local model_dir=${MODEL_DIR[$model_key]}
+    local model_id=${MODEL_ID[$model_key]}
     local log=$OUT/${model_key}_${prec}.log
     local prec_flag=""
     case "$prec" in
@@ -92,17 +95,21 @@ run_pair() {
         *) echo "unknown precision: $prec" >&2; return 1 ;;
     esac
 
-    if [[ ! -d "$model_dir" ]]; then
-        echo "  SKIP $model_key (dir not found: $model_dir)" >&2
-        echo "| $model_key | $prec | — | — | (model dir missing) |" >> "$SUMMARY"
+    # Quick existence probe via the cache dir naming convention. valkyr
+    # would error cleanly otherwise, but we want to record SKIP rather
+    # than ERR for "not downloaded yet" cases.
+    local cache_name="models--${model_id//\//--}"
+    if [[ ! -d "$HF_HUB/$cache_name" ]]; then
+        echo "  SKIP $model_key (not in HF cache: $model_id)" >&2
+        echo "| $model_key | $prec | — | — | (not in cache) |" >> "$SUMMARY"
         return 0
     fi
 
     echo "▶ $model_key $prec ..." >&2
     local t_start=$(date +%s)
-    # 600s timeout: 27B q4_k upload runs ~5–10 min on 8-core CPU. Will
-    # surface as "TIMEOUT" in the summary if exceeded.
-    if ! timeout 600 "$BIN" --chat "$model_dir" $prec_flag --seed $SEED "$PROMPT" > "$log" 2>&1; then
+    # 600s timeout: 27B q4_k upload runs ~5 min on 8-core CPU. Surfaces
+    # as TIMEOUT in the summary if exceeded.
+    if ! timeout 600 "$BIN" --chat "$model_id" $prec_flag --seed $SEED "$PROMPT" > "$log" 2>&1; then
         local rc=$?
         if [[ $rc -eq 124 ]]; then
             echo "| $model_key | $prec | TIMEOUT | — | (>600s) |" >> "$SUMMARY"
@@ -138,7 +145,7 @@ run_pair() {
 
 # ── Sweep ──────────────────────────────────────────────────────────
 for model in $MODELS; do
-    [[ -z "${MODEL_DIR[$model]:-}" ]] && { echo "skip unknown model: $model" >&2; continue; }
+    [[ -z "${MODEL_ID[$model]:-}" ]] && { echo "skip unknown model: $model" >&2; continue; }
     for prec in $PRECISIONS; do
         run_pair "$model" "$prec"
     done
