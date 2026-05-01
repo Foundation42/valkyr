@@ -492,18 +492,24 @@ sense).
 
 ## Limitations
 
-- **Gemma 1, Qwen3, Qwen3.5, and (architecturally) Qwen3.6 today.**
-  Qwen3.6 declares the same `Qwen3_5ForConditionalGeneration`
-  architecture as Qwen3.5 — it's a retrained 3.5, not a new family
-  — so it loads through the existing hybrid path with no code
-  changes. The new config keys (`mtp_*` for the speculative-decode
-  draft head, `output_gate_type: "swish"`) are silently accepted by
-  the JSON parser, the multi-token-prediction head is skipped, and
-  the multimodal vision tower is skipped at load time. With `--q4`
-  the 27B fits a 24 GiB consumer card. Llama 2 / 3 / Mistral are
-  expected to fall out cheaply from the existing `Family` enum +
-  SwiGLU shader path; Gemma 2 / 3 (sliding-window attention) and the
-  Qwen3.5/3.6 vision tower are larger lifts.
+- **Gemma 1, Llama 3 / Llama 2-arch chat fine-tunes, Qwen3, Qwen3.5,
+  and (architecturally) Qwen3.6 today.** Qwen3.6 declares the same
+  `Qwen3_5ForConditionalGeneration` architecture as Qwen3.5 — it's a
+  retrained 3.5, not a new family — so it loads through the existing
+  hybrid path with no code changes. The new config keys (`mtp_*` for
+  the speculative-decode draft head, `output_gate_type: "swish"`)
+  are silently accepted by the JSON parser, the multi-token-
+  prediction head is skipped, and the multimodal vision tower is
+  skipped at load time. With `--q4` the 27B fits a 24 GiB consumer
+  card. Llama 3.2 3B Instruct loads end-to-end through `Family.llama`
+  and the Llama 3 chat template; TinyLlama-style Llama 2-arch chat
+  fine-tunes are auto-detected via the absence of
+  `<|start_header_id|>` and routed through a Zephyr-format chat
+  composer (`<s><|user|>\n{msg}</s>\n<|assistant|>\n`). Llama 3.x's
+  `rope_scaling` (yarn) is silently ignored — fine for the 8 K
+  trained context, would need a parser pass for the full 128 K.
+  Mistral, Gemma 2 / 3 (sliding-window attention), and the
+  Qwen3.5/3.6 vision tower are larger lifts still on the menu.
 - The naive `matmul_nt_v2` kernel hits roughly 0.1% of the 3090's fp32
   peak. Most of the warm forward time is the FFN matmuls reading
   weights memory-bandwidth-bound — proper shared-memory tiling and
@@ -597,8 +603,10 @@ sense).
 
 The two big arcs:
 
-1. **Breadth.** Llama 2 / 3, Mistral, Qwen support — most should fall
-   out from the existing `Family` enum and a SwiGLU shader. Phi /
+1. **Breadth.** Mistral support (different `[INST]` chat template
+   + new family enum) and Gemma 2 / 3 (sliding-window attention)
+   are the next architectural lifts. Llama 2 / 3 already ship via
+   the existing `Family.llama` enum + SwiGLU shader path. Phi /
    StableLM / OLMo are next after that. With the head_dim parameterised
    the TurboQuant path generalises automatically.
 
