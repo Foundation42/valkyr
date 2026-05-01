@@ -23,6 +23,7 @@ const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
 const gpu_scratch = @import("gpu/scratch.zig");
 const gpu_recorder = @import("gpu/recorder.zig");
+const hf_cache = @import("hf_cache.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -33,16 +34,26 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--list")) {
+        try runList(allocator);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
-        try runInspect(allocator, args[2]);
+        const dir = try hf_cache.resolveModelArg(allocator, args[2]);
+        defer allocator.free(dir);
+        try runInspect(allocator, dir);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--load")) {
-        try runLoad(allocator, args[2]);
+        const dir = try hf_cache.resolveModelArg(allocator, args[2]);
+        defer allocator.free(dir);
+        try runLoad(allocator, dir);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--config")) {
-        try runConfig(allocator, args[2]);
+        const dir = try hf_cache.resolveModelArg(allocator, args[2]);
+        defer allocator.free(dir);
+        try runConfig(allocator, dir);
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--qwen35-layer-test")) {
@@ -132,7 +143,9 @@ pub fn main() !void {
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--encode")) {
-        try runEncode(allocator, args[2], args[3]);
+        const dir = try hf_cache.resolveModelArg(allocator, args[2]);
+        defer allocator.free(dir);
+        try runEncode(allocator, dir, args[3]);
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--tq4-kv-test")) {
@@ -158,7 +171,9 @@ pub fn main() !void {
                 n = try std.fmt.parseInt(usize, args[i + 1], 10);
             }
         }
-        try runBench(allocator, args[2], n);
+        const dir = try hf_cache.resolveModelArg(allocator, args[2]);
+        defer allocator.free(dir);
+        try runBench(allocator, dir, n);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
@@ -215,15 +230,21 @@ pub fn main() !void {
             return;
         }
         const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
+        // Resolve `args[2]` from a possibly-HF-id form ("org/name") to an
+        // on-disk snapshot path so chat works with `--chat
+        // meta-llama/Llama-3.2-3B-Instruct ...` as smoothly as it does
+        // with a literal path.
+        const dir = try hf_cache.resolveModelArg(allocator, args[2]);
+        defer allocator.free(dir);
         // Hybrid families need a different kernel set + per-layer
         // SSM state plumbing — dispatch to the dedicated path.
-        const cfg_path = try std.fs.path.join(allocator, &.{ args[2], "config.json" });
+        const cfg_path = try std.fs.path.join(allocator, &.{ dir, "config.json" });
         defer allocator.free(cfg_path);
         const cfg = try config_mod.Config.loadFromFile(allocator, cfg_path);
         if (cfg.family.isHybrid()) {
-            try runChatQwen35(allocator, args[2], user_msg, sp, seed, tq4v, precision);
+            try runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision);
         } else {
-            try runChat(allocator, args[2], user_msg, sp, seed, tq4v, precision);
+            try runChat(allocator, dir, user_msg, sp, seed, tq4v, precision);
         }
         return;
     }
@@ -260,6 +281,80 @@ pub fn main() !void {
     try runGpuTq4UnpackSmoke(allocator);
     try runGpuTq4RoundTripSmoke(allocator);
     try runGpuTq4PackToCacheSmoke(allocator);
+}
+
+// ── --list: enumerate cached HF models ─────────────────────────────
+//
+// Walks ~/.cache/huggingface/hub (env-overridable via HF_HUB_CACHE /
+// HF_HOME / XDG_CACHE_HOME) and prints one row per cached model with
+// its architecture, on-disk size, and a marker column showing whether
+// valkyr can load it. Designed to pair with `--chat <id>`: if a row
+// shows `[OK]`, you can chat the model directly via its id.
+
+fn runList(gpa: std.mem.Allocator) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    const root = try hf_cache.cacheRoot(gpa);
+    defer gpa.free(root);
+    try stdout.print("HF cache: {s}\n\n", .{root});
+
+    const models = try hf_cache.listModels(gpa);
+    defer {
+        for (models) |entry| {
+            var m = entry;
+            m.deinit(gpa);
+        }
+        gpa.free(models);
+    }
+    if (models.len == 0) {
+        try stdout.print("(no models cached — try `hf download <org/name>`)\n", .{});
+        return;
+    }
+
+    // Sort: supported first, then by id alphabetically. Two-key sort
+    // via std.mem.sort with a stable comparator.
+    std.mem.sort(hf_cache.ModelInfo, @constCast(models), {}, struct {
+        fn lt(_: void, a: hf_cache.ModelInfo, b: hf_cache.ModelInfo) bool {
+            if (a.supported != b.supported) return a.supported;
+            return std.mem.lessThan(u8, a.id, b.id);
+        }
+    }.lt);
+
+    // Width-fit columns for readability.
+    var max_id_w: usize = 5;
+    var max_arch_w: usize = 12;
+    for (models) |m| {
+        if (m.id.len > max_id_w) max_id_w = m.id.len;
+        if (m.architecture.len > max_arch_w) max_arch_w = m.architecture.len;
+    }
+    if (max_id_w > 60) max_id_w = 60;
+    if (max_arch_w > 36) max_arch_w = 36;
+
+    try stdout.print("  {s: <60}  {s: <36}  {s: >9}  {s}\n", .{
+        "model id (`--chat <this>`)",
+        "architecture",
+        "size",
+        "status",
+    });
+    try stdout.print("  {s:->60}  {s:->36}  {s:->9}  {s:->8}\n", .{ "", "", "", "" });
+
+    var size_buf: [32]u8 = undefined;
+    for (models) |m| {
+        const size_str = try hf_cache.formatSize(m.bytes, &size_buf);
+        const status: []const u8 = if (m.supported) "[OK]" else "[?]";
+        try stdout.print("  {s: <60}  {s: <36}  {s: >9}  {s}\n", .{
+            m.id,
+            m.architecture,
+            size_str,
+            status,
+        });
+    }
+
+    var supported_count: usize = 0;
+    for (models) |m| if (m.supported) {
+        supported_count += 1;
+    };
+    try stdout.print("\n{d}/{d} models supported by valkyr's loader.\n", .{ supported_count, models.len });
 }
 
 // ── inspect: dump the tensor inventory of a real .safetensors file ──

@@ -323,17 +323,24 @@ installed.
 
 ## Running
 
-The binary is one executable with mode flags. All modes take a
-HuggingFace snapshot directory containing `config.json`,
-`tokenizer.json`, and the `*.safetensors` shard(s).
+The binary is one executable with mode flags. Modes that take a
+model accept either a path to a HuggingFace snapshot directory
+(`config.json` + `tokenizer.json` + `*.safetensors`) **or** an HF
+model id like `meta-llama/Llama-3.2-3B-Instruct` — when the arg
+contains `/` and isn't an existing path, valkyr resolves it to
+the snapshot under `~/.cache/huggingface/hub/` (honoring the
+standard `HF_HUB_CACHE` / `HF_HOME` / `XDG_CACHE_HOME` env vars).
 
 ```sh
 # Default smoke run — 21 small kernel + format + parity tests, no model load
 zig build run
 
+# List cached models, marking which ones valkyr can load
+./zig-out/bin/valkyr --list
+
 # Inspect a checkpoint (no GPU touched)
 ./zig-out/bin/valkyr --inspect <model.safetensors>
-./zig-out/bin/valkyr --load    <model-dir>
+./zig-out/bin/valkyr --load    <model-dir-or-hf-id>
 
 # CPU reference forward + greedy sample (the parity oracle)
 ./zig-out/bin/valkyr --gen <model-dir> <token-id>
@@ -353,25 +360,26 @@ zig build run
 # GPU streaming generation (KV cache, multi-position attention)
 ./zig-out/bin/valkyr --gpu-gen-many <model-dir> <token-id> <n>
 
-# Chat (single-turn or multi-turn REPL)
-./zig-out/bin/valkyr --chat <model-dir> "What is the capital of France?"
-./zig-out/bin/valkyr --chat <model-dir>        # REPL with stdin
+# Chat (single-turn or multi-turn REPL) — `<model>` is either an HF
+# id (e.g. `meta-llama/Llama-3.2-3B-Instruct`) or a snapshot path.
+./zig-out/bin/valkyr --chat meta-llama/Llama-3.2-3B-Instruct "What is the capital of France?"
+./zig-out/bin/valkyr --chat <model>            # REPL with stdin
 
 # Chat with TurboQuant V-cache (asymmetric K=fp / V=TQ4)
-./zig-out/bin/valkyr --chat <model-dir> --tq4v "..."
+./zig-out/bin/valkyr --chat <model> --tq4v "..."
 
-# Chat with Q4_0 4-bit weights (lets 27B fit on a 3090; composes
-# with --tq4v for the smallest-footprint configuration)
-./zig-out/bin/valkyr --chat <model-dir> --q4 "..."
-./zig-out/bin/valkyr --chat <model-dir> --q4 --tq4v "..."
+# Chat with Q4_0 4-bit weights (composes with --tq4v for the
+# smallest-footprint configuration)
+./zig-out/bin/valkyr --chat <model> --q4 "..."
+./zig-out/bin/valkyr --chat <model> --q4 --tq4v "..."
 
 # Chat with Q4_K_M 4-bit weights (super-block-256, asymmetric — same
-# format llama.cpp ships as Q4_K_M.gguf; better quality than --q4 but
-# ~10–30% slower decode on these shapes; mutually exclusive with --q4)
-./zig-out/bin/valkyr --chat <model-dir> --q4k "..."
+# format llama.cpp ships as Q4_K_M.gguf; faster decode than --q4 +
+# ~32% lower quantize MSE; mutually exclusive with --q4)
+./zig-out/bin/valkyr --chat <model> --q4k "..."
 
 # Chat with sampling (works with or without --tq4v)
-./zig-out/bin/valkyr --chat <model-dir> \
+./zig-out/bin/valkyr --chat <model> \
     --temp 0.8 --top-p 0.9 --seed 42 \
     "Write a one-line haiku about Vulkan."
 
@@ -399,6 +407,8 @@ src/
 ├── dtype.zig            bf16/fp16 → fp32 bit-twiddling
 ├── jobs.zig             Chase-Lev work-stealing pool (vendored from
 │                        matryoshka/jobs.zig) — parallel weight upload
+├── hf_cache.zig         HuggingFace cache walker — resolves "org/name"
+│                        to snapshot paths, lists cached models for --list
 ├── cpu/
 │   ├── math.zig         Reference primitives: rmsnorm, matmul_nt,
 │   │                    RoPE, softmax, GeGLU, embedding lookup
