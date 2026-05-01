@@ -54,12 +54,29 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
   `sigmoid_mul`, `slice_copy`, `scale`).
 - **Multi-turn chat** with prompt prefill, KV cache persistence across
   turns, family-dispatched chat templates, and per-family stop tokens.
-- **TurboQuant TQ4 V-cache** on both families — opt in with `--tq4v`.
-  ~5.5× memory reduction on the V cache. Two block-size paths (256
-  for Gemma, 128 for Qwen3) share the same CPU oracle and ship six
-  paired GLSL shaders each.
-- **bf16 matmul weights on device** — halves both upload time and
-  steady-state matmul memory bandwidth versus fp32.
+- **TurboQuant TQ4 V-cache** on all three families — opt in with
+  `--tq4v`. ~5.5× memory reduction on the V cache. Block sizes 256
+  (Gemma + Qwen3.5 4B) and 128 (Qwen3 4B) share the same CPU oracle
+  and ship paired multi-block GLSL shaders. On the Qwen3.5 hybrid
+  the V-cache compression applies on the 1-in-4 full-attention
+  layers; the linear-attention layers carry a constant-size SSM
+  state that already doesn't grow with context.
+- **bf16 matmul weights on device** — halves upload time and matmul
+  memory bandwidth versus fp32.
+- **Q4_0 matmul weights on device** (`--q4`) — 4-bit signed
+  block-32 weights with one fp16 scale per block, dequant-on-the-fly
+  in the matmul shader. Quantization happens at upload time directly
+  from the bf16/fp32 safetensors (no GGUF dependency); the CPU
+  oracle is byte-clean against llama.cpp's `block_q4_0`. Drops the
+  per-tensor weight footprint to 0.625 B/elem — the path that lets
+  27B-class models actually fit on a 24 GiB card.
+- **Parallel weight upload** — the bf16 → fp32 conversion and Q4_0
+  row-wise quantize run on a vendored Chase-Lev work-stealing pool
+  ([credit: matryoshka/jobs.zig](https://github.com/foundation42/matryoshka)),
+  worker count auto-set to `CPU - 2`. Brings Qwen3.5 4B Q4_0 upload
+  from 24.1 s serial to 13.5 s on an 8-core test box (1.78×); the
+  remaining time is per-tensor Vulkan staging-buffer overhead, not
+  CPU work.
 - **Sampling**: greedy, temperature, top-K, top-P, with `--seed` for
   reproducible sampled runs. (Greedy decoding is non-deterministic
   across runs at the last digit due to GPU subgroup reduction order;
@@ -146,9 +163,10 @@ GPU forward (Vulkan SPIR-V, family-gated)       Gemma:    ✓ matches CPU
    ▼
 GPU TurboQuant V-cache (Vulkan + TQ4)           Gemma (256-block): top-5 match
                                                 Qwen3 (128-block): coherent generation
-                                                Qwen3.5: not yet — full-attn-only
-                                                  layers compress fine, linear-attn
-                                                  state is already small.
+                                                Qwen3.5 (256-block, 1-in-4 layers):
+                                                  coherent generation — linear-attn
+                                                  layers carry a fixed-size SSM
+                                                  state and are unaffected.
 ```
 
 The Qwen3 parity result is dramatic: HF top-5 logits are
@@ -191,8 +209,11 @@ generation; pin to CPU if you need bit-deterministic greedy output.
   PowerVR — within their device limits). Subgroup operations are
   required for the reduction kernels.
 - The headline numbers above are on an NVIDIA RTX 3090 (24 GiB VRAM).
-  Gemma 2B IT in bf16 needs ~5 GiB of weights and a few hundred MiB of
-  KV cache — comfortable on most modern dGPUs.
+  Gemma 2B IT in bf16 needs ~5 GiB of weights and a few hundred MiB
+  of KV cache — comfortable on most modern dGPUs. Qwen3.5 4B fits
+  comfortably in either bf16 (~8 GiB) or `--q4` (~2.5 GiB). Qwen3.6
+  27B at bf16 (~56 GiB) overflows 24 GiB by 2×; with `--q4`
+  (~16 GiB on-device, ~17 GiB peak with KV) it fits a single 3090.
 
 ## Build
 
@@ -261,6 +282,11 @@ zig build run
 # Chat with TurboQuant V-cache (asymmetric K=fp / V=TQ4)
 ./zig-out/bin/valkyr --chat <model-dir> --tq4v "..."
 
+# Chat with Q4_0 4-bit weights (lets 27B fit on a 3090; composes
+# with --tq4v for the smallest-footprint configuration)
+./zig-out/bin/valkyr --chat <model-dir> --q4 "..."
+./zig-out/bin/valkyr --chat <model-dir> --q4 --tq4v "..."
+
 # Chat with sampling (works with or without --tq4v)
 ./zig-out/bin/valkyr --chat <model-dir> \
     --temp 0.8 --top-p 0.9 --seed 42 \
@@ -288,19 +314,25 @@ src/
 ├── model.zig            CPU Model — config + tensors per layer
 ├── tokenizer.zig        BPE encode + decode, byte fallback
 ├── dtype.zig            bf16/fp16 → fp32 bit-twiddling
+├── jobs.zig             Chase-Lev work-stealing pool (vendored from
+│                        matryoshka/jobs.zig) — parallel weight upload
 ├── cpu/
 │   ├── math.zig         Reference primitives: rmsnorm, matmul_nt,
 │   │                    RoPE, softmax, GeGLU, embedding lookup
 │   ├── forward.zig      CPU full forward + sample (greedy/temp/top-k/top-p)
 │   │                    + forwardTq4V (TQ4 V-cache variant)
-│   └── turboquant.zig   Lloyd-Max codebooks + RHT (FWHT + sign flips)
-│                        + BlockTQ4 + quantize/dequantize — the oracle
+│   ├── turboquant.zig   Lloyd-Max codebooks + RHT (FWHT + sign flips)
+│   │                    + BlockTQ4 + quantize/dequantize — the oracle
+│   └── q4_0.zig         Llama.cpp-compatible Q4_0 quantize/dequantize
+│                        (block-32, fp16 scale, signed nibbles); parity
+│                        oracle for the GPU matmul shader
 └── gpu/
     ├── vk.zig           Headless Vulkan compute context
     ├── buffer.zig       Static / dynamic / device-only buffer abstraction
     ├── pipeline.zig     Compute pipeline + descriptor set wrapper
     ├── recorder.zig     One-command-buffer dispatch batcher (auto barriers)
-    ├── model.zig        GpuModel + Precision (fp32_all | bf16_matmul)
+    ├── model.zig        GpuModel + Precision (fp32_all | bf16_matmul |
+                         q4_0_matmul) + parallel upload via jobs.zig
     └── scratch.zig      Per-forward activation buffers + KV cache
                          (fp32 GpuKvCache + TurboQuant GpuKvCacheTq4)
 
@@ -308,6 +340,8 @@ shaders/
 ├── matmul_nt.comp           naive 1-thread-per-cell baseline
 ├── matmul_nt_v2.comp        cooperative-K reduction, fp32 weights
 ├── matmul_nt_v2_bf16.comp   bf16 weights, packed u32 reads
+├── matmul_nt_v2_q4_0.comp   Q4_0 weights, in-shader dequant
+│                            (block-32, fp16 scale, signed nibbles)
 ├── rmsnorm.comp             subgroup-reduced sum-of-squares + Gemma quirk
 ├── softmax.comp             stable two-pass with stride support
 ├── geglu.comp               fused gelu_tanh(gate) · up
@@ -357,20 +391,28 @@ sense).
 
 ## Limitations
 
-- **Gemma 1, Qwen3, and Qwen3.5 today.** Llama 2 / 3 / Mistral are
+- **Gemma 1, Qwen3, Qwen3.5, and (architecturally) Qwen3.6 today.**
+  Qwen3.6 declares the same `Qwen3_5ForConditionalGeneration`
+  architecture as Qwen3.5 — it's a retrained 3.5, not a new family
+  — so it loads through the existing hybrid path with no code
+  changes. The new config keys (`mtp_*` for the speculative-decode
+  draft head, `output_gate_type: "swish"`) are silently accepted by
+  the JSON parser, the multi-token-prediction head is skipped, and
+  the multimodal vision tower is skipped at load time. With `--q4`
+  the 27B fits a 24 GiB consumer card. Llama 2 / 3 / Mistral are
   expected to fall out cheaply from the existing `Family` enum +
   SwiGLU shader path; Gemma 2 / 3 (sliding-window attention) and the
-  Qwen3.5 multimodal vision tower are larger lifts.
+  Qwen3.5/3.6 vision tower are larger lifts.
 - The naive `matmul_nt_v2` kernel hits roughly 0.1% of the 3090's fp32
-  peak. Most of the warm forward time is the FFN matmuls reading bf16
+  peak. Most of the warm forward time is the FFN matmuls reading
   weights memory-bandwidth-bound — proper shared-memory tiling, fused
   attention (FlashAttention-style), and a bf16 embedding kernel are
-  obvious wins. The Qwen3.5 chat path now runs through
-  `matmul_nt_v2_bf16` for all per-layer projections (Q/K/V/O on
-  full-attn layers, the four in-projs + out_proj on linear-attn
-  layers, and the FFN trio): ~29 tok/s on the 4B and ~43 tok/s on the
-  0.8B at the same parity. The lm_head and embeddings stay fp32 (same
-  policy as Gemma).
+  obvious wins. The Qwen3.5 chat path runs through
+  `matmul_nt_v2_bf16` (~29 tok/s on the 4B, ~43 tok/s on the 0.8B)
+  by default, and `matmul_nt_v2_q4_0` with `--q4` (~30 tok/s on the
+  4B — slightly faster because the 4-bit weights cut matmul memory
+  bandwidth ~3×). The lm_head and embeddings stay fp32 in both
+  paths (same policy as Gemma).
 - TurboQuant TQ4 ships two block sizes (256 for Gemma + Qwen3.5,
   128 for Qwen3); other head dims need a new shader pair. The
   Qwen3.5 hybrid path supports `--tq4v` on its full-attention layers
