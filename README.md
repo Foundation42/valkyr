@@ -113,9 +113,10 @@ greedy at `--temp 0`:
 |---|---|---|
 | Gemma 2B IT | bf16 (layers) + fp32 (embed/lm_head) | ~120 |
 | Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~50 |
-| Qwen3.5 0.8B | bf16 + bf16 lm_head | ~43 |
-| Qwen3.5 4B | bf16 + bf16 lm_head | ~29 |
-| Qwen3.5 4B | `--q4` (bf16 embed/lm_head) | ~52 |
+| Qwen3.5 0.8B | bf16 + bf16 lm_head | ~81 |
+| Qwen3.5 0.8B | `--q4` (bf16 embed/lm_head) | ~82 |
+| Qwen3.5 4B | bf16 + bf16 lm_head | ~46 |
+| Qwen3.5 4B | `--q4` (bf16 embed/lm_head) | ~50 |
 | **Qwen3.6 27B** | `--q4` (bf16 embed/lm_head) | **~15** |
 
 Numbers reflect both the bf16 lm_head + embed_tokens win and the
@@ -429,9 +430,10 @@ sense).
   peak. Most of the warm forward time is the FFN matmuls reading
   weights memory-bandwidth-bound — proper shared-memory tiling and
   fused attention (FlashAttention-style) are obvious wins. The
-  Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~29 tok/s on
-  the 4B, ~43 tok/s on the 0.8B) by default, and
-  `matmul_nt_v2_q4_0` with `--q4` (~52 tok/s on the 4B). When any
+  Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~46 tok/s on
+  the 4B, ~80 tok/s on the 0.8B) by default, and
+  `matmul_nt_v2_q4_0` with `--q4` (~50 tok/s on the 4B, ~82 tok/s
+  on the 0.8B). When any
   non-fp32 path is active the lm_head and embed_tokens both ride
   bf16 — they're the single biggest matmul reads in the model
   (`N = vocab_size`, up to 248 K) and bf16 is the simplest safe
