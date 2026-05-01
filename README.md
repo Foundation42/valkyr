@@ -113,17 +113,27 @@ greedy at `--temp 0`:
 |---|---|---|
 | Gemma 2B IT | bf16 (layers) + fp32 (embed/lm_head) | ~120 |
 | Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~50 |
-| Qwen3.5 0.8B | bf16 + bf16 lm_head | ~81 |
-| Qwen3.5 0.8B | `--q4` (bf16 embed/lm_head) | ~82 |
-| Qwen3.5 4B | bf16 + bf16 lm_head | ~46 |
-| Qwen3.5 4B | `--q4` (bf16 embed/lm_head) | ~50 |
-| **Qwen3.6 27B** | `--q4` (bf16 embed/lm_head) | **~15** |
+| Qwen3.5 0.8B | bf16 | ~81 |
+| Qwen3.5 0.8B | bf16 `--tq4v` | ~81 |
+| Qwen3.5 0.8B | `--q4` | ~82 |
+| Qwen3.5 0.8B | `--q4 --tq4v` | ~82 |
+| Qwen3.5 4B | bf16 | ~46 |
+| Qwen3.5 4B | bf16 `--tq4v` | ~46 |
+| Qwen3.5 4B | `--q4` | ~50 |
+| Qwen3.5 4B | `--q4 --tq4v` | ~49 |
+| **Qwen3.6 27B** | `--q4` | **~15** |
+| **Qwen3.6 27B** | `--q4 --tq4v` | **~15** |
 
-Numbers reflect both the bf16 lm_head + embed_tokens win and the
-lazy LM head during prefill; the Qwen3.6 27B figure is on the same
-3090 the smaller models run on. `--tq4v` adds a per-step V-cache
-dequant pass that's small overhead at short context and pays for
-itself at long context where V-cache memory bandwidth dominates.
+All numbers measured at 96-token decode horizon. The Qwen3.6 27B
+figure is on the same 3090 the smaller models run on. `--tq4v` is
+**deliberately tok/s-neutral at short context** — at 96 tokens the
+V cache is tiny compared to the weight reads, so the per-step
+dequant pass costs about the same as the bandwidth savings on the
+attention-output kernel. `--tq4v`'s real wins land at long context
+(4K–8K+) where the V history starts dominating attention-output
+bandwidth, and as **steady memory savings** on the full-attention
+V cache (~5.5× compression) — relevant if you want to push the
+27B's effective context further on a 24 GiB card.
 
 ## TurboQuant in 60 seconds
 
