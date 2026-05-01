@@ -75,7 +75,7 @@ already runs, valkyr is.
 
 ## What works today
 
-- **Five model families end-to-end on GPU**:
+- **Six model families end-to-end on GPU**:
   - **Gemma 1** (`google/gemma-2b-it`): 18-layer transformer, multi-
     query attention, GeGLU FFN, RoPE, RMSNorm with `(1+w)`, tied LM
     head, SentencePiece tokenizer, `<bos>`/`<start_of_turn>` chat
@@ -94,6 +94,15 @@ already runs, valkyr is.
     with the auto-detected Zephyr-style chat template
     (`<s><|user|>\n{msg}</s>\n<|assistant|>\n` — markers as text,
     not specials).
+  - **Mistral 7B v0.3** (`mistralai/Mistral-7B-Instruct-v0.3`):
+    `MistralForCausalLM` routes through `Family.llama` (same SiLU /
+    plain-RMSNorm / GQA / untied-lm_head shape). 32 layers, 4:1 GQA
+    (32 heads / 8 KV × head_dim 128), rope_theta 1 M, no sliding-
+    window in v0.3. Chat template auto-detects via `[INST]` /
+    `[/INST]` specials and emits `<s>[INST]{msg}[/INST]`. Multi-
+    turn re-emits `</s>` between turns (the chat loop breaks on
+    EOS without writing it to KV). Note: Ministral 3 (2025) is
+    FP8 + multimodal — separate future arc, not the v0.3 path.
   - **Qwen3** (`Qwen/Qwen3-4B-Instruct-2507`): 36-layer transformer,
     4:1 grouped-query attention, SwiGLU FFN, RoPE (θ=5M), plain
     RMSNorm, per-head q_norm/k_norm before RoPE, tied LM head, byte-
@@ -213,6 +222,7 @@ greedy at `--temp 0`:
 | Llama 3.2 3B Instruct | bf16 | ~71 |
 | Llama 3.2 3B Instruct | `--q4k` | ~89 |
 | TinyLlama 1.1B Chat | bf16 | ~171 |
+| Mistral 7B Instruct v0.3 | `--q4k` | ~71 |
 | Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~55 |
 | Qwen3.5 0.8B | bf16 | ~113 |
 | Qwen3.5 0.8B | `--q4` | ~104 |
@@ -549,8 +559,8 @@ sense).
 
 ## Limitations
 
-- **Gemma 1, Llama 3 / Llama 2-arch chat fine-tunes, Qwen3, Qwen3.5,
-  and (architecturally) Qwen3.6 today.** Qwen3.6 declares the same
+- **Gemma 1, Llama 3 / Llama 2-arch chat fine-tunes, Mistral 7B v0.3,
+  Qwen3, Qwen3.5, and (architecturally) Qwen3.6 today.** Qwen3.6 declares the same
   `Qwen3_5ForConditionalGeneration` architecture as Qwen3.5 — it's a
   retrained 3.5, not a new family — so it loads through the existing
   hybrid path with no code changes. The new config keys (`mtp_*` for
@@ -565,8 +575,11 @@ sense).
   composer (`<s><|user|>\n{msg}</s>\n<|assistant|>\n`). Llama 3.x's
   `rope_scaling` (yarn) is silently ignored — fine for the 8 K
   trained context, would need a parser pass for the full 128 K.
-  Mistral, Gemma 2 / 3 (sliding-window attention), and the
-  Qwen3.5/3.6 vision tower are larger lifts still on the menu.
+  Mistral 7B Instruct v0.3 ships through the same `Family.llama`
+  with `[INST]/[/INST]` chat-format auto-detect — 7 B fits the 24 GiB
+  card cleanly via `--q4k` (~71 tok/s). Gemma 2 / 3 (sliding-window
+  attention), Ministral 3 (FP8 + multimodal), and the Qwen3.5/3.6
+  vision tower are larger lifts still on the menu.
 - The naive `matmul_nt_v2` kernel hits roughly 0.1% of the 3090's fp32
   peak. Most of the warm forward time is the FFN matmuls reading
   weights memory-bandwidth-bound — proper shared-memory tiling and

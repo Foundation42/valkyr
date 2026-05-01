@@ -3821,8 +3821,15 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
 //     stop on </s>. Markers `<|user|>` / `<|assistant|>` are TEXT
 //     (BPE-encoded), not special tokens — only `<s>` / `</s>` are.
 //
-// Family.llama auto-detects between Llama 3 and Zephyr by checking
-// whether <|start_header_id|> exists as a special — keeps the runtime
+//   Mistral / Ministral ([INST] / [/INST] format, v0.3+):
+//     <s>[INST]{msg}[/INST]
+//     stop on </s>. `[INST]` and `[/INST]` are special tokens in
+//     Mistral 7B v0.3+ and Ministral; older v0.1/v0.2 used them as
+//     text markers — for those, downgrade to a future `mistral_text`
+//     branch if/when we hit one.
+//
+// Family.llama auto-detects between Llama 3, Mistral, and Zephyr by
+// checking which specials exist in the tokenizer — keeps the runtime
 // surface small without a separate Family enum entry.
 
 const ChatTemplate = struct {
@@ -3853,6 +3860,10 @@ const ChatTemplate = struct {
     /// Separator between turns (after closing marker, before next
     /// opening). `\n` for Gemma / Qwen3 / Zephyr; empty for Llama 3.
     inter_turn_sep: []const u8,
+    /// Mistral's `[INST]` token (set only in `.mistral` format).
+    inst_open: ?u32 = null,
+    /// Mistral's `[/INST]` token (set only in `.mistral` format).
+    inst_close: ?u32 = null,
 
     pub const Format = enum {
         /// Gemma + Qwen3/3.5 share the `<sot>role\n{msg}<eot>\n` shape.
@@ -3863,6 +3874,9 @@ const ChatTemplate = struct {
         /// fine-tunes that don't ship Llama 3 specials. Roles are
         /// encoded as text; only BOS / EOT are special tokens.
         zephyr,
+        /// Mistral / Ministral v0.3+ format: `<s>[INST]{msg}[/INST]`
+        /// with [INST] and [/INST] as special tokens in the tokenizer.
+        mistral,
     };
 
     pub fn resolve(family: config_mod.Family, tok: *const tokenizer_mod.Tokenizer) !ChatTemplate {
@@ -3880,10 +3894,10 @@ const ChatTemplate = struct {
                 .inter_turn_sep = "\n",
             },
             .llama => llama: {
-                // Auto-detect: Llama 3 chat models ship `<|start_header_id|>`
-                // as a special; Llama 2-arch chat fine-tunes (TinyLlama
-                // and friends) don't, so fall back to the Zephyr text-
-                // marker template using `<s>` / `</s>` only.
+                // Auto-detect among the three Llama-arch chat formats:
+                //   1. <|start_header_id|> exists → Llama 3 (Meta header-id)
+                //   2. [INST] exists → Mistral / Ministral v0.3+
+                //   3. else → Zephyr text-marker (TinyLlama-style)
                 if (tok.specialTokenId("<|start_header_id|>")) |sot| {
                     break :llama .{
                         .family = family,
@@ -3896,6 +3910,22 @@ const ChatTemplate = struct {
                         .assistant_role = "assistant",
                         .header_sep = "\n\n",
                         .inter_turn_sep = "",
+                    };
+                }
+                if (tok.specialTokenId("[INST]")) |inst| {
+                    break :llama .{
+                        .family = family,
+                        .format = .mistral,
+                        .bos = tok.specialTokenId("<s>"),
+                        .start_of_turn = null,
+                        .end_of_turn = tok.specialTokenId("</s>") orelse return error.NoEndOfTurn,
+                        .end_header = null,
+                        .user_role = "user",            // unused
+                        .assistant_role = "assistant",  // unused
+                        .header_sep = "",                // unused
+                        .inter_turn_sep = "",            // unused
+                        .inst_open = inst,
+                        .inst_close = tok.specialTokenId("[/INST]") orelse return error.NoInstClose,
                     };
                 }
                 break :llama .{
@@ -3934,6 +3964,7 @@ const ChatTemplate = struct {
             .llama => switch (self.format) {
                 .llama3 => "Llama 3 chat",
                 .zephyr => "Llama (Zephyr-style) chat",
+                .mistral => "Mistral / Ministral chat",
                 else => "Llama chat",
             },
             .qwen3 => "Qwen3 chat",
@@ -3954,11 +3985,19 @@ const ChatTemplate = struct {
     ) !void {
         if (is_first) {
             if (self.bos) |b| try out.append(b);
+        } else if (self.format == .mistral) {
+            // Mistral multi-turn: canonical format is
+            //   <s>[INST]msg1[/INST]reply1</s>[INST]msg2[/INST]
+            // The chat loop breaks on </s> without writing it to the
+            // KV cache, so we re-emit it here at the start of each
+            // non-first turn to close the previous reply.
+            try out.append(self.end_of_turn);
         }
 
         switch (self.format) {
             .gemma_qwen, .llama3 => try self.composeWithSpecials(gpa, tok, user_msg, out),
             .zephyr => try self.composeZephyr(gpa, tok, user_msg, out),
+            .mistral => try self.composeMistral(gpa, tok, user_msg, out),
         }
     }
 
@@ -4066,6 +4105,29 @@ const ChatTemplate = struct {
             defer gpa.free(ids);
             try out.appendSlice(ids);
         }
+    }
+
+    /// Mistral / Ministral v0.3+ composer:
+    ///   <s>?[INST]{msg}[/INST]
+    /// `[INST]` and `[/INST]` are the special tokens detected at
+    /// resolve time. Generation continues from after `[/INST]` and
+    /// stops at `</s>`. (Older Mistral v0.1/v0.2 used these as text
+    /// markers; we'd need a separate `mistral_text` format for those —
+    /// add when we hit one.)
+    fn composeMistral(
+        self: ChatTemplate,
+        gpa: std.mem.Allocator,
+        tok: *const tokenizer_mod.Tokenizer,
+        user_msg: []const u8,
+        out: *std.ArrayList(u32),
+    ) !void {
+        try out.append(self.inst_open.?);
+        {
+            const ids = try tok.encode(gpa, user_msg);
+            defer gpa.free(ids);
+            try out.appendSlice(ids);
+        }
+        try out.append(self.inst_close.?);
     }
 };
 

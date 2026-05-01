@@ -27,7 +27,14 @@ pub const Family = enum {
     pub fn fromArchitectures(archs: []const []const u8) !Family {
         for (archs) |a| {
             if (std.mem.eql(u8, a, "GemmaForCausalLM")) return .gemma;
-            if (std.mem.eql(u8, a, "LlamaForCausalLM")) return .llama;
+            // Mistral & Ministral are architecturally identical to
+            // Llama (SiLU + plain RMSNorm + GQA + no-bias projections);
+            // only the chat template differs and that's auto-detected
+            // at template-resolve time. Newer Mistral 7B v0.3 dropped
+            // sliding-window attention, so we don't need a separate
+            // path.
+            if (std.mem.eql(u8, a, "LlamaForCausalLM") or
+                std.mem.eql(u8, a, "MistralForCausalLM")) return .llama;
             if (std.mem.eql(u8, a, "Qwen3ForCausalLM")) return .qwen3;
             if (std.mem.eql(u8, a, "Qwen3_5ForConditionalGeneration")) return .qwen35;
         }
@@ -209,6 +216,7 @@ pub const Config = struct {
                 if (mt == .string) {
                     if (std.mem.eql(u8, mt.string, "gemma")) family = .gemma;
                     if (std.mem.eql(u8, mt.string, "llama")) family = .llama;
+                    if (std.mem.eql(u8, mt.string, "mistral")) family = .llama;
                     if (std.mem.eql(u8, mt.string, "qwen3")) family = .qwen3;
                     if (std.mem.eql(u8, mt.string, "qwen3_5")) family = .qwen35;
                 }
