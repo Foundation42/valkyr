@@ -2,9 +2,14 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic      : require
 
-// matmul_nt with Q4_K_M-quantized weights on device. Same cooperative-K
-// reduction as matmul_nt_v2 / _bf16 / _q4_0; the difference is how B is
-// read.
+// matmul_nt with Q4_K_M-quantized weights on device, 8-wide K loop.
+//
+// Geometry: each iteration handles 8 consecutive K elements. They are
+// guaranteed to live in a single sub-block (sub-blocks are 32 elements;
+// 8 ≤ 32 with our 8-aligned k stride). That fact does the heavy lifting
+// — `(d, dmin, sc, m)` is decoded ONCE per 8 elements instead of once
+// per element. The scalar form was 5–10× more decode-bound than Q4_0;
+// amortizing 8× collapses the gap.
 //
 // Q4_K layout (matches src/cpu/q4_k.zig + the GPU repack in gpu/model.zig):
 // each row of K elements is laid out as K/256 super-blocks; each super-
@@ -25,24 +30,23 @@
 //
 //   x = d * sc[j] * q[i] - dmin * m[j]
 //
-// where j = sub-block index, i = element index. This is the load-bearing
-// quality difference vs. Q4_0's symmetric (q-8)*scale.
+// where j = sub-block index, i = element index. Factoring `d_eff = d*sc`,
+// `m_eff = dmin*m`, the per-iteration accumulation becomes
 //
-// K must be a multiple of 256 — true for every supported transformer
-// matmul shape (hidden_size and intermediate_size are multiples of 256
-// across Gemma 2B / Qwen3.5 / Qwen3.6 27B, the largest models we run).
+//   acc += d_eff * dot(av, q) - m_eff * sum(av)
 //
-// WG=128 matches matmul_nt_v2_bf16's tuning. Scalar K-stride iteration
-// here (not the bf16 8-wide vectorization): per-element decode for q4_K
-// is heavier (3 byte-extracts + bit-pack to recover sc, m), so the
-// vectorization arithmetic-density tradeoff isn't free. Revisit later
-// if profiling shows headroom — shape is correct on cache-line locality
-// (one super-block = 144 B = ~1.1 NVIDIA cache lines, contiguous).
+// over 8 elements — 8 mul + 8 mul + 1 sub instead of 8 × (mul + sub),
+// fewer instructions and lets the compiler fuse FMAs.
+//
+// K must be a multiple of 256 (super-block alignment). True for every
+// supported transformer matmul shape. WG=128 matches matmul_nt_v2_bf16's
+// tuning; with stride 8*128 = 1024, each thread does the full K loop
+// in K/1024 iterations (e.g. 17 iterations for 27B's K=17408).
 
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0, std430) readonly  buffer A    { float a[]; };
-layout(set = 0, binding = 1, std430) readonly  buffer Bq4k { uint  b_pack[]; };
+layout(set = 0, binding = 0, std430) readonly  buffer A    { vec4 a4[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Bq4k { uint b_pack[]; };
 layout(set = 0, binding = 2, std430) writeonly buffer C    { float c[]; };
 
 layout(push_constant) uniform Pc {
@@ -55,61 +59,91 @@ shared float sg_partials[32];
 
 const uint U32S_PER_SUPER = 36u;
 
-float q4_k_load(uint b_off_supers, uint k) {
-    uint super_idx = b_off_supers + (k >> 8u);     // k / 256
-    uint base = super_idx * U32S_PER_SUPER;
-    uint pos = k & 255u;                            // k % 256
-    uint sub_idx = pos >> 5u;                       // pos / 32  ∈ [0, 8)
-    uint elem_in_sub = pos & 31u;                   // pos % 32
-
-    // Super-block scales d, dmin packed in word 0.
-    vec2 d_dmin = unpackHalf2x16(b_pack[base]);
-    float d = d_dmin.x;
-    float dmin = d_dmin.y;
-
-    // 6-bit (sc, m) decode via get_scale_min_k4. The 12 scale bytes
-    // live in words 1..3 (word 1 holds bytes 0..3, word 2 bytes 4..7,
-    // word 3 bytes 8..11), little-endian byte order within each word.
-    uint sc, m;
-    if (sub_idx < 4u) {
-        uint b_j   = (b_pack[base + 1u] >> (sub_idx * 8u)) & 0xFFu; // bytes 0..3
-        uint b_jp4 = (b_pack[base + 2u] >> (sub_idx * 8u)) & 0xFFu; // bytes 4..7
-        sc = b_j   & 63u;
-        m  = b_jp4 & 63u;
-    } else {
-        uint local = sub_idx - 4u;                  // ∈ [0, 4)
-        uint b_jp4 = (b_pack[base + 3u] >> (local * 8u)) & 0xFFu;   // bytes 8..11
-        uint b_jm4 = (b_pack[base + 1u] >> (local * 8u)) & 0xFFu;   // bytes 0..3
-        uint b_j   = (b_pack[base + 2u] >> (local * 8u)) & 0xFFu;   // bytes 4..7
-        sc = (b_jp4 & 0xFu) | ((b_jm4 >> 6u) << 4u);
-        m  = (b_jp4 >> 4u)  | ((b_j   >> 6u) << 4u);
-    }
-
-    // 4-bit q decode. qs pairs sub-blocks (2k, 2k+1): low nibble of
-    // qs-byte (pair*32 + elem_in_sub) is sub-block 2k's element, high
-    // nibble is sub-block 2k+1's element. Word 4 starts the qs region.
-    uint pair  = sub_idx >> 1u;                     // 0..3
-    uint which = sub_idx & 1u;                      // 0 = low, 1 = high
-    uint qs_byte = pair * 32u + elem_in_sub;        // 0..127
-    uint qs_word = (b_pack[base + 4u + (qs_byte >> 2u)] >> ((qs_byte & 3u) * 8u)) & 0xFFu;
-    uint q = (which == 0u) ? (qs_word & 0xFu) : (qs_word >> 4u);
-
-    return d * float(sc) * float(q) - dmin * float(m);
-}
-
 void main() {
     uint cell = gl_WorkGroupID.x;
     uint i = cell / pc.N;
     uint j = cell - i * pc.N;
     if (i >= pc.M) return;
 
-    uint a_off = i * pc.K;
+    uint a_off = i * pc.K;                           // fp32 element offset
     uint b_off_supers = j * (pc.K >> 8u);            // K / 256 super-blocks per row
     uint tid = gl_LocalInvocationID.x;
 
     float acc = 0.0;
-    for (uint k = tid; k < pc.K; k += gl_WorkGroupSize.x) {
-        acc += a[a_off + k] * q4_k_load(b_off_supers, k);
+    // Stride 8 elements per thread per iteration. Each iteration's 8 K's
+    // share a single sub-block (and a single super-block, naturally).
+    for (uint k = tid * 8u; k < pc.K; k += gl_WorkGroupSize.x * 8u) {
+        uint super_idx   = b_off_supers + (k >> 8u);
+        uint base        = super_idx * U32S_PER_SUPER;
+        uint pos         = k & 255u;
+        uint sub_idx     = pos >> 5u;                // 0..7
+        uint elem_in_sub = pos & 31u;                // multiple of 8
+
+        // Super-block scales (1 word read, 1× per 8 elements vs. once/elem).
+        vec2 d_dmin = unpackHalf2x16(b_pack[base]);
+        float d    = d_dmin.x;
+        float dmin = d_dmin.y;
+
+        // 6-bit (sc, m) decode via get_scale_min_k4 (1× per 8 elements).
+        uint sc, m;
+        if (sub_idx < 4u) {
+            uint b_j   = (b_pack[base + 1u] >> (sub_idx * 8u)) & 0xFFu;
+            uint b_jp4 = (b_pack[base + 2u] >> (sub_idx * 8u)) & 0xFFu;
+            sc = b_j   & 63u;
+            m  = b_jp4 & 63u;
+        } else {
+            uint local = sub_idx - 4u;
+            uint b_jp4 = (b_pack[base + 3u] >> (local * 8u)) & 0xFFu;
+            uint b_jm4 = (b_pack[base + 1u] >> (local * 8u)) & 0xFFu;
+            uint b_j   = (b_pack[base + 2u] >> (local * 8u)) & 0xFFu;
+            sc = (b_jp4 & 0xFu) | ((b_jm4 >> 6u) << 4u);
+            m  = (b_jp4 >> 4u)  | ((b_j   >> 6u) << 4u);
+        }
+        float d_eff = d * float(sc);
+        float m_eff = dmin * float(m);
+
+        // qs reads. The qs region pairs sub-blocks (2k, 2k+1) in 32-byte
+        // chunks: low nibble = sub-block 2k's element, high nibble =
+        // sub-block 2k+1's. 8 consecutive bytes for a single sub-block
+        // start at qs_byte = pair*32 + elem_in_sub. With elem_in_sub a
+        // multiple of 8 (k is 8-aligned), this is u32-aligned and gives
+        // exactly 2 u32 reads per iteration.
+        uint pair       = sub_idx >> 1u;
+        uint which      = sub_idx & 1u;              // 0 = low, 1 = high
+        uint qs_byte    = pair * 32u + elem_in_sub;
+        uint qs_word    = base + 4u + (qs_byte >> 2u);
+        uint w0 = b_pack[qs_word];
+        uint w1 = b_pack[qs_word + 1u];
+
+        // Extract 8 nibbles branchlessly. `shift = which * 4` gives 0
+        // for low nibbles (sub-block 2*pair) and 4 for high nibbles
+        // (sub-block 2*pair+1) — same shift expression, no divergence
+        // across warp lanes that happen to land in different sub-blocks.
+        uint shift = which * 4u;
+        vec4 q0123 = vec4(
+            float((w0 >> (0u  + shift)) & 0xFu),
+            float((w0 >> (8u  + shift)) & 0xFu),
+            float((w0 >> (16u + shift)) & 0xFu),
+            float((w0 >> (24u + shift)) & 0xFu)
+        );
+        vec4 q4567 = vec4(
+            float((w1 >> (0u  + shift)) & 0xFu),
+            float((w1 >> (8u  + shift)) & 0xFu),
+            float((w1 >> (16u + shift)) & 0xFu),
+            float((w1 >> (24u + shift)) & 0xFu)
+        );
+
+        // 8 fp32 from A as 2 vec4 (A is fp32, std430 4-byte aligned).
+        vec4 av0 = a4[(a_off + k     ) >> 2];
+        vec4 av1 = a4[(a_off + k + 4u) >> 2];
+
+        // Factored MAC: acc += d_eff * Σ(av·q) − m_eff * Σ(av).
+        // Cuts mul count from 16 (8 × dequant + 8 × MAC) to 9 (2 dot
+        // products + 4-component sum + 2 final mul).
+        float qsum = dot(av0, q0123) + dot(av1, q4567);
+        float asum = av0.x + av0.y + av0.z + av0.w
+                   + av1.x + av1.y + av1.z + av1.w;
+        acc += d_eff * qsum - m_eff * asum;
     }
 
     float sg_sum = subgroupAdd(acc);

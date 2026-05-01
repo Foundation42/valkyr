@@ -91,16 +91,16 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
   `make_qkx2_quants` iterative fit — ~32% lower MSE than Q4_0 on
   unit-Gaussian oracle round-trip, comparable visible chat quality.
   4.5 bits/elem on device (vs. ~5 for our padded Q4_0), so ~10%
-  smaller and the path that closes the on-device-size gap to GGUF
-  Q4_K_M. **Decode is currently 10–50% slower than Q4_0** on these
-  shapes — regression scales with model size: 0.8B 9%, Gemma 29%,
-  4B 33%, 27B 51%. Per-element decode is heavier (3 byte-extracts
-  + bit-pack to recover sub-block scale + min vs. Q4_0's one nibble
-  + scale) and we haven't amortized it across consecutive K elements
-  yet. Upload also runs ~4–6× slower than Q4_0 because of the
-  iterative refinement (21 candidate iscales × 8 sub-blocks per
-  super-block). The fix — vectorize 8 K's per iteration so the
-  sub-block decode amortizes 8× — is queued as the next perf chunk.
+  smaller and matches GGUF Q4_K_M's on-device cost.
+  **Beats Q4_0 on decode tok/s across every model** (0.8B +10%,
+  Gemma +11%, 4B +13%, 27B +29%) thanks to an 8-wide-K matmul
+  shader: each iteration handles 8 consecutive K elements that
+  always share one sub-block, so the heavy `(d, dmin, sc, m)` decode
+  amortizes 8× and the qs reads collapse to 2 u32 / 8 nibbles.
+  Win scales with model size — bigger models have more matmul time
+  to amortize over. **Upload is ~4–6× slower than Q4_0** because of
+  the iterative refinement (21 candidate iscales × 8 sub-blocks per
+  super-block); GPU-side compute quantize would close that.
 - **Lazy LM head during prefill** — chat skips the `vocab × hidden`
   LM head matmul on every prompt token except the last. Pure
   time-to-first-token win: scales with prompt length, no cost to
@@ -142,12 +142,12 @@ greedy at `--temp 0`:
 | Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~55 |
 | Qwen3.5 0.8B | bf16 | ~113 |
 | Qwen3.5 0.8B | `--q4` | ~104 |
-| Qwen3.5 0.8B | `--q4k` | ~78 |
+| Qwen3.5 0.8B | `--q4k` | ~94 |
 | Qwen3.5 4B | bf16 | ~55 |
 | Qwen3.5 4B | `--q4` | ~59 |
-| Qwen3.5 4B | `--q4k` | ~35 |
+| Qwen3.5 4B | `--q4k` | ~60 |
 | **Qwen3.6 27B** | `--q4` | **~16.5** |
-| **Qwen3.6 27B** | `--q4k` | **~7.8** |
+| **Qwen3.6 27B** | `--q4k` | **~20.6** |
 
 bf16 matmul reads use vectorized `uvec4` (16-byte) loads — 4× fewer
 SSBO transactions on the weight side, decoded inline as eight bf16
@@ -484,9 +484,8 @@ sense).
   Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~55 tok/s on
   the 4B, ~113 tok/s on the 0.8B) by default,
   `matmul_nt_v2_q4_0` with `--q4` (~59 tok/s on the 4B, ~104 tok/s
-  on the 0.8B), and `matmul_nt_v2_q4_k` with `--q4k` (~35 tok/s on
-  the 4B, ~78 tok/s on the 0.8B — Q4_K's heavier per-element decode
-  isn't yet amortized across consecutive K's). When any
+  on the 0.8B), and `matmul_nt_v2_q4_k` with `--q4k` (~60 tok/s on
+  the 4B, ~94 tok/s on the 0.8B). When any
   non-fp32 path is active the lm_head and embed_tokens both ride
   bf16 — they're the single biggest matmul reads in the model
   (`N = vocab_size`, up to 248 K) and bf16 is the simplest safe
@@ -586,12 +585,12 @@ The two big arcs:
      for themselves at long context.
    - **bf16 LM head + bf16 embedding** kernels — currently fp32, the
      LM head matmul is the single biggest dispatch we do.
-   - **Q4_K_M decode amortization.** The shader currently re-decodes
-     `(d, dmin, sc, m)` per K-element; vectorizing 8 (or 32) consecutive
-     K's per iteration so the sub-block decode amortizes is the obvious
-     fix and would close the 10–30% perf gap to Q4_0 (and possibly
-     overshoot, since Q4_K's super-block is 8× larger than Q4_0's
-     and its on-device bytes-per-elem is ~10% smaller).
+   - **GPU-side compute quantize.** Q4_K_M upload is currently 4–6×
+     slower than Q4_0 because `make_qkx2_quants` runs 21 candidate
+     iscales × 8 sub-blocks per super-block on the CPU. Porting the
+     quantize loop to a Vulkan shader would amortize across the GPU's
+     thousands of cores — first-load time becomes near-IO-bound rather
+     than CPU-bound.
    - **TQ4-on-weights** — TurboQuant applied to the matmul weight
      side, orthogonal to Q4_0/Q4_K. Combined with `--tq4v` gets
      Gemma 2B into a few hundred MiB total.
