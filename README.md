@@ -91,10 +91,20 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
 - **Parallel weight upload** — the bf16 → fp32 conversion and Q4_0
   row-wise quantize run on a vendored Chase-Lev work-stealing pool
   ([credit: matryoshka/jobs.zig](https://github.com/foundation42/matryoshka)),
-  worker count auto-set to `CPU - 2`. Brings Qwen3.5 4B Q4_0 upload
-  from 24.1 s serial to 13.5 s on an 8-core test box (1.78×); the
-  remaining time is per-tensor Vulkan staging-buffer overhead, not
-  CPU work.
+  worker count auto-set to `CPU - 2`. Combined with the
+  single-suballocator weight pool below, Qwen3.5 4B Q4_0 upload
+  drops from 24.1 s serial → 13.5 s parallel → 6.9 s pooled.
+- **Single-suballocator weight pool** — every weight tensor's
+  VkBuffer binds into one big `VkDeviceMemory` (sized by an
+  upload-time pre-pass), and all per-tensor copies stage through
+  one persistent `HOST_VISIBLE` buffer with a shared command
+  buffer. Cuts ~640 per-tensor `vkAllocateMemory` /
+  `submitOneShot` / `vkQueueWaitIdle` cycles down to a handful
+  of flushes. Wins are size-dependent — smaller models that were
+  per-tensor-overhead-bound see 5×+ on upload (Qwen3.5 0.8B bf16
+  3.3 s → 0.6 s), bigger models gain less because the host-side
+  Q4_0 quantize starts dominating (Qwen3.6 27B `--q4` 84.3 s →
+  74.7 s, ~13%).
 - **Sampling**: greedy, temperature, top-K, top-P, with `--seed` for
   reproducible sampled runs. (Greedy decoding is non-deterministic
   across runs at the last digit due to GPU subgroup reduction order;
@@ -462,6 +472,25 @@ sense).
   implemented.
 - Single-stream batching only (M = 1 in every matmul).
 - Tokenizer encoder doesn't pre-protect special-token strings.
+
+## What we tried that didn't pan out
+
+- **Tiled-N matmul** (N_TILE = 4 then 2). On top of the vectorized
+  `uvec4` B reads, we tried packing 4 — then 2 — output cells per
+  workgroup so A is loaded once and reused across cells, and the
+  workgroup count drops by N_TILE. **N_TILE = 4 actually regressed
+  Qwen3.5 4B by ~3%.** The per-iteration MAC count grew faster
+  (8 → 32) than the per-iteration byte count (48 B → 96 B), pushing
+  the K-loop into compute-bound territory on shapes where memory
+  still had headroom. **N_TILE = 2 was flat on 4B / 27B / Gemma**
+  and only +9% on the 0.8B (likely from the halved dispatch
+  count, not from any A-reuse). With chunk-1 already capturing the
+  big win on memory bandwidth, threading a tile factor through 50
+  call sites for +9% on one model wasn't the trade. Reverted, kept
+  the unitilted vectorized shader. Future angles: real shared-
+  memory cooperative A loading, or just dropping WG size 256 → 128
+  to double concurrent occupancy without shader gymnastics.
+  See commit history + `project_roadmap.md` for the bench numbers.
 
 ## Where this can go next
 

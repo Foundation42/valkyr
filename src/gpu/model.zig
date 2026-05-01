@@ -118,6 +118,11 @@ pub const GpuModel = struct {
     /// (for the future memory-saving path), even though the buffers are
     /// distinct. For now informational only.
     lm_head_tied: bool,
+    /// Single VkDeviceMemory backing every weight tensor's VkBuffer.
+    /// Outlives the upload — freed by `deinit`. The persistent staging
+    /// buffer + cmd buffer it manages are torn down by `pool.finalize`
+    /// at the tail of `upload`.
+    pool: buffer.BufferPool,
     allocator: std.mem.Allocator,
 
     pub fn upload(
@@ -154,16 +159,75 @@ pub const GpuModel = struct {
             .fp32_all => .fp32,
             .bf16_matmul, .q4_0_matmul => .bf16_raw_if_bf16,
         };
-        var embed = try uploadByPath(gpa, ctx, cpu.embed_tokens, lm_head_path, js);
+
+        // Pre-pass: walk every tensor once to size the device pool and
+        // staging buffer. Mirrors the upload tree exactly, so the
+        // path/dtype decisions match. We compute the total target bytes
+        // (with per-tensor alignment slack) for the device VkDeviceMemory
+        // and the largest single tensor for the staging capacity. The
+        // alternative is allocating slightly conservatively without a
+        // pre-pass, but device memory pressure is already tight at 27B-
+        // class and we want a tight, deterministic allocation.
+        const slack_per_tensor: usize = 256;
+        var total_bytes: usize = 0;
+        var max_tensor_bytes: usize = 0;
+        const accountTensor = struct {
+            fn run(t: safetensors.Tensor, p: TensorPath, total: *usize, mx: *usize, slack: usize) void {
+                const tb = targetBytes(t, p);
+                total.* += tb + slack;
+                if (tb > mx.*) mx.* = tb;
+            }
+        }.run;
+        accountTensor(cpu.embed_tokens, lm_head_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+        accountTensor(cpu.final_norm,   .fp32,         &total_bytes, &max_tensor_bytes, slack_per_tensor);
+        accountTensor(cpu.lm_head,      lm_head_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
+        for (cpu.layers) |layer| {
+            accountTensor(layer.input_layernorm,          .fp32,        &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            accountTensor(layer.post_attention_layernorm, .fp32,        &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            accountTensor(layer.gate_proj,                matmul_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            accountTensor(layer.up_proj,                  matmul_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            accountTensor(layer.down_proj,                matmul_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            switch (layer.layer_type) {
+                .full_attention => {
+                    accountTensor(layer.q_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.k_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.v_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.o_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    if (layer.q_norm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    if (layer.k_norm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                },
+                .linear_attention => {
+                    accountTensor(layer.in_proj_qkv.?,    matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.in_proj_z.?,      matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.in_proj_b.?,      matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.in_proj_a.?,      matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.out_proj.?,       matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.conv1d_weight.?,  .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.A_log.?,          .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.dt_bias.?,        .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    accountTensor(layer.ssm_norm_weight.?, .fp32,      &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                },
+            }
+        }
+
+        // Staging buffer must fit the largest tensor in one shot —
+        // otherwise we'd have to chunk it. 64 KiB extra to absorb any
+        // stray alignment slop. Mid-stream flushes happen automatically
+        // when the running staging offset would overflow.
+        const staging_capacity: usize = max_tensor_bytes + 65536;
+        var pool = try buffer.BufferPool.init(ctx, total_bytes, staging_capacity);
+        errdefer pool.deinit(ctx.device);
+
+        var embed = try uploadByPath(gpa, ctx, cpu.embed_tokens, lm_head_path, js, &pool);
         errdefer embed.deinit(ctx.device);
 
-        var final_norm = try uploadTensor(gpa, ctx, cpu.final_norm, js);
+        var final_norm = try uploadTensor(gpa, ctx, cpu.final_norm, js, &pool);
         errdefer final_norm.deinit(ctx.device);
 
         // For the tied case we still upload a fresh copy — the bytes
         // come from the same source so the device-side data is the
         // same; only the host-side allocation pattern differs.
-        var lm_head = try uploadByPath(gpa, ctx, cpu.lm_head, lm_head_path, js);
+        var lm_head = try uploadByPath(gpa, ctx, cpu.lm_head, lm_head_path, js, &pool);
         errdefer lm_head.deinit(ctx.device);
 
         const layers = try gpa.alloc(GpuLayer, cpu.layers.len);
@@ -178,21 +242,21 @@ pub const GpuModel = struct {
             // Shared bits: norms + FFN trio.
             layers[i] = .{
                 .layer_type = layer.layer_type,
-                .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm, js),
-                .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm, js),
-                .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path, js),
-                .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path, js),
-                .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path, js),
+                .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm, js, &pool),
+                .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm, js, &pool),
+                .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path, js, &pool),
+                .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path, js, &pool),
+                .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path, js, &pool),
             };
 
             switch (layer.layer_type) {
                 .full_attention => {
-                    layers[i].q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path, js);
-                    layers[i].k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path, js);
-                    layers[i].v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path, js);
-                    layers[i].o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path, js);
-                    if (layer.q_norm) |t| layers[i].q_norm = try uploadTensor(gpa, ctx, t, js);
-                    if (layer.k_norm) |t| layers[i].k_norm = try uploadTensor(gpa, ctx, t, js);
+                    layers[i].q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path, js, &pool);
+                    layers[i].k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path, js, &pool);
+                    layers[i].v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path, js, &pool);
+                    layers[i].o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path, js, &pool);
+                    if (layer.q_norm) |t| layers[i].q_norm = try uploadTensor(gpa, ctx, t, js, &pool);
+                    if (layer.k_norm) |t| layers[i].k_norm = try uploadTensor(gpa, ctx, t, js, &pool);
                 },
                 .linear_attention => {
                     // Gated DeltaNet: in-projections + conv + per-head
@@ -200,19 +264,24 @@ pub const GpuModel = struct {
                     // matrices and out_proj go through the bf16-aware
                     // path; the rest are tiny scalars/per-head tables
                     // and stay fp32.
-                    layers[i].in_proj_qkv = try uploadByPath(gpa, ctx, layer.in_proj_qkv.?, matmul_path, js);
-                    layers[i].in_proj_z   = try uploadByPath(gpa, ctx, layer.in_proj_z.?, matmul_path, js);
-                    layers[i].in_proj_b   = try uploadByPath(gpa, ctx, layer.in_proj_b.?, matmul_path, js);
-                    layers[i].in_proj_a   = try uploadByPath(gpa, ctx, layer.in_proj_a.?, matmul_path, js);
-                    layers[i].out_proj    = try uploadByPath(gpa, ctx, layer.out_proj.?, matmul_path, js);
-                    layers[i].conv1d_weight   = try uploadTensor(gpa, ctx, layer.conv1d_weight.?, js);
-                    layers[i].A_log           = try uploadTensor(gpa, ctx, layer.A_log.?, js);
-                    layers[i].dt_bias         = try uploadTensor(gpa, ctx, layer.dt_bias.?, js);
-                    layers[i].ssm_norm_weight = try uploadTensor(gpa, ctx, layer.ssm_norm_weight.?, js);
+                    layers[i].in_proj_qkv = try uploadByPath(gpa, ctx, layer.in_proj_qkv.?, matmul_path, js, &pool);
+                    layers[i].in_proj_z   = try uploadByPath(gpa, ctx, layer.in_proj_z.?, matmul_path, js, &pool);
+                    layers[i].in_proj_b   = try uploadByPath(gpa, ctx, layer.in_proj_b.?, matmul_path, js, &pool);
+                    layers[i].in_proj_a   = try uploadByPath(gpa, ctx, layer.in_proj_a.?, matmul_path, js, &pool);
+                    layers[i].out_proj    = try uploadByPath(gpa, ctx, layer.out_proj.?, matmul_path, js, &pool);
+                    layers[i].conv1d_weight   = try uploadTensor(gpa, ctx, layer.conv1d_weight.?, js, &pool);
+                    layers[i].A_log           = try uploadTensor(gpa, ctx, layer.A_log.?, js, &pool);
+                    layers[i].dt_bias         = try uploadTensor(gpa, ctx, layer.dt_bias.?, js, &pool);
+                    layers[i].ssm_norm_weight = try uploadTensor(gpa, ctx, layer.ssm_norm_weight.?, js, &pool);
                 },
             }
             uploaded_layers = i + 1;
         }
+
+        // Submit the final batch + tear down staging. Pool's
+        // VkDeviceMemory survives in `GpuModel` so weight reads stay
+        // valid.
+        try pool.finalize(ctx);
 
         return .{
             .config = cfg,
@@ -222,6 +291,7 @@ pub const GpuModel = struct {
             .final_norm = final_norm,
             .lm_head = lm_head,
             .lm_head_tied = cpu.isLmHeadTied(),
+            .pool = pool,
             .allocator = gpa,
         };
     }
@@ -232,20 +302,38 @@ pub const GpuModel = struct {
         self.embed_tokens.deinit(device);
         self.final_norm.deinit(device);
         self.lm_head.deinit(device);
+        // VkBuffer handles came from the pool; the pool owns their
+        // backing VkDeviceMemory.
+        self.pool.deinit(device);
     }
 };
 
 /// Upload strategies the matmul-aware path can pick between.
 const TensorPath = enum { fp32, bf16_raw_if_bf16, q4_0_quantize };
 
-fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, path: TensorPath, js: *jobs.JobSystem) !buffer.Buffer {
+/// Bytes the device-side buffer will hold for `t` under `path`. Used
+/// by the upload pre-pass to size the BufferPool's VkDeviceMemory and
+/// staging buffer.
+fn targetBytes(t: safetensors.Tensor, path: TensorPath) usize {
     if (path == .bf16_raw_if_bf16 and t.dtype == .bf16) {
-        return uploadTensorBf16Raw(gpa, ctx, t);
+        return t.numel() * 2; // bf16, 2 bytes per element
     }
     if (path == .q4_0_quantize) {
-        return uploadTensorQ4_0(gpa, ctx, t, js);
+        const k = t.shape[t.shape.len - 1];
+        const blocks = (t.numel() / k) * (k / q4_0.BLOCK_SIZE);
+        return blocks * q4_0.GPU_U32S_PER_BLOCK * 4;
     }
-    return uploadTensor(gpa, ctx, t, js);
+    return t.numel() * 4; // fp32 destination
+}
+
+fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, path: TensorPath, js: *jobs.JobSystem, pool: *buffer.BufferPool) !buffer.Buffer {
+    if (path == .bf16_raw_if_bf16 and t.dtype == .bf16) {
+        return uploadTensorBf16Raw(gpa, ctx, t, pool);
+    }
+    if (path == .q4_0_quantize) {
+        return uploadTensorQ4_0(gpa, ctx, t, js, pool);
+    }
+    return uploadTensor(gpa, ctx, t, js, pool);
 }
 
 /// Upload a bf16 tensor as raw bytes — no conversion. The buffer is
@@ -254,19 +342,17 @@ fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.T
 /// reinterprets each pair of bf16 elements as one std430 uint and
 /// converts to fp32 inline. Halves the upload time and on-device
 /// footprint compared to the fp32 path.
-fn uploadTensorBf16Raw(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor) !buffer.Buffer {
+fn uploadTensorBf16Raw(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, pool: *buffer.BufferPool) !buffer.Buffer {
+    _ = gpa;
     std.debug.assert(t.dtype == .bf16);
     const numel = t.numel();
     if (numel % 2 != 0) return error.OddElementCountForU32Pack;
-    // The shader reads `uint b_pack[]`, each uint holding two bf16.
-    // Buffer.initStatic wants natural alignment, and the mmap source
-    // is align(1), so we copy through an aligned host buffer.
-    const u32_count = numel / 2;
-    const src = @as([*]align(1) const u32, @ptrCast(t.bytes.ptr))[0..u32_count];
-    const aligned = try gpa.alloc(u32, u32_count);
-    defer gpa.free(aligned);
-    @memcpy(aligned, src);
-    return buffer.Buffer.initStatic(ctx, u32, aligned);
+    // The shader reads `uint b_pack[]`, each uint holding two bf16. The
+    // staging buffer's mapped pointer is byte-aligned and Vulkan
+    // doesn't care about source alignment for memcpy, so we hand the
+    // raw mmap bytes straight into the pool — no aligned host scratch
+    // needed.
+    return pool.commit(ctx, t.bytes);
 }
 
 // ── Parallel inner-loop helpers ────────────────────────────────────
@@ -331,7 +417,7 @@ fn batchSize(total: usize, worker_count: u32) u32 {
 /// scratch + one canonical-Block scratch); both are freed before the
 /// next tensor is processed. For Qwen3.6-27B's 17.4 GiB FFN matmul
 /// at K=17408 that's ~1 GiB peak host scratch — fine.
-fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, js: *jobs.JobSystem) !buffer.Buffer {
+fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, js: *jobs.JobSystem, pool: *buffer.BufferPool) !buffer.Buffer {
     const numel = t.numel();
     if (t.shape.len < 2) return error.Q4_0NeedsAtLeast2D;
     const k = t.shape[t.shape.len - 1];
@@ -378,17 +464,16 @@ fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetenso
         js.waitFor(&counter);
     }
 
-    // Repack to the GPU's sequential 5-u32-per-block layout. This is
-    // also the storage we hand to the device — Buffer.initStatic
-    // uploads a tightly-packed u32 slice via staging. (packForGpu is
-    // serial; it's small relative to the per-row quantize and on most
-    // tensors finishes faster than a thread spawn anyway.)
+    // Repack to the GPU's sequential 5-u32-per-block layout and hand
+    // the bytes to the pool. (packForGpu is serial; it's small
+    // relative to the per-row quantize and on most tensors finishes
+    // faster than a thread spawn anyway.)
     const packed_words = total_blocks * q4_0.GPU_U32S_PER_BLOCK;
     const packed_buf = try gpa.alloc(u32, packed_words);
     defer gpa.free(packed_buf);
     q4_0.packForGpu(blocks, packed_buf);
 
-    return buffer.Buffer.initStatic(ctx, u32, packed_buf);
+    return pool.commit(ctx, std.mem.sliceAsBytes(packed_buf));
 }
 
 /// Materialise a Tensor as fp32 in a fresh device-local Buffer.
@@ -398,15 +483,13 @@ fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetenso
 /// copy. Peak host memory = one tensor's worth. The bf16/fp16
 /// conversion loops are parallelised across the upload pool; fp32
 /// just memcpys through (already memory-bandwidth-bound).
-fn uploadTensor(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, js: *jobs.JobSystem) !buffer.Buffer {
+fn uploadTensor(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, js: *jobs.JobSystem, pool: *buffer.BufferPool) !buffer.Buffer {
     const numel = t.numel();
     switch (t.dtype) {
         .f32 => {
-            const src = @as([*]align(1) const f32, @ptrCast(t.bytes.ptr))[0..numel];
-            const f = try gpa.alloc(f32, numel);
-            defer gpa.free(f);
-            @memcpy(f, src);
-            return buffer.Buffer.initStatic(ctx, f32, f);
+            // The mmap'd source is align(1); pool.commit just memcpys
+            // bytes into staging so no aligned host copy is needed.
+            return pool.commit(ctx, t.bytes);
         },
         .bf16 => {
             const u = dtype.asU16(t.bytes);
@@ -416,7 +499,7 @@ fn uploadTensor(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.T
             var counter = jobs.Counter.init(0);
             js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), bf16ConvJob, @ptrCast(&ctxc), &counter);
             js.waitFor(&counter);
-            return buffer.Buffer.initStatic(ctx, f32, f);
+            return pool.commit(ctx, std.mem.sliceAsBytes(f));
         },
         .f16 => {
             const u = dtype.asU16(t.bytes);
@@ -426,7 +509,7 @@ fn uploadTensor(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.T
             var counter = jobs.Counter.init(0);
             js.parallelFor(@intCast(numel), batchSize(numel, js.worker_count), fp16ConvJob, @ptrCast(&ctxc), &counter);
             js.waitFor(&counter);
-            return buffer.Buffer.initStatic(ctx, f32, f);
+            return pool.commit(ctx, std.mem.sliceAsBytes(f));
         },
         else => return error.UnsupportedWeightDtype,
     }
