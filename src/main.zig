@@ -4420,7 +4420,10 @@ fn chatTurn(
 
 /// Print a single token id to `w` after applying the decoder rule for
 /// the active tokenizer mode:
-///   - SentencePiece (Gemma): ▁ (U+2581, bytes E2 96 81) → ' '.
+///   - SentencePiece (Gemma / TinyLlama / Mistral): ▁ (U+2581, bytes
+///     E2 96 81) → ' '. Byte-fallback tokens with surface form
+///     `<0xHH>` decode to the literal byte 0xHH (newlines, tabs, and
+///     non-ASCII in models that use byte fallback for OOV codepoints).
 ///   - ByteLevel (Qwen3 / Llama3): walk the codepoints and reverse the
 ///     byte→unicode map back to original bytes.
 ///
@@ -4438,6 +4441,17 @@ fn printTokenForDisplay(
                 try w.print("<{d}>", .{id});
                 return;
             };
+            // Byte-fallback tokens have surface form `<0xHH>` (length
+            // 6, two uppercase hex digits) and decode to byte 0xHH.
+            // Detect by exact shape — any single token with that
+            // surface form is the byte-fallback encoding because
+            // SentencePiece reserves it for that purpose.
+            if (s.len == 6 and s[0] == '<' and s[1] == '0' and s[2] == 'x' and s[5] == '>') {
+                if (parseHexByte(s[3], s[4])) |b| {
+                    try w.writeAll(&[_]u8{b});
+                    return;
+                }
+            }
             var i: usize = 0;
             while (i < s.len) {
                 if (i + 3 <= s.len and s[i] == 0xE2 and s[i + 1] == 0x96 and s[i + 2] == 0x81) {
@@ -4458,6 +4472,24 @@ fn printTokenForDisplay(
             try w.writeAll(bytes);
         },
     }
+}
+
+/// Parse two ASCII hex chars into the byte they represent. Returns
+/// null on any non-hex input. Used by the SentencePiece byte-fallback
+/// path in `printTokenForDisplay`.
+fn parseHexByte(hi: u8, lo: u8) ?u8 {
+    const h = hexDigit(hi) orelse return null;
+    const l = hexDigit(lo) orelse return null;
+    return (h << 4) | l;
+}
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
 }
 
 // ── encode: BPE round-trip smoke ───────────────────────────────────
