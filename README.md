@@ -492,6 +492,26 @@ sense).
   to double concurrent occupancy without shader gymnastics.
   See commit history + `project_roadmap.md` for the bench numbers.
 
+- **Q4_0 split layout** (separate `indices ‖ scales` regions for
+  uvec4-aligned reads). The chunk-1 trick that won big on bf16 (4×
+  fewer SSBO transactions via uvec4 loads) doesn't translate to the
+  Q4_0 path. **Regressed 27B `--q4` from 16.5 → 12.0 tok/s (~27%)**
+  even though the per-element compute was unchanged and indices
+  reads now hit a clean 16-byte transaction granularity. **Cause:**
+  the OLD 5-u32-per-block contiguous layout puts indices + scale in
+  the *same 128-byte cache line* (~6 blocks fit per line); splitting
+  them into separate memory regions doubles cache-line traffic per
+  block (one line for indices, one for scales). NVIDIA's warp-level
+  coalescer was already getting near-peak bandwidth out of the
+  scalar-uint reads on the contiguous layout — the "vectorized"
+  16-byte read isn't a win when the bytes are already flowing
+  through the cache hierarchy efficiently. Reverted. The roadmap's
+  remaining FFN bandwidth headroom on Q4_0 has to come from
+  something other than load-width vectorization — either a
+  fundamentally different layout (Q4_K_M's super-blocks have better
+  locality), or a fused norm + matmul that reduces the per-token
+  reads. See `project_roadmap.md`.
+
 ## Where this can go next
 
 The two big arcs:
