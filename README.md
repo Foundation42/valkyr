@@ -512,6 +512,28 @@ sense).
   locality), or a fused norm + matmul that reduces the per-token
   reads. See `project_roadmap.md`.
 
+- **SwiGLU activation-sparsity skipping on `down_proj`**. Tried two
+  variants of "skip K-blocks where the post-SwiGLU activation is
+  near zero" (the trick DejaVu / PowerInfer / MoE-as-skipping
+  exploit). **Variant 1**: per-K-block mask + `if (mask[blk]==0)
+  continue` in the matmul shader. Regressed 27B `--q4` 16.5 → 12.0
+  (~−27%) because the in-loop branch added ~30% per-K overhead on
+  no-skip elements, and we never got skip rates high enough at
+  safe thresholds to overcome it. **Variant 2**: compact the
+  active block indices into a list (atomic-compact in a single
+  workgroup, self-resetting via `barrier()`), have the matmul
+  iterate the list (no per-K branch). Got us much closer — 27B
+  16.0 vs baseline 16.5 (~−3%). The remaining gap is the
+  per-layer compact-dispatch overhead (~50–100 µs × 64 layers =
+  6 ms/token), which roughly equals the savings from a 30% skip
+  rate on `down_proj`. Pushing threshold to 1e-1 finally crossed
+  break-even on 27B (+0.6%) but broke Qwen3.5 4B's output (1
+  token then EOS — quality cliff). No threshold worked on every
+  model. Reverted both. **Lesson:** NVIDIA's q4 matmul is already
+  near throughput-bound on these shapes; any pre-pass that adds
+  dispatch overhead has to clear it with savings *before*
+  quality starts to wobble, and that window is too narrow.
+
 ## Where this can go next
 
 The two big arcs:
