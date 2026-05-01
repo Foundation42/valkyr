@@ -163,14 +163,18 @@ pub fn main() !void {
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
         // Parse optional sampling flags + final user_msg. Format:
         //   --chat <dir> [--temp T] [--top-k K] [--top-p P] [--seed S]
-        //                [--tq4v] [user_msg]
+        //                [--tq4v] [--q4] [user_msg]
         // --tq4v switches the V cache to TurboQuant TQ4 (asymmetric:
-        // K stays full precision). The user_msg, if given, is the
-        // last positional arg.
+        //   K stays full precision).
+        // --q4   switches the per-layer projections to Q4_0 (4-bit weights,
+        //   block-32 with fp16 scale per block). Mutually exclusive with
+        //   bf16; lm_head + embeddings stay fp32.
+        // The user_msg, if given, is the last positional arg.
         var sp = cpu_forward.SampleParams{};
         var seed: u64 = @intCast(std.time.milliTimestamp());
         var user_msg: ?[]const u8 = null;
         var tq4v: bool = false;
+        var q4: bool = false;
         var i: usize = 3;
         while (i < args.len) {
             const a = args[i];
@@ -189,20 +193,24 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--tq4v")) {
                 tq4v = true;
                 i += 1;
+            } else if (std.mem.eql(u8, a, "--q4")) {
+                q4 = true;
+                i += 1;
             } else {
                 user_msg = a;
                 i += 1;
             }
         }
+        const precision: gpu_model.Precision = if (q4) .q4_0_matmul else .bf16_matmul;
         // Hybrid families need a different kernel set + per-layer
         // SSM state plumbing — dispatch to the dedicated path.
         const cfg_path = try std.fs.path.join(allocator, &.{ args[2], "config.json" });
         defer allocator.free(cfg_path);
         const cfg = try config_mod.Config.loadFromFile(allocator, cfg_path);
         if (cfg.family.isHybrid()) {
-            try runChatQwen35(allocator, args[2], user_msg, sp, seed, tq4v);
+            try runChatQwen35(allocator, args[2], user_msg, sp, seed, tq4v, precision);
         } else {
-            try runChat(allocator, args[2], user_msg, sp, seed, tq4v);
+            try runChat(allocator, args[2], user_msg, sp, seed, tq4v, precision);
         }
         return;
     }
@@ -3560,6 +3568,7 @@ fn runChat(
     sample_params: cpu_forward.SampleParams,
     seed: u64,
     tq4v: bool,
+    precision: gpu_model.Precision,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -3575,8 +3584,12 @@ fn runChat(
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    try stdout.print("uploading weights (bf16 matmul path)...\n", .{});
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .bf16_matmul);
+    try stdout.print("uploading weights ({s} matmul path)...\n", .{switch (precision) {
+        .fp32_all => "fp32",
+        .bf16_matmul => "bf16",
+        .q4_0_matmul => "Q4_0",
+    }});
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, precision);
     defer gm.deinit(ctx.device);
 
     // KV cache sized for a generous chat. 2048 positions ≈ 18 layers ×
@@ -4111,6 +4124,7 @@ fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision, fami
     const matmul_spv: []align(4) const u8 = switch (precision) {
         .fp32_all => &shaders.matmul_nt_v2,
         .bf16_matmul => &shaders.matmul_nt_v2_bf16,
+        .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
     };
     const ffn_spv: []align(4) const u8 = switch (family.activation()) {
         .gelu => &shaders.geglu,
@@ -5089,12 +5103,14 @@ const HybridChatKernels = struct {
     scale: pipeline.Kernel,
 
     fn init(ctx: *const vk.Context, precision: gpu_model.Precision) !HybridChatKernels {
-        // Mirrors `buildChatKernels`: bf16-aware matmul for the per-layer
-        // projections (q/k/v/o, in-projs, out_proj, FFN trio), but the
-        // lm_head stays fp32 because we upload it as fp32 unconditionally.
+        // Mirrors `buildChatKernels`: precision-aware matmul for the
+        // per-layer projections (q/k/v/o, in-projs, out_proj, FFN trio),
+        // but the lm_head stays fp32 because we upload it as fp32
+        // unconditionally.
         const matmul_spv: []align(4) const u8 = switch (precision) {
             .fp32_all => &shaders.matmul_nt_v2,
             .bf16_matmul => &shaders.matmul_nt_v2_bf16,
+            .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
         };
         return .{
             .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
@@ -5516,6 +5532,7 @@ fn runChatQwen35(
     sample_params: cpu_forward.SampleParams,
     seed: u64,
     tq4v: bool,
+    precision: gpu_model.Precision,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -5532,12 +5549,17 @@ fn runChatQwen35(
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    const prec_label: []const u8 = switch (precision) {
+        .fp32_all => "fp32",
+        .bf16_matmul => "bf16",
+        .q4_0_matmul => "Q4_0",
+    };
     if (tq4v) {
-        try stdout.print("uploading weights (bf16 + TQ4-V on full-attn layers)...\n", .{});
+        try stdout.print("uploading weights ({s} + TQ4-V on full-attn layers)...\n", .{prec_label});
     } else {
-        try stdout.print("uploading weights (bf16 path)...\n", .{});
+        try stdout.print("uploading weights ({s} path)...\n", .{prec_label});
     }
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .bf16_matmul);
+    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, precision);
     defer gm.deinit(ctx.device);
 
     // TQ4-V is only wired for head_dim ∈ {128, 256}. Both Qwen3.5 sizes

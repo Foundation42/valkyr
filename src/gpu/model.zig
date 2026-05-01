@@ -23,6 +23,7 @@ const safetensors = @import("../safetensors.zig");
 const config_mod = @import("../config.zig");
 const dtype = @import("../dtype.zig");
 const model_mod = @import("../model.zig");
+const q4_0 = @import("../cpu/q4_0.zig");
 
 /// How weights are stored on the device.
 ///
@@ -36,7 +37,21 @@ const model_mod = @import("../model.zig");
 ///   matmul shader bit-shifts each bf16 to fp32 in-register. Layernorms,
 ///   embeddings, and lm_head stay fp32 — they're either tiny or read
 ///   through kernels that haven't grown a bf16 path yet.
-pub const Precision = enum { fp32_all, bf16_matmul };
+pub const Precision = enum {
+    fp32_all,
+    bf16_matmul,
+    /// 4-bit weights for the seven big projections per layer (Q/K/V/O
+    /// + FFN trio + linear-attn projections + lm_head when matmul-pathed).
+    /// Quantization happens on the host at upload time using the
+    /// llama.cpp-compatible Q4_0 scheme (block-32, fp16 scale, signed
+    /// indices). The on-device layout is the sequential 5-u32-per-block
+    /// form consumed by `matmul_nt_v2_q4_0`. Layernorms, embeddings,
+    /// and lm_head stay fp32 — same policy as the bf16 path. Quality
+    /// trades roughly 0.05–0.10 PPL above Q4_K_M for ~3.6× weight-side
+    /// memory vs. fp32 (or 1.8× vs. bf16) — the only path that
+    /// realistically fits 27B-class models on a 24 GiB consumer card.
+    q4_0_matmul,
+};
 
 pub const GpuLayer = struct {
     layer_type: config_mod.LayerType,
@@ -114,6 +129,7 @@ pub const GpuModel = struct {
         const matmul_path: TensorPath = switch (precision) {
             .fp32_all => .fp32,
             .bf16_matmul => .bf16_raw_if_bf16,
+            .q4_0_matmul => .q4_0_quantize,
         };
 
         var embed = try uploadTensor(gpa, ctx, cpu.embed_tokens);
@@ -197,12 +213,15 @@ pub const GpuModel = struct {
     }
 };
 
-/// Two upload strategies the bf16-aware path can pick between.
-const TensorPath = enum { fp32, bf16_raw_if_bf16 };
+/// Upload strategies the matmul-aware path can pick between.
+const TensorPath = enum { fp32, bf16_raw_if_bf16, q4_0_quantize };
 
 fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, path: TensorPath) !buffer.Buffer {
     if (path == .bf16_raw_if_bf16 and t.dtype == .bf16) {
         return uploadTensorBf16Raw(gpa, ctx, t);
+    }
+    if (path == .q4_0_quantize) {
+        return uploadTensorQ4_0(gpa, ctx, t);
     }
     return uploadTensor(gpa, ctx, t);
 }
@@ -226,6 +245,67 @@ fn uploadTensorBf16Raw(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safete
     defer gpa.free(aligned);
     @memcpy(aligned, src);
     return buffer.Buffer.initStatic(ctx, u32, aligned);
+}
+
+/// Quantize a 2-D weight tensor row-wise to Q4_0 (block-32, fp16
+/// scale per block) and upload as a flat u32 buffer in the
+/// 5-u32-per-block GPU layout consumed by `matmul_nt_v2_q4_0`.
+///
+/// We assume the matmul tensor is laid out [N, K] (rows along the
+/// inner dimension, since matmul_nt computes A · B^T with each row
+/// of B being a K-vector). The last dim must be a multiple of 32.
+///
+/// Host peak during upload is roughly 2 × tensor_size_fp32 (one fp32
+/// scratch + one canonical-Block scratch); both are freed before the
+/// next tensor is processed. For Qwen3.6-27B's 17.4 GiB FFN matmul
+/// at K=17408 that's ~1 GiB peak host scratch — fine.
+fn uploadTensorQ4_0(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor) !buffer.Buffer {
+    const numel = t.numel();
+    if (t.shape.len < 2) return error.Q4_0NeedsAtLeast2D;
+    const k = t.shape[t.shape.len - 1];
+    if (k % q4_0.BLOCK_SIZE != 0) return error.Q4_0LastDimNotMultipleOf32;
+    const rows = numel / k;
+    const blocks_per_row = k / q4_0.BLOCK_SIZE;
+    const total_blocks = rows * blocks_per_row;
+
+    // Materialise the tensor as fp32 into a host scratch buffer.
+    const f = try gpa.alloc(f32, numel);
+    defer gpa.free(f);
+    switch (t.dtype) {
+        .f32 => {
+            const src = @as([*]align(1) const f32, @ptrCast(t.bytes.ptr))[0..numel];
+            @memcpy(f, src);
+        },
+        .bf16 => {
+            const u = dtype.asU16(t.bytes);
+            dtype.bf16SliceToF32(u, f);
+        },
+        .f16 => {
+            const u = dtype.asU16(t.bytes);
+            dtype.f16SliceToF32(u, f);
+        },
+        else => return error.UnsupportedWeightDtype,
+    }
+
+    // Row-wise Q4_0 quantize through the canonical Block layout.
+    const blocks = try gpa.alloc(q4_0.Block, total_blocks);
+    defer gpa.free(blocks);
+    var row_i: usize = 0;
+    while (row_i < rows) : (row_i += 1) {
+        const src_row = f[row_i * k .. (row_i + 1) * k];
+        const dst_row = blocks[row_i * blocks_per_row .. (row_i + 1) * blocks_per_row];
+        q4_0.quantizeRow(src_row, dst_row);
+    }
+
+    // Repack to the GPU's sequential 5-u32-per-block layout. This is
+    // also the storage we hand to the device — Buffer.initStatic
+    // uploads a tightly-packed u32 slice via staging.
+    const packed_words = total_blocks * q4_0.GPU_U32S_PER_BLOCK;
+    const packed_buf = try gpa.alloc(u32, packed_words);
+    defer gpa.free(packed_buf);
+    q4_0.packForGpu(blocks, packed_buf);
+
+    return buffer.Buffer.initStatic(ctx, u32, packed_buf);
 }
 
 /// Materialise a Tensor as fp32 in a fresh device-local Buffer.
