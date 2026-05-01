@@ -4142,6 +4142,13 @@ fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision, fami
         .bf16_matmul => &shaders.matmul_nt_v2_bf16,
         .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
     };
+    // The LM head stays bf16 (or fp32 in the all-fp32 path) — never
+    // Q4_0, because logits are sampled from and quantizing them risks
+    // shifting argmax. The upload side mirrors this in `gpu/model.zig`.
+    const lm_head_spv: []align(4) const u8 = switch (precision) {
+        .fp32_all => &shaders.matmul_nt_v2,
+        .bf16_matmul, .q4_0_matmul => &shaders.matmul_nt_v2_bf16,
+    };
     const ffn_spv: []align(4) const u8 = switch (family.activation()) {
         .gelu => &shaders.geglu,
         .silu => &shaders.swiglu,
@@ -4150,7 +4157,7 @@ fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision, fami
         .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
         .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
         .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
-        .matmul_lm_head = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+        .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
         .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
         .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
         .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
@@ -5121,18 +5128,23 @@ const HybridChatKernels = struct {
     fn init(ctx: *const vk.Context, precision: gpu_model.Precision) !HybridChatKernels {
         // Mirrors `buildChatKernels`: precision-aware matmul for the
         // per-layer projections (q/k/v/o, in-projs, out_proj, FFN trio),
-        // but the lm_head stays fp32 because we upload it as fp32
-        // unconditionally.
+        // and a separate selector for the LM head — bf16 when any
+        // non-fp32 path is active, fp32 in the all-fp32 path. Never
+        // Q4_0 (sampling argmax sensitivity).
         const matmul_spv: []align(4) const u8 = switch (precision) {
             .fp32_all => &shaders.matmul_nt_v2,
             .bf16_matmul => &shaders.matmul_nt_v2_bf16,
             .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
         };
+        const lm_head_spv: []align(4) const u8 = switch (precision) {
+            .fp32_all => &shaders.matmul_nt_v2,
+            .bf16_matmul, .q4_0_matmul => &shaders.matmul_nt_v2_bf16,
+        };
         return .{
             .embed = try pipeline.Kernel.init(ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush)),
             .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
             .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
-            .matmul_lm_head = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+            .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
             .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
             .swiglu = try pipeline.Kernel.init(ctx, &shaders.swiglu, 3, @sizeOf(GegluPush)),
             .rope_partial = try pipeline.Kernel.init(ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush)),

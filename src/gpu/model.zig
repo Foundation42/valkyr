@@ -149,8 +149,18 @@ pub const GpuModel = struct {
 
         // For the tied case we still upload a fresh copy — the bytes
         // come from the same source so the device-side data is the
-        // same; only the host-side allocation pattern differs.
-        var lm_head = try uploadTensor(gpa, ctx, cpu.lm_head, js);
+        // same; only the host-side allocation pattern differs. The
+        // lm_head goes through `bf16_raw_if_bf16` whenever precision
+        // is non-fp32 (bf16 or q4_0): it's the single biggest matmul
+        // in the model (N = vocab_size, up to 248 K) and bf16 is the
+        // simplest safe halving — we deliberately skip Q4_0 here
+        // since lm_head logits are sampled from and quantization
+        // could shift the argmax.
+        const lm_head_path: TensorPath = switch (precision) {
+            .fp32_all => .fp32,
+            .bf16_matmul, .q4_0_matmul => .bf16_raw_if_bf16,
+        };
+        var lm_head = try uploadByPath(gpa, ctx, cpu.lm_head, lm_head_path, js);
         errdefer lm_head.deinit(ctx.device);
 
         const layers = try gpa.alloc(GpuLayer, cpu.layers.len);
