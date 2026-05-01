@@ -18,7 +18,7 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
 
 ## What works today
 
-- **Three model families end-to-end on GPU**:
+- **Four model families end-to-end on GPU**:
   - **Gemma 1** (`google/gemma-2b-it`): 18-layer transformer, multi-
     query attention, GeGLU FFN, RoPE, RMSNorm with `(1+w)`, tied LM
     head, SentencePiece tokenizer, `<bos>`/`<start_of_turn>` chat
@@ -42,6 +42,14 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
     tokens, includes vision and tool-call specials we ignore). The
     multimodal vision tower and the multi-token-prediction head are
     skipped at load time.
+  - **Qwen3.6** (`Qwen/Qwen3.6-27B`): 64-layer (48 linear / 16 full)
+    retrained Qwen3.5 — declares the same
+    `Qwen3_5ForConditionalGeneration` architecture, so it loads
+    through the existing hybrid path with **no architecture code
+    changes**. The new config keys (`mtp_*` for the multi-token-
+    prediction draft head, `output_gate_type: "swish"`) pass through
+    the JSON parser without incident. With `--q4` the 27B fits a
+    single 24 GiB consumer card at ~15 tok/s greedy.
 - **End-to-end forward pass on GPU** — embed → N × (rmsnorm → Q/K/V →
   [q_norm/k_norm if present] → RoPE → attention with KV cache → o_proj
   → residual → rmsnorm → gated FFN → residual) → final norm → LM head
@@ -62,14 +70,24 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
   layers; the linear-attention layers carry a constant-size SSM
   state that already doesn't grow with context.
 - **bf16 matmul weights on device** — halves upload time and matmul
-  memory bandwidth versus fp32.
+  memory bandwidth versus fp32. Whenever the `bf16_matmul` or
+  `q4_0_matmul` precision is active, embed_tokens and lm_head also
+  ride bf16 (they're the largest single weight reads in the model;
+  Q4_0 is deliberately not used for them since logits are sampled
+  from). On Qwen3.5 4B with `--q4` this lifts decode from ~30 tok/s
+  to ~52 tok/s; on Qwen3.6 27B halving the embed_tokens staging-
+  buffer peak is what makes the model fit a 24 GiB card at all.
 - **Q4_0 matmul weights on device** (`--q4`) — 4-bit signed
   block-32 weights with one fp16 scale per block, dequant-on-the-fly
   in the matmul shader. Quantization happens at upload time directly
   from the bf16/fp32 safetensors (no GGUF dependency); the CPU
   oracle is byte-clean against llama.cpp's `block_q4_0`. Drops the
-  per-tensor weight footprint to 0.625 B/elem — the path that lets
+  per-layer weight footprint to 0.625 B/elem — the path that lets
   27B-class models actually fit on a 24 GiB card.
+- **Lazy LM head during prefill** — chat skips the `vocab × hidden`
+  LM head matmul on every prompt token except the last. Pure
+  time-to-first-token win: scales with prompt length, no cost to
+  decode tok/s.
 - **Parallel weight upload** — the bf16 → fp32 conversion and Q4_0
   row-wise quantize run on a vendored Chase-Lev work-stealing pool
   ([credit: matryoshka/jobs.zig](https://github.com/foundation42/matryoshka)),
@@ -86,23 +104,25 @@ via MoltenVK / Android — one SPIR-V binary, every vendor).
   time. Both encode paths verified bit-exact against the HF
   `tokenizers` reference on every prompt we've thrown at them.
 
-## How fast it goes (fp32 V-cache, baseline)
+## How fast it goes
 
-On `google/gemma-2b-it` / RTX 3090 / Vulkan 1.3 / Zig 0.14-dev,
-ReleaseFast build:
+RTX 3090 / Vulkan 1.3 / Zig 0.14-dev / ReleaseFast, all decode-only
+greedy at `--temp 0`:
 
-| | |
-|---|---|
-| upload (10 GiB → bf16 matmul, fp32 layernorms/embed) | 10.1 s |
-| cold first forward (includes GPU pipeline compile) | 225 ms |
-| warm median forward | **8.27 ms** |
-| warm p99 forward (p99/p50 = 1.08) | 8.90 ms |
-| **throughput** | **~120 tokens/sec greedy** |
+| model | precision | tok/s |
+|---|---|---|
+| Gemma 2B IT | bf16 (layers) + fp32 (embed/lm_head) | ~120 |
+| Qwen3 4B Instruct 2507 | bf16 + bf16 lm_head | ~50 |
+| Qwen3.5 0.8B | bf16 + bf16 lm_head | ~43 |
+| Qwen3.5 4B | bf16 + bf16 lm_head | ~29 |
+| Qwen3.5 4B | `--q4` (bf16 embed/lm_head) | ~52 |
+| **Qwen3.6 27B** | `--q4` (bf16 embed/lm_head) | **~15** |
 
-`--tq4v` adds a per-step dequant pass over the V history, which is a
-small overhead at short context and pays for itself at long context
-where the V-cache memory bandwidth dominates. Proper benchmarking is a
-phase-3 item; the algorithmic correctness is the win that landed first.
+Numbers reflect both the bf16 lm_head + embed_tokens win and the
+lazy LM head during prefill; the Qwen3.6 27B figure is on the same
+3090 the smaller models run on. `--tq4v` adds a per-step V-cache
+dequant pass that's small overhead at short context and pays for
+itself at long context where V-cache memory bandwidth dominates.
 
 ## TurboQuant in 60 seconds
 
@@ -342,6 +362,8 @@ shaders/
 ├── matmul_nt_v2_bf16.comp   bf16 weights, packed u32 reads
 ├── matmul_nt_v2_q4_0.comp   Q4_0 weights, in-shader dequant
 │                            (block-32, fp16 scale, signed nibbles)
+├── embed_lookup_bf16.comp   bf16 embed_tokens (halves upload-peak +
+│                            on-device footprint of vocab × hidden)
 ├── rmsnorm.comp             subgroup-reduced sum-of-squares + Gemma quirk
 ├── softmax.comp             stable two-pass with stride support
 ├── geglu.comp               fused gelu_tanh(gate) · up
@@ -405,14 +427,18 @@ sense).
   Qwen3.5/3.6 vision tower are larger lifts.
 - The naive `matmul_nt_v2` kernel hits roughly 0.1% of the 3090's fp32
   peak. Most of the warm forward time is the FFN matmuls reading
-  weights memory-bandwidth-bound — proper shared-memory tiling, fused
-  attention (FlashAttention-style), and a bf16 embedding kernel are
-  obvious wins. The Qwen3.5 chat path runs through
-  `matmul_nt_v2_bf16` (~29 tok/s on the 4B, ~43 tok/s on the 0.8B)
-  by default, and `matmul_nt_v2_q4_0` with `--q4` (~30 tok/s on the
-  4B — slightly faster because the 4-bit weights cut matmul memory
-  bandwidth ~3×). The lm_head and embeddings stay fp32 in both
-  paths (same policy as Gemma).
+  weights memory-bandwidth-bound — proper shared-memory tiling and
+  fused attention (FlashAttention-style) are obvious wins. The
+  Qwen3.5 chat path runs through `matmul_nt_v2_bf16` (~29 tok/s on
+  the 4B, ~43 tok/s on the 0.8B) by default, and
+  `matmul_nt_v2_q4_0` with `--q4` (~52 tok/s on the 4B). When any
+  non-fp32 path is active the lm_head and embed_tokens both ride
+  bf16 — they're the single biggest matmul reads in the model
+  (`N = vocab_size`, up to 248 K) and bf16 is the simplest safe
+  halving (Q4_0 here would risk shifting the sample argmax). On
+  Qwen3.6 27B that bf16 demotion is what makes the model fit a
+  24 GiB card at all: the staging-buffer peak during embed_tokens
+  upload halves from ~10 GiB to ~5 GiB.
 - TurboQuant TQ4 ships two block sizes (256 for Gemma + Qwen3.5,
   128 for Qwen3); other head dims need a new shader pair. The
   Qwen3.5 hybrid path supports `--tq4v` on its full-attention layers
