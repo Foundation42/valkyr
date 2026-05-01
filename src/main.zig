@@ -16,6 +16,7 @@ const cpu_forward = @import("cpu/forward.zig");
 const cpu_gated_delta = @import("cpu/gated_delta.zig");
 const cpu_full_attn = @import("cpu/full_attn.zig");
 const turboquant = @import("cpu/turboquant.zig");
+const q4_0 = @import("cpu/q4_0.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
@@ -213,6 +214,7 @@ pub fn main() !void {
     try runSoftmaxSmoke(allocator);
     try runGeluSmoke(allocator);
     try runTurboquantSmoke(allocator);
+    try runQ4_0Smoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runGpuRmsnormSmoke(allocator);
@@ -2263,6 +2265,110 @@ fn runTurboquantSmoke(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print("PASS turboquant CPU oracle (tables + FWHT + RHT + TQ4 round-trip + YATQ bit-exact)\n", .{});
+}
+
+// ── q4_0 CPU smoke: round-trip parity for the int4 weight oracle ───
+//
+// Tier-1 quantization preflight. The CPU q4_0.zig functions are the
+// reference the GPU shader will be parity-checked against, so this
+// smoke verifies them in isolation: hand-checked single-block encode,
+// round-trip on a Gaussian row (cosine sim and per-element MSE), and
+// the symmetric edge case where one element saturates +7.
+
+fn runQ4_0Smoke(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+
+    // 1) Single-block hand-check. With a deterministic ramp the largest
+    //    magnitude is the first or last element, so the scale d picks
+    //    up that element's sign and the round-trip is bit-tight.
+    {
+        var src: [32]f32 = undefined;
+        for (&src, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 16)) * 0.1;
+        // src ranges -1.6 .. +1.5 in steps of 0.1. amax = 1.6 with the
+        // largest signed magnitude = -1.6. So d = -1.6 / -8 = 0.2.
+        var blocks: [1]q4_0.Block = undefined;
+        q4_0.quantizeRow(&src, &blocks);
+        if (@abs(@as(f32, @floatCast(blocks[0].d)) - 0.2) > 1e-3) {
+            std.debug.print("q4_0 single-block: d={d}, want 0.2\n", .{@as(f32, @floatCast(blocks[0].d))});
+            return error.ParityFailed;
+        }
+
+        var rec: [32]f32 = undefined;
+        q4_0.dequantizeRow(&blocks, &rec);
+        var max_err: f32 = 0;
+        for (src, rec) |x, y| max_err = @max(max_err, @abs(x - y));
+        // With d=0.2, snap-to-grid worst case is 0.1 (half a step).
+        if (max_err > 0.105) {
+            std.debug.print("q4_0 single-block round-trip: max |Δ|={d}\n", .{max_err});
+            return error.ParityFailed;
+        }
+    }
+
+    // 2) Gaussian row round-trip (1024 floats = 32 blocks). Q4_0 on a
+    //    unit-Gaussian source gives ≈ 0.0033 SNR-bound MSE per coord;
+    //    we leave generous headroom against PRNG variance.
+    {
+        const n_elems: usize = 1024;
+        var prng = std.Random.DefaultPrng.init(0xC0DEC0DECAFE);
+        const r = prng.random();
+        var src: [n_elems]f32 = undefined;
+        for (&src) |*v| v.* = r.floatNorm(f32);
+
+        var blocks: [n_elems / 32]q4_0.Block = undefined;
+        q4_0.quantizeRow(&src, &blocks);
+        var rec: [n_elems]f32 = undefined;
+        q4_0.dequantizeRow(&blocks, &rec);
+
+        var err_sq: f64 = 0;
+        for (src, rec) |x, y| {
+            const d = @as(f64, x) - @as(f64, y);
+            err_sq += d * d;
+        }
+        const mse: f64 = err_sq / @as(f64, @floatFromInt(n_elems));
+        const cos = q4_0.cosineSim(&src, &rec);
+
+        if (mse > 0.01) {
+            std.debug.print("q4_0 Gaussian MSE={d:.5} (>0.01)\n", .{mse});
+            return error.ParityFailed;
+        }
+        if (cos < 0.995) {
+            std.debug.print("q4_0 Gaussian cos-sim={d:.5} (<0.995)\n", .{cos});
+            return error.ParityFailed;
+        }
+        std.debug.print("       q4_0 1024-float Gaussian: MSE={d:.5}, cos-sim={d:.5}\n", .{ mse, cos });
+    }
+
+    // 3) Saturation / extremes: in the llama.cpp Q4_0 scheme, the
+    //    element with the largest magnitude maps to idx 0 (signed
+    //    -8), so it round-trips EXACTLY. The opposite extreme
+    //    saturates against id=15 (signed +7) and reconstructs as
+    //    (15-8)*|d| = 7/8 of the original. Confirms clamp + sign
+    //    handling at the boundary.
+    {
+        var src: [32]f32 = [_]f32{0.0} ** 32;
+        src[0] = 1.0;   // largest magnitude (positive) — should round-trip exactly
+        src[15] = -1.0; // opposite extreme — should saturate to -0.875
+        var blocks: [1]q4_0.Block = undefined;
+        q4_0.quantizeRow(&src, &blocks);
+
+        // d = max / -8 = 1.0 / -8 = -0.125. Element 0 → idx 0 → (0-8)*-0.125 = 1.0.
+        // Element 15 → 8/(-0.125) ⇒ raw 8 → +8.5 ⇒ floor 16 ⇒ clamp 15 → (15-8)*-0.125 = -0.875.
+        const idx0: u8 = blocks[0].qs[0] & 0x0F;
+        const idx15: u8 = blocks[0].qs[15] & 0x0F;
+        if (idx0 != 0 or idx15 != 15) {
+            std.debug.print("q4_0 saturation: idx[0]={d} (want 0), idx[15]={d} (want 15)\n", .{ idx0, idx15 });
+            return error.ParityFailed;
+        }
+
+        var rec: [32]f32 = undefined;
+        q4_0.dequantizeRow(&blocks, &rec);
+        if (@abs(rec[0] - 1.0) > 1e-6 or @abs(rec[15] - (-0.875)) > 1e-6) {
+            std.debug.print("q4_0 saturation decode: rec[0]={d} (want 1.0), rec[15]={d} (want -0.875)\n", .{ rec[0], rec[15] });
+            return error.ParityFailed;
+        }
+    }
+
+    std.debug.print("PASS q4_0 CPU oracle (single-block, Gaussian round-trip, saturation edge)\n", .{});
 }
 
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
