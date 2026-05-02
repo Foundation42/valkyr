@@ -131,10 +131,13 @@ def main(root_arg: str) -> int:
             vs = layer_profile[sz].get(L, [])
             row += f"{fmt(statistics.mean(vs), 14, 4) if vs else '-':>14s}" if not vs else fmt(statistics.mean(vs), 14, 4)
         print(row)
-    # Final-layer drop relative to second-to-last (does the drop deepen
-    # with size?).
-    section("Final-layer entropy_norm drop (last vs penultimate)")
-    print(f"  {'size':<14s}{'penult':>14s}{'final':>14s}{'drop':>14s}")
+    # Final-layer entropy change relative to second-to-last. The
+    # original framework framing predicted a drop here ("final-layer
+    # output-projection compression"); we observe a lift in every
+    # cell. The label below reflects what the column actually shows
+    # rather than what was originally predicted.
+    section("Final-layer entropy_norm jump (final − penultimate)")
+    print(f"  {'size':<14s}{'penult':>14s}{'final':>14s}{'jump':>14s}")
     for sz in sizes:
         layers = sorted(layer_profile[sz].keys())
         if len(layers) < 2:
