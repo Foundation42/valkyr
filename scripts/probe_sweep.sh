@@ -23,13 +23,12 @@ mkdir -p "$OUT"
 MODELS=(
   "meta-llama/Llama-3.2-1B-Instruct:1B-llama32"
   "meta-llama/Llama-3.2-3B-Instruct:3B-llama32"
-  # Mistral 7B v0.3 isn't a same-family scale-up of Llama 3.2 — it's
-  # a neighbor architecture (same SiLU / plain-RMSNorm / GQA / untied
-  # lm_head shape, routes through the Llama loader) at ~7B scale.
-  # Treat its data point as "what does ~7B look like, with the caveat
-  # of slightly different training corpus + tokenizer." Llama 3.1 8B
-  # would be the cleanest third point but it's a gated checkpoint.
-  "mistralai/Mistral-7B-Instruct-v0.3:7B-mistral"
+  # Llama 3.1 8B is the same architecture family as Llama 3.2 1B/3B —
+  # clean substrate-relativity scale-up across an 8× span in parameter
+  # count, same tokenizer, same chat template, same RMSNorm/SwiGLU/GQA
+  # shapes. The Mistral 7B reference point in earlier runs was a
+  # neighbor-arch confound; with 8B available we drop it.
+  "meta-llama/Llama-3.1-8B-Instruct:8B-llama31"
 )
 # Optional extras passed as positional args (id:label form).
 for extra in "$@"; do MODELS+=("$extra"); done
@@ -56,7 +55,11 @@ for spec in "${MODELS[@]}"; do
     text="${p#*:}"
     out="$OUT/${label}_${pkind}.jsonl"
     echo "→ ${label} / ${pkind} → ${out}"
-    "$BIN" --chat "$id" --q4k --probe "$out" "$text" \
+    # bf16 across all sizes: removes the quantization confound from
+    # the substrate-relativity axis. 1B at Q4_K_M sits right at the
+    # coherence floor (collapses to token salad past ~150 tokens);
+    # bf16 keeps every size in its native dynamics.
+    "$BIN" --chat "$id" --probe "$out" "$text" \
       | tail -2 \
       | sed "s/^/    /"
   done

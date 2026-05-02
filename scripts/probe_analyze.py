@@ -25,10 +25,11 @@ NAME_RE = re.compile(r"^(?P<size>[^_]+)_(?P<prompt>[^.]+)\.jsonl$")
 PROMPT_ORDER = ["factual", "creative", "philosophical"]
 
 
-def load(path: pathlib.Path) -> tuple[dict, list[dict], list[dict]]:
+def load(path: pathlib.Path) -> tuple[dict, list[dict], list[dict], list[dict]]:
     header = None
     acts = []
     logs = []
+    attns = []
     with path.open() as f:
         for line in f:
             r = json.loads(line)
@@ -39,7 +40,9 @@ def load(path: pathlib.Path) -> tuple[dict, list[dict], list[dict]]:
                 acts.append(r)
             elif k == "logits":
                 logs.append(r)
-    return header, acts, logs
+            elif k == "attn":
+                attns.append(r)
+    return header, acts, logs, attns
 
 
 def discover(root: pathlib.Path) -> dict[str, dict[str, pathlib.Path]]:
@@ -94,7 +97,7 @@ def main(root_arg: str) -> int:
                 medians[sz][prompt] = float("nan")
                 row.append(f"{'-':>14s}")
                 continue
-            _, _, logs = load(p)
+            _, _, logs, _ = load(p)
             decode = [r for r in logs if not r["prefill"]]
             if not decode:
                 medians[sz][prompt] = float("nan")
@@ -116,7 +119,7 @@ def main(root_arg: str) -> int:
             p = by_size[sz].get(prompt)
             if p is None:
                 continue
-            _, acts, _ = load(p)
+            _, acts, _, _ = load(p)
             for r in acts:
                 layer_profile[sz].setdefault(r["layer"], []).append(r["entropy_norm"])
     # Print as size columns × layer rows.
@@ -152,13 +155,71 @@ def main(root_arg: str) -> int:
             if p is None:
                 row.append(f"{'-':>14s}")
                 continue
-            _, _, logs = load(p)
+            _, _, logs, _ = load(p)
             decode = [r for r in logs if not r["prefill"]]
             if not decode:
                 row.append(f"{'-':>14s}")
                 continue
             row.append(fmt(statistics.mean([r["kl_null"] for r in decode]), 14, 3))
         print(f"  {sz:<14s}" + "".join(row))
+
+    # ── K(t) attention-entropy by (size × prompt) ────────────────
+    #
+    # Decode-only mean of attn.entropy_norm across (token, layer, head).
+    # Skip n_pos == 1 rows (degenerate single-key attention has entropy
+    # 0 by construction). Reported normalized by log(n_pos) so the
+    # absolute scale is comparable across positions.
+    section("K(t) attention entropy_norm — decode-only mean across (layer × token)")
+    print(f"  {'size':<14s}" + "".join(f"{p:>14s}" for p in PROMPT_ORDER))
+    k_medians: dict[str, dict[str, float]] = {}
+    for sz in sizes:
+        row = []
+        k_medians[sz] = {}
+        for prompt in PROMPT_ORDER:
+            p = by_size[sz].get(prompt)
+            if p is None:
+                row.append(f"{'-':>14s}")
+                continue
+            _, _, _, attns = load(p)
+            sample = [r["entropy_norm"] for r in attns if not r["prefill"] and r["n_pos"] > 1]
+            if not sample:
+                row.append(f"{'-':>14s}")
+                continue
+            m = statistics.mean(sample)
+            k_medians[sz][prompt] = m
+            row.append(fmt(m, 14, 4))
+        print(f"  {sz:<14s}" + "".join(row))
+
+    # Top-weight (concentration) — lower means attention is spread,
+    # higher means a few keys dominate.
+    section("K(t) mean top attention weight — decode-only")
+    print(f"  {'size':<14s}" + "".join(f"{p:>14s}" for p in PROMPT_ORDER))
+    for sz in sizes:
+        row = []
+        for prompt in PROMPT_ORDER:
+            p = by_size[sz].get(prompt)
+            if p is None:
+                row.append(f"{'-':>14s}")
+                continue
+            _, _, _, attns = load(p)
+            sample = [r["top"] for r in attns if not r["prefill"] and r["n_pos"] > 1]
+            if not sample:
+                row.append(f"{'-':>14s}")
+                continue
+            row.append(fmt(statistics.mean(sample), 14, 4))
+        print(f"  {sz:<14s}" + "".join(row))
+
+    # K-axis substrate-relativity test: does the philosophical-creative
+    # gap on K mirror the threshold pattern we saw on D? Specifically:
+    # is K higher on philosophical than creative for 7B but not for
+    # smaller substrates?
+    section("K(t) ordering: phil vs creative by size")
+    for sz in sizes:
+        ph = k_medians[sz].get("philosophical", float("nan"))
+        cr = k_medians[sz].get("creative", float("nan"))
+        delta = ph - cr
+        sign = "phil > creative" if delta > 0 else "creative > phil"
+        print(f"  {sz:<14s}  phil={fmt(ph)}  creative={fmt(cr)}  Δ={fmt(delta)}  ({sign})")
 
     # ── C ordering sanity check ──────────────────────────────────
     section("RFF C-ordering check: factual < creative < philosophical?")

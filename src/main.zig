@@ -4313,6 +4313,8 @@ fn runChat(
     defer if (probe_bus) |*b| b.deinit(gpa);
     var probe_hidden_scratch: ?[]f32 = null;
     defer if (probe_hidden_scratch) |s| gpa.free(s);
+    var probe_attn_scratch: ?[]f32 = null;
+    defer if (probe_attn_scratch) |s| gpa.free(s);
     var probe_token_index: u32 = 0;
 
     if (probe_path) |pp| {
@@ -4336,19 +4338,24 @@ fn runChat(
         // the first prompt token — clean handoff, no reset needed.
 
         var bus = probe.Bus{};
-        const probes_buf = try gpa.alloc(probe.Probe, 2);
+        const probes_buf = try gpa.alloc(probe.Probe, 3);
         const lp = try probe.LogitProbe.create(gpa, w_ptr, @intCast(cfg.vocab_size), logits);
         const ap = try probe.ActivationEntropyProbe.create(gpa, w_ptr);
+        const kp = try probe.AttentionProbe.create(gpa, w_ptr);
         probes_buf[0] = lp.probe();
         probes_buf[1] = ap.probe();
+        probes_buf[2] = kp.probe();
         bus.probes = probes_buf;
         bus.finalize();
         probe_bus = bus;
 
-        try probe.writeHeader(w_ptr, probe_info, dir_path, &.{ "logits", "act" });
+        try probe.writeHeader(w_ptr, probe_info, dir_path, &.{ "logits", "act", "attn" });
 
         if (bus.needs_hidden_pre or bus.needs_hidden_post) {
             probe_hidden_scratch = try gpa.alloc(f32, cfg.hidden_size);
+        }
+        if (bus.needs_attention) {
+            probe_attn_scratch = try gpa.alloc(f32, cfg.num_attention_heads * max_pos);
         }
     }
 
@@ -4364,6 +4371,7 @@ fn runChat(
             probe_info,
             &probe_token_index,
             probe_hidden_scratch,
+            probe_attn_scratch,
         );
         return;
     }
@@ -4387,6 +4395,7 @@ fn runChat(
             probe_info,
             &probe_token_index,
             probe_hidden_scratch,
+            probe_attn_scratch,
         );
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
@@ -4423,6 +4432,7 @@ fn chatTurn(
     probe_info: probe.ModelInfo,
     probe_token_index: *u32,
     probe_hidden_scratch: ?[]f32,
+    probe_attn_scratch: ?[]f32,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -4479,7 +4489,7 @@ fn chatTurn(
         // state, the forward gets split into N submits with readbacks
         // between. Otherwise the fast single-submit path runs.
         const use_probed_forward = if (probe_bus) |bus|
-            bus.needs_hidden_pre or bus.needs_hidden_post
+            bus.needs_hidden_pre or bus.needs_hidden_post or bus.needs_attention
         else
             false;
 
@@ -4500,7 +4510,8 @@ fn chatTurn(
                 probe_info,
                 probe_token_index.*,
                 is_prefill,
-                probe_hidden_scratch.?,
+                probe_hidden_scratch,
+                probe_attn_scratch,
             );
         } else {
             if (pos.* > 0) try rec.reset();
@@ -4955,7 +4966,8 @@ fn forwardStepProbed(
     info: probe.ModelInfo,
     token_index: u32,
     is_prefill: bool,
-    hidden_scratch: []f32,
+    hidden_scratch: ?[]f32,
+    attn_scratch: ?[]f32,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const vocab: u32 = @intCast(cfg.vocab_size);
@@ -4975,18 +4987,21 @@ fn forwardStepProbed(
     try rec.endAndSubmit();
 
     // ── Per layer ──────────────────────────────────────────────────
+    const max_pos_u32: u32 = @intCast(sc.max_pos);
+    const n_heads_u32: u32 = @intCast(cfg.num_attention_heads);
     for (0..cfg.num_hidden_layers) |layer_idx| {
+        const layer_ctx = probe.Context{
+            .info = info,
+            .token_index = token_index,
+            .pos = pos,
+            .token_id = token_id,
+            .layer_idx = @intCast(layer_idx),
+            .is_prefill = is_prefill,
+        };
+
         if (bus.needs_hidden_pre) {
-            try sc.stream.readBack(vk_ctx, f32, hidden_scratch);
-            const ctx_h = probe.Context{
-                .info = info,
-                .token_index = token_index,
-                .pos = pos,
-                .token_id = token_id,
-                .layer_idx = @intCast(layer_idx),
-                .is_prefill = is_prefill,
-            };
-            try bus.onLayerEntry(ctx_h, hidden_scratch);
+            try sc.stream.readBack(vk_ctx, f32, hidden_scratch.?);
+            try bus.onLayerEntry(layer_ctx, hidden_scratch.?);
         }
 
         try rec.reset();
@@ -4994,17 +5009,19 @@ fn forwardStepProbed(
         try recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
         try rec.endAndSubmit();
 
+        // sc.scores holds this layer's post-softmax attention weights
+        // until the next layer's softmax overwrites it. Read it now
+        // while it's still valid. Layout is [n_heads, max_pos]
+        // row-major; only the first n_pos columns of each row are
+        // valid post-softmax — the probe slices accordingly.
+        if (bus.needs_attention) {
+            try sc.scores.readBack(vk_ctx, f32, attn_scratch.?);
+            try bus.onAttention(layer_ctx, attn_scratch.?, n_heads_u32, pushes.n_pos, max_pos_u32);
+        }
+
         if (bus.needs_hidden_post) {
-            try sc.stream.readBack(vk_ctx, f32, hidden_scratch);
-            const ctx_h = probe.Context{
-                .info = info,
-                .token_index = token_index,
-                .pos = pos,
-                .token_id = token_id,
-                .layer_idx = @intCast(layer_idx),
-                .is_prefill = is_prefill,
-            };
-            try bus.onLayerExit(ctx_h, hidden_scratch);
+            try sc.stream.readBack(vk_ctx, f32, hidden_scratch.?);
+            try bus.onLayerExit(layer_ctx, hidden_scratch.?);
         }
     }
 

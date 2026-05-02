@@ -87,13 +87,18 @@ pub const Slices = struct {
     /// `hidden_size` floats. Set in on_layer_entry and on_layer_exit.
     hidden: ?[]const f32 = null,
     /// Post-softmax attention weights, `[n_heads, n_pos]` row-major
-    /// with stride `scores_stride`. Set in on_attention (not yet
-    /// wired).
+    /// with stride `attn_scores_stride` (the buffer's row width is
+    /// max_pos, only the first n_pos entries of each row are valid).
+    /// Set in on_attention.
     attn_weights: ?[]const f32 = null,
+    /// Optional Q/K/V slices for downstream analysis (eigenspectra,
+    /// head specialisation). Not populated in v0 — exposed in the
+    /// signature for future-proofing per the dual-purpose design.
     attn_q: ?[]const f32 = null,
     attn_k: ?[]const f32 = null,
     attn_v: ?[]const f32 = null,
     attn_n_pos: u32 = 0,
+    attn_n_heads: u32 = 0,
     attn_scores_stride: u32 = 0,
     /// `vocab_size` floats. Set in on_logits.
     logits: ?[]const f32 = null,
@@ -171,7 +176,20 @@ pub const Bus = struct {
         }
     }
 
-    pub fn onAttention(self: *const Bus, ctx: Context, s: Slices) !void {
+    pub fn onAttention(
+        self: *const Bus,
+        ctx: Context,
+        weights: []const f32,
+        n_heads: u32,
+        n_pos: u32,
+        scores_stride: u32,
+    ) !void {
+        const s = Slices{
+            .attn_weights = weights,
+            .attn_n_heads = n_heads,
+            .attn_n_pos = n_pos,
+            .attn_scores_stride = scores_stride,
+        };
         for (self.probes) |p| {
             if (p.vt.on_attention) |f| try f(p.impl, ctx, s);
         }
@@ -447,6 +465,98 @@ pub const ActivationEntropyProbe = struct {
     };
 };
 
+// ── AttentionProbe — K(t) ────────────────────────────────────────────
+//
+// Per (token, layer): aggregate K(t) statistics across heads.
+//
+//   - mean Shannon entropy of post-softmax attention weights, in nats
+//   - same divided by log(n_pos) for a [0, 1] normalized variant
+//   - mean top-weight (max attention weight per head, averaged) — a
+//     concentration signal complementary to entropy. Two distributions
+//     can have similar entropy but different concentration peaks.
+//   - n_pos at this layer (always equal to ctx.pos+1, but recorded
+//     explicitly so post-processing doesn't have to derive it).
+//
+// During decode each step has a single query position, so what we
+// log per (token, layer) is a row-vector statistic across heads — no
+// rank-via-SVD, that requires accumulating multiple query rows. The
+// spec's "effective rank" (5.2.2) belongs to a separate post-
+// processing pass over a window of consecutive tokens.
+
+pub const AttentionProbe = struct {
+    gpa: std.mem.Allocator,
+    writer: *JsonlWriter,
+
+    pub fn create(gpa: std.mem.Allocator, writer: *JsonlWriter) !*AttentionProbe {
+        const self = try gpa.create(AttentionProbe);
+        self.* = .{ .gpa = gpa, .writer = writer };
+        return self;
+    }
+
+    fn wants(_: *anyopaque, what: Observable) bool {
+        return what == .attention;
+    }
+
+    fn onAttention(impl: *anyopaque, ctx: Context, s: Slices) !void {
+        const self: *AttentionProbe = @ptrCast(@alignCast(impl));
+        const w = s.attn_weights.?;
+        const n_heads: usize = @intCast(s.attn_n_heads);
+        const n_pos: usize = @intCast(s.attn_n_pos);
+        const stride: usize = @intCast(s.attn_scores_stride);
+        if (n_heads == 0 or n_pos == 0) return;
+
+        var sum_H: f64 = 0;
+        var sum_top: f64 = 0;
+        for (0..n_heads) |h| {
+            const row_start = h * stride;
+            const row = w[row_start .. row_start + n_pos];
+            var H: f64 = 0;
+            var top: f32 = 0;
+            for (row) |p| {
+                if (p > 0) H -= @as(f64, p) * @log(@as(f64, p));
+                if (p > top) top = p;
+            }
+            sum_H += H;
+            sum_top += @as(f64, top);
+        }
+        const mean_H = sum_H / @as(f64, @floatFromInt(n_heads));
+        const mean_top = sum_top / @as(f64, @floatFromInt(n_heads));
+        const log_npos = @log(@as(f64, @floatFromInt(n_pos)));
+        const mean_H_norm: f64 = if (log_npos > 0) mean_H / log_npos else 0;
+
+        var buf: [256]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf,
+            "{{\"kind\":\"attn\",\"tok\":{d},\"pos\":{d},\"layer\":{d},\"prefill\":{any},\"n_pos\":{d},\"entropy\":{d:.6},\"entropy_norm\":{d:.6},\"top\":{d:.6}}}",
+            .{
+                ctx.token_index,
+                ctx.pos,
+                ctx.layer_idx.?,
+                ctx.is_prefill,
+                n_pos,
+                mean_H,
+                mean_H_norm,
+                mean_top,
+            },
+        );
+        try self.writer.writeLine(line);
+    }
+
+    fn deinitImpl(impl: *anyopaque, gpa: std.mem.Allocator) void {
+        const self: *AttentionProbe = @ptrCast(@alignCast(impl));
+        gpa.destroy(self);
+    }
+
+    pub fn probe(self: *AttentionProbe) Probe {
+        return .{ .impl = self, .vt = &VT };
+    }
+
+    const VT: Probe.VTable = .{
+        .wants = wants,
+        .on_attention = onAttention,
+        .deinit = deinitImpl,
+    };
+};
+
 // ── Header writer ────────────────────────────────────────────────────
 //
 // Emit a single self-describing line at the top of each JSONL trace.
@@ -478,7 +588,7 @@ pub fn writeHeader(
         try w.print("\"{s}\"", .{k});
     }
     try w.writeAll(
-        "],\"defs\":{\"act.entropy\":\"Shannon entropy of L2-energy distribution p_i = a_i^2 / sum(a_j^2)\",\"act.entropy_norm\":\"entropy / log(hidden)\",\"act.l2\":\"sqrt(sum(a_i^2))\",\"logits.entropy\":\"Shannon entropy of softmax(logits)\",\"logits.kl_null\":\"KL(softmax(logits) || null_prior); null_prior = single-BOS-token forward at pos 0\"}}",
+        "],\"defs\":{\"act.entropy\":\"Shannon entropy of L2-energy distribution p_i = a_i^2 / sum(a_j^2)\",\"act.entropy_norm\":\"entropy / log(hidden)\",\"act.l2\":\"sqrt(sum(a_i^2))\",\"logits.entropy\":\"Shannon entropy of softmax(logits)\",\"logits.kl_null\":\"KL(softmax(logits) || null_prior); null_prior = single-BOS-token forward at pos 0\",\"attn.entropy\":\"per-layer mean across heads of Shannon entropy of post-softmax attention over n_pos keys\",\"attn.entropy_norm\":\"attn.entropy / log(n_pos)\",\"attn.top\":\"per-layer mean across heads of max(attention_weight)\"}}",
     );
     try writer.writeLine(fbs.getWritten());
 }
