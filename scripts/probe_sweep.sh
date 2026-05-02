@@ -29,6 +29,23 @@ MODELS=(
   # shapes. The Mistral 7B reference point in earlier runs was a
   # neighbor-arch confound; with 8B available we drop it.
   "meta-llama/Llama-3.1-8B-Instruct:8B-llama31"
+  # Qwen3.5 / 3.6 hybrid family — the v2 tilth-sweep substrate.
+  # Different family from Llama (later training era, denser per-
+  # parameter capacity, hybrid Gated-DeltaNet + full-attention
+  # architecture). Used to test whether the substrate-relativity
+  # threshold appears at lower parameter count when training-era
+  # variables are released. K probe is only valid on the 1-in-4
+  # full-attention layers; linear-attention layers contribute B and D
+  # only.
+  "Qwen/Qwen3.5-0.8B:0.8B-qwen35"
+  "Qwen/Qwen3.5-2B:2B-qwen35"
+  "Qwen/Qwen3.5-4B:4B-qwen35"
+  # Qwen3.6 27B is omitted from the bf16 sweep: 27B at bf16 needs
+  # ~54 GB of weight memory and does not fit on a 24 GB consumer GPU.
+  # It works at --q4k (~20 tok/s on a 3090) but mixing precision
+  # across the sweep would reintroduce the precision-by-size confound
+  # we removed in v1. Run it separately if a clean v2 27B comparison
+  # is wanted, with the precision caveat documented.
 )
 # Optional extras passed as positional args (id:label form).
 for extra in "$@"; do MODELS+=("$extra"); done

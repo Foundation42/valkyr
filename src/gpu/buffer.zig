@@ -122,6 +122,22 @@ pub const Buffer = struct {
         @memcpy(@as([*]u8, @ptrCast(dst))[0..bytes], std.mem.sliceAsBytes(data));
     }
 
+    /// Fill the entire buffer with zero. One-shot submission, blocks
+    /// until the queue is idle. Intended for resetting per-session
+    /// state (e.g. the SSM recurrent buffers between independent
+    /// prompts in a `--prompts` batch run); not appropriate for any
+    /// hot path.
+    pub fn fillZero(self: *const Buffer, ctx: *const vk.Context) !void {
+        if (self.bytes == 0) return;
+        try submitOneShot(ctx, struct {
+            buf: c.VkBuffer,
+            size: usize,
+            pub fn record(s: @This(), cmd: c.VkCommandBuffer) void {
+                c.vkCmdFillBuffer(cmd, s.buf, 0, @intCast(s.size), 0);
+            }
+        }{ .buf = self.handle, .size = self.bytes });
+    }
+
     /// Read a `device_only` buffer back to a host slice via a transient
     /// staging buffer. Init- or test-time only — far too slow for any
     /// hot loop. Intended for parity tests against the CPU reference.

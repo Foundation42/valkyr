@@ -22,7 +22,13 @@ import json, sys, statistics, pathlib, re
 # probe_sweep.sh — e.g. `1B-llama32_factual.jsonl`.
 NAME_RE = re.compile(r"^(?P<size>[^_]+)_(?P<prompt>[^.]+)\.jsonl$")
 
-PROMPT_ORDER = ["factual", "creative", "philosophical"]
+# Default ordering for the v1 prompt battery; analyser falls back to
+# auto-discovered prompts (alphabetical) when the v1 set isn't all
+# present, which is the case for expanded-taxonomy sweeps.
+DEFAULT_PROMPT_ORDER = ["factual", "creative", "philosophical"]
+# When neither factual nor philosophical is present we treat the
+# C-ordering check as not applicable. The threshold-mirror analysis
+# on K still makes sense if there are at least two prompts to compare.
 
 
 def load(path: pathlib.Path) -> tuple[dict, list[dict], list[dict], list[dict]]:
@@ -84,9 +90,30 @@ def main(root_arg: str) -> int:
 
     sizes = by_size_order(list(by_size.keys()))
 
+    # Detect which prompts are actually present. Use the v1 default
+    # order if all three v1 prompts (factual / creative / philosophical)
+    # are present; otherwise fall back to auto-discovered prompt names
+    # in alphabetical order, which is correct for expanded-taxonomy
+    # sweeps that don't share the v1 prompt names.
+    all_prompts: set[str] = set()
+    for sz in sizes:
+        all_prompts.update(by_size[sz].keys())
+    if all(p in all_prompts for p in DEFAULT_PROMPT_ORDER):
+        PROMPT_ORDER = DEFAULT_PROMPT_ORDER
+        v1_battery = True
+    else:
+        PROMPT_ORDER = sorted(all_prompts)
+        v1_battery = False
+        print(f"# expanded-taxonomy sweep detected (prompts: {', '.join(PROMPT_ORDER)})")
+        print(f"# v1-specific analyses (C-ordering, phil-fact gap) skipped")
+
     # ── 1. D(t) entropy gap by size ──────────────────────────────
-    section("D(t) median entropy by (size × prompt) — Prediction 1")
-    print(f"  {'size':<14s}" + "".join(f"{p:>14s}" for p in PROMPT_ORDER) + f"{'phil-fact':>14s}")
+    if v1_battery:
+        section("D(t) median entropy by (size × prompt) — Prediction 1")
+        print(f"  {'size':<14s}" + "".join(f"{p:>14s}" for p in PROMPT_ORDER) + f"{'phil-fact':>14s}")
+    else:
+        section("D(t) median entropy by (size × prompt)")
+        print(f"  {'size':<14s}" + "".join(f"{p:>14s}" for p in PROMPT_ORDER))
     medians: dict[str, dict[str, float]] = {}
     for sz in sizes:
         row = []
@@ -106,8 +133,9 @@ def main(root_arg: str) -> int:
             med = statistics.median([r["entropy"] for r in decode])
             medians[sz][prompt] = med
             row.append(fmt(med, 14, 4))
-        gap = medians[sz].get("philosophical", float("nan")) - medians[sz].get("factual", float("nan"))
-        row.append(fmt(gap, 14, 4))
+        if v1_battery:
+            gap = medians[sz].get("philosophical", float("nan")) - medians[sz].get("factual", float("nan"))
+            row.append(fmt(gap, 14, 4))
         print(f"  {sz:<14s}" + "".join(row))
 
     # ── 2. Per-layer B(t) profile shift by size ──────────────────
@@ -212,35 +240,54 @@ def main(root_arg: str) -> int:
             row.append(fmt(statistics.mean(sample), 14, 4))
         print(f"  {sz:<14s}" + "".join(row))
 
-    # K-axis substrate-relativity test: does the philosophical-creative
-    # gap on K mirror the threshold pattern we saw on D? Specifically:
-    # is K higher on philosophical than creative for 7B but not for
-    # smaller substrates?
-    section("K(t) ordering: phil vs creative by size")
-    for sz in sizes:
-        ph = k_medians[sz].get("philosophical", float("nan"))
-        cr = k_medians[sz].get("creative", float("nan"))
-        delta = ph - cr
-        sign = "phil > creative" if delta > 0 else "creative > phil"
-        print(f"  {sz:<14s}  phil={fmt(ph)}  creative={fmt(cr)}  Δ={fmt(delta)}  ({sign})")
-
-    # ── C ordering sanity check ──────────────────────────────────
-    section("RFF C-ordering check: factual < creative < philosophical?")
-    for sz in sizes:
-        m = medians[sz]
-        ok = m.get("factual", 9e9) < m.get("creative", 9e9) < m.get("philosophical", -9e9)
-        print(f"  {sz:<14s}  factual={fmt(m.get('factual',float('nan')))}  creative={fmt(m.get('creative',float('nan')))}  philosophical={fmt(m.get('philosophical',float('nan')))}  → {'PASS' if ok else 'FAIL'}")
-
-    # ── Predictions summary ──────────────────────────────────────
-    section("Verdict")
-    if len(sizes) >= 2:
-        gaps = []
+    if v1_battery:
+        # K-axis substrate-relativity test: does the philosophical-
+        # creative gap on K mirror the threshold pattern we saw on D?
+        section("K(t) ordering: phil vs creative by size")
         for sz in sizes:
-            g = medians[sz].get("philosophical", float("nan")) - medians[sz].get("factual", float("nan"))
-            gaps.append((sz, g))
-        gap_grows = all(gaps[i][1] <= gaps[i + 1][1] for i in range(len(gaps) - 1))
-        print(f"  Prediction 1 (entropy gap grows with size): {'CONSISTENT' if gap_grows else 'NOT CONSISTENT'}")
-        print(f"    gaps by size: {', '.join(f'{s}={fmt(g,8,4)}' for s,g in gaps)}")
+            ph = k_medians[sz].get("philosophical", float("nan"))
+            cr = k_medians[sz].get("creative", float("nan"))
+            delta = ph - cr
+            sign = "phil > creative" if delta > 0 else "creative > phil"
+            print(f"  {sz:<14s}  phil={fmt(ph)}  creative={fmt(cr)}  Δ={fmt(delta)}  ({sign})")
+
+        # ── C ordering sanity check ──────────────────────────────
+        section("RFF C-ordering check: factual < creative < philosophical?")
+        for sz in sizes:
+            m = medians[sz]
+            ok = m.get("factual", 9e9) < m.get("creative", 9e9) < m.get("philosophical", -9e9)
+            print(f"  {sz:<14s}  factual={fmt(m.get('factual',float('nan')))}  creative={fmt(m.get('creative',float('nan')))}  philosophical={fmt(m.get('philosophical',float('nan')))}  → {'PASS' if ok else 'FAIL'}")
+
+        # ── Predictions summary ──────────────────────────────────
+        section("Verdict")
+        if len(sizes) >= 2:
+            gaps = []
+            for sz in sizes:
+                g = medians[sz].get("philosophical", float("nan")) - medians[sz].get("factual", float("nan"))
+                gaps.append((sz, g))
+            gap_grows = all(gaps[i][1] <= gaps[i + 1][1] for i in range(len(gaps) - 1))
+            print(f"  Prediction 1 (entropy gap grows with size): {'CONSISTENT' if gap_grows else 'NOT CONSISTENT'}")
+            print(f"    gaps by size: {', '.join(f'{s}={fmt(g,8,4)}' for s,g in gaps)}")
+    else:
+        # Expanded-taxonomy mode: report all pairwise prompt orderings
+        # on D and K for each substrate, since there's no canonical
+        # control prompt to anchor the comparison against.
+        section("D(t) median entropy ranking by substrate (smallest → largest)")
+        for sz in sizes:
+            entries = sorted(
+                [(p, medians[sz].get(p, float("nan"))) for p in PROMPT_ORDER],
+                key=lambda kv: (float("inf") if kv[1] != kv[1] else kv[1])
+            )
+            ranked = "  ".join(f"{p}={fmt(v, 8, 4)}" for p, v in entries)
+            print(f"  {sz:<14s}  {ranked}")
+        section("K(t) attention entropy_norm ranking by substrate (smallest → largest)")
+        for sz in sizes:
+            entries = sorted(
+                [(p, k_medians[sz].get(p, float("nan"))) for p in PROMPT_ORDER],
+                key=lambda kv: (float("inf") if kv[1] != kv[1] else kv[1])
+            )
+            ranked = "  ".join(f"{p}={fmt(v, 8, 4)}" for p, v in entries)
+            print(f"  {sz:<14s}  {ranked}")
     return 0
 
 
