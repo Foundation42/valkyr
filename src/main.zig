@@ -24,6 +24,7 @@ const gpu_model = @import("gpu/model.zig");
 const gpu_scratch = @import("gpu/scratch.zig");
 const gpu_recorder = @import("gpu/recorder.zig");
 const hf_cache = @import("hf_cache.zig");
+const probe = @import("probe.zig");
 const shaders = @import("shaders");
 
 pub fn main() !void {
@@ -196,6 +197,7 @@ pub fn main() !void {
         var tq4v: bool = false;
         var q4: bool = false;
         var q4k: bool = false;
+        var probe_path: ?[]const u8 = null;
         var i: usize = 3;
         while (i < args.len) {
             const a = args[i];
@@ -220,6 +222,9 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--q4k")) {
                 q4k = true;
                 i += 1;
+            } else if (std.mem.eql(u8, a, "--probe") and i + 1 < args.len) {
+                probe_path = args[i + 1];
+                i += 2;
             } else {
                 user_msg = a;
                 i += 1;
@@ -242,9 +247,13 @@ pub fn main() !void {
         defer allocator.free(cfg_path);
         const cfg = try config_mod.Config.loadFromFile(allocator, cfg_path);
         if (cfg.family.isHybrid()) {
+            if (probe_path != null) {
+                std.debug.print("--probe is not yet wired for hybrid (Qwen3.5/3.6) models — Llama 3.2 family for v0\n", .{});
+                return;
+            }
             try runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision);
         } else {
-            try runChat(allocator, dir, user_msg, sp, seed, tq4v, precision);
+            try runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path);
         }
         return;
     }
@@ -4141,6 +4150,7 @@ fn runChat(
     seed: u64,
     tq4v: bool,
     precision: gpu_model.Precision,
+    probe_path: ?[]const u8,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -4279,12 +4289,82 @@ fn runChat(
     }
     if (tq4v) try stdout.print("KV cache: K=fp32, V=TurboQuant TQ4 (asymmetric)\n", .{});
 
+    // ── Probe wiring ─────────────────────────────────────────────────
+    //
+    // When --probe <path> is set, build a JSONL writer + Bus + the two
+    // v0 probes (LogitProbe for D, ActivationEntropyProbe for B). The
+    // null prior for D is computed by running a single forward on the
+    // BOS token at pos 0; the chat loop then starts at pos 0 too,
+    // overwriting that KV slot with the actual prompt token. No
+    // permanent state pollution.
+    const probe_info = probe.ModelInfo{
+        .family = @tagName(cfg.family),
+        .n_layers = @intCast(cfg.num_hidden_layers),
+        .hidden_size = @intCast(cfg.hidden_size),
+        .n_heads = @intCast(cfg.num_attention_heads),
+        .n_kv_heads = @intCast(cfg.num_key_value_heads),
+        .head_dim = @intCast(cfg.head_dim),
+        .vocab_size = @intCast(cfg.vocab_size),
+    };
+
+    var probe_writer: ?probe.JsonlWriter = null;
+    defer if (probe_writer) |*w| w.close();
+    var probe_bus: ?probe.Bus = null;
+    defer if (probe_bus) |*b| b.deinit(gpa);
+    var probe_hidden_scratch: ?[]f32 = null;
+    defer if (probe_hidden_scratch) |s| gpa.free(s);
+    var probe_token_index: u32 = 0;
+
+    if (probe_path) |pp| {
+        probe_writer = try probe.JsonlWriter.open(pp);
+        const w_ptr: *probe.JsonlWriter = &probe_writer.?;
+
+        try stdout.print("probe: writing trace to {s}\n", .{pp});
+
+        // Compute null prior: forward a single BOS token at pos 0,
+        // read back the resulting logits, then hand them to LogitProbe
+        // as the q distribution for KL(p || q).
+        const bos: u32 = cfg.bos_token_id orelse 1;
+        try stdout.print("probe: computing null prior (BOS={d})...\n", .{bos});
+        try rec.reset();
+        try rec.begin();
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, bos, tq4_hooks, true);
+        try rec.endAndSubmit();
+        try sc.logits.readBack(&ctx, f32, logits);
+        // KV slot at pos 0 is now dirty with the BOS forward. The chat
+        // loop below starts at pos = 0 and overwrites that slot with
+        // the first prompt token — clean handoff, no reset needed.
+
+        var bus = probe.Bus{};
+        const probes_buf = try gpa.alloc(probe.Probe, 2);
+        const lp = try probe.LogitProbe.create(gpa, w_ptr, @intCast(cfg.vocab_size), logits);
+        const ap = try probe.ActivationEntropyProbe.create(gpa, w_ptr);
+        probes_buf[0] = lp.probe();
+        probes_buf[1] = ap.probe();
+        bus.probes = probes_buf;
+        bus.finalize();
+        probe_bus = bus;
+
+        try probe.writeHeader(w_ptr, probe_info, dir_path, &.{ "logits", "act" });
+
+        if (bus.needs_hidden_pre or bus.needs_hidden_post) {
+            probe_hidden_scratch = try gpa.alloc(f32, cfg.hidden_size);
+        }
+    }
+
     // Position counter persists across turns (multi-turn chat builds on
     // the same KV cache).
     var pos: usize = 0;
 
     if (single_msg) |m| {
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits, sample_scratch, sample_params, rng, tmpl, false, tq4_hooks);
+        try chatTurn(
+            gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits,
+            sample_scratch, sample_params, rng, tmpl, false, tq4_hooks,
+            if (probe_bus) |*b| b else null,
+            probe_info,
+            &probe_token_index,
+            probe_hidden_scratch,
+        );
         return;
     }
 
@@ -4300,7 +4380,14 @@ fn runChat(
             break;
         };
         if (line.len == 0) continue;
-        try chatTurn(gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits, sample_scratch, sample_params, rng, tmpl, true, tq4_hooks);
+        try chatTurn(
+            gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits,
+            sample_scratch, sample_params, rng, tmpl, true, tq4_hooks,
+            if (probe_bus) |*b| b else null,
+            probe_info,
+            &probe_token_index,
+            probe_hidden_scratch,
+        );
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
             break;
@@ -4332,6 +4419,10 @@ fn chatTurn(
     tmpl: ChatTemplate,
     is_repl: bool,
     tq4_v: ?Tq4VHooks,
+    probe_bus: ?*probe.Bus,
+    probe_info: probe.ModelInfo,
+    probe_token_index: *u32,
+    probe_hidden_scratch: ?[]f32,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -4374,14 +4465,69 @@ fn chatTurn(
         // tokens is a free ~10% startup win on short prompts and
         // scales linearly with prompt length on long ones.
         const is_last_prefill_or_decoding = (prompt_idx + 1 >= prompt.items.len);
-        if (pos.* > 0) try rec.reset();
-        try rec.begin();
-        try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, tq4_v, is_last_prefill_or_decoding);
-        try rec.endAndSubmit();
+        const is_prefill = (prompt_idx + 1 < prompt.items.len);
+
+        if (probe_bus) |bus| try bus.onTokenStart(.{
+            .info = probe_info,
+            .token_index = probe_token_index.*,
+            .pos = pos.*,
+            .token_id = current,
+            .is_prefill = is_prefill,
+        });
+
+        // Probed path forks here: when a probe wants per-layer hidden
+        // state, the forward gets split into N submits with readbacks
+        // between. Otherwise the fast single-submit path runs.
+        const use_probed_forward = if (probe_bus) |bus|
+            bus.needs_hidden_pre or bus.needs_hidden_post
+        else
+            false;
+
+        if (use_probed_forward) {
+            try forwardStepProbed(
+                rec,
+                ctx,
+                sc,
+                gm,
+                kv,
+                cfg,
+                k,
+                pos.*,
+                current,
+                tq4_v,
+                is_last_prefill_or_decoding,
+                probe_bus.?,
+                probe_info,
+                probe_token_index.*,
+                is_prefill,
+                probe_hidden_scratch.?,
+            );
+        } else {
+            if (pos.* > 0) try rec.reset();
+            try rec.begin();
+            try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, tq4_v, is_last_prefill_or_decoding);
+            try rec.endAndSubmit();
+        }
+
+        // If logits were computed this step, give probes that want
+        // them a look before sampling.
+        if (probe_bus) |bus| {
+            if (is_last_prefill_or_decoding and bus.needs_logits) {
+                try sc.logits.readBack(ctx, f32, logits);
+                try bus.onLogits(.{
+                    .info = probe_info,
+                    .token_index = probe_token_index.*,
+                    .pos = pos.*,
+                    .token_id = current,
+                    .is_prefill = is_prefill,
+                }, logits);
+            }
+        }
 
         // Decide what to do at this position.
         prompt_idx += 1;
         pos.* += 1;
+        probe_token_index.* += 1;
 
         if (prompt_idx < prompt.items.len) {
             // Still consuming prompt — advance to next prompt token.
@@ -4394,9 +4540,21 @@ fn chatTurn(
             decode_started = true;
         }
 
-        // Past the last prompt token: sample.
+        // Past the last prompt token: sample. The logits readback may
+        // already have happened above for the probe, in which case the
+        // device buffer is unchanged and a second readBack is just a
+        // re-fetch (small cost, kept simple). If the probe path didn't
+        // ask, this is the canonical readback.
         try sc.logits.readBack(ctx, f32, logits);
         const next = try cpu_forward.sample(logits, sample_params, rng, sample_scratch);
+
+        if (probe_bus) |bus| try bus.onTokenEnd(.{
+            .info = probe_info,
+            .token_index = probe_token_index.*,
+            .pos = pos.*,
+            .token_id = current,
+            .is_prefill = false,
+        }, @intCast(next));
 
         // Stop conditions.
         if (next == eot) break;
@@ -4572,6 +4730,169 @@ const Tq4VHooks = struct {
     cache: *const gpu_scratch.GpuKvCacheTq4,
 };
 
+/// Per-step push constants reused across every layer's dispatches.
+/// Computed once from cfg + pos by `computeForwardPushes`.
+const ForwardPushes = struct {
+    rms_push: RmsnormPush,
+    qkn_push: RmsnormPush,
+    add_push: AddInPlacePush,
+    rope_q_push: RopePush,
+    rope_k_push: RopePush,
+    kv_write_push: KvWritePush,
+    scores_push: AttnScoresPush,
+    softmax_push: SoftmaxPush,
+    attn_out_push: AttnOutputPush,
+    geglu_push: GegluPush,
+    n_pos: u32,
+};
+
+fn computeForwardPushes(cfg: config_mod.Config, sc: *const gpu_scratch.GpuScratch, pos: usize) ForwardPushes {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+    const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
+    const heads_per_kv: u32 = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads);
+    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+    const max_pos_u32: u32 = @intCast(sc.max_pos);
+    const n_pos: u32 = @intCast(pos + 1);
+
+    return .{
+        .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
+        // Qwen3 per-head q_norm/k_norm push: same shader as the regular
+        // rmsnorm but reduces over `head_dim` per row instead of `hidden`,
+        // and never applies the (1+w) Gemma quirk.
+        .qkn_push = .{ .dim = @intCast(cfg.head_dim), .eps = cfg.rms_norm_eps, .gemma_quirk = 0 },
+        .add_push = .{ .n = hidden },
+        .rope_q_push = .{
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .head_dim = @intCast(cfg.head_dim),
+            .pos = @intCast(pos),
+            .theta_base = cfg.rope_theta,
+        },
+        .rope_k_push = .{
+            .n_heads = @intCast(cfg.num_key_value_heads),
+            .head_dim = @intCast(cfg.head_dim),
+            .pos = @intCast(pos),
+            .theta_base = cfg.rope_theta,
+        },
+        .kv_write_push = .{ .n = kv_dim, .dst_off = @intCast(pos * @as(usize, kv_dim)) },
+        .scores_push = .{
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .heads_per_kv = heads_per_kv,
+            .head_dim = @intCast(cfg.head_dim),
+            .n_pos = n_pos,
+            .kv_stride = kv_dim,
+            .scores_stride = max_pos_u32,
+            .inv_sqrt_dim = inv_sqrt_dim,
+        },
+        .softmax_push = .{ .dim = n_pos, .stride = max_pos_u32 },
+        .attn_out_push = .{
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .heads_per_kv = heads_per_kv,
+            .head_dim = @intCast(cfg.head_dim),
+            .n_pos = n_pos,
+            .kv_stride = kv_dim,
+            .scores_stride = max_pos_u32,
+        },
+        .geglu_push = .{ .n = inter },
+        .n_pos = n_pos,
+    };
+}
+
+/// Record the dispatches for a single transformer block (input_layernorm
+/// → Q/K/V → optional q_norm/k_norm → RoPE → KV write → attention →
+/// o_proj → residual → post_attention_layernorm → gated FFN → residual).
+/// Caller manages the recorder's begin/endAndSubmit cycle. Used both by
+/// the single-submit `recordForwardStep` and by the probed multi-submit
+/// path that interleaves readbacks between layers.
+fn recordOneLayer(
+    rec: *gpu_recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: ChatKernels,
+    layer_idx: usize,
+    pos: usize,
+    p: *const ForwardPushes,
+    tq4_v: ?Tq4VHooks,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+
+    const layer = &gm.layers[layer_idx];
+
+    try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &p.rms_push, 1);
+
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
+
+    if (layer.q_norm) |*qn| {
+        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.q, qn, &sc.q }, &p.qkn_push, @intCast(cfg.num_attention_heads));
+    }
+    if (layer.k_norm) |*kn| {
+        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &p.qkn_push, @intCast(cfg.num_key_value_heads));
+    }
+
+    try recDispatchRope(rec, k.rope, &.{ &sc.q, &sc.q_rot }, &p.rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+    try recDispatchRope(rec, k.rope, &.{ &sc.k, &sc.k_rot }, &p.rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+
+    const kv_layer = &kv.layers[layer_idx];
+    try recDispatch1D(rec, k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &p.kv_write_push, kv_dim);
+
+    // V write: either the legacy kv_write (fp32 raw copy) or the
+    // TQ4 quantising pack-to-cache when Tq4VHooks is supplied.
+    if (tq4_v) |t| {
+        const tq_layer = &t.cache.layers[layer_idx];
+        const n_blocks: u32 = @intCast(t.cache.n_blocks_per_pos);
+        const pack_push = Tq4PackPush{ .dst_block_idx = @intCast(pos * t.cache.n_blocks_per_pos) };
+        try rec.dispatch(t.pack, &.{ &sc.v, &tq_layer.v_cache }, &pack_push, n_blocks, 1, 1);
+    } else {
+        try recDispatch1D(rec, k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &p.kv_write_push, kv_dim);
+    }
+
+    try rec.dispatch(
+        k.scores,
+        &.{ &sc.q_rot, &kv_layer.k_cache, &sc.scores },
+        &p.scores_push,
+        @as(u32, @intCast(cfg.num_attention_heads)) * p.n_pos,
+        1,
+        1,
+    );
+    try recDispatchPerRow(rec, k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, @intCast(cfg.num_attention_heads));
+
+    const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
+        const tq_layer = &t.cache.layers[layer_idx];
+        const total_blocks: u32 = p.n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
+        try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, total_blocks, 1, 1);
+        break :blk &t.cache.dequant_v;
+    } else &kv_layer.v_cache;
+
+    try rec.dispatch(
+        k.attn_out,
+        &.{ &sc.scores, v_for_attn, &sc.head_out },
+        &p.attn_out_push,
+        @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
+        1,
+        1,
+    );
+
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
+    try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
+
+    try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, 1);
+
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
+    try recDispatch1D(rec, k.geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.geglu_push, inter);
+    try recDispatchMatmul(rec, k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
+
+    try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, hidden);
+}
+
 fn recordForwardStep(
     rec: *gpu_recorder.Recorder,
     sc: *const gpu_scratch.GpuScratch,
@@ -4585,146 +4906,20 @@ fn recordForwardStep(
     compute_logits: bool,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
-    const inter: u32 = @intCast(cfg.intermediate_size);
-    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
-    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
     const vocab: u32 = @intCast(cfg.vocab_size);
-    const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
-    const heads_per_kv: u32 = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads);
-    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-    const max_pos_u32: u32 = @intCast(sc.max_pos);
-    const n_pos: u32 = @intCast(pos + 1);
+
+    const pushes = computeForwardPushes(cfg, sc, pos);
 
     const embed_push = EmbedLookupPush{
         .token_id = token_id,
         .dim = hidden,
         .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
     };
-    const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
-    // Qwen3 per-head q_norm/k_norm push: same shader as the regular
-    // rmsnorm but reduces over `head_dim` per row instead of `hidden`,
-    // and never applies the (1+w) Gemma quirk.
-    const qkn_push = RmsnormPush{ .dim = @intCast(cfg.head_dim), .eps = cfg.rms_norm_eps, .gemma_quirk = 0 };
-    const add_push = AddInPlacePush{ .n = hidden };
-    const rope_q_push = RopePush{
-        .n_heads = @intCast(cfg.num_attention_heads),
-        .head_dim = @intCast(cfg.head_dim),
-        .pos = @intCast(pos),
-        .theta_base = cfg.rope_theta,
-    };
-    const rope_k_push = RopePush{
-        .n_heads = @intCast(cfg.num_key_value_heads),
-        .head_dim = @intCast(cfg.head_dim),
-        .pos = @intCast(pos),
-        .theta_base = cfg.rope_theta,
-    };
-    const kv_write_push = KvWritePush{
-        .n = kv_dim,
-        .dst_off = @intCast(pos * @as(usize, kv_dim)),
-    };
-    const scores_push = AttnScoresPush{
-        .n_heads = @intCast(cfg.num_attention_heads),
-        .heads_per_kv = heads_per_kv,
-        .head_dim = @intCast(cfg.head_dim),
-        .n_pos = n_pos,
-        .kv_stride = kv_dim,
-        .scores_stride = max_pos_u32,
-        .inv_sqrt_dim = inv_sqrt_dim,
-    };
-    const softmax_push = SoftmaxPush{ .dim = n_pos, .stride = max_pos_u32 };
-    const attn_out_push = AttnOutputPush{
-        .n_heads = @intCast(cfg.num_attention_heads),
-        .heads_per_kv = heads_per_kv,
-        .head_dim = @intCast(cfg.head_dim),
-        .n_pos = n_pos,
-        .kv_stride = kv_dim,
-        .scores_stride = max_pos_u32,
-    };
-    const geglu_push = GegluPush{ .n = inter };
 
     try recDispatch1D(rec, k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
 
-    for (gm.layers, 0..) |*layer, layer_idx| {
-        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
-
-        try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
-        try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
-        try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
-
-        // Qwen3 q_norm / k_norm: per-head RMSNorm with `pc.dim =
-        // head_dim` and `n_rows = num_{q,kv}_heads`. We reuse the same
-        // rmsnorm shader; only the push constants change. No
-        // gemma_quirk on Qwen3 (qkn_push has gemma_quirk = 0).
-        if (layer.q_norm) |*qn| {
-            try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.q, qn, &sc.q }, &qkn_push, @intCast(cfg.num_attention_heads));
-        }
-        if (layer.k_norm) |*kn| {
-            try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &qkn_push, @intCast(cfg.num_key_value_heads));
-        }
-
-        try recDispatchRope(rec, k.rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
-        try recDispatchRope(rec, k.rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
-
-        const kv_layer = &kv.layers[layer_idx];
-        try recDispatch1D(rec, k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &kv_write_push, kv_dim);
-
-        // V write: either the legacy kv_write (fp32 raw copy) or the
-        // TQ4 quantising pack-to-cache when Tq4VHooks is supplied.
-        // For multi-block-per-pos shapes (Qwen3: kv_heads=8), we
-        // dispatch one workgroup per kv-head; the shader picks the
-        // input slice from gl_WorkGroupID.x and the cache slot from
-        // dst_block_idx + gl_WorkGroupID.x.
-        if (tq4_v) |t| {
-            const tq_layer = &t.cache.layers[layer_idx];
-            const n_blocks: u32 = @intCast(t.cache.n_blocks_per_pos);
-            const pack_push = Tq4PackPush{ .dst_block_idx = @intCast(pos * t.cache.n_blocks_per_pos) };
-            try rec.dispatch(t.pack, &.{ &sc.v, &tq_layer.v_cache }, &pack_push, n_blocks, 1, 1);
-        } else {
-            try recDispatch1D(rec, k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &kv_write_push, kv_dim);
-        }
-
-        try rec.dispatch(
-            k.scores,
-            &.{ &sc.q_rot, &kv_layer.k_cache, &sc.scores },
-            &scores_push,
-            @as(u32, @intCast(cfg.num_attention_heads)) * n_pos,
-            1,
-            1,
-        );
-        try recDispatchPerRow(rec, k.softmax, &.{ &sc.scores, &sc.scores }, &softmax_push, @intCast(cfg.num_attention_heads));
-
-        // V read for attention output: either reads kv_layer.v_cache
-        // directly (fp32 path) or first dequants the whole TQ4 V
-        // history into the shared dequant_v scratch then reads that.
-        // Unpack dispatches one WG per block; for multi-block layouts
-        // (Qwen3) that's `n_pos * n_blocks_per_pos`.
-        const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
-            const tq_layer = &t.cache.layers[layer_idx];
-            const total_blocks: u32 = n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
-            try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, total_blocks, 1, 1);
-            break :blk &t.cache.dequant_v;
-        } else &kv_layer.v_cache;
-
-        try rec.dispatch(
-            k.attn_out,
-            &.{ &sc.scores, v_for_attn, &sc.head_out },
-            &attn_out_push,
-            @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
-            1,
-            1,
-        );
-
-        try recDispatchMatmul(rec, k.matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
-        try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
-
-        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
-
-        try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
-        try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
-        try recDispatch1D(rec, k.geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
-        try recDispatchMatmul(rec, k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
-
-        try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
+    for (0..cfg.num_hidden_layers) |layer_idx| {
+        try recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
     }
 
     // Final norm + LM head: skip when the caller doesn't need logits
@@ -4732,8 +4927,94 @@ fn recordForwardStep(
     // we only need the logits to sample the first response token, and
     // the LM head matmul is by far the largest in the model).
     if (compute_logits) {
-        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
         try recDispatchMatmul(rec, k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    }
+}
+
+/// Probed forward: same model dispatches as `recordForwardStep` but
+/// split across multiple submits so the host can read back per-layer
+/// hidden state into the bus between layers. Slow path, only invoked
+/// when the bus has a probe that wants `hidden_post_layer`. Generation
+/// output (next-token logits) is bit-identical to the fast path
+/// because the GPU does the same math in the same order — only the
+/// command-buffer chunking changes.
+fn forwardStepProbed(
+    rec: *gpu_recorder.Recorder,
+    vk_ctx: *const vk.Context,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: ChatKernels,
+    pos: usize,
+    token_id: u32,
+    tq4_v: ?Tq4VHooks,
+    compute_logits: bool,
+    bus: *const probe.Bus,
+    info: probe.ModelInfo,
+    token_index: u32,
+    is_prefill: bool,
+    hidden_scratch: []f32,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const vocab: u32 = @intCast(cfg.vocab_size);
+
+    const pushes = computeForwardPushes(cfg, sc, pos);
+
+    const embed_push = EmbedLookupPush{
+        .token_id = token_id,
+        .dim = hidden,
+        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+    };
+
+    // ── Embed ───────────────────────────────────────────────────────
+    try rec.reset();
+    try rec.begin();
+    try recDispatch1D(rec, k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+    try rec.endAndSubmit();
+
+    // ── Per layer ──────────────────────────────────────────────────
+    for (0..cfg.num_hidden_layers) |layer_idx| {
+        if (bus.needs_hidden_pre) {
+            try sc.stream.readBack(vk_ctx, f32, hidden_scratch);
+            const ctx_h = probe.Context{
+                .info = info,
+                .token_index = token_index,
+                .pos = pos,
+                .token_id = token_id,
+                .layer_idx = @intCast(layer_idx),
+                .is_prefill = is_prefill,
+            };
+            try bus.onLayerEntry(ctx_h, hidden_scratch);
+        }
+
+        try rec.reset();
+        try rec.begin();
+        try recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
+        try rec.endAndSubmit();
+
+        if (bus.needs_hidden_post) {
+            try sc.stream.readBack(vk_ctx, f32, hidden_scratch);
+            const ctx_h = probe.Context{
+                .info = info,
+                .token_index = token_index,
+                .pos = pos,
+                .token_id = token_id,
+                .layer_idx = @intCast(layer_idx),
+                .is_prefill = is_prefill,
+            };
+            try bus.onLayerExit(ctx_h, hidden_scratch);
+        }
+    }
+
+    // ── Final norm + LM head ───────────────────────────────────────
+    if (compute_logits) {
+        try rec.reset();
+        try rec.begin();
+        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
+        try recDispatchMatmul(rec, k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+        try rec.endAndSubmit();
     }
 }
 
