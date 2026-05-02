@@ -13,3 +13,6 @@ reference/
 # Per-run perf bench logs (scripts/bench.sh writes timestamped dirs here).
 # The script itself is checked in; the artifacts are local-only.
 bench/
+
+# Local research notes / draft specs — kept out of the public repo.
+rff/
