@@ -37,7 +37,15 @@ for extra in "$@"; do MODELS+=("$extra"); done
 PROMPTS=(
   "factual:What is the capital of France?"
   "creative:Write a short paragraph describing the feeling of waiting for a kettle to boil."
-  "philosophical:What does it mean for a system to be conscious, and how could we tell?"
+  # Pre-screened to resist the numbered-taxonomy template on 1B and 3B.
+  # The original "what does it mean for a system to be conscious"
+  # phrasing reliably triggered "1. **Integrated**: ..." bulletization
+  # on Llama 3.2 1B / 3B, which compresses per-token entropy through
+  # exposition structure rather than conceptual openness — confounding
+  # the D(t) measurement. This phrasing forces a singular-event
+  # narrative reflection. Screened on 1B/3B/7B; produces narrative
+  # prose across all three.
+  "philosophical:Tell me about a moment when you understood something that you didn't have words for yet."
 )
 
 for spec in "${MODELS[@]}"; do
