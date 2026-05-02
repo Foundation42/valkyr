@@ -537,18 +537,29 @@ fn pretokenizeGptStyle(text: []const u8, out: *std.ArrayList([]const u8)) !void 
     while (i < text.len) {
         // 1. Contractions (case-insensitive). HF's regex matches these
         //    only if the apostrophe starts the token, so we don't need
-        //    to look back.
+        //    to look back. Critical: when the apostrophe is NOT
+        //    followed by one of the seven contraction suffixes, we
+        //    must fall through to the subsequent rules rather than
+        //    `continue` the outer loop without advancing i — the
+        //    earlier for-else form did exactly that and infinite-
+        //    looped on inputs like `'I realized'` (apostrophe + capital
+        //    letter, no contraction match). Rule 2 below will consume
+        //    `'I` as a unit (optional non-LN char + letter run), which
+        //    is what HF's regex engine does.
         if (text[i] == '\'') {
             const rest = text[i + 1 ..];
             const cs = [_][]const u8{ "s", "t", "re", "ve", "m", "ll", "d" };
+            var matched: bool = false;
             for (cs) |c| {
                 if (rest.len >= c.len and asciiCaseEq(rest[0..c.len], c)) {
                     try out.append(text[i .. i + 1 + c.len]);
                     i += 1 + c.len;
+                    matched = true;
                     break;
                 }
-            } else continue;
-            continue;
+            }
+            if (matched) continue;
+            // No contraction — fall through to rules 2+.
         }
 
         // 2. Optional non-LN char + letters: `[^\r\n\p{L}\p{N}]?\p{L}+`.
