@@ -135,6 +135,28 @@ pub fn build(b: *std.Build) void {
         \\pub const tq4_pack_to_cache128 align(4) = @embedFile("tq4_pack_to_cache128.spv").*;
     );
 
+    // ── Public Zig module for host-engine embedding ──
+    // `valkyr_gpu` exposes the cooperative-compute surface
+    // (Context.attach + Recorder.attachCmd + buffer + pipeline + the
+    // SPIR-V shader blobs) so a downstream Zig package — currently
+    // Matryoshka — can `@import("valkyr_gpu")` and run kernels into
+    // its own per-frame command buffer. Narrow on purpose; see
+    // src/lib.zig for the rationale on what's NOT exported.
+    //
+    // Vulkan + libC are the consumer's responsibility — they have to
+    // linkSystemLibrary("vulkan") + linkLibC() on their executable
+    // anyway, the same flags the valkyr exe below uses. Letting the
+    // host own the link config keeps it singular when one host links
+    // against several embedded libraries.
+    const valkyr_gpu_mod = b.addModule("valkyr_gpu", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    valkyr_gpu_mod.addAnonymousImport("shaders", .{
+        .root_source_file = shader_mod,
+    });
+
     const exe = b.addExecutable(.{
         .name = "valkyr",
         .root_source_file = b.path("src/main.zig"),
