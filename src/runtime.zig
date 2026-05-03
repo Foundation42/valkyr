@@ -1,0 +1,468 @@
+//! Library-side forward-step + sampling primitives for embedded callers.
+//!
+//! `loader.zig` (chunk 7a) handles the static "model on disk → model on
+//! GPU" half. This file handles the runtime half: per-token forward
+//! recording + CPU-side sampling. Together they are everything chunk
+//! 7c's `Session` needs to wrap a default state machine around.
+//!
+//! Scope for chunk 7b
+//! ──────────────────
+//! - Dense Llama / Gemma full-attention only (no hybrid linear-attn,
+//!   no TQ4 V-cache). Hybrid + TQ4 will get exposed if/when a host
+//!   actually wants them; today's first integration target is
+//!   straightforward dense models.
+//! - One-shot full-forward (`Forward.recordStep`) is enough for ai_demo's
+//!   "load + tokenize + forward + print predicted token" verification.
+//!   The per-layer split needed for frame-budget chunking is exposed
+//!   too via `Forward.recordOneLayer` so chunk 7c's Session can build
+//!   the state machine on top.
+//!
+//! Why this duplicates structs from main.zig
+//! ─────────────────────────────────────────
+//! valkyr's CLI (`main.zig`) declares its own copies of these push
+//! structs + helpers as file-private consts; ~325 references inside
+//! main.zig touch them. Lifting all of those to runtime.zig would be
+//! a big-blast-radius refactor for chunk 7b.
+//!
+//! Both definitions are layout-compatible (extern structs with
+//! identical field order), so they marshal the same bytes into the
+//! same SPIR-V shaders. Drift risk is bounded — these structs change
+//! infrequently (stable since phase 1) and any divergence would show
+//! up as immediate validation-layer / output-correctness failures.
+//! When chunk 7c lands the Session API, we can DRY main.zig to
+//! re-import these from runtime as a follow-up cleanup.
+
+const std = @import("std");
+const vk = @import("gpu/vk.zig");
+const buffer = @import("gpu/buffer.zig");
+const pipeline = @import("gpu/pipeline.zig");
+const recorder = @import("gpu/recorder.zig");
+const gpu_model = @import("gpu/model.zig");
+const gpu_scratch = @import("gpu/scratch.zig");
+const config_mod = @import("config.zig");
+const shaders = @import("shaders");
+
+// ── Push structs ──────────────────────────────────────────────────
+
+pub const RmsnormPush = extern struct {
+    dim: u32,
+    eps: f32,
+    gemma_quirk: u32,
+};
+
+pub const RopePush = extern struct {
+    n_heads: u32,
+    head_dim: u32,
+    pos: u32,
+    theta_base: f32,
+};
+
+pub const KvWritePush = extern struct {
+    n: u32,
+    dst_off: u32,
+};
+
+pub const AttnScoresPush = extern struct {
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_pos: u32,
+    kv_stride: u32,
+    scores_stride: u32,
+    inv_sqrt_dim: f32,
+};
+
+pub const SoftmaxPush = extern struct { dim: u32, stride: u32 };
+
+pub const AttnOutputPush = extern struct {
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_pos: u32,
+    kv_stride: u32,
+    scores_stride: u32,
+};
+
+pub const AddInPlacePush = extern struct { n: u32 };
+
+pub const GegluPush = extern struct { n: u32 };
+
+pub const EmbedLookupPush = extern struct {
+    token_id: u32,
+    dim: u32,
+    scale: f32,
+};
+
+pub const MatmulPush = extern struct { m: u32, n: u32, k: u32 };
+
+// ── ChatKernels: pre-built compute pipelines ──────────────────────
+
+/// Bundle of compiled compute pipelines a forward pass needs. Built
+/// once per `Forward` and re-used across every recorded layer.
+pub const ChatKernels = struct {
+    embed: pipeline.Kernel,
+    rmsnorm: pipeline.Kernel,
+    matmul: pipeline.Kernel,
+    matmul_lm_head: pipeline.Kernel,
+    rope: pipeline.Kernel,
+    kv_write: pipeline.Kernel,
+    scores: pipeline.Kernel,
+    softmax: pipeline.Kernel,
+    attn_out: pipeline.Kernel,
+    add: pipeline.Kernel,
+    geglu: pipeline.Kernel,
+
+    pub fn init(
+        ctx: *const vk.Context,
+        precision: gpu_model.Precision,
+        family: config_mod.Family,
+    ) !ChatKernels {
+        const matmul_spv: []align(4) const u8 = switch (precision) {
+            .fp32_all => &shaders.matmul_nt_v2,
+            .bf16_matmul => &shaders.matmul_nt_v2_bf16,
+            .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
+            .q4_k_matmul => &shaders.matmul_nt_v2_q4_k,
+        };
+        // LM head + embeddings stay fp32/bf16 even when layer matmuls
+        // are quantised — argmax-shifting risk on logits, see
+        // project_q4_k.md.
+        const lm_head_spv: []align(4) const u8 = switch (precision) {
+            .fp32_all => &shaders.matmul_nt_v2,
+            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.matmul_nt_v2_bf16,
+        };
+        const embed_spv: []align(4) const u8 = switch (precision) {
+            .fp32_all => &shaders.embed_lookup,
+            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.embed_lookup_bf16,
+        };
+        const ffn_spv: []align(4) const u8 = switch (family.activation()) {
+            .gelu => &shaders.geglu,
+            .silu => &shaders.swiglu,
+        };
+        return .{
+            .embed = try pipeline.Kernel.init(ctx, embed_spv, 2, @sizeOf(EmbedLookupPush)),
+            .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
+            .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
+            .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
+            .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
+            .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
+            .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
+            .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
+            .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
+            .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
+            .geglu = try pipeline.Kernel.init(ctx, ffn_spv, 3, @sizeOf(GegluPush)),
+        };
+    }
+
+    pub fn deinit(self: *ChatKernels) void {
+        self.embed.deinit();
+        self.rmsnorm.deinit();
+        self.matmul.deinit();
+        self.matmul_lm_head.deinit();
+        self.rope.deinit();
+        self.kv_write.deinit();
+        self.scores.deinit();
+        self.softmax.deinit();
+        self.attn_out.deinit();
+        self.add.deinit();
+        self.geglu.deinit();
+    }
+};
+
+// ── Per-step push computation ─────────────────────────────────────
+
+pub const ForwardPushes = struct {
+    rms_push: RmsnormPush,
+    qkn_push: RmsnormPush,
+    add_push: AddInPlacePush,
+    rope_q_push: RopePush,
+    rope_k_push: RopePush,
+    kv_write_push: KvWritePush,
+    scores_push: AttnScoresPush,
+    softmax_push: SoftmaxPush,
+    attn_out_push: AttnOutputPush,
+    geglu_push: GegluPush,
+    n_pos: u32,
+};
+
+pub fn computeForwardPushes(
+    cfg: config_mod.Config,
+    sc: *const gpu_scratch.GpuScratch,
+    pos: usize,
+) ForwardPushes {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+    const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
+    const heads_per_kv: u32 = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads);
+    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+    const max_pos_u32: u32 = @intCast(sc.max_pos);
+    const n_pos: u32 = @intCast(pos + 1);
+
+    return .{
+        .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
+        .qkn_push = .{ .dim = @intCast(cfg.head_dim), .eps = cfg.rms_norm_eps, .gemma_quirk = 0 },
+        .add_push = .{ .n = hidden },
+        .rope_q_push = .{
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .head_dim = @intCast(cfg.head_dim),
+            .pos = @intCast(pos),
+            .theta_base = cfg.rope_theta,
+        },
+        .rope_k_push = .{
+            .n_heads = @intCast(cfg.num_key_value_heads),
+            .head_dim = @intCast(cfg.head_dim),
+            .pos = @intCast(pos),
+            .theta_base = cfg.rope_theta,
+        },
+        .kv_write_push = .{ .n = kv_dim, .dst_off = @intCast(pos * @as(usize, kv_dim)) },
+        .scores_push = .{
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .heads_per_kv = heads_per_kv,
+            .head_dim = @intCast(cfg.head_dim),
+            .n_pos = n_pos,
+            .kv_stride = kv_dim,
+            .scores_stride = max_pos_u32,
+            .inv_sqrt_dim = inv_sqrt_dim,
+        },
+        .softmax_push = .{ .dim = n_pos, .stride = max_pos_u32 },
+        .attn_out_push = .{
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .heads_per_kv = heads_per_kv,
+            .head_dim = @intCast(cfg.head_dim),
+            .n_pos = n_pos,
+            .kv_stride = kv_dim,
+            .scores_stride = max_pos_u32,
+        },
+        .geglu_push = .{ .n = inter },
+        .n_pos = n_pos,
+    };
+}
+
+// ── Dispatch helpers ──────────────────────────────────────────────
+
+fn recDispatch1D(
+    rec: *recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    push: anytype,
+    n: u32,
+) !void {
+    const local: u32 = 256;
+    const groups: u32 = (n + local - 1) / local;
+    try rec.dispatch(kern, bufs, push, groups, 1, 1);
+}
+
+fn recDispatchPerRow(
+    rec: *recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    push: anytype,
+    n_rows: u32,
+) !void {
+    try rec.dispatch(kern, bufs, push, n_rows, 1, 1);
+}
+
+fn recDispatchMatmul(
+    rec: *recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    m: u32,
+    n: u32,
+    k: u32,
+) !void {
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    try rec.dispatch(kern, bufs, &push, m * n, 1, 1);
+}
+
+fn recDispatchRope(
+    rec: *recorder.Recorder,
+    kern: *const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    push: *const RopePush,
+    n_heads: usize,
+    head_dim: usize,
+) !void {
+    const local: u32 = 256;
+    const pairs: u32 = @intCast(n_heads * (head_dim / 2));
+    const groups: u32 = (pairs + local - 1) / local;
+    try rec.dispatch(kern, bufs, push, groups, 1, 1);
+}
+
+// ── Per-layer + full-step recording ───────────────────────────────
+
+/// Record one transformer block's dispatches (input_layernorm → Q/K/V
+/// → optional q_norm/k_norm → RoPE → KV write → attention → o_proj →
+/// residual → post_attention_layernorm → gated FFN → residual).
+/// Used by the full-forward `recordStep` AND directly by chunk 7c's
+/// Session for frame-budget chunking.
+pub fn recordOneLayer(
+    rec: *recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    layer_idx: usize,
+    p: *const ForwardPushes,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+
+    const layer = &gm.layers[layer_idx];
+
+    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &p.rms_push, 1);
+
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
+
+    if (layer.q_norm) |*qn| {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.q, qn, &sc.q }, &p.qkn_push, @intCast(cfg.num_attention_heads));
+    }
+    if (layer.k_norm) |*kn| {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &p.qkn_push, @intCast(cfg.num_key_value_heads));
+    }
+
+    try recDispatchRope(rec, &k.rope, &.{ &sc.q, &sc.q_rot }, &p.rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+    try recDispatchRope(rec, &k.rope, &.{ &sc.k, &sc.k_rot }, &p.rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+
+    const kv_layer = &kv.layers[layer_idx];
+    try recDispatch1D(rec, &k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &p.kv_write_push, kv_dim);
+    try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &p.kv_write_push, kv_dim);
+
+    try rec.dispatch(
+        &k.scores,
+        &.{ &sc.q_rot, &kv_layer.k_cache, &sc.scores },
+        &p.scores_push,
+        @as(u32, @intCast(cfg.num_attention_heads)) * p.n_pos,
+        1,
+        1,
+    );
+    try recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, @intCast(cfg.num_attention_heads));
+
+    try rec.dispatch(
+        &k.attn_out,
+        &.{ &sc.scores, &kv_layer.v_cache, &sc.head_out },
+        &p.attn_out_push,
+        @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
+        1,
+        1,
+    );
+
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
+    try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
+
+    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, 1);
+
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
+    try recDispatch1D(rec, &k.geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.geglu_push, inter);
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
+
+    try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, hidden);
+}
+
+/// Embedding lookup → scratch.stream. Called once per token at the
+/// start of a forward.
+pub fn recordEmbedding(
+    rec: *recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    token_id: u32,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const embed_push = EmbedLookupPush{
+        .token_id = token_id,
+        .dim = hidden,
+        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+    };
+    try recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+}
+
+/// Final norm + LM head matmul → scratch.logits. Skip on prefill
+/// tokens (only the LAST prompt token needs logits to sample).
+pub fn recordSampleStep(
+    rec: *recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    p: *const ForwardPushes,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const vocab: u32 = @intCast(cfg.vocab_size);
+    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &p.rms_push, 1);
+    try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+}
+
+// ── High-level Forward facade ─────────────────────────────────────
+
+/// Convenience wrapper: builds the kernel set once and exposes a
+/// one-call recordStep that does embedding + all layers + (optional)
+/// sample-step. Layout of dispatches into the recorder is identical
+/// to valkyr's CLI chat path.
+///
+/// For frame-budget chunking, callers should bypass `recordStep` and
+/// drive `recordEmbedding` + `recordOneLayer` + `recordSampleStep`
+/// themselves at their own pace — that's what chunk 7c's Session does.
+pub const Forward = struct {
+    kernels: ChatKernels,
+    cfg: config_mod.Config,
+
+    pub fn init(
+        ctx: *const vk.Context,
+        gm: *const gpu_model.GpuModel,
+    ) !Forward {
+        return .{
+            .kernels = try ChatKernels.init(ctx, gm.precision, gm.config.family),
+            .cfg = gm.config,
+        };
+    }
+
+    pub fn deinit(self: *Forward) void {
+        self.kernels.deinit();
+    }
+
+    pub fn recordStep(
+        self: *const Forward,
+        rec: *recorder.Recorder,
+        sc: *const gpu_scratch.GpuScratch,
+        gm: *const gpu_model.GpuModel,
+        kv: *const gpu_scratch.GpuKvCache,
+        pos: usize,
+        token_id: u32,
+        compute_logits: bool,
+    ) !void {
+        const pushes = computeForwardPushes(self.cfg, sc, pos);
+        try recordEmbedding(rec, sc, gm, self.cfg, &self.kernels, token_id);
+        for (0..self.cfg.num_hidden_layers) |layer_idx| {
+            try recordOneLayer(rec, sc, gm, kv, self.cfg, &self.kernels, layer_idx, &pushes);
+        }
+        if (compute_logits) {
+            try recordSampleStep(rec, sc, gm, self.cfg, &self.kernels, &pushes);
+        }
+    }
+};
+
+// ── Sampling ──────────────────────────────────────────────────────
+
+/// Greedy argmax over a logits vector. Returns the token id with the
+/// largest logit. Ties are broken toward lower index (the first max
+/// wins) — this matches valkyr's CLI sampler so library-driven
+/// generation reproduces CLI-driven generation bit-for-bit.
+pub fn sampleArgmax(logits: []const f32) u32 {
+    var best: u32 = 0;
+    var best_v: f32 = logits[0];
+    var i: u32 = 1;
+    while (i < logits.len) : (i += 1) {
+        if (logits[i] > best_v) {
+            best_v = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}

@@ -45,3 +45,12 @@ pub const tokenizer = @import("tokenizer.zig");
 pub const gpu_model = @import("gpu/model.zig");
 pub const hf_cache = @import("hf_cache.zig");
 pub const loader = @import("loader.zig");
+
+// ── Runtime primitives (chunk 7b) ───────────────────────────────
+// Per-step forward recording + sampling. Hosts that want a default
+// state machine wait for the Session API in chunk 7c, which is built
+// on top of these primitives. Hosts that want bespoke orchestration
+// reach `runtime.recordOneLayer`, `recordEmbedding`,
+// `recordSampleStep`, and `sampleArgmax` directly.
+pub const gpu_scratch = @import("gpu/scratch.zig");
+pub const runtime = @import("runtime.zig");
