@@ -1,0 +1,69 @@
+#version 460
+// Synthetic 1D attention pattern.
+//
+// Generates a length-N float vector that LOOKS like a per-token attention
+// distribution: a Gaussian focal point that drifts over time, multiplied
+// by a recency bias (positions closer to the "current token" at index N-1
+// weight higher than ancient context). Output is normalised to [0, 1]
+// per element — host-side visualizers can scale however they like.
+//
+// The point of this kernel is to drive the engine-integration
+// visualization path with a plausible, animated pattern WITHOUT needing
+// a real model loaded. When a real model lands behind the aiDispatch
+// hook, the same SSBO shape can be filled by the real attention scores
+// post-softmax — the host renderer side stays unchanged.
+//
+// Invariants:
+//   - Output is non-negative.
+//   - Output is bounded by 1.0 (Gaussian peak × recency_max).
+//   - At fixed `frame`, output is bit-deterministic — re-running with
+//     the same push gives the same bytes back. (Keeps debug repro cheap.)
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer Out { float data[]; };
+
+layout(push_constant) uniform Pc {
+    uint n;        // number of tokens (= output length)
+    uint frame;    // monotonically increasing frame counter
+    float speed;   // overall time-scale; 0.02 ≈ slow drift
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    // ── Time variable ────────────────────────────────────────────────
+    // `t` paces the entire animation. The host bumps `frame` once per
+    // visible frame; `speed` lets the host slow it down (debug) or speed
+    // it up (demo).
+    float t = float(pc.frame) * pc.speed;
+
+    // ── Drifting Gaussian centre ─────────────────────────────────────
+    // Two superimposed sinusoids of incommensurable rates so the centre
+    // never repeats the same trajectory — gives the strip a "wandering
+    // attention" feel rather than an obvious back-and-forth.
+    float n_minus_1 = float(pc.n - 1);
+    float center = n_minus_1 * 0.5
+                 + n_minus_1 * 0.35 * sin(t)
+                 + 1.5 * sin(t * 2.7);
+
+    // Width breathes with the wander — wider when the centre is moving
+    // fast (high derivative ≈ broader focus), narrower at the turning
+    // points. Approximated with a phase-shifted sine so we don't have
+    // to compute the derivative explicitly.
+    float sigma = 1.5 + 0.8 * sin(t * 0.7 + 1.0);
+
+    // ── Recency bias ─────────────────────────────────────────────────
+    // Linear ramp from 0.3 at position 0 to 1.0 at position n-1. Mimics
+    // the decoder-only-LM behaviour where attention is biased toward
+    // recent tokens, especially when no special task pulls focus
+    // backward.
+    float pos = float(i);
+    float recency = mix(0.3, 1.0, pos / max(n_minus_1, 1.0));
+
+    // ── Gaussian × recency ───────────────────────────────────────────
+    float dx = pos - center;
+    float gauss = exp(-(dx * dx) / (2.0 * sigma * sigma));
+    data[i] = gauss * recency;
+}
