@@ -38,12 +38,16 @@ years), and intentionally *less* than llama.cpp. So why pick it up?
   inference that runs alongside your render passes on the same
   queue, in the same submit, with no parallel CUDA runtime, no
   shared-memory split, no extra GB of dynamic libraries.
-  Token streaming, real-time tensor visualization (an `on_layer`
-  hook gives shaders direct access to attention scores / hidden
-  states), and bespoke per-step orchestration are all first-class.
-  See [docs/embedding.md](docs/embedding.md). **The natural fit if
-  you want inference inside an app that already has a Vulkan
-  graphics stack.**
+  `Session` works across all six supported families — Gemma, Llama,
+  Mistral, Qwen3 (dense), Qwen3.5 / Qwen3.6 (hybrid Gated DeltaNet)
+  — picking the right kernel set and per-layer state shape
+  automatically. Token streaming, real-time tensor visualization (an
+  `on_layer` hook gives shaders direct access to attention scores /
+  hidden states on dense models), and bespoke per-step orchestration
+  are all first-class. See
+  [docs/embedding.md](docs/embedding.md). **The natural fit if you
+  want inference inside an app that already has a Vulkan graphics
+  stack.**
 
 - **Pedagogically transparent.** Every GPU shader has a CPU reference
   in `src/cpu/*.zig` that gets parity-checked against. The full
@@ -530,10 +534,15 @@ Two integration tiers are available:
   `tickFrame(rec)` once per frame. The default state machine handles
   per-layer chunking, KV/scratch lifecycle, deferred sampling, and
   on-layer / on-token callbacks for visualization or streaming.
+  `Session.init` picks a dense or hybrid backend automatically based
+  on `cfg.family.isHybrid()`, so the same call works for Gemma /
+  Llama / Mistral / Qwen3 (dense) and Qwen3.5 / Qwen3.6 (hybrid
+  Gated DeltaNet).
 - **Cooperative-compute primitives** — `Context.attach` +
-  `Recorder.attachCmd` + `runtime.recordOneLayer` etc. for hosts that
-  want to drive the per-step graph themselves (custom samplers,
-  multi-NPC scheduling, non-LM forward shapes).
+  `Recorder.attachCmd` + `runtime.recordOneLayer` (dense) or
+  `runtime_hybrid.recordOneLayer` (hybrid) for hosts that want to
+  drive the per-step graph themselves (custom samplers, multi-NPC
+  scheduling, non-LM forward shapes).
 
 A worked example lives in
 [Matryoshka](https://github.com/foundation42/matryoshka)'s `ai_demo`
@@ -541,6 +550,14 @@ Game: Gemma 2B IT generating text token-by-token inside the renderer's
 `drawFrame`, with the model's last-layer attention driving 16 point
 lights through the `on_layer` hook — all sharing one `VkDevice`, one
 queue, one submit per frame.
+
+For headless verification before wiring a model into a host, valkyr
+ships `--session-smoke <model>`: same code path as `ai_demo` minus
+the GUI. Validated on Gemma 2B IT, Llama 3.2 1B-Instruct, Qwen3 4B
+dense, and Qwen3.5 0.8B hybrid — all four produce coherent
+streaming output through the embed/Session path. The
+`scripts/bench.sh --smoke` regression net runs the CLI side
+(`--chat`) across the same four families in ~90 s.
 
 For the full integration guide — build setup, code examples for both
 tiers, frame-budget mechanics, sampling readback strategy, lifetime

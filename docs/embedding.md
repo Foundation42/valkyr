@@ -174,14 +174,36 @@ normal frame submit. valkyr does no submitting on its own.
 fn onToken(user: ?*anyopaque, tok_id: u32, decoded: []const u8) void {
     _ = user;
     _ = tok_id;
-    // Print, render, store — your call. The decoded slice lives in
-    // the tokenizer's vocab table; treat as borrow.
+    // `decoded` is display-ready UTF-8. SentencePiece `▁`, byte-level
+    // `Ġ` / `Ċ`, and `<0xBB>` byte-fallback tokens are already
+    // resolved by `Tokenizer.decodeForDisplay` before the callback
+    // fires — your loop just prints (or animates / forwards) the
+    // bytes. The slice is owned by Session and valid only for the
+    // duration of this call; copy if you need it later.
     std.debug.print("{s}", .{decoded});
 }
 ```
 
 Pass `user` as your engine's context (NPC pointer, dialog box state,
 etc.) via `Config.on_token_user`. The pointer is opaque to valkyr.
+
+### Family support
+
+`Session.init` picks a dense or hybrid backend automatically based on
+`cfg.family.isHybrid()`:
+
+- **Dense** (`Backend.dense`): Gemma 1, Llama 3 / Llama 2-arch chat
+  fine-tunes, Mistral 7B v0.3, Qwen3. Runs through `runtime.zig`'s
+  ChatKernels + GpuScratch + GpuKvCache.
+- **Hybrid** (`Backend.hybrid`): Qwen3.5 (and architecturally Qwen3.6)
+  — Gated DeltaNet linear-attention layers interleaved with full
+  attention, attn-output gate, partial RoPE. Runs through
+  `runtime_hybrid.zig`'s ChatKernels + Scratch + State (per-layer SSM
+  conv/recurrent + per-layer KV cache).
+
+Hosts get the same Session API for all of them. The branching is
+internal; `tickFrame` dispatches to the right runtime module based on
+the loaded model's family.
 
 ## Frame budget mechanics
 
@@ -279,9 +301,19 @@ the host registers one in `Config.on_layer`. The callback sees the
 recorder + `scratch` and can record its own dispatches or copies
 into the same command buffer.
 
-This is the hook that lets a host build *real-time tensor visualizers*
-without ever leaving the GPU — what's currently driving the rainbow
-attention strip in Matryoshka's `ai_demo`.
+**Dense-only today.** The callback signature takes
+`*const gpu_scratch.GpuScratch` — the dense scratch struct. Hybrid
+sessions don't fire it (Session.init prints a one-time warning if a
+host registers `on_layer` against a hybrid model so the gap surfaces
+clearly). Hybrid attention has a different shape — `scratch.scores`
+is only valid on full-attention layers (1 in 4 for Qwen3.5), and the
+linear-attention layers carry SSM state instead. A future chunk will
+generalize the hook for hybrid hosts that want it.
+
+This is the hook that lets a dense host build *real-time tensor
+visualizers* without ever leaving the GPU — what's currently driving
+the rainbow attention strip in Matryoshka's `ai_demo` running Gemma
+2B IT.
 
 ```zig
 fn onLayer(
@@ -429,24 +461,22 @@ attention pattern, illuminating the cube and ground in real time.
 
 ## Known limitations
 
-- **Dense Llama / Gemma only**, today. Hybrid Qwen3.5 / Qwen3.6
-  paths (linear-attention layers, partial RoPE) aren't exposed
-  through `runtime` / `Session` yet — they live in valkyr's CLI
-  path. Adding hybrid coverage is a chunk that has to thread the
-  per-layer-type recorder distinction through `recordOneLayer`.
 - **Greedy sampler only**, today. `SamplerKind` is a union; the
-  shape's there but only `.greedy` is implemented.
-- **Byte-level BPE display**. `on_token` passes
-  `tokenizer.decode(id)` as `[]const u8`. For SentencePiece this
-  is direct UTF-8 (with the standard `▁` boundary marker). For
-  byte-level BPE (Qwen, Llama 3) the raw vocab strings carry GPT-2
-  byte-mapping markers (`Ġ`, `Ċ`, etc.) that need
-  `decodeByteLevel` to round-trip to natural UTF-8. The Session
-  hands hosts the raw form for now; pass through your own decoder
-  if you're integrating a byte-level model.
+  shape's there but only `.greedy` is implemented. Custom samplers
+  via the primitives layer (`runtime.recordSampleStep` +
+  `runtime.sampleArgmax` + your own logic on the logits mirror).
+- **`on_layer` is dense-only.** Hybrid sessions skip the hook (with
+  a one-time warning at init) — the callback's `GpuScratch`
+  signature doesn't match hybrid scratch, and hybrid attention is
+  only valid on 1-in-4 layers. Generalizing to hybrid is a future
+  chunk.
 - **One Session per process** is fine but **multi-Session** has had
   no test exposure. Per-NPC dialog should work; it'll get serious
   testing when a host actually does it.
+- **No TQ4 V-cache through Session.** The hooks exist in `runtime`
+  / `runtime_hybrid` (`Tq4VHooks`) but Session doesn't expose them
+  yet. Drop down to the primitives layer if you need asymmetric
+  K=fp / V=TQ4 in-engine.
 - **No multi-token-prediction draft head** (Qwen3.6 specific).
   Speculative decoding is on the broader roadmap, not this surface.
 
@@ -466,13 +496,29 @@ This doc covers the embedded contract. Other paths:
 - `src/lib.zig` — the public module's root. Each `pub const` is one
   importable submodule.
 - `src/loader.zig` — `loadGpuModel` and friends.
-- `src/runtime.zig` — `Forward.recordStep`, `recordOneLayer`,
-  `recordEmbedding`, `recordSampleStep`, `sampleArgmax`. Public
-  primitives.
-- `src/session.zig` — `Session`, `Config`, `TickResult`,
-  `LayerCallback`, `TokenCallback`, `createHostMirrorBuffer`.
-- `src/gpu/{vk,buffer,pipeline,recorder}.zig` — the cooperative
-  compute primitives.
+- `src/runtime.zig` — dense forward primitives:
+  `Forward.recordStep`, `recordForwardStep`, `recordOneLayer`,
+  `recordEmbedding`, `recordSampleStep`, `sampleArgmax`,
+  `ChatKernels`, push structs, dispatch helpers.
+- `src/runtime_hybrid.zig` — hybrid (Qwen3.5 family) forward
+  primitives: `ChatKernels`, `Scratch`, `State`, `Tq4VHooks`,
+  `recordOneLayer`, `recordForwardStep`. Mirror of `runtime.zig`'s
+  shape but with the Gated-DeltaNet kernel set + per-layer SSM
+  state.
+- `src/session.zig` — `Session`, `Backend` tagged union (dense /
+  hybrid), `Config`, `TickResult`, `LayerCallback`, `TokenCallback`,
+  `createHostMirrorBuffer`.
+- `src/tokenizer.zig` — `decodeForDisplay` resolves `▁` / `Ġ` /
+  byte-fallback for streaming hosts.
+- `src/gpu/{vk,buffer,pipeline,recorder,scratch}.zig` — cooperative
+  compute primitives + dense scratch / KV cache.
+
+A headless validator lives in valkyr's CLI: `valkyr --session-smoke
+<model>` runs the same code path matryoshka's `ai_demo` runs
+in-engine, minus the GUI. Useful for verifying a model loads and
+streams correctly through the embed surface before wiring it into a
+host. Validated on Gemma 2B IT, Llama 3.2 1B-Instruct, Qwen3 4B
+dense, Qwen3.5 0.8B hybrid.
 
 If something here is wrong or unclear, the source is the source of
 truth — these files are short enough to read top-to-bottom.
