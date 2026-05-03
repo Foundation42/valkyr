@@ -28,3 +28,20 @@ pub const recorder = @import("gpu/recorder.zig");
 /// shader (e.g. `shaders.matmul_nt`, `shaders.matmul_nt_v2`,
 /// `shaders.rmsnorm`, ...). See valkyr's build.zig for the full list.
 pub const shaders = @import("shaders");
+
+// ── Static-model surface (chunk 7a) ─────────────────────────────
+// Hosts that want to load and run a real language model from inside
+// their own Vulkan context need access to the safetensors parsing,
+// config types, tokenizer, and the GpuModel upload pipeline. None of
+// these are tied to a specific runtime state machine — they're the
+// inert "model on disk → model on GPU" pieces. The Session type
+// (chunk 7c) layers a default state machine on top of these; hosts
+// that want bespoke orchestration use them directly.
+pub const config = @import("config.zig");
+pub const dtype = @import("dtype.zig");
+pub const safetensors = @import("safetensors.zig");
+pub const model = @import("model.zig");
+pub const tokenizer = @import("tokenizer.zig");
+pub const gpu_model = @import("gpu/model.zig");
+pub const hf_cache = @import("hf_cache.zig");
+pub const loader = @import("loader.zig");
