@@ -297,61 +297,59 @@ unchanged.
 ## Per-token visualization with `on_layer`
 
 valkyr fires an `on_layer` callback after each `recordOneLayer` if
-the host registers one in `Config.on_layer`. The callback sees the
-recorder + `scratch` and can record its own dispatches or copies
-into the same command buffer.
-
-**Dense-only today.** The callback signature takes
-`*const gpu_scratch.GpuScratch` — the dense scratch struct. Hybrid
-sessions don't fire it (Session.init prints a one-time warning if a
-host registers `on_layer` against a hybrid model so the gap surfaces
-clearly). Hybrid attention has a different shape — `scratch.scores`
-is only valid on full-attention layers (1 in 4 for Qwen3.5), and the
-linear-attention layers carry SSM state instead. A future chunk will
-generalize the hook for hybrid hosts that want it.
-
-This is the hook that lets a dense host build *real-time tensor
-visualizers* without ever leaving the GPU — what's currently driving
-the rainbow attention strip in Matryoshka's `ai_demo` running Gemma
-2B IT.
+the host registers one in `Config.on_layer`. The callback receives
+a `LayerTap` — a small struct that papers over both backends — and
+can record its own dispatches or copies into the same command
+buffer.
 
 ```zig
-fn onLayer(
-    user: ?*anyopaque,
-    rec: *vkr.recorder.Recorder,
+pub const LayerTap = struct {
+    rec: *recorder.Recorder,
     layer_idx: u32,
-    scratch: *const vkr.gpu_scratch.GpuScratch,
-) anyerror!void {
+    layer_kind: LayerKind,    // .full_attention | .linear_attention
+    scores: ?*const buffer.Buffer,  // [n_q_heads, max_pos] f32, or null
+    n_q_heads: u32,
+    max_pos: u32,
+};
+```
+
+The same hook fires on dense and hybrid models. On hybrid (Qwen3.5,
+Qwen3.6) only **1 in 4** invocations carries non-null `scores` — the
+full-attention layers; the other 3-in-4 are linear-attention (Gated
+DeltaNet) and have no attention to mirror that frame. Hosts handle
+the difference with a single `orelse return`:
+
+```zig
+fn onLayer(user: ?*anyopaque, tap: *const vkr.session.LayerTap) anyerror!void {
     const state: *State = @ptrCast(@alignCast(user.?));
+    if (tap.layer_idx != state.viz_layer) return;
+    const scores = tap.scores orelse return;  // skip linear-attn frames
 
-    // Only act on the layer we care about.
-    if (layer_idx != state.viz_layer) return;
-
-    // Insert SHADER_WRITE → TRANSFER_READ barrier (the recorder's
-    // auto-barriers don't cover transfer reads).
+    // SHADER_WRITE → TRANSFER_READ barrier (recorder's auto-barriers
+    // don't cover transfer reads).
     var bar = std.mem.zeroes(c.VkMemoryBarrier);
     bar.sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     bar.srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT;
     bar.dstAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT;
     c.vkCmdPipelineBarrier(
-        @ptrCast(rec.cmd),
+        @ptrCast(tap.rec.cmd),
         c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         c.VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 1, &bar, 0, null, 0, null,
     );
 
-    // Mirror one head's first-N attention values from scratch.scores
-    // (layout: row-major [n_heads, max_pos] f32) into a host-visible
+    // Mirror one head's first-N attention values from `scores`
+    // (layout [n_q_heads, max_pos] f32 row-major) into a host-visible
     // buffer the host already allocated.
-    const head_offset = state.viz_head * scratch.max_pos * @sizeOf(f32);
+    const head_offset = @as(u64, state.viz_head) * @as(u64, tap.max_pos) * @sizeOf(f32);
     const region = c.VkBufferCopy{
         .srcOffset = head_offset,
         .dstOffset = 0,
         .size = state.mirror.bytes,
     };
     c.vkCmdCopyBuffer(
-        @ptrCast(rec.cmd),
-        @ptrCast(scratch.scores.handle),
+        @ptrCast(tap.rec.cmd),
+        @ptrCast(scores.handle),
         @ptrCast(state.mirror.handle),
         1, &region,
     );
@@ -363,15 +361,17 @@ The host-visible mirror gets allocated once at engine setup via
 exactly what's needed (HOST_VISIBLE+HOST_COHERENT, persistent-mapped,
 TRANSFER_DST_BIT enabled).
 
-What lives in `scratch` at hook time:
-- `scratch.stream` — residual stream after this layer (hidden_dim f32)
-- `scratch.scores` — post-softmax attention scores `[n_heads, max_pos]`,
-  valid `[0..n_pos]` per row
-- `scratch.q_rot`, `scratch.k_rot` — post-RoPE Q and K for THIS token
+**Picking a viz layer for hybrid models.** Qwen3.5 / Qwen3.6 schedule
+linear×3 + full×1 layers; the last layer is full-attention on the
+sizes we ship support for, so `cfg.num_hidden_layers - 1` is a safe
+default. If a future config lands the last layer on linear-attn,
+the host's `orelse return` keeps the strip on its previous value
+instead of glitching.
 
-These are GPU-resident SSBOs; you can sample them in your render
-shaders directly (with appropriate barriers) instead of mirroring
-to host.
+This is the hook driving the rainbow attention strip in Matryoshka's
+`ai_demo` — works for both Gemma 2B IT (dense, every frame carries
+scores) and Qwen3.5 0.8B (hybrid, scores arrive on every 4th
+recorded layer).
 
 ## Lifetime + ownership rules
 
@@ -465,11 +465,12 @@ attention pattern, illuminating the cube and ground in real time.
   shape's there but only `.greedy` is implemented. Custom samplers
   via the primitives layer (`runtime.recordSampleStep` +
   `runtime.sampleArgmax` + your own logic on the logits mirror).
-- **`on_layer` is dense-only.** Hybrid sessions skip the hook (with
-  a one-time warning at init) — the callback's `GpuScratch`
-  signature doesn't match hybrid scratch, and hybrid attention is
-  only valid on 1-in-4 layers. Generalizing to hybrid is a future
-  chunk.
+- **`on_layer` exposes attention only.** The `LayerTap.scores`
+  buffer covers post-softmax attention scores. SSM state on hybrid
+  models (linear-attn `recurrent_state` / `conv_state`, the deltas
+  through Gated DeltaNet) isn't piped through yet — viz hosts that
+  want to render the linear-attn side need to wait for additional
+  optional fields on `LayerTap`.
 - **One Session per process** is fine but **multi-Session** has had
   no test exposure. Per-NPC dialog should work; it'll get serious
   testing when a host actually does it.

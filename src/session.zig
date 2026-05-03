@@ -89,21 +89,51 @@ pub const TokenCallback = *const fn (
     decoded: []const u8,
 ) void;
 
-/// Optional viz / mech-interp hook. Fires DURING recording, after
-/// `recordOneLayer` but before the next layer or the sample step.
-/// The callback may record its own commands into the same recorder
-/// (e.g. a `vkCmdCopyBuffer` of `scratch.scores` into a host-owned
-/// SSBO mirror).
-///
-/// Unwrap pointers and offsets carefully: `scratch.scores` is laid
-/// out as `[n_heads, max_pos]` row-major — see `gpu/scratch.zig`.
-/// Each row currently holds the post-softmax attention distribution
-/// for the layer's heads against KV positions [0..n_pos].
-pub const LayerCallback = *const fn (
-    user: ?*anyopaque,
+/// What sort of layer just got recorded. Dense models are always
+/// `.full_attention`; hybrid (Qwen3.5 / Qwen3.6) interleaves
+/// `.linear_attention` (Gated DeltaNet, no attention scores) and
+/// `.full_attention` (every 4th layer in the typical 3+1 schedule).
+pub const LayerKind = enum { full_attention, linear_attention };
+
+/// Snapshot of the model's GPU state right after `recordOneLayer`.
+/// Stable across dense and hybrid backends — hosts that visualize
+/// attention don't need to know which one is running. Linear-attn
+/// layers leave `scores == null` (those frames carry SSM state
+/// instead of attention; future tap fields will expose it for hosts
+/// that want to viz that side too).
+pub const LayerTap = struct {
     rec: *recorder_mod.Recorder,
     layer_idx: u32,
-    scratch: *const gpu_scratch.GpuScratch,
+    layer_kind: LayerKind,
+    /// Post-softmax attention scores buffer, layout
+    /// `[n_q_heads, max_pos]` f32 row-major. Each head's row is
+    /// valid for positions `[0..n_pos]`; the rest is stale from
+    /// previous tokens. `null` on `.linear_attention` layers
+    /// (those use SSM state instead — Gated DeltaNet).
+    scores: ?*const buffer.Buffer,
+    /// Number of query heads — the row count of `scores`. Stays
+    /// the value passed in even when `scores == null`, so hosts
+    /// can size mirrors at init time off the model config.
+    n_q_heads: u32,
+    /// Stride between rows in `scores`. = `Session.max_pos`.
+    max_pos: u32,
+};
+
+/// Optional viz / mech-interp hook. Fires DURING recording, after
+/// `recordOneLayer` but before the next layer or the sample step.
+/// The callback may record its own commands into the recorder
+/// (e.g. a `vkCmdCopyBuffer` of `tap.scores.?` into a host-owned
+/// SSBO mirror) — those land in the same per-frame command buffer
+/// the host submits.
+///
+/// Both dense and hybrid backends fire this. On hybrid models only
+/// 1-in-4 invocations carries non-null `tap.scores` (the
+/// full-attention layers); the other 3-in-4 are linear-attention
+/// layers with no attention to mirror, so `tap.scores == null` —
+/// hosts should early-return on those.
+pub const LayerCallback = *const fn (
+    user: ?*anyopaque,
+    tap: *const LayerTap,
 ) anyerror!void;
 
 pub const Config = struct {
@@ -222,19 +252,6 @@ pub const Session = struct {
     ) !Session {
         const cfg_model = gm.config;
         const max_pos: u32 = @intCast(cfg.max_pos);
-
-        // on_layer is a dense-only hook — its callback signature
-        // takes `*const gpu_scratch.GpuScratch`, which doesn't apply
-        // to the hybrid Scratch (different type, different fields:
-        // hybrid scratch.scores only valid on full-attn layers, etc.).
-        // Surface a clear warning so hosts notice rather than
-        // silently get no callbacks.
-        if (cfg_model.family.isHybrid() and cfg.on_layer != null) {
-            std.debug.print(
-                "[valkyr.session] warning: on_layer callback is not supported on hybrid models (family={s}); hook will be ignored\n",
-                .{@tagName(cfg_model.family)},
-            );
-        }
 
         var backend: Backend = if (cfg_model.family.isHybrid()) blk: {
             var kernels = try runtime_hybrid.ChatKernels.init(ctx, gm.precision);
@@ -428,7 +445,15 @@ pub const Session = struct {
                             null,
                         );
                         if (self.cfg.on_layer) |cb| {
-                            try cb(self.cfg.on_layer_user, rec, self.fwd_layer, &b.scratch);
+                            const tap = LayerTap{
+                                .rec = rec,
+                                .layer_idx = self.fwd_layer,
+                                .layer_kind = .full_attention,
+                                .scores = &b.scratch.scores,
+                                .n_q_heads = @intCast(self.cfg_model.num_attention_heads),
+                                .max_pos = self.max_pos,
+                            };
+                            try cb(self.cfg.on_layer_user, &tap);
                         }
                         self.fwd_layer += 1;
                         work += 1;
@@ -499,7 +524,32 @@ pub const Session = struct {
                             &pushes,
                             null,
                         );
-                        // on_layer is dense-only — see warning at init.
+                        if (self.cfg.on_layer) |cb| {
+                            // Branch on the per-layer schedule: full-attn
+                            // layers populated `scratch.scores` exactly
+                            // like dense; linear-attn layers ran the
+                            // Gated DeltaNet path which doesn't touch
+                            // scores, so we tell the host explicitly via
+                            // the optional buffer pointer.
+                            const lt = self.cfg_model.layer_types[self.fwd_layer];
+                            const kind: LayerKind = switch (lt) {
+                                .full_attention => .full_attention,
+                                .linear_attention => .linear_attention,
+                            };
+                            const scores_buf: ?*const buffer.Buffer = switch (lt) {
+                                .full_attention => &b.scratch.scores,
+                                .linear_attention => null,
+                            };
+                            const tap = LayerTap{
+                                .rec = rec,
+                                .layer_idx = self.fwd_layer,
+                                .layer_kind = kind,
+                                .scores = scores_buf,
+                                .n_q_heads = @intCast(self.cfg_model.num_attention_heads),
+                                .max_pos = self.max_pos,
+                            };
+                            try cb(self.cfg.on_layer_user, &tap);
+                        }
                         self.fwd_layer += 1;
                         work += 1;
                         continue;
