@@ -54,3 +54,11 @@ pub const loader = @import("loader.zig");
 // `recordSampleStep`, and `sampleArgmax` directly.
 pub const gpu_scratch = @import("gpu/scratch.zig");
 pub const runtime = @import("runtime.zig");
+
+// ── Session API (chunk 7c) ──────────────────────────────────────
+// Frame-budgeted cooperative-inference state machine. Hosts that just
+// want text-out call `Session.init` + `appendPrompt` + `tickFrame`
+// once per frame. The state machine handles per-layer chunking,
+// deferred sampling, and KV/scratch lifecycle. Hosts that want
+// bespoke orchestration use the `runtime` primitives directly.
+pub const session = @import("session.zig");
