@@ -104,11 +104,11 @@ pub fn readRequest(allocator: std.mem.Allocator, reader: anytype) ReadError!Requ
     var head_buf = std.ArrayList(u8).init(a);
     var byte_buf: [1]u8 = undefined;
     while (head_buf.items.len < MAX_REQUEST_HEAD_BYTES) {
-        const n = reader.read(&byte_buf) catch |e| return switch (e) {
+        const n = reader.read(&byte_buf) catch |e| switch (e) {
             error.WouldBlock,
             error.NotOpenForReading,
-            => error.ConnectionClosed,
-            else => |x| @errorCast(x),
+            => return error.ConnectionClosed,
+            else => |x| return x,
         };
         if (n == 0) {
             if (head_buf.items.len == 0) return error.ConnectionClosed;
@@ -169,7 +169,7 @@ pub fn readRequest(allocator: std.mem.Allocator, reader: anytype) ReadError!Requ
     const body_owned = try a.alloc(u8, content_length);
     var read_total: usize = 0;
     while (read_total < content_length) {
-        const n = reader.read(body_owned[read_total..]) catch |e| return @errorCast(e);
+        const n = try reader.read(body_owned[read_total..]);
         if (n == 0) return error.ConnectionClosed;
         read_total += n;
     }
