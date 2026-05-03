@@ -309,6 +309,42 @@ pub fn main() !void {
         try runSessionMessages(allocator, args[2], smoke_max_new, precision);
         return;
     }
+    if (args.len >= 3 and (std.mem.eql(u8, args[1], "--runner-smoke") or
+                            std.mem.eql(u8, args[1], "--runner-smoke-threaded")))
+    {
+        // End-to-end exercise of valkyr.inference.InferenceRunner.
+        // --runner-smoke           → inline mode (host drives tickInline)
+        // --runner-smoke-threaded  → spawn worker thread; submit/poll
+        //                            from main thread.
+        // Same 3-turn fixture as --session-messages; output should
+        // be bit-identical across all three smokes.
+        // Format: <flag> <model> [--max-new N] [--q4|--q4k]
+        const threaded = std.mem.eql(u8, args[1], "--runner-smoke-threaded");
+        var smoke_max_new: u32 = 64;
+        var q4: bool = false;
+        var q4k: bool = false;
+        var i: usize = 3;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--max-new") and i + 1 < args.len) {
+                smoke_max_new = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--q4")) {
+                q4 = true; i += 1;
+            } else if (std.mem.eql(u8, a, "--q4k")) {
+                q4k = true; i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (q4 and q4k) {
+            std.debug.print("--q4 and --q4k are mutually exclusive\n", .{});
+            return;
+        }
+        const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
+        try runRunnerSmoke(allocator, args[2], smoke_max_new, precision, threaded);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
         // Parse optional sampling flags + final user_msg. Format:
         //   --chat <dir> [--temp T] [--top-k K] [--top-p P] [--seed S]
@@ -4194,6 +4230,127 @@ fn runSessionMessages(
         try rec.endAndSubmit();
     }
     try stdout.print("\n", .{});
+}
+
+// ── runner-smoke: end-to-end InferenceRunner inline-mode exercise ─
+
+const inference_queue = @import("inference/queue.zig");
+const inference_arena = @import("inference/arena.zig");
+const inference_proto = @import("inference/proto.zig");
+const inference_runner = @import("inference/runner.zig");
+
+fn runRunnerSmoke(
+    gpa: std.mem.Allocator,
+    model_arg: []const u8,
+    max_new: u32,
+    precision: gpu_model.Precision,
+    threaded: bool,
+) !void {
+    const stdout = std.io.getStdOut().writer();
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    try stdout.print("loading model {s}...\n", .{model_arg});
+
+    const t0 = std.time.nanoTimestamp();
+    var loaded = try loader.loadGpuModel(gpa, &ctx, model_arg, .{ .precision = precision });
+    defer loaded.deinit(ctx.device);
+    const t1 = std.time.nanoTimestamp();
+    const cfg = loaded.config();
+    try stdout.print(
+        "loaded in {d:.1} s — family={s} layers={d} hybrid={}\n",
+        .{ @as(f64, @floatFromInt(t1 - t0)) / 1e9, @tagName(cfg.family), cfg.num_hidden_layers, cfg.family.isHybrid() },
+    );
+
+    // Build a Session that the runner will borrow. Same shape as
+    // --session-messages but the runner owns the on_token wiring +
+    // budget + stops, so we leave them at defaults here.
+    var sess = try session_mod.Session.init(gpa, &ctx, &loaded.gpu_model, &loaded.tokenizer, .{
+        .max_pos = 2048,
+    });
+    defer sess.deinit();
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
+    defer rec.deinit();
+
+    var runner = try inference_runner.InferenceRunner.initBorrow(gpa, &sess, &rec, .{
+        .default_max_tokens = max_new,
+    });
+    defer runner.deinit();
+
+    if (threaded) try runner.start();
+
+    // Same 3-turn fixture as --session-messages.
+    const messages = [_]chat_template_mod.Message{
+        .{ .role = .user, .content = "Hi" },
+        .{ .role = .assistant, .content = "Hello! How can I help?" },
+        .{ .role = .user, .content = "Tell me a short joke." },
+    };
+
+    // Stop-string sanity: any of these terminates with reason=stop.
+    // Most won't trigger on the joke fixture; "guts!" matches the
+    // Qwen3 4B response, "stick" matches Gemma's. Demonstrates the
+    // suffix-match path without making the smoke flaky.
+    const stop_strings = [_][]const u8{ "guts!", "stick.", "</response>" };
+
+    try runner.submit(.{ .chat = .{
+        .corr = 1,
+        .messages = &messages,
+        .max_tokens = max_new,
+        .stop_strings = &stop_strings,
+        .deadline_ns = 30 * std.time.ns_per_s, // 30s — plenty of headroom
+    } });
+
+    try stdout.print("response: ", .{});
+
+    var token_count: u32 = 0;
+    var saw_finish = false;
+    var prefill_tokens: u32 = 0;
+    var finish_reason: inference_proto.FinishReason = .stop;
+    var elapsed_ns: u64 = 0;
+
+    var ticks: u32 = 0;
+    while (!saw_finish and ticks < 8192) : (ticks += 1) {
+        // In inline mode the main thread drives ticks. In threaded
+        // mode the worker drives ticks itself; we just sleep + poll.
+        if (threaded) {
+            std.time.sleep(500_000); // 500µs poll interval
+        } else {
+            try runner.tickInline();
+        }
+        while (runner.pollEvent()) |ev| {
+            switch (ev.kind) {
+                .accepted => |a| prefill_tokens = a.prefill_tokens,
+                .token => |t| {
+                    const text = runner.resolve(t.decoded);
+                    try stdout.writeAll(text);
+                    token_count += 1;
+                },
+                .arena_swap => {},
+                .finish => |f| {
+                    saw_finish = true;
+                    finish_reason = f.reason;
+                    elapsed_ns = f.elapsed_ns;
+                },
+                .err => |e| {
+                    try stdout.print("\n[runner err: {s}]\n", .{e.msg});
+                    saw_finish = true;
+                },
+            }
+        }
+    }
+    try stdout.print(
+        "\n[mode={s}  prefill={d}  completion={d}  reason={s}  elapsed={d:.1} ms  ticks={d}]\n",
+        .{
+            if (threaded) "threaded" else "inline",
+            prefill_tokens, token_count, @tagName(finish_reason),
+            @as(f64, @floatFromInt(elapsed_ns)) / 1e6, ticks,
+        },
+    );
+    // Threaded mode: shutdown joins the worker before deinit's
+    // shutdown call (which would also work; just being explicit).
+    if (threaded) runner.shutdown();
 }
 
 // ── bench: cold / warm forward timing on Gemma 2B IT ───────────────

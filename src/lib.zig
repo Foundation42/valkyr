@@ -77,3 +77,15 @@ pub const runtime_hybrid = @import("runtime_hybrid.zig");
 // deferred sampling, and KV/scratch lifecycle. Hosts that want
 // bespoke orchestration use the `runtime` primitives directly.
 pub const session = @import("session.zig");
+
+// ── Inference runner (Sketch #3) ────────────────────────────────
+// SPSC queue + ping-pong text arena + InferenceRunner that drives
+// Session from a producer command stream. Powers the upcoming
+// `valkyr --serve` HTTP path AND embed callers that want a
+// queue-based decoupling from the render thread.
+pub const inference = struct {
+    pub const queue = @import("inference/queue.zig");
+    pub const arena = @import("inference/arena.zig");
+    pub const proto = @import("inference/proto.zig");
+    pub const runner = @import("inference/runner.zig");
+};
