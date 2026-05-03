@@ -89,3 +89,15 @@ pub const inference = struct {
     pub const proto = @import("inference/proto.zig");
     pub const runner = @import("inference/runner.zig");
 };
+
+// ── HTTP server (Sketch #4) ─────────────────────────────────────
+// OpenAI-compatible `/v1/chat/completions` + `/v1/models`. Thin
+// adapter over inference.runner. valkyr --serve is the canonical
+// consumer; embed hosts can spin up their own Server if they want
+// to expose a model on HTTP alongside their main loop.
+pub const server = struct {
+    pub const http = @import("server/http.zig");
+    pub const json = @import("server/json.zig");
+    pub const Server = @import("server/server.zig").Server;
+    pub const ServerConfig = @import("server/server.zig").ServerConfig;
+};

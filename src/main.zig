@@ -345,6 +345,55 @@ pub fn main() !void {
         try runRunnerSmoke(allocator, args[2], smoke_max_new, precision, threaded);
         return;
     }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--serve")) {
+        // OpenAI-compatible HTTP server. Loads <model> once, listens
+        // on --port (default 8080), accepts POST /v1/chat/completions
+        // (streaming or not via "stream":true) and GET /v1/models.
+        // Format:
+        //   --serve <model> [--port N] [--bind ADDR] [--id PUBLIC_ID]
+        //                   [--max-new N] [--q4|--q4k]
+        // <model> is the HF id used to load (`Qwen/Qwen3-4B-Instruct-2507`).
+        // --id  is the public model id surfaced via /v1/models and
+        //        validated against the request's `model` field.
+        //        Defaults to the HF id (clients can post that
+        //        verbatim).
+        var port: u16 = 8080;
+        var bind_addr: []const u8 = "127.0.0.1";
+        var public_id: ?[]const u8 = null;
+        var max_new: u32 = 256;
+        var q4: bool = false;
+        var q4k: bool = false;
+        var i: usize = 3;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--port") and i + 1 < args.len) {
+                port = try std.fmt.parseInt(u16, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--bind") and i + 1 < args.len) {
+                bind_addr = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--id") and i + 1 < args.len) {
+                public_id = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--max-new") and i + 1 < args.len) {
+                max_new = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--q4")) {
+                q4 = true; i += 1;
+            } else if (std.mem.eql(u8, a, "--q4k")) {
+                q4k = true; i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (q4 and q4k) {
+            std.debug.print("--q4 and --q4k are mutually exclusive\n", .{});
+            return;
+        }
+        const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
+        try runServe(allocator, args[2], public_id orelse args[2], bind_addr, port, max_new, precision);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
         // Parse optional sampling flags + final user_msg. Format:
         //   --chat <dir> [--temp T] [--top-k K] [--top-p P] [--seed S]
@@ -4351,6 +4400,77 @@ fn runRunnerSmoke(
     // Threaded mode: shutdown joins the worker before deinit's
     // shutdown call (which would also work; just being explicit).
     if (threaded) runner.shutdown();
+}
+
+// ── serve: OpenAI-compatible HTTP endpoint ─────────────────────────
+
+const server_mod = @import("server/server.zig");
+
+fn runServe(
+    gpa: std.mem.Allocator,
+    model_arg: []const u8,
+    public_id: []const u8,
+    bind_addr: []const u8,
+    port: u16,
+    max_new: u32,
+    precision: gpu_model.Precision,
+) !void {
+    const stdout = std.io.getStdOut().writer();
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    try stdout.print("loading model {s}...\n", .{model_arg});
+
+    const t0 = std.time.nanoTimestamp();
+    var loaded = try loader.loadGpuModel(gpa, &ctx, model_arg, .{ .precision = precision });
+    defer loaded.deinit(ctx.device);
+    const t1 = std.time.nanoTimestamp();
+    const cfg = loaded.config();
+    try stdout.print(
+        "loaded in {d:.1} s — family={s} layers={d} hybrid={}\n",
+        .{ @as(f64, @floatFromInt(t1 - t0)) / 1e9, @tagName(cfg.family), cfg.num_hidden_layers, cfg.family.isHybrid() },
+    );
+
+    var sess = try session_mod.Session.init(gpa, &ctx, &loaded.gpu_model, &loaded.tokenizer, .{
+        .max_pos = 4096,
+    });
+    defer sess.deinit();
+
+    // Recorder sized for serve's likely usage: pure-µs budget mode
+    // (default for runner) + worst-case big-model layer counts. The
+    // runner default is `.either{layers=8, µs=5000}` so the layer
+    // cap keeps us inside 4096 sets / 16384 descriptors.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
+    defer rec.deinit();
+
+    var runner = try inference_runner.InferenceRunner.initBorrow(gpa, &sess, &rec, .{
+        .default_max_tokens = max_new,
+    });
+    defer runner.deinit();
+    try runner.start();
+
+    var srv = try server_mod.Server.init(gpa, &runner, .{
+        .bind_address = bind_addr,
+        .port = port,
+        .model_id = public_id,
+        .default_max_tokens = max_new,
+    });
+    defer srv.deinit();
+    try srv.start();
+
+    try stdout.print(
+        "server ready: POST http://{s}:{d}/v1/chat/completions  •  GET /v1/models\n" ++
+            "model id (validate against request.model): {s}\n" ++
+            "Ctrl-C to stop.\n",
+        .{ bind_addr, port, public_id },
+    );
+
+    // Park forever — Ctrl-C kills the process. We don't install a
+    // signal handler; the OS reaping is fine for v0.
+    while (true) {
+        std.time.sleep(std.time.ns_per_s);
+    }
 }
 
 // ── bench: cold / warm forward timing on Gemma 2B IT ───────────────

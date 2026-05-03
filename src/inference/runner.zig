@@ -537,6 +537,18 @@ pub const InferenceRunner = struct {
 
     fn handleToken(self: *InferenceRunner, tok_id: u32, decoded: []const u8) !void {
         const a = if (self.active) |*ap| ap else return;
+
+        // Suppress EOT/stop tokens: their decoded form (`<|im_end|>`,
+        // `<|eot_id|>`, `<end_of_turn>`) would leak into client
+        // responses if streamed verbatim. Session's stop-token
+        // check fires AFTER on_token, so by the time we see this
+        // callback we already know we'd be done; just don't push
+        // the token event. completion_tokens still doesn't tick
+        // because we never count tokens we don't emit.
+        for (a.stop_tokens_buf) |stop_id| {
+            if (tok_id == stop_id) return;
+        }
+
         a.completion_tokens += 1;
 
         // 1. Write decoded bytes into the ping-pong arena.
