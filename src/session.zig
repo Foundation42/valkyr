@@ -207,7 +207,7 @@ pub const Session = struct {
         // (Gemma vocab × 4) of host-visible VRAM — invisible alongside
         // the model itself.
         const mirror_bytes = cfg_model.vocab_size * @sizeOf(f32);
-        var logits_mirror = try createHostVisibleTransferDstBuffer(ctx, mirror_bytes);
+        var logits_mirror = try createHostMirrorBuffer(ctx, mirror_bytes);
         errdefer logits_mirror.deinit(ctx.device);
 
         return .{
@@ -414,11 +414,13 @@ pub const Session = struct {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-/// HOST_VISIBLE+HOST_COHERENT VkBuffer with TRANSFER_DST_BIT enabled.
+/// HOST_VISIBLE+HOST_COHERENT VkBuffer with TRANSFER_DST_BIT enabled,
+/// persistent-mapped. Used by Session for its logits mirror, and
+/// publicly available so hosts can allocate their own mirrors for
+/// the on_layer callback (chunk 7d's attention-strip viz uses one).
 /// `Buffer.initDynamic` is close to what we need but only enables
-/// STORAGE_BUFFER_BIT — hence this little custom variant. Persistent-
-/// mapped on success so callers can read directly via `mapped`.
-fn createHostVisibleTransferDstBuffer(ctx: *const vk.Context, bytes: usize) !buffer.Buffer {
+/// STORAGE_BUFFER_BIT — vkCmdCopyBuffer's dst needs TRANSFER_DST.
+pub fn createHostMirrorBuffer(ctx: *const vk.Context, bytes: usize) !buffer.Buffer {
     const c = vk.c;
     var bci = std.mem.zeroes(c.VkBufferCreateInfo);
     bci.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
