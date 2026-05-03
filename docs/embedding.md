@@ -36,28 +36,37 @@ llama.cpp / vLLM / ZINC. Those assume "give me a prompt, take my
 queue, return tokens." valkyr supports that too (its CLI runs that
 way) — but it *also* supports the embedded shape.
 
-## Two API tiers
+## Three API tiers
 
 valkyr exposes a public Zig module called `valkyr_gpu`. Within it,
-hosts can integrate at two levels:
+hosts can integrate at three levels — pick the highest one that does
+what you need:
 
 1. **Cooperative-compute primitives** (`vk.Context`, `buffer`,
-   `pipeline`, `recorder`, `shaders`). For hosts that want to run
-   their own compute shaders alongside graphics — sharing a device
-   without running an LLM at all. This is the smallest contract:
-   attach to host handles, record dispatches into the host's command
-   buffer.
+   `pipeline`, `recorder`, `shaders`). Hosts that want to run their
+   own compute shaders alongside graphics, sharing a device without
+   running an LLM at all. Smallest contract: attach to host handles,
+   record dispatches into the host's command buffer.
 
-2. **Session-driven text generation** (`session.Session`). For hosts
-   that want valkyr to do the inference work — load a model, ingest
-   a prompt, tick the state machine each frame, get tokens out. The
+2. **Session-driven text generation** (`session.Session`). Hosts that
+   want valkyr to do the inference work — load a model, ingest a
+   prompt, tick the state machine each frame, get tokens out. The
    per-layer scheduling, KV/scratch lifecycle, and deferred-sample
    correctness invariants are owned in one place.
 
-Hosts can use either tier alone or both together. The Session API
-is built on top of the primitives — picking it doesn't lock you out
-of the lower layer; the recorder you pass into `Session.tickFrame`
-is the same recorder you use for your own dispatches.
+3. **InferenceRunner** (`inference.runner.InferenceRunner`). The
+   queue-based scheduler that wraps Session with a request/event
+   protocol. Submit a `Command.chat` with a `messages` array; drain
+   `Event`s (`accepted` / `token` / `arena_swap` / `finish` / `err`)
+   with `pollEvent`. **Same Runner powers `valkyr --serve`** (the
+   OpenAI-compatible HTTP path — see [server.md](server.md)) —
+   embed and HTTP eat from one inference abstraction. Inline mode
+   ticks from the host's render loop; threaded mode owns its own
+   worker thread.
+
+Hosts can use any tier alone or in combination. Higher tiers are
+built on top of lower ones — picking the Runner doesn't lock you
+out of `runtime.recordOneLayer` for special cases.
 
 ## Build setup
 
@@ -97,10 +106,12 @@ That's the whole build wiring. Zig's package system handles the rest
 `@import("valkyr_gpu")` in your code reaches everything documented
 below.
 
-## Quick start: Session-driven text generation
+## Quick start: InferenceRunner in inline-embed mode
 
-The most common integration. Drop a model into your host and have it
-generate text inside the render loop.
+The recommended integration for engine hosts. The Runner gives you
+a queue-based API (chat command in, events out) and reuses the same
+inference path as `valkyr --serve`. Inline mode means *you* drive
+ticks from your render loop — no extra threads.
 
 ### One-time setup (e.g. inside your engine's init)
 
@@ -117,7 +128,7 @@ const ctx = vkr.vk.Context.attach(
     host_cmd_pool,
 );
 
-// Load a model. Either a directory or an HF id.
+// Load a model — directory or HF id.
 const loaded = try vkr.loader.loadGpuModel(
     allocator, &ctx, "google/gemma-2b-it",
     .{ .precision = .q4_k_matmul }, // or .bf16_matmul, .q4_0_matmul, .fp32_all
@@ -127,65 +138,122 @@ const loaded = try vkr.loader.loadGpuModel(
 var sess = try vkr.session.Session.init(
     allocator, &ctx, &loaded.gpu_model, &loaded.tokenizer,
     .{
-        .budget_layers = 8,        // layers/frame; default 8
+        .budget = .{ .layers = 8 },   // layers/frame; default 8
         .max_new_tokens = 256,
-        .on_token = onToken,       // optional streaming callback
         .max_pos = 1024,
+        // Optional: per-layer attention viz hook (see below).
+        // .on_layer = onLayer, .on_layer_user = state,
     },
 );
 
-try sess.appendPrompt("Once upon a time");
+// Recorder attached to host's per-frame VkCommandBuffer.
+var rec = try vkr.recorder.Recorder.attachCmd(
+    &ctx, host_cmd, /* max_sets */ 512, /* max_descriptors */ 2048,
+);
+
+// Build the runner; it borrows Session + Recorder.
+var runner = try vkr.inference.runner.InferenceRunner.initBorrow(
+    allocator, &sess, &rec,
+    .{
+        .default_budget = .{ .layers = 8 },
+        .default_max_tokens = 256,
+    },
+);
+
+// Submit a chat-templated request. The Runner deep-copies messages
+// on accept; producer slices can be stack/static and freed after
+// `submit` returns.
+const messages = [_]vkr.chat_template.Message{
+    .{ .role = .user, .content = "Once upon a time" },
+};
+try runner.submit(.{ .chat = .{
+    .corr = 1,
+    .messages = &messages,
+    .max_tokens = 256,
+} });
 ```
 
 ### Per frame (inside your render frame, after begin and any sync)
 
 ```zig
-// Attach the recorder to the host's per-frame command buffer.
-// Allocated once at engine init and reused; the descriptor pool is
-// reset each frame.
-var rec = try vkr.recorder.Recorder.attachCmd(
-    &ctx, host_cmd, /* max_sets */ 512, /* max_descriptors */ 2048,
-);
-
-try rec.reset();
-try rec.begin(); // attached-mode no-op (host already began host_cmd)
+try rec.reset();        // descriptor pool reset; cmd buffer untouched
+try rec.begin();        // no-op in attached mode
 
 // ... your own compute dispatches that the LLM might want to read ...
 
-// Drive the state machine. Records up to budget_layers worth of
-// dispatches into host_cmd, advances internal state across frames.
-const r = try sess.tickFrame(&rec);
-if (r.new_token) |tok| {
-    // Token just emerged. The on_token callback already fired with
-    // the decoded UTF-8; here you can do anything else (animate UI,
-    // write to a log, etc.).
-    _ = tok;
+// Advance the state machine. tickWork records up to cfg.budget
+// worth of LLM forward dispatches into host_cmd; it does NOT touch
+// cmd buffer reset/begin/end (your render loop owns that lifecycle).
+try runner.tickWork();
+
+// Drain runner events. Token events stream decoded UTF-8;
+// arena_swap is bookkeeping; finish ends the request.
+while (runner.pollEvent()) |ev| {
+    switch (ev.kind) {
+        .accepted => {},
+        .token => |t| {
+            const text = runner.resolve(t.decoded);
+            std.debug.print("{s}", .{text});
+        },
+        .arena_swap => {},
+        .finish => |f| {
+            std.debug.print(
+                "\n[done] reason={s} prompt={d} completion={d}\n",
+                .{ @tagName(f.reason), f.prompt_tokens, f.completion_tokens },
+            );
+        },
+        .err => |e| std.debug.print("\n[err] {s}\n", .{e.msg}),
+    }
 }
 
 // ... your downstream rendering passes that consume valkyr's outputs ...
 ```
 
 The host then ends + submits + fences `host_cmd` as part of its
-normal frame submit. valkyr does no submitting on its own.
+normal frame submit. valkyr does no submitting on its own —
+`tickWork` is the embed-shaped entry point that respects host cmd
+buffer ownership.
 
-### The token streaming callback
+### Chat templates: `appendMessages` does this for you
+
+The Runner internally calls `Session.appendMessages(messages)` on
+accept, which composes through the family's chat template:
+
+- **Gemma**: `<bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n`
+- **Qwen3 / Qwen3.5** (ChatML): `<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`
+- **Llama 3** (header-id): `<|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|>...`
+- **Zephyr / TinyLlama**: text-marker `<|user|>\n...</s>\n<|assistant|>\n`
+- **Mistral v0.3+**: `<s>[INST]...[/INST]`
+- **System role** is folded into the first user turn for Gemma /
+  Mistral (which lack a system role); emitted separately for the
+  others. Multi-turn histories supported — pass the full
+  conversation in `messages`.
+
+This is what unlocks Qwen3.5's `<think>` reasoning preamble in the
+embed path: the model's chat fine-tuning expects ChatML markers,
+and the Runner makes sure they're emitted. Hosts that want to
+bypass templating (raw token-level prompts for special cases) can
+still call `Session.appendPrompt(raw_text)` directly; the Runner
+only takes over once you submit a chat command.
+
+### Without the Runner (legacy direct-Session path)
+
+Hosts that need bespoke token-level orchestration (custom samplers,
+multi-NPC scheduling) can drive `Session.tickFrame` directly:
 
 ```zig
-fn onToken(user: ?*anyopaque, tok_id: u32, decoded: []const u8) void {
-    _ = user;
-    _ = tok_id;
-    // `decoded` is display-ready UTF-8. SentencePiece `▁`, byte-level
-    // `Ġ` / `Ċ`, and `<0xBB>` byte-fallback tokens are already
-    // resolved by `Tokenizer.decodeForDisplay` before the callback
-    // fires — your loop just prints (or animates / forwards) the
-    // bytes. The slice is owned by Session and valid only for the
-    // duration of this call; copy if you need it later.
-    std.debug.print("{s}", .{decoded});
-}
+try sess.appendMessages(&messages); // or appendPrompt(raw_text)
+
+// Each frame:
+try rec.reset();
+try rec.begin();
+const r = try sess.tickFrame(&rec);
+if (r.new_token) |tok| { ... }
+// host submits host_cmd
 ```
 
-Pass `user` as your engine's context (NPC pointer, dialog box state,
-etc.) via `Config.on_token_user`. The pointer is opaque to valkyr.
+The Runner's mostly cleaner for the typical "stream tokens to
+screen" case, but the direct path is still there.
 
 ### Family support
 
@@ -207,26 +275,40 @@ the loaded model's family.
 
 ## Frame budget mechanics
 
-`Config.budget_layers` is the per-`tickFrame` work cap. Each
-`recordOneLayer` counts as one unit; the sample step counts as one;
-`recordEmbedding` is free (single dispatch, sub-microsecond).
+`Config.budget` is the per-`tickFrame` work cap. Three modes via a
+tagged union:
 
-For Gemma 2B IT (18 layers) at `budget_layers = 8`:
+```zig
+.budget = .{ .layers = 8 },                              // layer count cap
+.budget = .{ .microseconds = 5000 },                     // wall-clock cap
+.budget = .{ .either = .{ .layers = 8, .microseconds = 5000 } }, // both, first to fire wins
+```
+
+Each `recordOneLayer` counts as one layer-unit; the sample step
+counts as one; `recordEmbedding` is free (single dispatch,
+sub-microsecond). The time mode samples `Instant.now()` once per
+layer-unit (~30 ns) — coarse enough that one expensive layer can
+overshoot by one unit; the residual surfaces in `TickResult`.
+
+For Gemma 2B IT (18 layers) at `.layers = 8`:
 - Token forward = 18 layers + 1 sample step = 19 work units
 - Spread across `ceil(19 / 8) + 1` = ~3 frames per token
   (the +1 is the deferred-sample tick — sampling reads logits AFTER
    the host's frame fence signals)
 - At 60 fps: **~20 tok/s** with full graphics also rendering
 
-Tune `budget_layers` to taste:
-- Lower (4) when frame budget is tight or model is in the background
-- Higher (16) for foreground-priority generation
-- Max budget = total layers = whole forward in one frame
+`.either` is the right choice for most embed hosts: a coarse layer
+backstop prevents the recorder's descriptor pool from overflowing
+on big models, and the µs cap governs on small ones. The Runner's
+default is `.either{layers=8, µs=5000}`.
 
-There's no wall-clock timer. The budget is layers-per-frame, not
-microseconds. The host's frame fence at the top of the next
-`drawFrame` ensures the previous frame's submit completed, so by
-the time `tickFrame` runs again everything's deterministic.
+`TickResult` reports both `elapsed_us` and signed `residual_us`
+(target − elapsed; positive = under-budget, negative = overshot)
+so a host can converge on a target frame budget with a simple
+feedback loop. For `.layers`-only mode `residual_us` is zero (no
+time signal). What we budget is *recording* time — Vulkan command
+recording is what we steal from the host's frame; GPU work runs
+async on the host's submit.
 
 ## Sampling readback strategy
 
@@ -445,17 +527,27 @@ every contract in this doc:
 - An `aiDispatch` vtable slot fires inside `drawFrame` with the
   host cmd buffer in recording state, between sim and traversal.
 - Post-AI memory barrier covers SHADER/TRANSFER → SHADER/HOST.
-- The Game owns a Session loaded with `google/gemma-2b-it`,
-  appendPrompt'd with `"Once upon a time"`, ticked each frame.
-- An `on_layer` callback mirrors one head's attention scores into a
+- The Game owns a Session + Recorder + InferenceRunner loaded with
+  `google/gemma-2b-it`. A single chat command is submitted at
+  startup with `"Once upon a time"` as a user message; the Runner's
+  `tickWork` is called from `aiDispatch` each frame.
+- The runner emits `token` events synchronously inside `tickWork`;
+  `aiDispatch` drains `pollEvent` after each tick to print
+  decoded text and react to `finish`.
+- An `on_layer` callback (still wired to Session, orthogonal to
+  the Runner) mirrors one head's attention scores into a
   host-visible buffer; the Game's `update` reads via persistent
   map and modulates 16 dynamic point lights' intensities.
 - LIFO defer order: `defer renderer.deinit()` registered first,
-  `defer game.deinit()` registered second; game cleanup runs first.
+  `defer game.deinit()` registered second; game cleanup runs first
+  (which itself deinits Runner before Session before model).
 
-Result at 60 fps: Gemma generates coherent text token-by-token while
-a rainbow strip of point lights pulses with the model's last-layer
-attention pattern, illuminating the cube and ground in real time.
+Result at 60 fps: Gemma generates coherent chat-templated text
+token-by-token while a rainbow strip of point lights pulses with
+the model's last-layer attention pattern, illuminating the cube
+and ground in real time. Switch the model to Qwen3.5 hybrid and
+the same code emits the model's `<think>` reasoning preamble
+in-render.
 
 [Matryoshka repo](https://github.com/foundation42/matryoshka)
 
@@ -471,15 +563,23 @@ attention pattern, illuminating the cube and ground in real time.
   through Gated DeltaNet) isn't piped through yet — viz hosts that
   want to render the linear-attn side need to wait for additional
   optional fields on `LayerTap`.
-- **One Session per process** is fine but **multi-Session** has had
-  no test exposure. Per-NPC dialog should work; it'll get serious
-  testing when a host actually does it.
-- **No TQ4 V-cache through Session.** The hooks exist in `runtime`
-  / `runtime_hybrid` (`Tq4VHooks`) but Session doesn't expose them
-  yet. Drop down to the primitives layer if you need asymmetric
-  K=fp / V=TQ4 in-engine.
+- **One Session per Runner.** Multi-Session (multiple concurrent
+  conversations sharing GPU, e.g. per-NPC dialog) is on the
+  roadmap; the Runner's command/event protocol is keyed by `corr`
+  so the swap is "route per-corr to a Session pool", not a
+  rewrite. Single-Session works for embed hosts that focus one
+  NPC at a time.
+- **No TQ4 V-cache through Session/Runner.** The hooks exist in
+  `runtime` / `runtime_hybrid` (`Tq4VHooks`) but Session doesn't
+  expose them yet. Drop to the primitives layer if you need
+  asymmetric K=fp / V=TQ4 in-engine.
 - **No multi-token-prediction draft head** (Qwen3.6 specific).
-  Speculative decoding is on the broader roadmap, not this surface.
+  Speculative decoding is on the broader roadmap.
+- **Image/audio attachments accepted-but-rejected at the protocol
+  level.** `ChatCommand.attachments` carries a future-proofed
+  `Attachment` union with `.text`/`.image_url`/`.image_bytes`
+  variants; v0 only routes `.text` and rejects the others with a
+  clean error. Vision lands when the encoder side does.
 
 ## What's not in scope here
 
@@ -487,8 +587,10 @@ This doc covers the embedded contract. Other paths:
 
 - Standalone CLI / chat REPL: `valkyr --chat <model>`. See the main
   README's [Running](../README.md#running) section.
-- HTTP / OpenAI-compatible server: not yet built. Would naturally
-  share Session's machinery.
+- **OpenAI-compatible HTTP server**: see [server.md](server.md).
+  `valkyr --serve <model>` exposes `/v1/chat/completions` (streaming
+  + non-streaming) and `/v1/models` over the same `InferenceRunner`
+  the embed path uses.
 - Training: planned, see roadmap. Sits on top of valkyr's
   forward kernels + paired backwards in TRiP's `reference/math.c`.
 
@@ -507,19 +609,40 @@ This doc covers the embedded contract. Other paths:
   shape but with the Gated-DeltaNet kernel set + per-layer SSM
   state.
 - `src/session.zig` — `Session`, `Backend` tagged union (dense /
-  hybrid), `Config`, `TickResult`, `LayerCallback`, `TokenCallback`,
+  hybrid), `Config`, `Budget`, `TickResult`, `LayerCallback`,
+  `TokenCallback`, `appendPrompt`, `appendMessages`,
   `createHostMirrorBuffer`.
+- `src/chat_template.zig` — `Role`, `Message`, `ChatTemplate` with
+  `composeConversation` (multi-turn) and `composePrompt` (legacy
+  single-turn). Per-family special-token tables.
+- `src/inference/queue.zig` — `SpscRing(T, cap_log2)` lock-free
+  ring buffer.
+- `src/inference/arena.zig` — `PingPongArena` + `DecodedSlice` for
+  zero-alloc streaming text.
+- `src/inference/proto.zig` — `Command`, `Event`, `FinishReason`,
+  `Attachment` (text/image_url/image_bytes — v0 routes text only).
+- `src/inference/runner.zig` — `InferenceRunner` with
+  `initBorrow`, `submit`, `pollEvent`, `tickInline` (owns
+  recorder), `tickWork` (host-attached recorder), `start` /
+  `shutdown` for threaded mode.
+- `src/server/{http,json,server}.zig` — bare-metal HTTP/1.1 +
+  OpenAI codec + Server. See [server.md](server.md).
 - `src/tokenizer.zig` — `decodeForDisplay` resolves `▁` / `Ġ` /
   byte-fallback for streaming hosts.
 - `src/gpu/{vk,buffer,pipeline,recorder,scratch}.zig` — cooperative
   compute primitives + dense scratch / KV cache.
 
-A headless validator lives in valkyr's CLI: `valkyr --session-smoke
-<model>` runs the same code path matryoshka's `ai_demo` runs
-in-engine, minus the GUI. Useful for verifying a model loads and
-streams correctly through the embed surface before wiring it into a
-host. Validated on Gemma 2B IT, Llama 3.2 1B-Instruct, Qwen3 4B
-dense, Qwen3.5 0.8B hybrid.
+Three headless validators live in valkyr's CLI:
+- `valkyr --session-smoke <model>` — direct Session.tickFrame path.
+- `valkyr --runner-smoke <model>` — InferenceRunner inline mode.
+- `valkyr --runner-smoke-threaded <model>` — Runner with worker
+  thread.
+
+All three produce bit-identical text across the four supported
+families (Gemma 2B IT, Llama 3.2 1B-Instruct, Qwen3 4B dense,
+Qwen3.5 0.8B hybrid). Useful for verifying a model loads and
+streams correctly through the embed surface before wiring it into
+a host.
 
 If something here is wrong or unclear, the source is the source of
 truth — these files are short enough to read top-to-bottom.
