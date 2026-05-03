@@ -25,6 +25,8 @@ const gpu_scratch = @import("gpu/scratch.zig");
 const gpu_recorder = @import("gpu/recorder.zig");
 const runtime = @import("runtime.zig");
 const runtime_hybrid = @import("runtime_hybrid.zig");
+const loader = @import("loader.zig");
+const session_mod = @import("session.zig");
 const hf_cache = @import("hf_cache.zig");
 const probe = @import("probe.zig");
 const shaders = @import("shaders");
@@ -220,6 +222,46 @@ pub fn main() !void {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
         try runBench(allocator, dir, n);
+        return;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--session-smoke")) {
+        // Headless exercise of valkyr.session.Session — the same code
+        // path matryoshka's ai_demo runs in-engine. Lets us validate
+        // dense AND hybrid families through the embed surface without
+        // a GUI. Format:
+        //   --session-smoke <model> [--prompt "..."] [--max-new N]
+        //                           [--budget K] [--q4|--q4k]
+        var prompt: []const u8 = "Once upon a time";
+        var smoke_max_new: u32 = 20;
+        var budget: u32 = 8;
+        var q4: bool = false;
+        var q4k: bool = false;
+        var i: usize = 3;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--prompt") and i + 1 < args.len) {
+                prompt = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--max-new") and i + 1 < args.len) {
+                smoke_max_new = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--budget") and i + 1 < args.len) {
+                budget = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--q4")) {
+                q4 = true; i += 1;
+            } else if (std.mem.eql(u8, a, "--q4k")) {
+                q4k = true; i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (q4 and q4k) {
+            std.debug.print("--q4 and --q4k are mutually exclusive\n", .{});
+            return;
+        }
+        const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
+        try runSessionSmoke(allocator, args[2], prompt, smoke_max_new, budget, precision);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
@@ -3937,6 +3979,102 @@ fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
         }
     }
     return out;
+}
+
+// ── session-smoke: headless exercise of valkyr.session.Session ───────
+//
+// Same code path matryoshka's ai_demo runs in-engine, minus the GUI.
+// Loads the model via `loader.loadGpuModel`, builds a `Session`, feeds
+// the prompt, and ticks until done while streaming generated tokens
+// to stdout. Used to validate dense + hybrid family support through
+// the embed surface — `--chat` doesn't go through Session at all.
+
+const SessionSmokeOnTokenCtx = struct {
+    stdout: std.fs.File.Writer,
+    family: config_mod.Family,
+};
+
+fn sessionSmokeOnToken(user: ?*anyopaque, tok_id: u32, decoded: []const u8) void {
+    _ = tok_id;
+    const ctx: *SessionSmokeOnTokenCtx = @ptrCast(@alignCast(user.?));
+    // Best-effort decode display: SentencePiece `▁` → space, byte-level
+    // BPE leaves Ġ visible (chunk E will fix that). Same shape as
+    // matryoshka's ai_demo onTokenStreamed so we exercise the same
+    // code path the host would.
+    var i: usize = 0;
+    while (i < decoded.len) {
+        if (i + 3 <= decoded.len and decoded[i] == 0xE2 and decoded[i + 1] == 0x96 and decoded[i + 2] == 0x81) {
+            ctx.stdout.print(" ", .{}) catch return;
+            i += 3;
+        } else {
+            ctx.stdout.print("{c}", .{decoded[i]}) catch return;
+            i += 1;
+        }
+    }
+}
+
+fn runSessionSmoke(
+    gpa: std.mem.Allocator,
+    model_arg: []const u8,
+    prompt: []const u8,
+    max_new: u32,
+    budget: u32,
+    precision: gpu_model.Precision,
+) !void {
+    const stdout = std.io.getStdOut().writer();
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    try stdout.print("loading model {s}...\n", .{model_arg});
+
+    const t0 = std.time.nanoTimestamp();
+    var loaded = try loader.loadGpuModel(gpa, &ctx, model_arg, .{ .precision = precision });
+    defer loaded.deinit(ctx.device);
+    const t1 = std.time.nanoTimestamp();
+    const cfg = loaded.config();
+    try stdout.print(
+        "loaded in {d:.1} s — family={s} layers={d} hybrid={}\n",
+        .{ @as(f64, @floatFromInt(t1 - t0)) / 1e9, @tagName(cfg.family), cfg.num_hidden_layers, cfg.family.isHybrid() },
+    );
+
+    var on_token_ctx = SessionSmokeOnTokenCtx{ .stdout = stdout, .family = cfg.family };
+
+    var sess = try session_mod.Session.init(gpa, &ctx, &loaded.gpu_model, &loaded.tokenizer, .{
+        .budget_layers = budget,
+        .max_new_tokens = max_new,
+        .on_token = sessionSmokeOnToken,
+        .on_token_user = &on_token_ctx,
+        .max_pos = 1024,
+    });
+    defer sess.deinit();
+    try sess.appendPrompt(prompt);
+
+    try stdout.print("\nprompt: \"{s}\"\n", .{prompt});
+    try stdout.print("response: ", .{});
+
+    // Single shared command buffer + recorder, mirroring the host
+    // setup. Each tickFrame records into the recorder; after the
+    // budget loop we submit + wait. Real hosts overlap with frame
+    // submits; we don't bother here since we just want correctness.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 512, 4096);
+    defer rec.deinit();
+
+    const decode_t0 = std.time.nanoTimestamp();
+    var ticks: u32 = 0;
+    while (!sess.isDone() and ticks < 4096) : (ticks += 1) {
+        try rec.reset();
+        try rec.begin();
+        _ = try sess.tickFrame(&rec);
+        try rec.endAndSubmit();
+    }
+    const decode_t1 = std.time.nanoTimestamp();
+    const tokens = sess.generatedTokens();
+    const wall_s = @as(f64, @floatFromInt(decode_t1 - decode_t0)) / 1e9;
+    try stdout.print(
+        "\n[{d} tok in {d:.0} ms over {d} ticks, {d:.1} tok/s]\n",
+        .{ tokens.len, wall_s * 1000.0, ticks, @as(f64, @floatFromInt(tokens.len)) / wall_s },
+    );
 }
 
 // ── bench: cold / warm forward timing on Gemma 2B IT ───────────────

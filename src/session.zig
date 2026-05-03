@@ -65,6 +65,7 @@ const gpu_scratch = @import("gpu/scratch.zig");
 const config_mod = @import("config.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const runtime = @import("runtime.zig");
+const runtime_hybrid = @import("runtime_hybrid.zig");
 
 pub const Phase = enum { idle, prompt, decode, done };
 
@@ -152,6 +153,33 @@ pub const TickResult = struct {
     phase: Phase,
 };
 
+/// Per-family backend. Dense (Llama / Gemma / Qwen3 dense) holds a
+/// `runtime.ChatKernels` + `GpuScratch` + `GpuKvCache`; hybrid
+/// (Qwen3.5 family) holds `runtime_hybrid.ChatKernels` + `Scratch` +
+/// `State`. Session.init picks based on `cfg.family.isHybrid()`.
+pub const Backend = union(enum) {
+    dense: struct {
+        kernels: runtime.ChatKernels,
+        scratch: gpu_scratch.GpuScratch,
+        kv: gpu_scratch.GpuKvCache,
+    },
+    hybrid: struct {
+        kernels: runtime_hybrid.ChatKernels,
+        scratch: runtime_hybrid.Scratch,
+        state: runtime_hybrid.State,
+    },
+
+    /// Both backends store logits in `scratch.logits` (same shape: a
+    /// device-only `vocab × f32` buffer). This accessor papers over
+    /// the union so the sample-step copy can stay backend-agnostic.
+    pub fn logitsBuffer(self: *const Backend) *const buffer.Buffer {
+        return switch (self.*) {
+            .dense => |*b| &b.scratch.logits,
+            .hybrid => |*b| &b.scratch.logits,
+        };
+    }
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     ctx: *const vk.Context,
@@ -160,9 +188,9 @@ pub const Session = struct {
     cfg_model: config_mod.Config,
     cfg: Config,
 
-    forward: runtime.Forward,
-    scratch: gpu_scratch.GpuScratch,
-    kv: gpu_scratch.GpuKvCache,
+    backend: Backend,
+    max_pos: u32,
+
     /// Host-visible mirror of `scratch.logits`. The recorder appends a
     /// `vkCmdCopyBuffer` after the sample step; once the host's frame
     /// fence signals, this buffer's persistent map shows the new
@@ -189,23 +217,65 @@ pub const Session = struct {
         cfg: Config,
     ) !Session {
         const cfg_model = gm.config;
+        const max_pos: u32 = @intCast(cfg.max_pos);
 
-        var forward = try runtime.Forward.init(ctx, gm);
-        errdefer forward.deinit();
+        // on_layer is a dense-only hook — its callback signature
+        // takes `*const gpu_scratch.GpuScratch`, which doesn't apply
+        // to the hybrid Scratch (different type, different fields:
+        // hybrid scratch.scores only valid on full-attn layers, etc.).
+        // Surface a clear warning so hosts notice rather than
+        // silently get no callbacks.
+        if (cfg_model.family.isHybrid() and cfg.on_layer != null) {
+            std.debug.print(
+                "[valkyr.session] warning: on_layer callback is not supported on hybrid models (family={s}); hook will be ignored\n",
+                .{@tagName(cfg_model.family)},
+            );
+        }
 
-        var scratch = try gpu_scratch.GpuScratch.init(ctx, cfg_model, cfg.max_pos);
-        errdefer scratch.deinit(ctx.device);
-
-        var kv = try gpu_scratch.GpuKvCache.init(allocator, ctx, cfg_model, cfg.max_pos);
-        errdefer kv.deinit(ctx.device);
+        var backend: Backend = if (cfg_model.family.isHybrid()) blk: {
+            var kernels = try runtime_hybrid.ChatKernels.init(ctx, gm.precision);
+            errdefer kernels.deinit();
+            var scratch = try runtime_hybrid.Scratch.init(ctx, cfg_model, max_pos, false);
+            errdefer scratch.deinit(ctx.device);
+            var state = try runtime_hybrid.State.init(allocator, ctx, cfg_model, max_pos, false);
+            errdefer state.deinit(ctx.device);
+            break :blk .{ .hybrid = .{
+                .kernels = kernels,
+                .scratch = scratch,
+                .state = state,
+            } };
+        } else blk: {
+            var kernels = try runtime.ChatKernels.init(ctx, gm.precision, cfg_model.family);
+            errdefer kernels.deinit();
+            var scratch = try gpu_scratch.GpuScratch.init(ctx, cfg_model, cfg.max_pos);
+            errdefer scratch.deinit(ctx.device);
+            var kv = try gpu_scratch.GpuKvCache.init(allocator, ctx, cfg_model, cfg.max_pos);
+            errdefer kv.deinit(ctx.device);
+            break :blk .{ .dense = .{
+                .kernels = kernels,
+                .scratch = scratch,
+                .kv = kv,
+            } };
+        };
+        errdefer switch (backend) {
+            .dense => |*b| {
+                var k = b.kernels;
+                k.deinit();
+                b.scratch.deinit(ctx.device);
+                b.kv.deinit(ctx.device);
+            },
+            .hybrid => |*b| {
+                var k = b.kernels;
+                k.deinit();
+                b.scratch.deinit(ctx.device);
+                b.state.deinit(ctx.device);
+            },
+        };
 
         // HOST_VISIBLE+HOST_COHERENT persistent-mapped, sized to the
-        // logits vector. TRANSFER_DST_BIT comes free with initDynamic
-        // is NOT true — `initDynamic` only enables STORAGE_BUFFER_BIT,
-        // and we need TRANSFER_DST_BIT for vkCmdCopyBuffer's dst.
-        // Roll a small custom buffer here. The cost is ~1 MB
-        // (Gemma vocab × 4) of host-visible VRAM — invisible alongside
-        // the model itself.
+        // logits vector. TRANSFER_DST_BIT — vkCmdCopyBuffer's dst.
+        // ~1 MB (Gemma vocab × 4) of host-visible VRAM, invisible
+        // alongside the model itself.
         const mirror_bytes = cfg_model.vocab_size * @sizeOf(f32);
         var logits_mirror = try createHostMirrorBuffer(ctx, mirror_bytes);
         errdefer logits_mirror.deinit(ctx.device);
@@ -217,9 +287,8 @@ pub const Session = struct {
             .tokenizer = tokenizer,
             .cfg_model = cfg_model,
             .cfg = cfg,
-            .forward = forward,
-            .scratch = scratch,
-            .kv = kv,
+            .backend = backend,
+            .max_pos = max_pos,
             .logits_mirror = logits_mirror,
             .phase = .idle,
             .pos = 0,
@@ -236,9 +305,18 @@ pub const Session = struct {
         self.prompt_q.deinit();
         self.generated.deinit();
         self.logits_mirror.deinit(self.ctx.device);
-        self.kv.deinit(self.ctx.device);
-        self.scratch.deinit(self.ctx.device);
-        self.forward.deinit();
+        switch (self.backend) {
+            .dense => |*b| {
+                b.kv.deinit(self.ctx.device);
+                b.scratch.deinit(self.ctx.device);
+                b.kernels.deinit();
+            },
+            .hybrid => |*b| {
+                b.state.deinit(self.ctx.device);
+                b.scratch.deinit(self.ctx.device);
+                b.kernels.deinit();
+            },
+        }
     }
 
     /// Tokenize `text` and queue it for prefill. Can be called
@@ -299,81 +377,156 @@ pub const Session = struct {
 
         // ── 2. Record up to budget_layers of work. ───────────────────
         while (work < self.cfg.budget_layers and self.phase != .done) {
-            if (!self.fwd_in_flight) {
-                const next_tok = self.pickNextInputToken() orelse break;
-                try runtime.recordEmbedding(
-                    rec,
-                    &self.scratch,
-                    self.gm,
-                    self.cfg_model,
-                    &self.forward.kernels,
-                    next_tok,
-                );
-                self.fwd_in_flight = true;
-                self.fwd_layer = 0;
-                // Embedding is one shader dispatch (~µs); not charged
-                // against the layer budget.
-                continue;
-            }
+            switch (self.backend) {
+                .dense => |*b| {
+                    if (!self.fwd_in_flight) {
+                        const next_tok = self.pickNextInputToken() orelse break;
+                        try runtime.recordEmbedding(
+                            rec,
+                            &b.scratch,
+                            self.gm,
+                            self.cfg_model,
+                            &b.kernels,
+                            next_tok,
+                        );
+                        self.fwd_in_flight = true;
+                        self.fwd_layer = 0;
+                        // Embedding is one shader dispatch (~µs); not
+                        // charged against the layer budget.
+                        continue;
+                    }
 
-            if (self.fwd_layer < self.cfg_model.num_hidden_layers) {
-                const pushes = runtime.computeForwardPushes(
-                    self.cfg_model,
-                    &self.scratch,
-                    self.pos,
-                );
-                try runtime.recordOneLayer(
-                    rec,
-                    &self.scratch,
-                    self.gm,
-                    &self.kv,
-                    self.cfg_model,
-                    &self.forward.kernels,
-                    self.fwd_layer,
-                    self.pos,
-                    &pushes,
-                    null,
-                );
-                if (self.cfg.on_layer) |cb| {
-                    try cb(self.cfg.on_layer_user, rec, self.fwd_layer, &self.scratch);
-                }
-                self.fwd_layer += 1;
-                work += 1;
-                continue;
-            }
+                    if (self.fwd_layer < self.cfg_model.num_hidden_layers) {
+                        const pushes = runtime.computeForwardPushes(
+                            self.cfg_model,
+                            &b.scratch,
+                            self.pos,
+                        );
+                        try runtime.recordOneLayer(
+                            rec,
+                            &b.scratch,
+                            self.gm,
+                            &b.kv,
+                            self.cfg_model,
+                            &b.kernels,
+                            self.fwd_layer,
+                            self.pos,
+                            &pushes,
+                            null,
+                        );
+                        if (self.cfg.on_layer) |cb| {
+                            try cb(self.cfg.on_layer_user, rec, self.fwd_layer, &b.scratch);
+                        }
+                        self.fwd_layer += 1;
+                        work += 1;
+                        continue;
+                    }
 
-            // ── Layers exhausted for this token. Two paths: ──────────
-            // (a) Non-final prefill token: KV is populated, advance pos
-            //     and go pick up the next prompt token within budget.
-            // (b) Last prefill token OR decode-phase token: record
-            //     sample step + copy logits to mirror, set
-            //     sample_pending, break — the GPU executes during the
-            //     host's frame submit, the next tick consumes the
-            //     mirror after the fence signals.
-            if (self.prompt_q.items.len > 0) {
-                self.pos += 1;
-                self.fwd_in_flight = false;
-                self.fwd_layer = 0;
-                continue;
-            }
+                    if (self.prompt_q.items.len > 0) {
+                        self.pos += 1;
+                        self.fwd_in_flight = false;
+                        self.fwd_layer = 0;
+                        continue;
+                    }
 
-            const pushes = runtime.computeForwardPushes(
-                self.cfg_model,
-                &self.scratch,
-                self.pos,
-            );
-            try runtime.recordSampleStep(
-                rec,
-                &self.scratch,
-                self.gm,
-                self.cfg_model,
-                &self.forward.kernels,
-                &pushes,
-            );
-            recordCopyToHostMirror(rec, &self.scratch.logits, &self.logits_mirror);
-            self.sample_pending = true;
-            work += 1;
-            break;
+                    const pushes = runtime.computeForwardPushes(
+                        self.cfg_model,
+                        &b.scratch,
+                        self.pos,
+                    );
+                    try runtime.recordSampleStep(
+                        rec,
+                        &b.scratch,
+                        self.gm,
+                        self.cfg_model,
+                        &b.kernels,
+                        &pushes,
+                    );
+                    recordCopyToHostMirror(rec, &b.scratch.logits, &self.logits_mirror);
+                    self.sample_pending = true;
+                    work += 1;
+                    break;
+                },
+                .hybrid => |*b| {
+                    if (!self.fwd_in_flight) {
+                        const next_tok = self.pickNextInputToken() orelse break;
+                        const hidden: u32 = @intCast(self.cfg_model.hidden_size);
+                        const embed_push = runtime_hybrid.EmbedLookupPush{
+                            .token_id = next_tok,
+                            .dim = hidden,
+                            .scale = if (self.cfg_model.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+                        };
+                        try runtime.recDispatch1D(
+                            rec,
+                            &b.kernels.embed,
+                            &.{ &self.gm.embed_tokens, &b.scratch.stream },
+                            &embed_push,
+                            hidden,
+                        );
+                        self.fwd_in_flight = true;
+                        self.fwd_layer = 0;
+                        continue;
+                    }
+
+                    if (self.fwd_layer < self.cfg_model.num_hidden_layers) {
+                        const pushes = runtime_hybrid.computeForwardPushes(
+                            self.cfg_model,
+                            self.pos,
+                            self.max_pos,
+                        );
+                        try runtime_hybrid.recordOneLayer(
+                            rec,
+                            &b.scratch,
+                            &b.state,
+                            self.gm,
+                            self.cfg_model,
+                            &b.kernels,
+                            self.fwd_layer,
+                            self.pos,
+                            &pushes,
+                            null,
+                        );
+                        // on_layer is dense-only — see warning at init.
+                        self.fwd_layer += 1;
+                        work += 1;
+                        continue;
+                    }
+
+                    if (self.prompt_q.items.len > 0) {
+                        self.pos += 1;
+                        self.fwd_in_flight = false;
+                        self.fwd_layer = 0;
+                        continue;
+                    }
+
+                    const pushes = runtime_hybrid.computeForwardPushes(
+                        self.cfg_model,
+                        self.pos,
+                        self.max_pos,
+                    );
+                    const hidden: u32 = @intCast(self.cfg_model.hidden_size);
+                    const vocab: u32 = @intCast(self.cfg_model.vocab_size);
+                    try runtime.recDispatchPerRow(
+                        rec,
+                        &b.kernels.rmsnorm,
+                        &.{ &b.scratch.stream, &self.gm.final_norm, &b.scratch.final_norm_out },
+                        &pushes.rms_push,
+                        1,
+                    );
+                    try runtime.recDispatchMatmul(
+                        rec,
+                        &b.kernels.matmul_lm_head,
+                        &.{ &b.scratch.final_norm_out, &self.gm.lm_head, &b.scratch.logits },
+                        1,
+                        vocab,
+                        hidden,
+                    );
+                    recordCopyToHostMirror(rec, &b.scratch.logits, &self.logits_mirror);
+                    self.sample_pending = true;
+                    work += 1;
+                    break;
+                },
+            }
         }
 
         return .{ .new_token = emitted, .layers_done = work, .phase = self.phase };
