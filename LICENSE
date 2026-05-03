@@ -1,0 +1,46 @@
+valkyr — dual-licensed
+========================
+
+valkyr is available under either of:
+
+  - the Apache License, Version 2.0 (see LICENSE-APACHE), OR
+  - a commercial license offered by Foundation42 / Entrained.ai
+    (see LICENSE-COMMERCIAL.md and contact chris@foundation42.org).
+
+You may pick whichever fits your use case. Open-source users, students,
+researchers, and most downstream projects should use Apache 2.0 — it
+imposes no copyleft and grants explicit patent rights.
+
+The commercial license is for organizations that want:
+
+  - a path free of Apache 2.0's attribution / NOTICE-file requirements,
+  - indemnification, support, or a contractual SLA,
+  - use without distributing the corresponding NOTICE.
+
+Both licenses cover the same code. There is no "open core" / "premium
+features" split — the entire valkyr runtime, kernels, server, embed
+surface, and tooling is available under either license at the licensee's
+choice.
+
+Contact
+-------
+
+Christian Beaumont — chris@foundation42.org
+Foundation42 — https://foundation42.org
+Entrained.ai  — https://entrained.ai
+
+Third-party
+-----------
+
+The transformer math implemented here is prior art (Vaswani et al.
+2017; Karpathy's `llama2.c`; the open `transformers` reference
+implementation; published descriptions of RoPE, RMSNorm, GeGLU, SwiGLU,
+GQA/MQA, Gated DeltaNet, TurboQuant, RHT, Q4_0, and Q4_K_M). The Zig
+and GLSL implementation in this repo is original.
+
+The Apache 2.0 license file applies to all source code in this
+repository (`src/`, `shaders/`, `build.zig`, `build.zig.zon`, and the
+`docs/` and `README.md` documentation). It does not extend to weights,
+checkpoints, or third-party material that may be loaded at runtime —
+those carry their own upstream licenses (e.g., Gemma's terms,
+Llama's terms, Mistral's terms, Qwen's terms).

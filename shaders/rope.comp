@@ -12,9 +12,9 @@
 //
 // Convention note: HF Gemma was trained with half-split RoPE (paired
 // dims `j` and `j + D/2`). Our standard matmul produces Q/K in this
-// layout directly, so this shader is the natural match. (TRiP uses
-// the pairwise-interleaved variant with a custom permuting matmul
-// upstream; we explicitly chose not to follow that path.)
+// layout directly, so this shader is the natural match. (Some C
+// references use pairwise-interleaved RoPE with a custom permuting
+// matmul upstream; we explicitly chose not to follow that path.)
 
 layout(local_size_x = 256) in;
 

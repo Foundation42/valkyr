@@ -85,9 +85,9 @@ pub const Context = struct {
         // ── Instance ────────────────────────────────────────────────
         var app_info = std.mem.zeroes(c.VkApplicationInfo);
         app_info.sType = c.VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        app_info.pApplicationName = "tripvulkan";
+        app_info.pApplicationName = "valkyr";
         app_info.applicationVersion = makeApiVersion(0, 0, 1, 0);
-        app_info.pEngineName = "tripvulkan";
+        app_info.pEngineName = "valkyr";
         app_info.engineVersion = makeApiVersion(0, 0, 1, 0);
         app_info.apiVersion = makeApiVersion(0, 1, 3, 0);
 

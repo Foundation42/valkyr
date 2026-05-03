@@ -75,7 +75,7 @@ valkyr is a Zig dependency. Add it to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .valkyr = .{
-        .path = "../path/to/tripvulkan",
+        .path = "../path/to/valkyr",
         // Or — once published — a .url + .hash entry; for now path is
         // the only flavor.
     },
@@ -592,7 +592,8 @@ This doc covers the embedded contract. Other paths:
   + non-streaming) and `/v1/models` over the same `InferenceRunner`
   the embed path uses.
 - Training: planned, see roadmap. Sits on top of valkyr's
-  forward kernels + paired backwards in TRiP's `reference/math.c`.
+  forward kernels + paired backward primitives, each parity-checked
+  against a CPU oracle.
 
 ## Pointers
 

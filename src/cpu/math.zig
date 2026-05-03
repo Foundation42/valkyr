@@ -2,15 +2,15 @@
 //!
 //! These exist for correctness, not speed. Every kernel has a GPU
 //! counterpart in `shaders/`; the CPU version here is the oracle the
-//! GPU version must match to within fp32 tolerance, and (where the
-//! arithmetic order matches) is also what we'll diff against TRiP's
-//! C reference for absolute correctness.
+//! GPU version must match to within fp32 tolerance, and is also the
+//! reference we diff against the HuggingFace `transformers` outputs
+//! for absolute correctness.
 //!
 //! All operations take fp32 activations; weight tensors retain their
 //! storage dtype (bf16/fp16/f32 — whichever the checkpoint shipped) and
-//! are converted lazily, scalar-by-scalar, exactly like TRiP does. This
-//! matches the C reference's accumulation order, which we want when we
-//! eventually diff outputs.
+//! are converted lazily, scalar-by-scalar. Accumulation order is
+//! sequential scalar fp32 throughout — easy to read, easy to diff, and
+//! the obvious choice for an oracle whose job is correctness, not speed.
 
 const std = @import("std");
 const safetensors = @import("../safetensors.zig");
@@ -28,14 +28,12 @@ const Family = config_mod.Family;
 ///
 /// Length of all three slices is `dim`. `weight` is read straight from
 /// the checkpoint; we dispatch on its dtype here rather than ask the
-/// caller to pre-materialise an fp32 copy. This both matches TRiP and
-/// avoids a pointless 2× memory blowup for Gemma's bf16 weights.
+/// caller to pre-materialise an fp32 copy. This avoids a pointless 2×
+/// memory blowup for Gemma's bf16 weights.
 ///
-/// Accumulation order intentionally mirrors TRiP/math.c rmsnorm so that
-/// a later parity test against the C reference compares bit-close at
-/// fp32. Specifically: rms is summed sequentially in the input order;
-/// the final per-element formula is `(gain * rms_inv) * in[i]` with no
-/// intermediate that TRiP doesn't also compute.
+/// Accumulation order is sequential scalar fp32: rms is summed in input
+/// order, the final per-element formula is `(gain * rms_inv) * in[i]`,
+/// no fused intermediates. Easy to diff against any reference.
 pub fn rmsnorm(
     out: []f32,
     in: []const f32,
@@ -138,10 +136,9 @@ pub fn rmsnormPerHead(
 /// layers — `y = W·x` with W in HF's [out_dim, in_dim] becomes a single
 /// matmul_nt call with no extra copy.
 ///
-/// Inner accumulation order matches TRiP/math.c matmulf_nt (sequential
-/// over k, scalar fp32 add) so the future C-vs-Zig parity test compares
-/// bit-close. Performance is deliberately not optimised; this is the
-/// correctness oracle, with the GPU kernel being where speed lives.
+/// Inner accumulation is sequential scalar fp32 add over k. Performance
+/// is deliberately not optimised; this is the correctness oracle, with
+/// the GPU kernel being where speed lives.
 pub fn matmul_nt(
     out: []f32,
     a: []const f32,
@@ -208,12 +205,11 @@ pub fn matmul_nt(
 /// so the same routine serves both Q (n_heads = num_attention_heads)
 /// and K (n_heads = num_key_value_heads under MQA/GQA).
 ///
-/// Convention choice notes: TRiP uses pairwise-interleaved RoPE and a
-/// custom half-split→pairwise permuting matmul (math.c
-/// matmulf_nt_interleaved) so its in-memory Q has pairwise layout.
-/// We don't do that — our Q is in the HF half-split layout direct from
-/// the standard matmul, so the half-split RoPE is the natural match.
-/// Final attention scores are identical between the two paths.
+/// Convention choice notes: some references use pairwise-interleaved
+/// RoPE with a custom half-split→pairwise permuting matmul. We don't —
+/// our Q comes out of the standard matmul in HF half-split layout, so
+/// half-split RoPE is the natural match. Final attention scores are
+/// identical between the two paths.
 ///
 /// At pos = 0 every angle is zero, so cos = 1, sin = 0, and the output
 /// equals the input. That's our sanity check in the smoke test.
@@ -300,8 +296,8 @@ pub fn softmax(x: []f32) void {
 /// GELU with the tanh approximation:
 ///     0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
 ///
-/// This is the variant Gemma 1 was trained with (TRiP NL_GELU_TANH;
-/// HuggingFace `gelu_pytorch_tanh`). Despite Gemma's `hidden_act:
+/// This is the variant Gemma 1 was trained with (HuggingFace
+/// `gelu_pytorch_tanh`). Despite Gemma's `hidden_act:
 /// "gelu"` config string, the modeling code routes to this approx —
 /// using the exact erf form here would silently shift every activation
 /// and drift logits.

@@ -36,7 +36,7 @@ The two big arcs:
    - **TQ4-on-weights** — TurboQuant applied to the matmul weight
      side, orthogonal to Q4_0/Q4_K. Combined with `--tq4v` gets
      Gemma 2B into a few hundred MiB total.
-   - **Training port**, the Unsloth-alternative ambition. TRiP carries
-     paired forward/backward in `reference/math.c` — every op has a
-     `_backward` immediately below it, a built-in correctness oracle
-     for every gradient.
+   - **Training port**, the Unsloth-alternative ambition. Each forward
+     primitive gets a paired `_backward` companion CPU-first as the
+     gradient oracle, then ported to Vulkan. The architecture is built
+     for it; what's left is the implementation pass.

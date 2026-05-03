@@ -4,21 +4,22 @@
 
 # valkyr
 
-**Cross-vendor LLM inference based on TRiP using Vulkan compute. Zig +
-TurboQuant — no CUDA lock-in.**
+**Cross-vendor LLM inference in pure Zig + Vulkan. One SPIR-V binary
+runs on every GPU — no CUDA lock-in.**
 
-Greedy and sampled text generation, multi-turn chat, four-tier parity
-verified against HuggingFace `transformers`, and (we believe) the first
-publicly-demonstrable [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
-inference on a non-CUDA backend.
+Greedy and sampled text generation across six model families,
+multi-turn chat, parity-verified against HuggingFace `transformers`,
+OpenAI-compatible HTTP server, embeddable inside any Vulkan host.
+Supported families: Gemma, Llama, Mistral, Qwen3 (dense), Qwen3.5 /
+Qwen3.6 (hybrid Gated DeltaNet), TinyLlama / Zephyr.
 
-valkyr started as a port of the math from [Carlo Valenti's TRiP](https://github.com/carlovalenti/TRiP)
-("Transformers in Progress" — see `reference/`) to Zig + Vulkan compute.
-TRiP is a few-files-in-C, single-author transformer engine built for
-clarity. valkyr keeps that pedagogical spirit but trades the
-OpenMP-on-CPU back end for a Vulkan compute back end that runs the same
-math on any GPU that supports Vulkan 1.3 (AMD / Intel / NVIDIA / Apple
-via MoltenVK / Android — one SPIR-V binary, every vendor).
+valkyr runs the same math on any GPU that supports Vulkan 1.3
+(AMD / Intel / NVIDIA / Apple via MoltenVK / Android Adreno / Mali) —
+one SPIR-V binary, every vendor, no per-backend kernel duplication.
+Includes
+[TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
+TQ4 KV-cache compression as `--tq4v`; we believe this is the first
+publicly-demonstrable TurboQuant inference on a non-CUDA backend.
 
 ## Why valkyr?
 
@@ -81,12 +82,10 @@ years), and intentionally *less* than llama.cpp. So why pick it up?
   references, not bolted onto an older core. The architectural
   diversity stays legible because nothing's grandfathered.
 
-- **Training is on the menu.** TRiP ships paired `*_backward`
-  functions for every primitive in `reference/math.c` — built-in
-  gradient oracles. The plan is an Unsloth-class training port on top
-  of the same Vulkan kernels, with bit-close parity vs. TRiP's CPU
-  reference. Not yet shipped (see roadmap), but the architecture
-  supports it.
+- **Training is on the menu.** The plan is an Unsloth-class training
+  port on top of the same Vulkan kernels — paired forward/backward
+  primitives, parity-checked against CPU references. Not yet shipped
+  (see roadmap), but the architecture is built for it.
 
 **Honest framing.** valkyr is younger and smaller than llama.cpp. On
 raw decode tok/s on a single CUDA card, llama.cpp's CUDA path is
@@ -175,12 +174,6 @@ path see **[docs/server.md](docs/server.md)**.
 
 This was a real team effort:
 
-- **Carlo Valenti** — for [TRiP](https://github.com/carlovalenti/TRiP) (Transformers in
-  Progress), the C reference whose math we ported and whose paired
-  forward/backward layout we kept in spirit. Carlo's pedagogical
-  clarity made the whole port tractable, and his enthusiasm carried
-  through every chunk.
-
 - **Christian Beaumont** — [chris@foundation42.org](mailto:chris@foundation42.org),
   founder of [Entrained.ai](https://entrained.ai) and
   [Foundation42](https://foundation42.org). Architect, partner, and
@@ -188,18 +181,24 @@ This was a real team effort:
   between, parity-verify before moving on" rhythm that produced this
   codebase is Christian's, and so is the call that "going fast is
   nice, but correctness is something we need to be very conscious of"
-  — which is what put a four-tier YATQ ↔ CPU ↔ GPU ↔ TQ parity
-  story in the way of any algorithm shipping.
+  — which is what put four-tier HF ↔ CPU ↔ GPU ↔ GPU+TQ parity in
+  the way of any algorithm shipping.
 
 - **[Anthropic Claude](https://claude.ai)** — implementation partner
   across the marathon sessions. Wrote most of the Zig and GLSL,
   authored the parity tests, and got to celebrate the wins alongside
-  Christian and Carlo.
+  Christian.
 
 And the wider community:
 
-- **Andrej Karpathy** for `llama2.c` and the lectures that gave both
-  TRiP and this port a starting point.
+- **Andrej Karpathy** for `llama2.c` and the lectures that gave us a
+  starting point for the transformer math.
+- **Carlo Valenti** for [TRiP](https://github.com/carlovalenti/TRiP)
+  (Transformers in Progress), an early CPU reference that helped seed
+  the project's pedagogical spirit. valkyr has long since grown into
+  its own architecture (Vulkan compute, six families, hybrid backends,
+  embed surface, OpenAI server), but the early enthusiasm Carlo
+  brought to the port was a real boost.
 - **Google** for Gemma; **HuggingFace** for the `transformers` and
   `tokenizers` libraries used as the parity oracle.
 - **Amir Zandieh** and the TurboQuant authors at Google Research for
@@ -213,7 +212,18 @@ And the wider community:
 
 ## License
 
-The Zig + GLSL code in this repo is yours to read and learn from.
-Carlo Valenti's TRiP (in `reference/`, gitignored) is CC-BY-NC 4.0;
-this project derives ideas and per-op accumulation order from it, so
-the same non-commercial restriction applies to derivatives.
+valkyr is **dual-licensed**:
+
+- **[Apache 2.0](LICENSE-APACHE)** — open-source default. Permissive,
+  patent grant included. The right pick for almost everyone.
+- **[Commercial](LICENSE-COMMERCIAL.md)** — for organizations that
+  want indemnification, SLA / support, no-attribution embedding,
+  or custom terms. Contact
+  [chris@foundation42.org](mailto:chris@foundation42.org).
+
+Both licenses cover the same code — no "open core" split. See
+[LICENSE](LICENSE) for the overview. The transformer math in this
+repo is prior art (Vaswani et al. 2017, Karpathy's `llama2.c`, the
+open `transformers` reference, published descriptions of RoPE /
+RMSNorm / GeGLU / SwiGLU / GQA / Gated DeltaNet / TurboQuant / RHT);
+the Zig + Vulkan implementation is original.

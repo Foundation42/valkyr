@@ -7640,7 +7640,7 @@ fn runSafeTensorsSmoke(allocator: std.mem.Allocator) !void {
     try blob.appendSlice(std.mem.sliceAsBytes(&w_b));
 
     // Write to a temp file, parse, verify, delete.
-    const tmp_path = "/tmp/tripvulkan_smoke.safetensors";
+    const tmp_path = "/tmp/valkyr_smoke.safetensors";
     {
         const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
         defer f.close();
