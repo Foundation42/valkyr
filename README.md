@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/valkyr-banner.png" alt="valkyr — cross-vendor LLM inference, Zig + Vulkan, unified compute" width="100%" />
+</p>
+
 # valkyr
 
 **Cross-vendor LLM inference based on TRiP using Vulkan compute. Zig +
