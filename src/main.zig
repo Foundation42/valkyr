@@ -244,6 +244,7 @@ pub fn main() !void {
         var probe_path: ?[]const u8 = null;
         var prompts_tsv: ?[]const u8 = null;
         var probe_prefix: ?[]const u8 = null;
+        var max_new: usize = 256;
         var i: usize = 3;
         while (i < args.len) {
             const a = args[i];
@@ -276,6 +277,9 @@ pub fn main() !void {
                 i += 2;
             } else if (std.mem.eql(u8, a, "--probe-prefix") and i + 1 < args.len) {
                 probe_prefix = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--max-new") and i + 1 < args.len) {
+                max_new = try std.fmt.parseInt(usize, args[i + 1], 10);
                 i += 2;
             } else {
                 user_msg = a;
@@ -333,9 +337,9 @@ pub fn main() !void {
         }
 
         if (cfg.family.isHybrid()) {
-            try runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix);
+            try runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new);
         } else {
-            try runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix);
+            try runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new);
         }
         return;
     }
@@ -4401,6 +4405,7 @@ fn runChat(
     probe_path: ?[]const u8,
     batch_prompts: ?[]const PromptEntry,
     probe_prefix: ?[]const u8,
+    max_new: usize,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -4643,6 +4648,7 @@ fn runChat(
                 gpa, &ctx, &rec, &sc, &gm, &kv, cfg, &k, &tok, entry.text, &pos, logits,
                 sample_scratch, sample_params, rng, tmpl, false, tq4_hooks,
                 &bus, probe_info, &token_index, hidden_scratch, attn_scratch,
+                max_new,
             );
         }
         return;
@@ -4661,6 +4667,7 @@ fn runChat(
             &probe_token_index,
             probe_hidden_scratch,
             probe_attn_scratch,
+            max_new,
         );
         return;
     }
@@ -4685,6 +4692,7 @@ fn runChat(
             &probe_token_index,
             probe_hidden_scratch,
             probe_attn_scratch,
+            max_new,
         );
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
@@ -4722,6 +4730,7 @@ fn chatTurn(
     probe_token_index: *u32,
     probe_hidden_scratch: ?[]f32,
     probe_attn_scratch: ?[]f32,
+    max_new: usize,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -4739,7 +4748,7 @@ fn chatTurn(
 
     const eos: ?u32 = cfg.eos_token_id;
     const eot: u32 = tmpl.end_of_turn;
-    const max_response: usize = 256;
+    const max_response: usize = max_new;
 
     // Run all prompt tokens through the model. We only need the logits
     // at the LAST prefill position (which gives us the first response
@@ -6607,6 +6616,7 @@ fn runChatQwen35(
     probe_path: ?[]const u8,
     batch_prompts: ?[]const PromptEntry,
     probe_prefix: ?[]const u8,
+    max_new: usize,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -6833,6 +6843,7 @@ fn runChatQwen35(
                 gpa, &ctx, &rec, &sc, &state, &gm, cfg, &ks, &tok, entry.text, &pos, logits,
                 sample_scratch, sample_params, rng, tmpl, false, max_pos, tq4_hooks,
                 &bus, probe_info, &token_index, hidden_scratch, attn_scratch,
+                max_new,
             );
         }
         return;
@@ -6849,6 +6860,7 @@ fn runChatQwen35(
             &probe_token_index,
             probe_hidden_scratch,
             probe_attn_scratch,
+            max_new,
         );
         return;
     }
@@ -6872,6 +6884,7 @@ fn runChatQwen35(
             &probe_token_index,
             probe_hidden_scratch,
             probe_attn_scratch,
+            max_new,
         );
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
@@ -6905,6 +6918,7 @@ fn chatTurnHybrid(
     probe_token_index: *u32,
     probe_hidden_scratch: ?[]f32,
     probe_attn_scratch: ?[]f32,
+    max_new: usize,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -6922,7 +6936,7 @@ fn chatTurnHybrid(
 
     const eos: ?u32 = cfg.eos_token_id;
     const eot: u32 = tmpl.end_of_turn;
-    const max_response: usize = 256;
+    const max_response: usize = max_new;
 
     var current: u32 = prompt.items[0];
     var prompt_idx: usize = 0;

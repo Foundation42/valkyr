@@ -9,6 +9,13 @@
 #   scripts/bench.sh --quick               # skip 27B (slow upload)
 #   scripts/bench.sh --models gemma,4b     # subset of models
 #   scripts/bench.sh --precisions q4k,bf16 # subset of precisions
+#   scripts/bench.sh --smoke               # one-model-per-family quick smoke
+#                                          # (gemma + llama32 + qwen3 dense +
+#                                          # qwen3.5 hybrid, q4k only,
+#                                          # --max-new 20). Use as a refactor
+#                                          # regression net.
+#   scripts/bench.sh --max-new N           # cap generation at N tokens
+#                                          # (default 256; smoke uses 20)
 #
 # Markdown summary table goes to stdout + bench/<ts>/SUMMARY.md.
 # Build is checked but not forced — run `zig build -Doptimize=ReleaseFast`
@@ -25,8 +32,10 @@ HF_HUB="${HF_HUB:-$HOME/.cache/huggingface/hub}"
 declare -A MODEL_ID=(
     [gemma]="google/gemma-2b-it"
     [tinyllama]="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    [llama32-1b]="meta-llama/Llama-3.2-1B-Instruct"
     [llama32]="meta-llama/Llama-3.2-3B-Instruct"
     [mistral7b]="mistralai/Mistral-7B-Instruct-v0.3"
+    [qwen3-4b]="Qwen/Qwen3-4B-Instruct-2507"
     [0.8b]="Qwen/Qwen3.5-0.8B"
     [4b]="Qwen/Qwen3.5-4B"
     [27b]="Qwen/Qwen3.6-27B"
@@ -34,20 +43,37 @@ declare -A MODEL_ID=(
 DEFAULT_MODELS="gemma tinyllama llama32 mistral7b 0.8b 4b 27b"
 DEFAULT_PRECISIONS="bf16 q4 q4k"
 
+# Smoke covers one model per family (Gemma / Llama / Qwen3 dense /
+# Qwen3.5 hybrid) so a refactor regression in any one path surfaces
+# fast. q4k matches the production embed path (matryoshka ai_demo).
+SMOKE_MODELS="gemma llama32-1b qwen3-4b 0.8b"
+SMOKE_PRECISIONS="q4k"
+
 # ── Args ────────────────────────────────────────────────────────────
 MODELS="$DEFAULT_MODELS"
 PRECISIONS="$DEFAULT_PRECISIONS"
 QUICK=0
+SMOKE=0
+MAX_NEW=256
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --quick)        QUICK=1; shift ;;
+        --smoke)        SMOKE=1; shift ;;
+        --max-new)      MAX_NEW="$2"; shift 2 ;;
         --models)       MODELS="${2//,/ }"; shift 2 ;;
         --precisions)   PRECISIONS="${2//,/ }"; shift 2 ;;
         -h|--help)
-            sed -n '4,16p' "$0"; exit 0 ;;
+            sed -n '4,22p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ $SMOKE -eq 1 ]]; then
+    # Override unless the caller explicitly passed --models / --precisions.
+    [[ "$MODELS" == "$DEFAULT_MODELS" ]] && MODELS="$SMOKE_MODELS"
+    [[ "$PRECISIONS" == "$DEFAULT_PRECISIONS" ]] && PRECISIONS="$SMOKE_PRECISIONS"
+    [[ "$MAX_NEW" == "256" ]] && MAX_NEW=20
+fi
 
 if [[ $QUICK -eq 1 ]]; then
     MODELS="${MODELS//27b/}"
@@ -73,9 +99,13 @@ SEED=42
 
 SUMMARY=$OUT/SUMMARY.md
 {
-    echo "# valkyr cross-model bench — $TS"
+    if [[ $SMOKE -eq 1 ]]; then
+        echo "# valkyr smoke — $TS"
+    else
+        echo "# valkyr cross-model bench — $TS"
+    fi
     echo
-    echo "Prompt: \`$PROMPT\`  •  Seed: $SEED"
+    echo "Prompt: \`$PROMPT\`  •  Seed: $SEED  •  max-new: $MAX_NEW"
     echo
     echo "| Model | Precision | Upload (s) | tok/s | Response (first 200 chars) |"
     echo "|---|---|---:|---:|---|"
@@ -109,7 +139,7 @@ run_pair() {
     local t_start=$(date +%s)
     # 600s timeout: 27B q4_k upload runs ~5 min on 8-core CPU. Surfaces
     # as TIMEOUT in the summary if exceeded.
-    if ! timeout 600 "$BIN" --chat "$model_id" $prec_flag --seed $SEED "$PROMPT" > "$log" 2>&1; then
+    if ! timeout 600 "$BIN" --chat "$model_id" $prec_flag --seed $SEED --max-new $MAX_NEW "$PROMPT" > "$log" 2>&1; then
         local rc=$?
         if [[ $rc -eq 124 ]]; then
             echo "| $model_key | $prec | TIMEOUT | — | (>600s) |" >> "$SUMMARY"
