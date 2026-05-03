@@ -46,6 +46,13 @@ pub const gpu_model = @import("gpu/model.zig");
 pub const hf_cache = @import("hf_cache.zig");
 pub const loader = @import("loader.zig");
 
+/// Per-family chat-template machinery. Resolves family-specific
+/// special-token markers and composes either a single user turn
+/// (legacy CLI path) or a full `[{role, content}]` history
+/// (server / embed `Session.appendMessages`). Lifted out of main.zig
+/// so embed callers and the future `--serve` mode share one composer.
+pub const chat_template = @import("chat_template.zig");
+
 // ── Runtime primitives (chunk 7b) ───────────────────────────────
 // Per-step forward recording + sampling. Hosts that want a default
 // state machine wait for the Session API in chunk 7c, which is built

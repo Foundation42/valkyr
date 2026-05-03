@@ -27,6 +27,7 @@ const runtime = @import("runtime.zig");
 const runtime_hybrid = @import("runtime_hybrid.zig");
 const loader = @import("loader.zig");
 const session_mod = @import("session.zig");
+const chat_template_mod = @import("chat_template.zig");
 const hf_cache = @import("hf_cache.zig");
 const probe = @import("probe.zig");
 const shaders = @import("shaders");
@@ -276,6 +277,36 @@ pub fn main() !void {
             .{ .layers = budget_layers orelse 8 };
         const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
         try runSessionSmoke(allocator, args[2], prompt, smoke_max_new, budget, precision);
+        return;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--session-messages")) {
+        // Multi-turn smoke for `Session.appendMessages`. Hardcoded
+        // 3-turn fixture exercises the family's chat template through
+        // the Session surface (matches how `valkyr --serve` will work).
+        // Format: --session-messages <model> [--max-new N] [--q4|--q4k]
+        var smoke_max_new: u32 = 32;
+        var q4: bool = false;
+        var q4k: bool = false;
+        var i: usize = 3;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--max-new") and i + 1 < args.len) {
+                smoke_max_new = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--q4")) {
+                q4 = true; i += 1;
+            } else if (std.mem.eql(u8, a, "--q4k")) {
+                q4k = true; i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (q4 and q4k) {
+            std.debug.print("--q4 and --q4k are mutually exclusive\n", .{});
+            return;
+        }
+        const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
+        try runSessionMessages(allocator, args[2], smoke_max_new, precision);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
@@ -4096,6 +4127,75 @@ fn runSessionSmoke(
     }
 }
 
+// ── session-messages: multi-turn exercise of Session.appendMessages ──
+
+fn runSessionMessages(
+    gpa: std.mem.Allocator,
+    model_arg: []const u8,
+    max_new: u32,
+    precision: gpu_model.Precision,
+) !void {
+    const stdout = std.io.getStdOut().writer();
+    var ctx = try vk.Context.init(gpa);
+    defer ctx.deinit();
+
+    try stdout.print("device: {s}\n", .{ctx.deviceName()});
+    try stdout.print("loading model {s}...\n", .{model_arg});
+
+    const t0 = std.time.nanoTimestamp();
+    var loaded = try loader.loadGpuModel(gpa, &ctx, model_arg, .{ .precision = precision });
+    defer loaded.deinit(ctx.device);
+    const t1 = std.time.nanoTimestamp();
+    const cfg = loaded.config();
+    try stdout.print(
+        "loaded in {d:.1} s — family={s} layers={d} hybrid={}\n",
+        .{ @as(f64, @floatFromInt(t1 - t0)) / 1e9, @tagName(cfg.family), cfg.num_hidden_layers, cfg.family.isHybrid() },
+    );
+
+    // Hardcoded multi-turn fixture matching what an OpenAI client
+    // would post to `/v1/chat/completions`. Generation continues
+    // from the trailing open assistant header.
+    const messages = [_]session_mod.Message{
+        .{ .role = .user, .content = "Hi" },
+        .{ .role = .assistant, .content = "Hello! How can I help?" },
+        .{ .role = .user, .content = "Tell me a short joke." },
+    };
+
+    var on_token_ctx = SessionSmokeOnTokenCtx{ .stdout = stdout, .family = cfg.family };
+
+    // Stop on the family's end_of_turn token so a coherent reply ends
+    // cleanly instead of running into max_new_tokens.
+    var stop_tokens_buf: [1]u32 = undefined;
+    var sess = try session_mod.Session.init(gpa, &ctx, &loaded.gpu_model, &loaded.tokenizer, .{
+        .budget = .{ .layers = 8 },
+        .max_new_tokens = max_new,
+        .on_token = sessionSmokeOnToken,
+        .on_token_user = &on_token_ctx,
+        .max_pos = 2048,
+        .stop_tokens = &.{},
+    });
+    defer sess.deinit();
+    stop_tokens_buf[0] = sess.template.end_of_turn;
+    sess.cfg.stop_tokens = stop_tokens_buf[0..1];
+
+    try sess.appendMessages(&messages);
+
+    try stdout.print("\n--- composed prompt: {d} tokens ---\n", .{sess.prompt_q.items.len});
+    try stdout.print("response: ", .{});
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
+    defer rec.deinit();
+
+    var ticks: u32 = 0;
+    while (!sess.isDone() and ticks < 4096) : (ticks += 1) {
+        try rec.reset();
+        try rec.begin();
+        _ = try sess.tickFrame(&rec);
+        try rec.endAndSubmit();
+    }
+    try stdout.print("\n", .{});
+}
+
 // ── bench: cold / warm forward timing on Gemma 2B IT ───────────────
 
 fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void {
@@ -4207,343 +4307,6 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
     }
 }
 
-// ── chat templates ─────────────────────────────────────────────────
-//
-// Different model families serialize a chat turn into very different
-// token sequences. ChatTemplate is the small abstraction that hides
-// the difference from the chat loop.
-//
-//   Gemma (`<bos>` + `<start_of_turn>` markers):
-//     <bos><start_of_turn>user\n{msg}<end_of_turn>\n
-//          <start_of_turn>model\n
-//     stop on <end_of_turn>.
-//
-//   Qwen3 (ChatML, `<|im_start|>` / `<|im_end|>` markers):
-//     <|im_start|>user\n{msg}<|im_end|>\n
-//     <|im_start|>assistant\n
-//     stop on <|im_end|>.
-//
-//   Llama 3 (Meta's header-id format):
-//     <|begin_of_text|>
-//     <|start_header_id|>user<|end_header_id|>\n\n{msg}<|eot_id|>
-//     <|start_header_id|>assistant<|end_header_id|>\n\n
-//     stop on <|eot_id|>.
-//
-//   Zephyr (TinyLlama / Llama 2-arch chat fine-tunes that ship without
-//   Llama 3 header_id specials):
-//     <s><|user|>\n{msg}</s>\n<|assistant|>\n
-//     stop on </s>. Markers `<|user|>` / `<|assistant|>` are TEXT
-//     (BPE-encoded), not special tokens — only `<s>` / `</s>` are.
-//
-//   Mistral / Ministral ([INST] / [/INST] format, v0.3+):
-//     <s>[INST]{msg}[/INST]
-//     stop on </s>. `[INST]` and `[/INST]` are special tokens in
-//     Mistral 7B v0.3+ and Ministral; older v0.1/v0.2 used them as
-//     text markers — for those, downgrade to a future `mistral_text`
-//     branch if/when we hit one.
-//
-// Family.llama auto-detects between Llama 3, Mistral, and Zephyr by
-// checking which specials exist in the tokenizer — keeps the runtime
-// surface small without a separate Family enum entry.
-
-const ChatTemplate = struct {
-    family: config_mod.Family,
-    format: Format,
-    /// First-conversation-turn marker. Gemma / Llama 3 / Zephyr emit
-    /// one; Qwen3 doesn't.
-    bos: ?u32,
-    /// Per-turn opening marker (`<start_of_turn>` / `<|im_start|>` /
-    /// `<|start_header_id|>`). `null` in Zephyr where the role marker
-    /// is text (`<|user|>` / `<|assistant|>`), not a special token.
-    start_of_turn: ?u32,
-    /// Per-turn closing marker (`<end_of_turn>` / `<|im_end|>` /
-    /// `<|eot_id|>` / `</s>`). Also the stop token the sampler
-    /// watches for.
-    end_of_turn: u32,
-    /// Llama 3's `<|end_header_id|>` token. `null` for other formats.
-    end_header: ?u32,
-    /// Role prefix typed BY the model in its response prefix
-    /// (`"model"` for Gemma, `"assistant"` for Qwen3 / Llama 3,
-    /// `"<|assistant|>"` text marker for Zephyr).
-    assistant_role: []const u8,
-    /// User-turn role text (`"user"` for most; `"<|user|>"` for Zephyr).
-    user_role: []const u8,
-    /// Separator between the role-header section and content. `\n` for
-    /// Gemma / Qwen3, `\n\n` for Llama 3, `\n` for Zephyr.
-    header_sep: []const u8,
-    /// Separator between turns (after closing marker, before next
-    /// opening). `\n` for Gemma / Qwen3 / Zephyr; empty for Llama 3.
-    inter_turn_sep: []const u8,
-    /// Mistral's `[INST]` token (set only in `.mistral` format).
-    inst_open: ?u32 = null,
-    /// Mistral's `[/INST]` token (set only in `.mistral` format).
-    inst_close: ?u32 = null,
-
-    pub const Format = enum {
-        /// Gemma + Qwen3/3.5 share the `<sot>role\n{msg}<eot>\n` shape.
-        gemma_qwen,
-        /// Llama 3's `<sot>role<eoh>\n\n{msg}<eot>` shape.
-        llama3,
-        /// Text-marker template used by TinyLlama and Llama 2-arch chat
-        /// fine-tunes that don't ship Llama 3 specials. Roles are
-        /// encoded as text; only BOS / EOT are special tokens.
-        zephyr,
-        /// Mistral / Ministral v0.3+ format: `<s>[INST]{msg}[/INST]`
-        /// with [INST] and [/INST] as special tokens in the tokenizer.
-        mistral,
-    };
-
-    pub fn resolve(family: config_mod.Family, tok: *const tokenizer_mod.Tokenizer) !ChatTemplate {
-        return switch (family) {
-            .gemma => .{
-                .family = family,
-                .format = .gemma_qwen,
-                .bos = tok.specialTokenId("<bos>") orelse return error.NoBos,
-                .start_of_turn = tok.specialTokenId("<start_of_turn>") orelse return error.NoStartOfTurn,
-                .end_of_turn = tok.specialTokenId("<end_of_turn>") orelse return error.NoEndOfTurn,
-                .end_header = null,
-                .user_role = "user",
-                .assistant_role = "model",
-                .header_sep = "\n",
-                .inter_turn_sep = "\n",
-            },
-            .llama => llama: {
-                // Auto-detect among the three Llama-arch chat formats:
-                //   1. <|start_header_id|> exists → Llama 3 (Meta header-id)
-                //   2. [INST] exists → Mistral / Ministral v0.3+
-                //   3. else → Zephyr text-marker (TinyLlama-style)
-                if (tok.specialTokenId("<|start_header_id|>")) |sot| {
-                    break :llama .{
-                        .family = family,
-                        .format = .llama3,
-                        .bos = tok.specialTokenId("<|begin_of_text|>"),
-                        .start_of_turn = sot,
-                        .end_of_turn = tok.specialTokenId("<|eot_id|>") orelse return error.NoEndOfTurn,
-                        .end_header = tok.specialTokenId("<|end_header_id|>") orelse return error.NoEndHeader,
-                        .user_role = "user",
-                        .assistant_role = "assistant",
-                        .header_sep = "\n\n",
-                        .inter_turn_sep = "",
-                    };
-                }
-                if (tok.specialTokenId("[INST]")) |inst| {
-                    break :llama .{
-                        .family = family,
-                        .format = .mistral,
-                        .bos = tok.specialTokenId("<s>"),
-                        .start_of_turn = null,
-                        .end_of_turn = tok.specialTokenId("</s>") orelse return error.NoEndOfTurn,
-                        .end_header = null,
-                        .user_role = "user",            // unused
-                        .assistant_role = "assistant",  // unused
-                        .header_sep = "",                // unused
-                        .inter_turn_sep = "",            // unused
-                        .inst_open = inst,
-                        .inst_close = tok.specialTokenId("[/INST]") orelse return error.NoInstClose,
-                    };
-                }
-                break :llama .{
-                    .family = family,
-                    .format = .zephyr,
-                    .bos = tok.specialTokenId("<s>"),
-                    .start_of_turn = null,
-                    .end_of_turn = tok.specialTokenId("</s>") orelse return error.NoEndOfTurn,
-                    .end_header = null,
-                    .user_role = "<|user|>",
-                    .assistant_role = "<|assistant|>",
-                    .header_sep = "\n",
-                    .inter_turn_sep = "\n",
-                };
-            },
-            .qwen3, .qwen35 => .{
-                .family = family,
-                .format = .gemma_qwen,
-                // Qwen3 / Qwen3.5 chat doesn't prepend BOS; both use the
-                // ChatML `<|im_start|>` / `<|im_end|>` markers.
-                .bos = null,
-                .start_of_turn = tok.specialTokenId("<|im_start|>") orelse return error.NoStartOfTurn,
-                .end_of_turn = tok.specialTokenId("<|im_end|>") orelse return error.NoEndOfTurn,
-                .end_header = null,
-                .user_role = "user",
-                .assistant_role = "assistant",
-                .header_sep = "\n",
-                .inter_turn_sep = "\n",
-            },
-        };
-    }
-
-    pub fn banner(self: ChatTemplate) []const u8 {
-        return switch (self.family) {
-            .gemma => "Gemma chat",
-            .llama => switch (self.format) {
-                .llama3 => "Llama 3 chat",
-                .zephyr => "Llama (Zephyr-style) chat",
-                .mistral => "Mistral / Ministral chat",
-                else => "Llama chat",
-            },
-            .qwen3 => "Qwen3 chat",
-            .qwen35 => "Qwen3.5 chat",
-        };
-    }
-
-    /// Compose a turn's prompt token sequence into `out`. `is_first`
-    /// controls BOS emission (Gemma / Llama 3 / Zephyr emit one;
-    /// Qwen3 doesn't).
-    pub fn composePrompt(
-        self: ChatTemplate,
-        gpa: std.mem.Allocator,
-        tok: *const tokenizer_mod.Tokenizer,
-        user_msg: []const u8,
-        is_first: bool,
-        out: *std.ArrayList(u32),
-    ) !void {
-        if (is_first) {
-            if (self.bos) |b| try out.append(b);
-        } else if (self.format == .mistral) {
-            // Mistral multi-turn: canonical format is
-            //   <s>[INST]msg1[/INST]reply1</s>[INST]msg2[/INST]
-            // The chat loop breaks on </s> without writing it to the
-            // KV cache, so we re-emit it here at the start of each
-            // non-first turn to close the previous reply.
-            try out.append(self.end_of_turn);
-        }
-
-        switch (self.format) {
-            .gemma_qwen, .llama3 => try self.composeWithSpecials(gpa, tok, user_msg, out),
-            .zephyr => try self.composeZephyr(gpa, tok, user_msg, out),
-            .mistral => try self.composeMistral(gpa, tok, user_msg, out),
-        }
-    }
-
-    /// Special-token-driven composer: shared between Gemma/Qwen and
-    /// Llama 3. Differences (header_sep, inter_turn_sep, end_header)
-    /// are absorbed by the field set.
-    fn composeWithSpecials(
-        self: ChatTemplate,
-        gpa: std.mem.Allocator,
-        tok: *const tokenizer_mod.Tokenizer,
-        user_msg: []const u8,
-        out: *std.ArrayList(u32),
-    ) !void {
-        const sot = self.start_of_turn.?;
-
-        // User turn header
-        try out.append(sot);
-        try self.appendRoleSection(gpa, tok, self.user_role, out);
-
-        // User message body
-        {
-            const ids = try tok.encode(gpa, user_msg);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-        }
-        try out.append(self.end_of_turn);
-
-        // Inter-turn separator
-        if (self.inter_turn_sep.len > 0) {
-            const ids = try tok.encode(gpa, self.inter_turn_sep);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-        }
-
-        // Assistant turn header (no body — generation continues here)
-        try out.append(sot);
-        try self.appendRoleSection(gpa, tok, self.assistant_role, out);
-    }
-
-    /// Emit the role-name section in the special-token formats.
-    fn appendRoleSection(
-        self: ChatTemplate,
-        gpa: std.mem.Allocator,
-        tok: *const tokenizer_mod.Tokenizer,
-        role: []const u8,
-        out: *std.ArrayList(u32),
-    ) !void {
-        if (self.end_header) |eoh| {
-            // Llama 3: role is text, then <|end_header_id|>, then `\n\n`.
-            const ids = try tok.encode(gpa, role);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-            try out.append(eoh);
-            const sep_ids = try tok.encode(gpa, self.header_sep);
-            defer gpa.free(sep_ids);
-            try out.appendSlice(sep_ids);
-        } else {
-            // Gemma / Qwen3: role + `\n` encoded together so BPE merges
-            // at the boundary match the reference exactly.
-            const buf = try std.fmt.allocPrint(gpa, "{s}{s}", .{ role, self.header_sep });
-            defer gpa.free(buf);
-            const ids = try tok.encode(gpa, buf);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-        }
-    }
-
-    /// Zephyr / TinyLlama composer:
-    ///   <s>?<|user|>\n{msg}</s>\n<|assistant|>\n
-    /// where `<|user|>` / `<|assistant|>` are TEXT (encoded by BPE,
-    /// not special tokens) and `</s>` is the EOT special.
-    fn composeZephyr(
-        self: ChatTemplate,
-        gpa: std.mem.Allocator,
-        tok: *const tokenizer_mod.Tokenizer,
-        user_msg: []const u8,
-        out: *std.ArrayList(u32),
-    ) !void {
-        // `<|user|>\n` as one encode so any BPE merges at the role/sep
-        // boundary land the same as the HF reference.
-        {
-            const buf = try std.fmt.allocPrint(gpa, "{s}{s}", .{ self.user_role, self.header_sep });
-            defer gpa.free(buf);
-            const ids = try tok.encode(gpa, buf);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-        }
-
-        // User message body, then `</s>` (special).
-        {
-            const ids = try tok.encode(gpa, user_msg);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-        }
-        try out.append(self.end_of_turn);
-
-        // `\n<|assistant|>\n` — inter-turn `\n` + assistant text marker
-        // + header_sep, again encoded as one string for clean BPE.
-        {
-            const buf = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{
-                self.inter_turn_sep, self.assistant_role, self.header_sep,
-            });
-            defer gpa.free(buf);
-            const ids = try tok.encode(gpa, buf);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-        }
-    }
-
-    /// Mistral / Ministral v0.3+ composer:
-    ///   <s>?[INST]{msg}[/INST]
-    /// `[INST]` and `[/INST]` are the special tokens detected at
-    /// resolve time. Generation continues from after `[/INST]` and
-    /// stops at `</s>`. (Older Mistral v0.1/v0.2 used these as text
-    /// markers; we'd need a separate `mistral_text` format for those —
-    /// add when we hit one.)
-    fn composeMistral(
-        self: ChatTemplate,
-        gpa: std.mem.Allocator,
-        tok: *const tokenizer_mod.Tokenizer,
-        user_msg: []const u8,
-        out: *std.ArrayList(u32),
-    ) !void {
-        try out.append(self.inst_open.?);
-        {
-            const ids = try tok.encode(gpa, user_msg);
-            defer gpa.free(ids);
-            try out.appendSlice(ids);
-        }
-        try out.append(self.inst_close.?);
-    }
-};
 
 // ── chat: prompt prefill + generation, single-turn or REPL ─────────
 
@@ -4649,7 +4412,7 @@ fn runChat(
     // uses `<bos>` + `<start_of_turn>` + `<end_of_turn>`; Qwen3 (ChatML)
     // uses `<|endoftext|>` as BOS-equivalent and `<|im_start|>` /
     // `<|im_end|>` as turn markers.
-    const tmpl = try ChatTemplate.resolve(cfg.family, &tok);
+    const tmpl = try chat_template_mod.ChatTemplate.resolve(cfg.family, &tok);
 
     const logits = try gpa.alloc(f32, cfg.vocab_size);
     defer gpa.free(logits);
@@ -4857,7 +4620,7 @@ fn runChat(
 /// One round-trip through the model: prefill the prompt for `user_msg`
 /// then sample until the family-specific end-of-turn marker (or
 /// max_response). `pos` is updated in place so the next turn picks up
-/// where this one stopped. The `ChatTemplate` arg encapsulates which
+/// where this one stopped. The `chat_template_mod.ChatTemplate` arg encapsulates which
 /// special tokens to emit and where.
 fn chatTurn(
     gpa: std.mem.Allocator,
@@ -4875,7 +4638,7 @@ fn chatTurn(
     sample_scratch: []f32,
     sample_params: cpu_forward.SampleParams,
     rng: std.Random,
-    tmpl: ChatTemplate,
+    tmpl: chat_template_mod.ChatTemplate,
     is_repl: bool,
     tq4_v: ?Tq4VHooks,
     probe_bus: ?*probe.Bus,
@@ -6317,7 +6080,7 @@ fn runChatQwen35(
     var rec = try gpu_recorder.Recorder.init(&ctx, sets_per_step, sets_per_step * 4);
     defer rec.deinit();
 
-    const tmpl = try ChatTemplate.resolve(cfg.family, &tok);
+    const tmpl = try chat_template_mod.ChatTemplate.resolve(cfg.family, &tok);
 
     const logits = try gpa.alloc(f32, cfg.vocab_size);
     defer gpa.free(logits);
@@ -6526,7 +6289,7 @@ fn chatTurnHybrid(
     sample_scratch: []f32,
     sample_params: cpu_forward.SampleParams,
     rng: std.Random,
-    tmpl: ChatTemplate,
+    tmpl: chat_template_mod.ChatTemplate,
     is_repl: bool,
     max_pos: u32,
     tq4_v: ?HybridTq4VHooks,

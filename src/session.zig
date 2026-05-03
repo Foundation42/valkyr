@@ -82,6 +82,13 @@ const config_mod = @import("config.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const runtime = @import("runtime.zig");
 const runtime_hybrid = @import("runtime_hybrid.zig");
+const chat_template_mod = @import("chat_template.zig");
+
+/// Re-export so embed callers can write `session.Message` /
+/// `session.Role` instead of pulling chat_template directly.
+pub const Message = chat_template_mod.Message;
+pub const Role = chat_template_mod.Role;
+pub const ChatTemplate = chat_template_mod.ChatTemplate;
 
 pub const Phase = enum { idle, prompt, decode, done };
 
@@ -286,6 +293,14 @@ pub const Session = struct {
     prompt_q: std.ArrayList(u32),
     generated: std.ArrayList(u32),
 
+    /// Per-family chat template, resolved eagerly at init. Lets
+    /// `appendMessages` compose conversation history into the prompt
+    /// queue without each caller resolving the template themselves.
+    /// Hosts that bypass the chat layer (`appendPrompt(raw_text)`)
+    /// can ignore this field. Hosts that want to register
+    /// `template.end_of_turn` as a stop token can read it directly.
+    template: ChatTemplate,
+
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *const vk.Context,
@@ -344,6 +359,13 @@ pub const Session = struct {
         var logits_mirror = try createHostMirrorBuffer(ctx, mirror_bytes);
         errdefer logits_mirror.deinit(ctx.device);
 
+        // Eager resolve. Costs ~µs (a few hash lookups in the
+        // tokenizer special table). Embed callers that only use
+        // `appendPrompt(raw_text)` still pay this once at init —
+        // negligible. If we ever support a model whose tokenizer
+        // doesn't expose chat specials, this becomes lazy.
+        const template = try ChatTemplate.resolve(cfg_model.family, tokenizer);
+
         return .{
             .allocator = allocator,
             .ctx = ctx,
@@ -362,6 +384,7 @@ pub const Session = struct {
             .bos_consumed = false,
             .prompt_q = std.ArrayList(u32).init(allocator),
             .generated = std.ArrayList(u32).init(allocator),
+            .template = template,
         };
     }
 
@@ -397,6 +420,29 @@ pub const Session = struct {
         const encoded = try self.tokenizer.encode(self.allocator, text);
         defer self.allocator.free(encoded);
         try self.prompt_q.appendSlice(encoded);
+        if (self.phase == .idle) self.phase = .prompt;
+    }
+
+    /// Compose `messages` through the family's chat template and
+    /// queue the resulting tokens for prefill. The template owns
+    /// BOS emission, role headers, and the trailing open assistant
+    /// header — `appendPrompt`'s auto-BOS path is bypassed.
+    ///
+    /// Drives both embed callers (matryoshka NPCs that want
+    /// chat-mode reasoning, e.g. Qwen3.5's `<think>` preamble) and
+    /// the future `valkyr --serve` from one composer.
+    ///
+    /// Hosts that want chat-style stopping should pass
+    /// `template.end_of_turn` (or whatever stop token they prefer)
+    /// in `cfg.stop_tokens` — appendMessages does not auto-register.
+    pub fn appendMessages(self: *Session, messages: []const Message) !void {
+        var buf = std.ArrayList(u32).init(self.allocator);
+        defer buf.deinit();
+        try self.template.composeConversation(self.allocator, self.tokenizer, messages, &buf);
+        try self.prompt_q.appendSlice(buf.items);
+        // Template handled BOS; lock it so a follow-up appendPrompt
+        // doesn't double-emit.
+        self.bos_consumed = true;
         if (self.phase == .idle) self.phase = .prompt;
     }
 
