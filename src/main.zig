@@ -23,6 +23,7 @@ const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
 const gpu_scratch = @import("gpu/scratch.zig");
 const gpu_recorder = @import("gpu/recorder.zig");
+const runtime = @import("runtime.zig");
 const hf_cache = @import("hf_cache.zig");
 const probe = @import("probe.zig");
 const shaders = @import("shaders");
@@ -817,7 +818,7 @@ fn runSoftmaxSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu matmul_nt smoke: synthetic A·Bᵀ on the GPU vs CPU expected ──
 
-const MatmulPush = extern struct { m: u32, n: u32, k: u32 };
+const MatmulPush = runtime.MatmulPush;
 
 fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1316,11 +1317,7 @@ fn runGpuMatmulQ4_KSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu rmsnorm smoke: synthetic vs CPU rmsnorm ────────────────────
 
-const RmsnormPush = extern struct {
-    dim: u32,
-    eps: f32,
-    gemma_quirk: u32,
-};
+const RmsnormPush = runtime.RmsnormPush;
 
 fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1392,7 +1389,7 @@ fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu geglu smoke: synthetic vs CPU geglu ─────────────────────────
 
-const GegluPush = extern struct { n: u32 };
+const GegluPush = runtime.GegluPush;
 
 fn runGpuGegluSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1456,20 +1453,8 @@ fn runGpuGegluSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu rope smoke: pos=0 identity + pos=1 vs CPU ───────────────────
 
-const RopePush = extern struct {
-    n_heads: u32,
-    head_dim: u32,
-    pos: u32,
-    theta_base: f32,
-};
-
-const RopePartialPush = extern struct {
-    n_heads: u32,
-    head_dim: u32,
-    rotary_dim: u32,
-    pos: u32,
-    theta_base: f32,
-};
+const RopePush = runtime.RopePush;
+const RopePartialPush = runtime.RopePartialPush;
 
 fn runGpuRopeSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -2158,7 +2143,7 @@ fn runGpuGatedDeltaStepSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu softmax smoke: synthetic vs CPU softmax ─────────────────────
 
-const SoftmaxPush = extern struct { dim: u32, stride: u32 };
+const SoftmaxPush = runtime.SoftmaxPush;
 
 fn runGpuSoftmaxSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -2574,7 +2559,7 @@ fn runGpuTq4RoundTripSmoke(allocator: std.mem.Allocator) !void {
 // once. Each reconstructed block must match the corresponding
 // CPU pack→dequant output.
 
-const Tq4PackPush = extern struct { dst_block_idx: u32 };
+const Tq4PackPush = runtime.Tq4PackPush;
 
 fn runGpuTq4PackToCacheSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -3983,31 +3968,8 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
-    defer ks.embed.deinit();
-    defer ks.rmsnorm.deinit();
-    defer ks.matmul.deinit();
-    defer ks.matmul_lm_head.deinit();
-    defer ks.rope.deinit();
-    defer ks.kv_write.deinit();
-    defer ks.scores.deinit();
-    defer ks.softmax.deinit();
-    defer ks.attn_out.deinit();
-    defer ks.add.deinit();
-    defer ks.geglu.deinit();
-    const k = ChatKernels{
-        .embed = &ks.embed,
-        .rmsnorm = &ks.rmsnorm,
-        .matmul = &ks.matmul,
-        .matmul_lm_head = &ks.matmul_lm_head,
-        .rope = &ks.rope,
-        .kv_write = &ks.kv_write,
-        .scores = &ks.scores,
-        .softmax = &ks.softmax,
-        .attn_out = &ks.attn_out,
-        .add = &ks.add,
-        .geglu = &ks.geglu,
-    };
+    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    defer k.deinit();
 
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
     defer rec.deinit();
@@ -4032,7 +3994,7 @@ fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void 
     for (0..n_steps) |step| {
         if (step > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, step, current, null, true);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, step, current, null, true);
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
         const t1 = std.time.nanoTimestamp();
@@ -4486,31 +4448,8 @@ fn runChat(
         null;
     defer if (kv_tq4) |*c| c.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
-    defer ks.embed.deinit();
-    defer ks.rmsnorm.deinit();
-    defer ks.matmul.deinit();
-    defer ks.matmul_lm_head.deinit();
-    defer ks.rope.deinit();
-    defer ks.kv_write.deinit();
-    defer ks.scores.deinit();
-    defer ks.softmax.deinit();
-    defer ks.attn_out.deinit();
-    defer ks.add.deinit();
-    defer ks.geglu.deinit();
-    const k = ChatKernels{
-        .embed = &ks.embed,
-        .rmsnorm = &ks.rmsnorm,
-        .matmul = &ks.matmul,
-        .matmul_lm_head = &ks.matmul_lm_head,
-        .rope = &ks.rope,
-        .kv_write = &ks.kv_write,
-        .scores = &ks.scores,
-        .softmax = &ks.softmax,
-        .attn_out = &ks.attn_out,
-        .add = &ks.add,
-        .geglu = &ks.geglu,
-    };
+    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    defer k.deinit();
 
     // TQ4 pack/unpack kernels — picked by head_dim, only built in
     // tq4v mode, kept allocated for the lifetime of the chat session.
@@ -4618,7 +4557,7 @@ fn runChat(
         try stdout.print("probe: computing null prior (BOS={d})...\n", .{bos});
         try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, bos, tq4_hooks, true);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, bos, tq4_hooks, true);
         try rec.endAndSubmit();
         try sc.logits.readBack(&ctx, f32, logits);
         // KV slot at pos 0 is now dirty with the BOS forward. The chat
@@ -4664,7 +4603,7 @@ fn runChat(
         defer gpa.free(null_prior_buf);
         try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, bos, tq4_hooks, true);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, bos, tq4_hooks, true);
         try rec.endAndSubmit();
         try sc.logits.readBack(&ctx, f32, null_prior_buf);
 
@@ -4701,7 +4640,7 @@ fn runChat(
             var token_index: u32 = 0;
 
             try chatTurn(
-                gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, entry.text, &pos, logits,
+                gpa, &ctx, &rec, &sc, &gm, &kv, cfg, &k, &tok, entry.text, &pos, logits,
                 sample_scratch, sample_params, rng, tmpl, false, tq4_hooks,
                 &bus, probe_info, &token_index, hidden_scratch, attn_scratch,
             );
@@ -4715,7 +4654,7 @@ fn runChat(
 
     if (single_msg) |m| {
         try chatTurn(
-            gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, m, &pos, logits,
+            gpa, &ctx, &rec, &sc, &gm, &kv, cfg, &k, &tok, m, &pos, logits,
             sample_scratch, sample_params, rng, tmpl, false, tq4_hooks,
             if (probe_bus) |*b| b else null,
             probe_info,
@@ -4739,7 +4678,7 @@ fn runChat(
         };
         if (line.len == 0) continue;
         try chatTurn(
-            gpa, &ctx, &rec, &sc, &gm, &kv, cfg, k, &tok, line, &pos, logits,
+            gpa, &ctx, &rec, &sc, &gm, &kv, cfg, &k, &tok, line, &pos, logits,
             sample_scratch, sample_params, rng, tmpl, true, tq4_hooks,
             if (probe_bus) |*b| b else null,
             probe_info,
@@ -4767,7 +4706,7 @@ fn chatTurn(
     gm: *const gpu_model.GpuModel,
     kv: *const gpu_scratch.GpuKvCache,
     cfg: config_mod.Config,
-    k: ChatKernels,
+    k: *const ChatKernels,
     tok: *const tokenizer_mod.Tokenizer,
     user_msg: []const u8,
     pos: *usize,
@@ -5054,244 +4993,13 @@ fn runEncode(gpa: std.mem.Allocator, dir_path: []const u8, text: []const u8) !vo
 
 // ── Forward-step helper used by both gen-many and chat ─────────────
 
-const ChatKernels = struct {
-    embed: *const pipeline.Kernel,
-    rmsnorm: *const pipeline.Kernel,
-    /// Matmul kernel used for the seven big projections per layer.
-    /// Picks the bf16 variant when the model was uploaded with
-    /// `precision = .bf16_matmul`.
-    matmul: *const pipeline.Kernel,
-    /// Matmul kernel for the LM head — always fp32 because lm_head
-    /// stays fp32 even when layer matmul weights are bf16.
-    matmul_lm_head: *const pipeline.Kernel,
-    rope: *const pipeline.Kernel,
-    kv_write: *const pipeline.Kernel,
-    scores: *const pipeline.Kernel,
-    softmax: *const pipeline.Kernel,
-    attn_out: *const pipeline.Kernel,
-    add: *const pipeline.Kernel,
-    geglu: *const pipeline.Kernel,
-};
+const ChatKernels = runtime.ChatKernels;
+const Tq4VHooks = runtime.Tq4VHooks;
+const ForwardPushes = runtime.ForwardPushes;
 
-/// Record a full forward pass for token `token_id` at position `pos`.
-/// The recorder must already be in the begin() state. After this call
-/// the recorder still needs an endAndSubmit() — the caller controls
-/// when to actually submit (handy for batching multiple steps later).
-///
-/// On exit the device-side `sc.logits` buffer holds the next-token
-/// distribution for position `pos + 1`.
-/// Optional TQ4 V-cache hooks. When all three fields are non-null
-/// `recordForwardStep` writes V into a packed TQ4 cache and dequants
-/// the whole V history into a scratch buffer just before attention,
-/// instead of using the fp32 V cache passed via `kv`. The K cache
-/// in `kv` is still used for the K-side. K=fp / V=TQ4 (asymmetric).
-const Tq4VHooks = struct {
-    pack: *const pipeline.Kernel,
-    unpack: *const pipeline.Kernel,
-    cache: *const gpu_scratch.GpuKvCacheTq4,
-};
-
-/// Per-step push constants reused across every layer's dispatches.
-/// Computed once from cfg + pos by `computeForwardPushes`.
-const ForwardPushes = struct {
-    rms_push: RmsnormPush,
-    qkn_push: RmsnormPush,
-    add_push: AddInPlacePush,
-    rope_q_push: RopePush,
-    rope_k_push: RopePush,
-    kv_write_push: KvWritePush,
-    scores_push: AttnScoresPush,
-    softmax_push: SoftmaxPush,
-    attn_out_push: AttnOutputPush,
-    geglu_push: GegluPush,
-    n_pos: u32,
-};
-
-fn computeForwardPushes(cfg: config_mod.Config, sc: *const gpu_scratch.GpuScratch, pos: usize) ForwardPushes {
-    const hidden: u32 = @intCast(cfg.hidden_size);
-    const inter: u32 = @intCast(cfg.intermediate_size);
-    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
-    const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
-    const heads_per_kv: u32 = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads);
-    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-    const max_pos_u32: u32 = @intCast(sc.max_pos);
-    const n_pos: u32 = @intCast(pos + 1);
-
-    return .{
-        .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
-        // Qwen3 per-head q_norm/k_norm push: same shader as the regular
-        // rmsnorm but reduces over `head_dim` per row instead of `hidden`,
-        // and never applies the (1+w) Gemma quirk.
-        .qkn_push = .{ .dim = @intCast(cfg.head_dim), .eps = cfg.rms_norm_eps, .gemma_quirk = 0 },
-        .add_push = .{ .n = hidden },
-        .rope_q_push = .{
-            .n_heads = @intCast(cfg.num_attention_heads),
-            .head_dim = @intCast(cfg.head_dim),
-            .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
-        },
-        .rope_k_push = .{
-            .n_heads = @intCast(cfg.num_key_value_heads),
-            .head_dim = @intCast(cfg.head_dim),
-            .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
-        },
-        .kv_write_push = .{ .n = kv_dim, .dst_off = @intCast(pos * @as(usize, kv_dim)) },
-        .scores_push = .{
-            .n_heads = @intCast(cfg.num_attention_heads),
-            .heads_per_kv = heads_per_kv,
-            .head_dim = @intCast(cfg.head_dim),
-            .n_pos = n_pos,
-            .kv_stride = kv_dim,
-            .scores_stride = max_pos_u32,
-            .inv_sqrt_dim = inv_sqrt_dim,
-        },
-        .softmax_push = .{ .dim = n_pos, .stride = max_pos_u32 },
-        .attn_out_push = .{
-            .n_heads = @intCast(cfg.num_attention_heads),
-            .heads_per_kv = heads_per_kv,
-            .head_dim = @intCast(cfg.head_dim),
-            .n_pos = n_pos,
-            .kv_stride = kv_dim,
-            .scores_stride = max_pos_u32,
-        },
-        .geglu_push = .{ .n = inter },
-        .n_pos = n_pos,
-    };
-}
-
-/// Record the dispatches for a single transformer block (input_layernorm
-/// → Q/K/V → optional q_norm/k_norm → RoPE → KV write → attention →
-/// o_proj → residual → post_attention_layernorm → gated FFN → residual).
-/// Caller manages the recorder's begin/endAndSubmit cycle. Used both by
-/// the single-submit `recordForwardStep` and by the probed multi-submit
-/// path that interleaves readbacks between layers.
-fn recordOneLayer(
-    rec: *gpu_recorder.Recorder,
-    sc: *const gpu_scratch.GpuScratch,
-    gm: *const gpu_model.GpuModel,
-    kv: *const gpu_scratch.GpuKvCache,
-    cfg: config_mod.Config,
-    k: ChatKernels,
-    layer_idx: usize,
-    pos: usize,
-    p: *const ForwardPushes,
-    tq4_v: ?Tq4VHooks,
-) !void {
-    const hidden: u32 = @intCast(cfg.hidden_size);
-    const inter: u32 = @intCast(cfg.intermediate_size);
-    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
-    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
-
-    const layer = &gm.layers[layer_idx];
-
-    try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &p.rms_push, 1);
-
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
-
-    if (layer.q_norm) |*qn| {
-        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.q, qn, &sc.q }, &p.qkn_push, @intCast(cfg.num_attention_heads));
-    }
-    if (layer.k_norm) |*kn| {
-        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &p.qkn_push, @intCast(cfg.num_key_value_heads));
-    }
-
-    try recDispatchRope(rec, k.rope, &.{ &sc.q, &sc.q_rot }, &p.rope_q_push, cfg.num_attention_heads, cfg.head_dim);
-    try recDispatchRope(rec, k.rope, &.{ &sc.k, &sc.k_rot }, &p.rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
-
-    const kv_layer = &kv.layers[layer_idx];
-    try recDispatch1D(rec, k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &p.kv_write_push, kv_dim);
-
-    // V write: either the legacy kv_write (fp32 raw copy) or the
-    // TQ4 quantising pack-to-cache when Tq4VHooks is supplied.
-    if (tq4_v) |t| {
-        const tq_layer = &t.cache.layers[layer_idx];
-        const n_blocks: u32 = @intCast(t.cache.n_blocks_per_pos);
-        const pack_push = Tq4PackPush{ .dst_block_idx = @intCast(pos * t.cache.n_blocks_per_pos) };
-        try rec.dispatch(t.pack, &.{ &sc.v, &tq_layer.v_cache }, &pack_push, n_blocks, 1, 1);
-    } else {
-        try recDispatch1D(rec, k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &p.kv_write_push, kv_dim);
-    }
-
-    try rec.dispatch(
-        k.scores,
-        &.{ &sc.q_rot, &kv_layer.k_cache, &sc.scores },
-        &p.scores_push,
-        @as(u32, @intCast(cfg.num_attention_heads)) * p.n_pos,
-        1,
-        1,
-    );
-    try recDispatchPerRow(rec, k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, @intCast(cfg.num_attention_heads));
-
-    const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
-        const tq_layer = &t.cache.layers[layer_idx];
-        const total_blocks: u32 = p.n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
-        try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, total_blocks, 1, 1);
-        break :blk &t.cache.dequant_v;
-    } else &kv_layer.v_cache;
-
-    try rec.dispatch(
-        k.attn_out,
-        &.{ &sc.scores, v_for_attn, &sc.head_out },
-        &p.attn_out_push,
-        @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
-        1,
-        1,
-    );
-
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
-    try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
-
-    try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, 1);
-
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
-    try recDispatch1D(rec, k.geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.geglu_push, inter);
-    try recDispatchMatmul(rec, k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
-
-    try recDispatch1D(rec, k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, hidden);
-}
-
-fn recordForwardStep(
-    rec: *gpu_recorder.Recorder,
-    sc: *const gpu_scratch.GpuScratch,
-    gm: *const gpu_model.GpuModel,
-    kv: *const gpu_scratch.GpuKvCache,
-    cfg: config_mod.Config,
-    k: ChatKernels,
-    pos: usize,
-    token_id: u32,
-    tq4_v: ?Tq4VHooks,
-    compute_logits: bool,
-) !void {
-    const hidden: u32 = @intCast(cfg.hidden_size);
-    const vocab: u32 = @intCast(cfg.vocab_size);
-
-    const pushes = computeForwardPushes(cfg, sc, pos);
-
-    const embed_push = EmbedLookupPush{
-        .token_id = token_id,
-        .dim = hidden,
-        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
-    };
-
-    try recDispatch1D(rec, k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
-
-    for (0..cfg.num_hidden_layers) |layer_idx| {
-        try recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
-    }
-
-    // Final norm + LM head: skip when the caller doesn't need logits
-    // (chat prefill skips them on every prompt token except the last —
-    // we only need the logits to sample the first response token, and
-    // the LM head matmul is by far the largest in the model).
-    if (compute_logits) {
-        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
-        try recDispatchMatmul(rec, k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
-    }
-}
+const computeForwardPushes = runtime.computeForwardPushes;
+const recordOneLayer = runtime.recordOneLayer;
+const recordForwardStep = runtime.recordForwardStep;
 
 /// Probed forward: same model dispatches as `recordForwardStep` but
 /// split across multiple submits so the host can read back per-layer
@@ -5307,7 +5015,7 @@ fn forwardStepProbed(
     gm: *const gpu_model.GpuModel,
     kv: *const gpu_scratch.GpuKvCache,
     cfg: config_mod.Config,
-    k: ChatKernels,
+    k: *const ChatKernels,
     pos: usize,
     token_id: u32,
     tq4_v: ?Tq4VHooks,
@@ -5333,7 +5041,7 @@ fn forwardStepProbed(
     // ── Embed ───────────────────────────────────────────────────────
     try rec.reset();
     try rec.begin();
-    try recDispatch1D(rec, k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+    try recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
     try rec.endAndSubmit();
 
     // ── Per layer ──────────────────────────────────────────────────
@@ -5379,99 +5087,17 @@ fn forwardStepProbed(
     if (compute_logits) {
         try rec.reset();
         try rec.begin();
-        try recDispatchPerRow(rec, k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
-        try recDispatchMatmul(rec, k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
+        try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
         try rec.endAndSubmit();
     }
 }
 
-/// Build the kernel set for chat/gen-many. `matmul_for_layers` picks
-/// whether the per-layer projection matmuls run on fp32 or bf16
-/// weights — must agree with the precision the model was uploaded
-/// with. The LM head matmul is always fp32 since lm_head never goes
-/// bf16 in the current scheme.
-///
-/// The `geglu` kernel slot actually holds whichever gated-FFN
-/// activation the model family wants — geglu (Gemma) or swiglu
-/// (Llama / Qwen3). Both shaders share the same binding layout +
-/// push constant, so the dispatch site doesn't care which one it's
-/// running.
-fn buildChatKernels(ctx: *const vk.Context, precision: gpu_model.Precision, family: config_mod.Family) !struct {
-    embed: pipeline.Kernel,
-    rmsnorm: pipeline.Kernel,
-    matmul: pipeline.Kernel,
-    matmul_lm_head: pipeline.Kernel,
-    rope: pipeline.Kernel,
-    kv_write: pipeline.Kernel,
-    scores: pipeline.Kernel,
-    softmax: pipeline.Kernel,
-    attn_out: pipeline.Kernel,
-    add: pipeline.Kernel,
-    geglu: pipeline.Kernel,
-} {
-    const matmul_spv: []align(4) const u8 = switch (precision) {
-        .fp32_all => &shaders.matmul_nt_v2,
-        .bf16_matmul => &shaders.matmul_nt_v2_bf16,
-        .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
-        .q4_k_matmul => &shaders.matmul_nt_v2_q4_k,
-    };
-    // The LM head stays bf16 (or fp32 in the all-fp32 path) — never
-    // Q4_0/Q4_K, because logits are sampled from and quantizing them
-    // risks shifting argmax. The upload side mirrors this in
-    // `gpu/model.zig`.
-    const lm_head_spv: []align(4) const u8 = switch (precision) {
-        .fp32_all => &shaders.matmul_nt_v2,
-        .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.matmul_nt_v2_bf16,
-    };
-    // embed_tokens follows the same bf16-when-non-fp32 rule as lm_head.
-    const embed_spv: []align(4) const u8 = switch (precision) {
-        .fp32_all => &shaders.embed_lookup,
-        .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.embed_lookup_bf16,
-    };
-    const ffn_spv: []align(4) const u8 = switch (family.activation()) {
-        .gelu => &shaders.geglu,
-        .silu => &shaders.swiglu,
-    };
-    return .{
-        .embed = try pipeline.Kernel.init(ctx, embed_spv, 2, @sizeOf(EmbedLookupPush)),
-        .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
-        .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
-        .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
-        .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
-        .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
-        .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
-        .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
-        .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
-        .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
-        .geglu = try pipeline.Kernel.init(ctx, ffn_spv, 3, @sizeOf(GegluPush)),
-    };
-}
-
 // ── gpu-gen-many: multi-token generation with KV cache ─────────────
 
-const AttnScoresPush = extern struct {
-    n_heads: u32,
-    heads_per_kv: u32,
-    head_dim: u32,
-    n_pos: u32,
-    kv_stride: u32,
-    scores_stride: u32,
-    inv_sqrt_dim: f32,
-};
-
-const AttnOutputPush = extern struct {
-    n_heads: u32,
-    heads_per_kv: u32,
-    head_dim: u32,
-    n_pos: u32,
-    kv_stride: u32,
-    scores_stride: u32,
-};
-
-const KvWritePush = extern struct {
-    n: u32,
-    dst_off: u32,
-};
+const AttnScoresPush = runtime.AttnScoresPush;
+const AttnOutputPush = runtime.AttnOutputPush;
+const KvWritePush = runtime.KvWritePush;
 
 fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32, n_tokens: usize) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
@@ -5498,31 +5124,8 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
-    defer ks.embed.deinit();
-    defer ks.rmsnorm.deinit();
-    defer ks.matmul.deinit();
-    defer ks.matmul_lm_head.deinit();
-    defer ks.rope.deinit();
-    defer ks.kv_write.deinit();
-    defer ks.scores.deinit();
-    defer ks.softmax.deinit();
-    defer ks.attn_out.deinit();
-    defer ks.add.deinit();
-    defer ks.geglu.deinit();
-    const k = ChatKernels{
-        .embed = &ks.embed,
-        .rmsnorm = &ks.rmsnorm,
-        .matmul = &ks.matmul,
-        .matmul_lm_head = &ks.matmul_lm_head,
-        .rope = &ks.rope,
-        .kv_write = &ks.kv_write,
-        .scores = &ks.scores,
-        .softmax = &ks.softmax,
-        .attn_out = &ks.attn_out,
-        .add = &ks.add,
-        .geglu = &ks.geglu,
-    };
+    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    defer k.deinit();
 
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
     defer rec.deinit();
@@ -5542,7 +5145,7 @@ fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: u32,
     while (pos < n_tokens) : (pos += 1) {
         if (pos > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, pos, current_token, null, true);
+        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, pos, current_token, null, true);
 
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
@@ -5605,31 +5208,8 @@ fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
     var kv_tq4 = try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos);
     defer kv_tq4.deinit(ctx.device);
 
-    var ks = try buildChatKernels(&ctx, gm.precision, cfg.family);
-    defer ks.embed.deinit();
-    defer ks.rmsnorm.deinit();
-    defer ks.matmul.deinit();
-    defer ks.matmul_lm_head.deinit();
-    defer ks.rope.deinit();
-    defer ks.kv_write.deinit();
-    defer ks.scores.deinit();
-    defer ks.softmax.deinit();
-    defer ks.attn_out.deinit();
-    defer ks.add.deinit();
-    defer ks.geglu.deinit();
-    const k = ChatKernels{
-        .embed = &ks.embed,
-        .rmsnorm = &ks.rmsnorm,
-        .matmul = &ks.matmul,
-        .matmul_lm_head = &ks.matmul_lm_head,
-        .rope = &ks.rope,
-        .kv_write = &ks.kv_write,
-        .scores = &ks.scores,
-        .softmax = &ks.softmax,
-        .attn_out = &ks.attn_out,
-        .add = &ks.add,
-        .geglu = &ks.geglu,
-    };
+    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    defer k.deinit();
 
     var tq_pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(Tq4PackPush));
     defer tq_pack.deinit();
@@ -5647,14 +5227,14 @@ fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
 
     // Pass 1: fp32 V baseline.
     try rec.begin();
-    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, null, true);
+    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, token_id, null, true);
     try rec.endAndSubmit();
     try sc.logits.readBack(&ctx, f32, logits_a);
 
     // Pass 2: TQ4 V.
     try rec.reset();
     try rec.begin();
-    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, k, 0, token_id, tq4_hooks, true);
+    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, token_id, tq4_hooks, true);
     try rec.endAndSubmit();
     try sc.logits.readBack(&ctx, f32, logits_b);
 
@@ -7459,8 +7039,8 @@ fn chatTurnHybrid(
 
 // ── gpu-layer0-test: full layer 0 forward on GPU vs CPU ────────────
 
-const EmbedLookupPush = extern struct { token_id: u32, dim: u32, scale: f32 };
-const AddInPlacePush = extern struct { n: u32 };
+const EmbedLookupPush = runtime.EmbedLookupPush;
+const AddInPlacePush = runtime.AddInPlacePush;
 const AttnDecodeSinglePush = extern struct { n_heads: u32, heads_per_kv: u32, head_dim: u32 };
 const ScalePush = extern struct { n: u32, scale: f32 };
 const SliceCopyPush = extern struct { src_off: u32, dst_off: u32, n_elem: u32 };
@@ -7692,59 +7272,12 @@ fn cpuLayer0Forward(gpa: std.mem.Allocator, cpu: *const model_mod.Model, token_i
     return stream;
 }
 
-// ── Recorder-based dispatch helpers (one command buffer for whole pass) ──
+// ── Recorder-based dispatch helpers (single source of truth: runtime.zig) ──
 
-fn recDispatch1D(
-    rec: *gpu_recorder.Recorder,
-    kern: *const pipeline.Kernel,
-    bufs: []const *const buffer.Buffer,
-    push: anytype,
-    n: u32,
-) !void {
-    const local: u32 = 256;
-    const groups: u32 = (n + local - 1) / local;
-    try rec.dispatch(kern, bufs, push, groups, 1, 1);
-}
-
-fn recDispatchPerRow(
-    rec: *gpu_recorder.Recorder,
-    kern: *const pipeline.Kernel,
-    bufs: []const *const buffer.Buffer,
-    push: anytype,
-    n_rows: u32,
-) !void {
-    try rec.dispatch(kern, bufs, push, n_rows, 1, 1);
-}
-
-fn recDispatchMatmul(
-    rec: *gpu_recorder.Recorder,
-    kern: *const pipeline.Kernel,
-    bufs: []const *const buffer.Buffer,
-    m: u32,
-    n: u32,
-    k: u32,
-) !void {
-    // matmul_nt_v2 dispatch: one WG per output cell, 256 threads each
-    // cooperate over K with subgroup reduction. Workgroup count is
-    // M*N which is well within the 65535 per-dim limit even at our
-    // largest matmul (M=1, N=vocab_size=256000).
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
-    try rec.dispatch(kern, bufs, &push, m * n, 1, 1);
-}
-
-fn recDispatchRope(
-    rec: *gpu_recorder.Recorder,
-    kern: *const pipeline.Kernel,
-    bufs: []const *const buffer.Buffer,
-    push: *const RopePush,
-    n_heads: usize,
-    head_dim: usize,
-) !void {
-    const local: u32 = 256;
-    const pairs: u32 = @intCast(n_heads * (head_dim / 2));
-    const groups: u32 = (pairs + local - 1) / local;
-    try rec.dispatch(kern, bufs, push, groups, 1, 1);
-}
+const recDispatch1D = runtime.recDispatch1D;
+const recDispatchPerRow = runtime.recDispatchPerRow;
+const recDispatchMatmul = runtime.recDispatchMatmul;
+const recDispatchRope = runtime.recDispatchRope;
 
 // ── Dispatch helpers — keep call sites readable ──────────────────────
 

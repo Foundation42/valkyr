@@ -57,9 +57,30 @@ pub const RopePush = extern struct {
     theta_base: f32,
 };
 
+pub const RopePartialPush = extern struct {
+    n_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    pos: u32,
+    theta_base: f32,
+};
+
 pub const KvWritePush = extern struct {
     n: u32,
     dst_off: u32,
+};
+
+pub const Tq4PackPush = extern struct { dst_block_idx: u32 };
+
+/// Optional TQ4 V-cache hooks. When supplied to `recordOneLayer`,
+/// V is packed into the TQ4 cache instead of the fp32 V cache
+/// passed via `kv`, and the whole V history is dequantised into a
+/// scratch buffer just before attention. K stays in `kv` (K=fp /
+/// V=TQ4 asymmetric).
+pub const Tq4VHooks = struct {
+    pack: *const pipeline.Kernel,
+    unpack: *const pipeline.Kernel,
+    cache: *const gpu_scratch.GpuKvCacheTq4,
 };
 
 pub const AttnScoresPush = extern struct {
@@ -105,6 +126,7 @@ pub const ChatKernels = struct {
     matmul: pipeline.Kernel,
     matmul_lm_head: pipeline.Kernel,
     rope: pipeline.Kernel,
+    rope_partial: pipeline.Kernel,
     kv_write: pipeline.Kernel,
     scores: pipeline.Kernel,
     softmax: pipeline.Kernel,
@@ -144,6 +166,7 @@ pub const ChatKernels = struct {
             .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
             .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
             .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
+            .rope_partial = try pipeline.Kernel.init(ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush)),
             .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
             .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
             .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
@@ -159,6 +182,7 @@ pub const ChatKernels = struct {
         self.matmul.deinit();
         self.matmul_lm_head.deinit();
         self.rope.deinit();
+        self.rope_partial.deinit();
         self.kv_write.deinit();
         self.scores.deinit();
         self.softmax.deinit();
@@ -176,6 +200,9 @@ pub const ForwardPushes = struct {
     add_push: AddInPlacePush,
     rope_q_push: RopePush,
     rope_k_push: RopePush,
+    rope_q_partial_push: RopePartialPush,
+    rope_k_partial_push: RopePartialPush,
+    use_partial_rope: bool,
     kv_write_push: KvWritePush,
     scores_push: AttnScoresPush,
     softmax_push: SoftmaxPush,
@@ -197,23 +224,41 @@ pub fn computeForwardPushes(
     const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
     const max_pos_u32: u32 = @intCast(sc.max_pos);
     const n_pos: u32 = @intCast(pos + 1);
+    const head_dim_u32: u32 = @intCast(cfg.head_dim);
+    const rotary_dim: u32 = @intFromFloat(@as(f32, @floatFromInt(head_dim_u32)) * cfg.partial_rotary_factor);
+    const use_partial_rope: bool = cfg.partial_rotary_factor < 1.0;
 
     return .{
         .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
-        .qkn_push = .{ .dim = @intCast(cfg.head_dim), .eps = cfg.rms_norm_eps, .gemma_quirk = 0 },
+        .qkn_push = .{ .dim = head_dim_u32, .eps = cfg.rms_norm_eps, .gemma_quirk = 0 },
         .add_push = .{ .n = hidden },
         .rope_q_push = .{
             .n_heads = @intCast(cfg.num_attention_heads),
-            .head_dim = @intCast(cfg.head_dim),
+            .head_dim = head_dim_u32,
             .pos = @intCast(pos),
             .theta_base = cfg.rope_theta,
         },
         .rope_k_push = .{
             .n_heads = @intCast(cfg.num_key_value_heads),
-            .head_dim = @intCast(cfg.head_dim),
+            .head_dim = head_dim_u32,
             .pos = @intCast(pos),
             .theta_base = cfg.rope_theta,
         },
+        .rope_q_partial_push = .{
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .head_dim = head_dim_u32,
+            .rotary_dim = rotary_dim,
+            .pos = @intCast(pos),
+            .theta_base = cfg.rope_theta,
+        },
+        .rope_k_partial_push = .{
+            .n_heads = @intCast(cfg.num_key_value_heads),
+            .head_dim = head_dim_u32,
+            .rotary_dim = rotary_dim,
+            .pos = @intCast(pos),
+            .theta_base = cfg.rope_theta,
+        },
+        .use_partial_rope = use_partial_rope,
         .kv_write_push = .{ .n = kv_dim, .dst_off = @intCast(pos * @as(usize, kv_dim)) },
         .scores_push = .{
             .n_heads = @intCast(cfg.num_attention_heads),
@@ -240,7 +285,7 @@ pub fn computeForwardPushes(
 
 // ── Dispatch helpers ──────────────────────────────────────────────
 
-fn recDispatch1D(
+pub fn recDispatch1D(
     rec: *recorder.Recorder,
     kern: *const pipeline.Kernel,
     bufs: []const *const buffer.Buffer,
@@ -252,7 +297,7 @@ fn recDispatch1D(
     try rec.dispatch(kern, bufs, push, groups, 1, 1);
 }
 
-fn recDispatchPerRow(
+pub fn recDispatchPerRow(
     rec: *recorder.Recorder,
     kern: *const pipeline.Kernel,
     bufs: []const *const buffer.Buffer,
@@ -262,7 +307,7 @@ fn recDispatchPerRow(
     try rec.dispatch(kern, bufs, push, n_rows, 1, 1);
 }
 
-fn recDispatchMatmul(
+pub fn recDispatchMatmul(
     rec: *recorder.Recorder,
     kern: *const pipeline.Kernel,
     bufs: []const *const buffer.Buffer,
@@ -274,7 +319,7 @@ fn recDispatchMatmul(
     try rec.dispatch(kern, bufs, &push, m * n, 1, 1);
 }
 
-fn recDispatchRope(
+pub fn recDispatchRope(
     rec: *recorder.Recorder,
     kern: *const pipeline.Kernel,
     bufs: []const *const buffer.Buffer,
@@ -291,10 +336,15 @@ fn recDispatchRope(
 // ── Per-layer + full-step recording ───────────────────────────────
 
 /// Record one transformer block's dispatches (input_layernorm → Q/K/V
-/// → optional q_norm/k_norm → RoPE → KV write → attention → o_proj →
-/// residual → post_attention_layernorm → gated FFN → residual).
-/// Used by the full-forward `recordStep` AND directly by chunk 7c's
-/// Session for frame-budget chunking.
+/// → optional q_norm/k_norm → RoPE (full or partial) → KV write →
+/// attention → o_proj → residual → post_attention_layernorm → gated
+/// FFN → residual). Used by the full-forward `recordStep` AND
+/// directly by chunk 7c's Session for frame-budget chunking.
+///
+/// `tq4_v` switches V into a TQ4-packed cache (asymmetric K=fp/V=TQ4).
+/// `pos` is only consulted when `tq4_v` is non-null (for the V-pack
+/// destination block index); pass `p.kv_write_push.dst_off /
+/// p.kv_write_push.n` if you don't have it handy.
 pub fn recordOneLayer(
     rec: *recorder.Recorder,
     sc: *const gpu_scratch.GpuScratch,
@@ -303,7 +353,9 @@ pub fn recordOneLayer(
     cfg: config_mod.Config,
     k: *const ChatKernels,
     layer_idx: usize,
+    pos: usize,
     p: *const ForwardPushes,
+    tq4_v: ?Tq4VHooks,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
@@ -325,12 +377,25 @@ pub fn recordOneLayer(
         try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &p.qkn_push, @intCast(cfg.num_key_value_heads));
     }
 
-    try recDispatchRope(rec, &k.rope, &.{ &sc.q, &sc.q_rot }, &p.rope_q_push, cfg.num_attention_heads, cfg.head_dim);
-    try recDispatchRope(rec, &k.rope, &.{ &sc.k, &sc.k_rot }, &p.rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+    if (p.use_partial_rope) {
+        try recDispatch1D(rec, &k.rope_partial, &.{ &sc.q, &sc.q_rot }, &p.rope_q_partial_push, @intCast(cfg.num_attention_heads * cfg.head_dim));
+        try recDispatch1D(rec, &k.rope_partial, &.{ &sc.k, &sc.k_rot }, &p.rope_k_partial_push, @intCast(cfg.num_key_value_heads * cfg.head_dim));
+    } else {
+        try recDispatchRope(rec, &k.rope, &.{ &sc.q, &sc.q_rot }, &p.rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+        try recDispatchRope(rec, &k.rope, &.{ &sc.k, &sc.k_rot }, &p.rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+    }
 
     const kv_layer = &kv.layers[layer_idx];
     try recDispatch1D(rec, &k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &p.kv_write_push, kv_dim);
-    try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &p.kv_write_push, kv_dim);
+
+    if (tq4_v) |t| {
+        const tq_layer = &t.cache.layers[layer_idx];
+        const n_blocks: u32 = @intCast(t.cache.n_blocks_per_pos);
+        const pack_push = Tq4PackPush{ .dst_block_idx = @intCast(pos * t.cache.n_blocks_per_pos) };
+        try rec.dispatch(t.pack, &.{ &sc.v, &tq_layer.v_cache }, &pack_push, n_blocks, 1, 1);
+    } else {
+        try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &p.kv_write_push, kv_dim);
+    }
 
     try rec.dispatch(
         &k.scores,
@@ -342,9 +407,16 @@ pub fn recordOneLayer(
     );
     try recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, @intCast(cfg.num_attention_heads));
 
+    const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
+        const tq_layer = &t.cache.layers[layer_idx];
+        const total_blocks: u32 = p.n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
+        try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, total_blocks, 1, 1);
+        break :blk &t.cache.dequant_v;
+    } else &kv_layer.v_cache;
+
     try rec.dispatch(
         &k.attn_out,
-        &.{ &sc.scores, &kv_layer.v_cache, &sc.head_out },
+        &.{ &sc.scores, v_for_attn, &sc.head_out },
         &p.attn_out_push,
         @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
         1,
@@ -381,6 +453,33 @@ pub fn recordEmbedding(
         .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
     };
     try recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+}
+
+/// One-call full forward: embed → all layers → optional sample-step.
+/// Equivalent to `Forward.recordStep` but free-standing so callers
+/// that already have an owned `ChatKernels` (e.g. valkyr's CLI) don't
+/// need to wrap it in a `Forward`. Identical dispatch order, so
+/// generation output is bit-identical to `Forward.recordStep`.
+pub fn recordForwardStep(
+    rec: *recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    pos: usize,
+    token_id: u32,
+    tq4_v: ?Tq4VHooks,
+    compute_logits: bool,
+) !void {
+    const pushes = computeForwardPushes(cfg, sc, pos);
+    try recordEmbedding(rec, sc, gm, cfg, k, token_id);
+    for (0..cfg.num_hidden_layers) |layer_idx| {
+        try recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
+    }
+    if (compute_logits) {
+        try recordSampleStep(rec, sc, gm, cfg, k, &pushes);
+    }
 }
 
 /// Final norm + LM head matmul → scratch.logits. Skip on prefill
@@ -440,7 +539,7 @@ pub const Forward = struct {
         const pushes = computeForwardPushes(self.cfg, sc, pos);
         try recordEmbedding(rec, sc, gm, self.cfg, &self.kernels, token_id);
         for (0..self.cfg.num_hidden_layers) |layer_idx| {
-            try recordOneLayer(rec, sc, gm, kv, self.cfg, &self.kernels, layer_idx, &pushes);
+            try recordOneLayer(rec, sc, gm, kv, self.cfg, &self.kernels, layer_idx, pos, &pushes, null);
         }
         if (compute_logits) {
             try recordSampleStep(rec, sc, gm, self.cfg, &self.kernels, &pushes);

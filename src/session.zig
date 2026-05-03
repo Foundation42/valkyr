@@ -330,7 +330,9 @@ pub const Session = struct {
                     self.cfg_model,
                     &self.forward.kernels,
                     self.fwd_layer,
+                    self.pos,
                     &pushes,
+                    null,
                 );
                 if (self.cfg.on_layer) |cb| {
                     try cb(self.cfg.on_layer_user, rec, self.fwd_layer, &self.scratch);
