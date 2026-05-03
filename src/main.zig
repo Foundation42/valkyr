@@ -24,6 +24,7 @@ const gpu_model = @import("gpu/model.zig");
 const gpu_scratch = @import("gpu/scratch.zig");
 const gpu_recorder = @import("gpu/recorder.zig");
 const runtime = @import("runtime.zig");
+const runtime_hybrid = @import("runtime_hybrid.zig");
 const hf_cache = @import("hf_cache.zig");
 const probe = @import("probe.zig");
 const shaders = @import("shaders");
@@ -1622,7 +1623,7 @@ fn runGpuRopePartialSmoke(allocator: std.mem.Allocator) !void {
 // layout produced by the 2× q_proj is correctly demuxed into two flat
 // `(num_heads*head_dim)` buffers preserving per-head ordering.
 
-const SplitQGatePush = extern struct { num_heads: u32, head_dim: u32 };
+const SplitQGatePush = runtime_hybrid.SplitQGatePush;
 
 fn runGpuSplitQGateSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1690,7 +1691,7 @@ fn runGpuSplitQGateSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu sigmoid_mul smoke: out = a * sigmoid(b) vs CPU ──────────────
 
-const SigmoidMulPush = extern struct { n_elem: u32 };
+const SigmoidMulPush = runtime_hybrid.SigmoidMulPush;
 
 fn runGpuSigmoidMulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1748,7 +1749,7 @@ fn runGpuSigmoidMulSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu l2norm-per-head smoke: synthetic vs CPU ─────────────────────
 
-const L2normPush = extern struct { head_dim: u32, eps: f32 };
+const L2normPush = runtime_hybrid.L2normPush;
 
 fn runGpuL2normPerHeadSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1822,7 +1823,7 @@ fn runGpuL2normPerHeadSmoke(allocator: std.mem.Allocator) !void {
 // place state shift across multiple decode steps; if the shift / append
 // got transposed, the third output diverges immediately.
 
-const Conv1dUpdatePush = extern struct { conv_dim: u32, kernel_size: u32 };
+const Conv1dUpdatePush = runtime_hybrid.Conv1dUpdatePush;
 
 fn runGpuConv1dUpdateSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1908,7 +1909,7 @@ fn runGpuConv1dUpdateSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu rmsnorm_gated smoke: synthetic vs CPU ───────────────────────
 
-const RmsnormGatedPush = extern struct { head_dim: u32, eps: f32 };
+const RmsnormGatedPush = runtime_hybrid.RmsnormGatedPush;
 
 fn runGpuRmsnormGatedSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -1990,12 +1991,7 @@ fn runGpuRmsnormGatedSmoke(allocator: std.mem.Allocator) !void {
 // invocations to exercise both the readout AND the in-place state
 // update; if the state update lands wrong, step 2 diverges.
 
-const GatedDeltaStepPush = extern struct {
-    num_k_heads: u32,
-    num_v_heads: u32,
-    head_k: u32,
-    head_v: u32,
-};
+const GatedDeltaStepPush = runtime_hybrid.GatedDeltaStepPush;
 
 fn runGpuGatedDeltaStepSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -5972,551 +5968,15 @@ fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) 
 //     this layer — the gated_delta_step shader updates them in place,
 //     so the next decode step naturally sees the previous step's state.
 
-const HybridChatKernels = struct {
-    embed: pipeline.Kernel,
-    rmsnorm: pipeline.Kernel,
-    matmul: pipeline.Kernel,
-    matmul_lm_head: pipeline.Kernel,
-    add: pipeline.Kernel,
-    swiglu: pipeline.Kernel,
-    rope_partial: pipeline.Kernel,
-    split_q_gate: pipeline.Kernel,
-    sigmoid_mul: pipeline.Kernel,
-    l2norm_per_head: pipeline.Kernel,
-    conv1d_update: pipeline.Kernel,
-    rmsnorm_gated: pipeline.Kernel,
-    gated_delta_step: pipeline.Kernel,
-    kv_write: pipeline.Kernel,
-    scores: pipeline.Kernel,
-    softmax: pipeline.Kernel,
-    attn_out: pipeline.Kernel,
-    slice_copy: pipeline.Kernel,
-    scale: pipeline.Kernel,
+const HybridChatKernels = runtime_hybrid.ChatKernels;
+const HybridChatScratch = runtime_hybrid.Scratch;
+const HybridChatState = runtime_hybrid.State;
+const HybridTq4VHooks = runtime_hybrid.Tq4VHooks;
+const HybridForwardPushes = runtime_hybrid.ForwardPushes;
+const computeHybridForwardPushes = runtime_hybrid.computeForwardPushes;
+const recordOneHybridLayer = runtime_hybrid.recordOneLayer;
+const recordHybridForwardStep = runtime_hybrid.recordForwardStep;
 
-    fn init(ctx: *const vk.Context, precision: gpu_model.Precision) !HybridChatKernels {
-        // Mirrors `buildChatKernels`: precision-aware matmul for the
-        // per-layer projections (q/k/v/o, in-projs, out_proj, FFN trio),
-        // and a separate selector for the LM head — bf16 when any
-        // non-fp32 path is active, fp32 in the all-fp32 path. Never
-        // Q4_0 (sampling argmax sensitivity).
-        const matmul_spv: []align(4) const u8 = switch (precision) {
-            .fp32_all => &shaders.matmul_nt_v2,
-            .bf16_matmul => &shaders.matmul_nt_v2_bf16,
-            .q4_0_matmul => &shaders.matmul_nt_v2_q4_0,
-            .q4_k_matmul => &shaders.matmul_nt_v2_q4_k,
-        };
-        const lm_head_spv: []align(4) const u8 = switch (precision) {
-            .fp32_all => &shaders.matmul_nt_v2,
-            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.matmul_nt_v2_bf16,
-        };
-        const embed_spv: []align(4) const u8 = switch (precision) {
-            .fp32_all => &shaders.embed_lookup,
-            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.embed_lookup_bf16,
-        };
-        return .{
-            .embed = try pipeline.Kernel.init(ctx, embed_spv, 2, @sizeOf(EmbedLookupPush)),
-            .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
-            .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
-            .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
-            .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
-            .swiglu = try pipeline.Kernel.init(ctx, &shaders.swiglu, 3, @sizeOf(GegluPush)),
-            .rope_partial = try pipeline.Kernel.init(ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush)),
-            .split_q_gate = try pipeline.Kernel.init(ctx, &shaders.split_q_gate, 3, @sizeOf(SplitQGatePush)),
-            .sigmoid_mul = try pipeline.Kernel.init(ctx, &shaders.sigmoid_mul, 3, @sizeOf(SigmoidMulPush)),
-            .l2norm_per_head = try pipeline.Kernel.init(ctx, &shaders.l2norm_per_head, 2, @sizeOf(L2normPush)),
-            .conv1d_update = try pipeline.Kernel.init(ctx, &shaders.conv1d_update, 4, @sizeOf(Conv1dUpdatePush)),
-            .rmsnorm_gated = try pipeline.Kernel.init(ctx, &shaders.rmsnorm_gated, 4, @sizeOf(RmsnormGatedPush)),
-            .gated_delta_step = try pipeline.Kernel.init(ctx, &shaders.gated_delta_step, 9, @sizeOf(GatedDeltaStepPush)),
-            .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
-            .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
-            .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
-            .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
-            .slice_copy = try pipeline.Kernel.init(ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush)),
-            .scale = try pipeline.Kernel.init(ctx, &shaders.scale, 2, @sizeOf(ScalePush)),
-        };
-    }
-
-    fn deinit(self: *HybridChatKernels) void {
-        inline for (.{
-            "embed",            "rmsnorm",        "matmul",           "matmul_lm_head", "add",
-            "swiglu",           "rope_partial",   "split_q_gate",     "sigmoid_mul",    "l2norm_per_head",
-            "conv1d_update",    "rmsnorm_gated",  "gated_delta_step", "kv_write",       "scores",
-            "softmax",          "attn_out",       "slice_copy",       "scale",
-        }) |fname| {
-            @field(self, fname).deinit();
-        }
-    }
-};
-
-const HybridChatScratch = struct {
-    stream: buffer.Buffer,
-    x_norm: buffer.Buffer,
-    mid_norm: buffer.Buffer,
-    attn_out: buffer.Buffer,
-    gate: buffer.Buffer,
-    up: buffer.Buffer,
-    fused: buffer.Buffer,
-    ffn_out: buffer.Buffer,
-    final_norm_out: buffer.Buffer,
-    logits: buffer.Buffer,
-    // Linear-attn scratch
-    mixed_qkv: buffer.Buffer,
-    mixed_qkv_post: buffer.Buffer,
-    z: buffer.Buffer,
-    b_raw: buffer.Buffer,
-    a_raw: buffer.Buffer,
-    q_lin: buffer.Buffer,
-    k_lin: buffer.Buffer,
-    v_lin: buffer.Buffer,
-    q_lin_n: buffer.Buffer,
-    k_lin_n: buffer.Buffer,
-    y: buffer.Buffer,
-    post_norm: buffer.Buffer,
-    // Full-attn scratch
-    q_gate: buffer.Buffer,
-    q: buffer.Buffer,
-    gate_attn: buffer.Buffer,
-    k: buffer.Buffer,
-    v: buffer.Buffer,
-    qrot: buffer.Buffer,
-    krot: buffer.Buffer,
-    head_out: buffer.Buffer,
-    head_out_gated: buffer.Buffer,
-    scores: buffer.Buffer,
-    /// Shared TQ4-V dequant scratch — sized for one full V history at
-    /// `max_pos`, reused across all full-attn layers. Only allocated
-    /// when --tq4v is on; otherwise `null`.
-    dequant_v: ?buffer.Buffer,
-
-    fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32, tq4v: bool) !HybridChatScratch {
-        const f = @sizeOf(f32);
-        const hidden = cfg.hidden_size;
-        const inter = cfg.intermediate_size;
-        const head_dim = cfg.head_dim;
-        const n_q = cfg.num_attention_heads;
-        const n_kv = cfg.num_key_value_heads;
-        const q_dim = n_q * head_dim;
-        const kv_dim = n_kv * head_dim;
-        const q_proj_rows = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
-        const conv_dim = cfg.linearAttnConvDim();
-        const value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
-        const key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
-        return .{
-            .stream          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .x_norm          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .mid_norm        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .attn_out        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .gate            = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .up              = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .fused           = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .ffn_out         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .final_norm_out  = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .logits          = try buffer.Buffer.initDeviceOnly(ctx, cfg.vocab_size * f),
-            .mixed_qkv       = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
-            .mixed_qkv_post  = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
-            .z               = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
-            .b_raw           = try buffer.Buffer.initDeviceOnly(ctx, cfg.linear_num_value_heads * f),
-            .a_raw           = try buffer.Buffer.initDeviceOnly(ctx, cfg.linear_num_value_heads * f),
-            .q_lin           = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
-            .k_lin           = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
-            .v_lin           = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
-            .q_lin_n         = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
-            .k_lin_n         = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
-            .y               = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
-            .post_norm       = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
-            .q_gate          = try buffer.Buffer.initDeviceOnly(ctx, q_proj_rows * f),
-            .q               = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .gate_attn       = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .k               = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .v               = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .qrot            = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .krot            = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .head_out        = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .head_out_gated  = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .scores          = try buffer.Buffer.initDeviceOnly(ctx, n_q * max_pos * f),
-            .dequant_v       = if (tq4v) try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f) else null,
-        };
-    }
-
-    fn deinit(self: *HybridChatScratch, device: vk.c.VkDevice) void {
-        inline for (.{
-            "stream", "x_norm", "mid_norm", "attn_out",
-            "gate", "up", "fused", "ffn_out",
-            "final_norm_out", "logits",
-            "mixed_qkv", "mixed_qkv_post", "z", "b_raw", "a_raw",
-            "q_lin", "k_lin", "v_lin", "q_lin_n", "k_lin_n",
-            "y", "post_norm",
-            "q_gate", "q", "gate_attn", "k", "v", "qrot", "krot",
-            "head_out", "head_out_gated", "scores",
-        }) |fname| {
-            @field(self, fname).deinit(device);
-        }
-        if (self.dequant_v) |*b| b.deinit(device);
-    }
-};
-
-const HybridChatState = struct {
-    /// `[num_layers]` per-layer Gated DeltaNet conv state. Slots for
-    /// full-attention layers are `null`.
-    ssm_conv: []?buffer.Buffer,
-    /// `[num_layers]` per-layer Gated DeltaNet recurrent state.
-    ssm_rec: []?buffer.Buffer,
-    /// `[num_layers]` per-layer KV-cache K. Slots for linear layers
-    /// are `null`. Sized for `max_pos` positions.
-    kv_k: []?buffer.Buffer,
-    /// `[num_layers]` per-layer KV-cache V (fp32 path). When `--tq4v`
-    /// is on this stays `null` for every layer and `kv_v_tq4` is used
-    /// instead.
-    kv_v: []?buffer.Buffer,
-    /// `[num_layers]` per-layer TQ4-packed V cache. Allocated only for
-    /// `.full_attention` slots when `--tq4v` is on; `null` otherwise.
-    kv_v_tq4: []?buffer.Buffer,
-    allocator: std.mem.Allocator,
-
-    fn init(gpa: std.mem.Allocator, ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32, tq4v: bool) !HybridChatState {
-        const f = @sizeOf(f32);
-        const u = @sizeOf(u32);
-        const conv_dim = cfg.linearAttnConvDim();
-        const conv_kernel = cfg.linear_conv_kernel_dim;
-        const head_k = cfg.linear_key_head_dim;
-        const head_v = cfg.linear_value_head_dim;
-        const n_v_heads = cfg.linear_num_value_heads;
-        const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-        // TQ4 sizing — same convention as GpuKvCacheTq4: block_size =
-        // head_dim (must be 128 or 256 to hit the existing shader pair),
-        // n_blocks_per_pos = num_kv_heads, and each block is one γ word
-        // plus head_dim/8 packed-index words.
-        const block_size = cfg.head_dim;
-        const n_blocks_per_pos = cfg.num_key_value_heads;
-        const u32s_per_block = 1 + block_size / 8;
-
-        var ssm_conv = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
-        @memset(ssm_conv, null);
-        var ssm_rec = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
-        @memset(ssm_rec, null);
-        var kv_k = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
-        @memset(kv_k, null);
-        var kv_v = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
-        @memset(kv_v, null);
-        var kv_v_tq4 = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
-        @memset(kv_v_tq4, null);
-
-        for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| switch (lt) {
-            .linear_attention => {
-                ssm_conv[i] = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * conv_kernel * f);
-                ssm_rec[i] = try buffer.Buffer.initDeviceOnly(ctx, n_v_heads * head_k * head_v * f);
-            },
-            .full_attention => {
-                kv_k[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
-                if (tq4v) {
-                    kv_v_tq4[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * n_blocks_per_pos * u32s_per_block * u);
-                } else {
-                    kv_v[i] = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f);
-                }
-            },
-        };
-        return .{
-            .ssm_conv = ssm_conv,
-            .ssm_rec = ssm_rec,
-            .kv_k = kv_k,
-            .kv_v = kv_v,
-            .kv_v_tq4 = kv_v_tq4,
-            .allocator = gpa,
-        };
-    }
-
-    fn deinit(self: *HybridChatState, device: vk.c.VkDevice) void {
-        for (self.ssm_conv) |*b| if (b.*) |*v| v.deinit(device);
-        for (self.ssm_rec) |*b| if (b.*) |*v| v.deinit(device);
-        for (self.kv_k) |*b| if (b.*) |*v| v.deinit(device);
-        for (self.kv_v) |*b| if (b.*) |*v| v.deinit(device);
-        for (self.kv_v_tq4) |*b| if (b.*) |*v| v.deinit(device);
-        self.allocator.free(self.ssm_conv);
-        self.allocator.free(self.ssm_rec);
-        self.allocator.free(self.kv_k);
-        self.allocator.free(self.kv_v);
-        self.allocator.free(self.kv_v_tq4);
-    }
-
-    /// Zero the per-layer SSM state (conv + recurrent) so a fresh
-    /// prompt can run from a clean Gated DeltaNet state. KV slots are
-    /// left untouched: they are unconditionally overwritten when the
-    /// new prompt's prefill writes to positions [0, n_pos), and only
-    /// positions in that range are read by attention. Used by the
-    /// `--prompts` batch path where a single model load runs many
-    /// independent prompts.
-    fn reset(self: *HybridChatState, ctx: *const vk.Context) !void {
-        for (self.ssm_conv) |*b| if (b.*) |*v| try v.fillZero(ctx);
-        for (self.ssm_rec) |*b| if (b.*) |*v| try v.fillZero(ctx);
-    }
-};
-
-/// TQ4-V hooks for the hybrid forward step. Differs from the Gemma
-/// `Tq4VHooks` because the hybrid model already owns its per-layer V
-/// buffers via `HybridChatState`, so we don't need a separate
-/// `GpuKvCacheTq4`. The shared `dequant_v` lives on `HybridChatScratch`.
-const HybridTq4VHooks = struct {
-    pack: *const pipeline.Kernel,
-    unpack: *const pipeline.Kernel,
-    n_blocks_per_pos: u32,
-};
-
-/// Record one decode step into the recorder. `pos` is the position
-/// being written this step (0-based); `n_pos = pos + 1` is the number
-/// of cached K/V slots that the attention reads. SSM state buffers are
-/// updated in place by the gated_delta_step shader; we don't pass `pos`
-/// to the linear path because it has no notion of position.
-/// Per-step push constants reused across every hybrid layer's
-/// dispatches. Computed once from cfg + pos by
-/// `computeHybridForwardPushes`.
-const HybridForwardPushes = struct {
-    rms_push: RmsnormPush,
-    qkn_push: RmsnormPush,
-    add_push: AddInPlacePush,
-    swiglu_push: GegluPush,
-    conv1d_push: Conv1dUpdatePush,
-    l2_push: L2normPush,
-    rms_gated_push: RmsnormGatedPush,
-    gds_push: GatedDeltaStepPush,
-    split_push: SplitQGatePush,
-    sigmul_push: SigmoidMulPush,
-    rope_q_push: RopePartialPush,
-    rope_k_push: RopePartialPush,
-    kv_write_push: KvWritePush,
-    scores_push: AttnScoresPush,
-    softmax_push: SoftmaxPush,
-    attn_out_push: AttnOutputPush,
-    n_pos: u32,
-    q_scale: f32,
-    key_dim: u32,
-    value_dim: u32,
-    n_v_heads: u32,
-    n_k_heads_lin: u32,
-    n_q_heads: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-    q_dim: u32,
-    q_proj_rows: u32,
-    kv_dim: u32,
-    conv_dim: u32,
-};
-
-fn computeHybridForwardPushes(cfg: config_mod.Config, pos: usize, max_pos: u32) HybridForwardPushes {
-    const hidden: u32 = @intCast(cfg.hidden_size);
-    const inter: u32 = @intCast(cfg.intermediate_size);
-    const head_dim: u32 = @intCast(cfg.head_dim);
-    const n_q_heads: u32 = @intCast(cfg.num_attention_heads);
-    const n_kv_heads: u32 = @intCast(cfg.num_key_value_heads);
-    const heads_per_kv: u32 = n_q_heads / n_kv_heads;
-    const q_dim: u32 = n_q_heads * head_dim;
-    const q_proj_rows: u32 = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
-    const kv_dim: u32 = n_kv_heads * head_dim;
-    const rotary_dim: u32 = @intFromFloat(@as(f32, @floatFromInt(head_dim)) * cfg.partial_rotary_factor);
-
-    const conv_dim: u32 = @intCast(cfg.linearAttnConvDim());
-    const value_dim: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_value_head_dim);
-    const key_dim: u32 = @intCast(cfg.linear_num_key_heads * cfg.linear_key_head_dim);
-    const n_v_heads: u32 = @intCast(cfg.linear_num_value_heads);
-    const n_k_heads_lin: u32 = @intCast(cfg.linear_num_key_heads);
-    const head_k: u32 = @intCast(cfg.linear_key_head_dim);
-    const head_v: u32 = @intCast(cfg.linear_value_head_dim);
-    const conv_kernel: u32 = @intCast(cfg.linear_conv_kernel_dim);
-    const q_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.linear_key_head_dim)));
-
-    const gemma_quirk: u32 = if (cfg.family.rmsnormAddOne()) 1 else 0;
-    const n_pos: u32 = @intCast(pos + 1);
-
-    return .{
-        .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
-        .qkn_push = .{ .dim = head_dim, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
-        .add_push = .{ .n = hidden },
-        .swiglu_push = .{ .n = inter },
-        .conv1d_push = .{ .conv_dim = conv_dim, .kernel_size = conv_kernel },
-        .l2_push = .{ .head_dim = head_k, .eps = 1e-6 },
-        .rms_gated_push = .{ .head_dim = head_v, .eps = cfg.rms_norm_eps },
-        .gds_push = .{
-            .num_k_heads = n_k_heads_lin,
-            .num_v_heads = n_v_heads,
-            .head_k = head_k,
-            .head_v = head_v,
-        },
-        .split_push = .{ .num_heads = n_q_heads, .head_dim = head_dim },
-        .sigmul_push = .{ .n_elem = q_dim },
-        .rope_q_push = .{
-            .n_heads = n_q_heads,
-            .head_dim = head_dim,
-            .rotary_dim = rotary_dim,
-            .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
-        },
-        .rope_k_push = .{
-            .n_heads = n_kv_heads,
-            .head_dim = head_dim,
-            .rotary_dim = rotary_dim,
-            .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
-        },
-        .kv_write_push = .{ .n = kv_dim, .dst_off = @as(u32, @intCast(pos)) * kv_dim },
-        .scores_push = .{
-            .n_heads = n_q_heads,
-            .heads_per_kv = heads_per_kv,
-            .head_dim = head_dim,
-            .n_pos = n_pos,
-            .kv_stride = kv_dim,
-            .scores_stride = max_pos,
-            .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
-        },
-        .softmax_push = .{ .dim = n_pos, .stride = max_pos },
-        .attn_out_push = .{
-            .n_heads = n_q_heads,
-            .heads_per_kv = heads_per_kv,
-            .head_dim = head_dim,
-            .n_pos = n_pos,
-            .kv_stride = kv_dim,
-            .scores_stride = max_pos,
-        },
-        .n_pos = n_pos,
-        .q_scale = q_scale,
-        .key_dim = key_dim,
-        .value_dim = value_dim,
-        .n_v_heads = n_v_heads,
-        .n_k_heads_lin = n_k_heads_lin,
-        .n_q_heads = n_q_heads,
-        .n_kv_heads = n_kv_heads,
-        .head_dim = head_dim,
-        .q_dim = q_dim,
-        .q_proj_rows = q_proj_rows,
-        .kv_dim = kv_dim,
-        .conv_dim = conv_dim,
-    };
-}
-
-/// Record the dispatches for a single hybrid transformer block. The
-/// layer may be either a linear-attention (Gated DeltaNet) layer or a
-/// full-attention layer; the layer body branches on `layer.layer_type`.
-/// Caller manages the recorder's begin/endAndSubmit cycle. Used both
-/// by the single-submit `recordHybridForwardStep` and by the probed
-/// multi-submit path.
-fn recordOneHybridLayer(
-    rec: *gpu_recorder.Recorder,
-    sc: *const HybridChatScratch,
-    state: *const HybridChatState,
-    gm: *const gpu_model.GpuModel,
-    cfg: config_mod.Config,
-    k: *const HybridChatKernels,
-    layer_idx: usize,
-    pos: usize,
-    p: *const HybridForwardPushes,
-    tq4_v: ?HybridTq4VHooks,
-) !void {
-    const hidden: u32 = @intCast(cfg.hidden_size);
-    const inter: u32 = @intCast(cfg.intermediate_size);
-    const layer = &gm.layers[layer_idx];
-
-    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &p.rms_push, 1);
-
-    switch (layer.layer_type) {
-        .linear_attention => {
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_qkv.?, &sc.mixed_qkv }, 1, p.conv_dim, hidden);
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_z.?, &sc.z }, 1, p.value_dim, hidden);
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_b.?, &sc.b_raw }, 1, p.n_v_heads, hidden);
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_a.?, &sc.a_raw }, 1, p.n_v_heads, hidden);
-            try recDispatch1D(rec, &k.conv1d_update, &.{ &sc.mixed_qkv, &layer.conv1d_weight.?, &state.ssm_conv[layer_idx].?, &sc.mixed_qkv_post }, &p.conv1d_push, p.conv_dim);
-
-            const slice_q_push = SliceCopyPush{ .src_off = 0,             .dst_off = 0, .n_elem = p.key_dim };
-            const slice_k_push = SliceCopyPush{ .src_off = p.key_dim,     .dst_off = 0, .n_elem = p.key_dim };
-            const slice_v_push = SliceCopyPush{ .src_off = 2 * p.key_dim, .dst_off = 0, .n_elem = p.value_dim };
-            try recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.q_lin }, &slice_q_push, p.key_dim);
-            try recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.k_lin }, &slice_k_push, p.key_dim);
-            try recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.v_lin }, &slice_v_push, p.value_dim);
-
-            try rec.dispatch(&k.l2norm_per_head, &.{ &sc.q_lin, &sc.q_lin_n }, &p.l2_push, p.n_k_heads_lin, 1, 1);
-            try rec.dispatch(&k.l2norm_per_head, &.{ &sc.k_lin, &sc.k_lin_n }, &p.l2_push, p.n_k_heads_lin, 1, 1);
-            const scale_push = ScalePush{ .n = p.key_dim, .scale = p.q_scale };
-            try recDispatch1D(rec, &k.scale, &.{ &sc.q_lin_n, &sc.q_lin }, &scale_push, p.key_dim);
-
-            try rec.dispatch(&k.gated_delta_step, &.{
-                &state.ssm_rec[layer_idx].?, &sc.q_lin, &sc.k_lin_n, &sc.v_lin,
-                &sc.b_raw, &sc.a_raw, &layer.A_log.?, &layer.dt_bias.?,
-                &sc.y,
-            }, &p.gds_push, p.n_v_heads, 1, 1);
-            try rec.dispatch(&k.rmsnorm_gated, &.{ &sc.y, &sc.z, &layer.ssm_norm_weight.?, &sc.post_norm }, &p.rms_gated_push, p.n_v_heads, 1, 1);
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.post_norm, &layer.out_proj.?, &sc.attn_out }, 1, hidden, p.value_dim);
-        },
-        .full_attention => {
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q_gate }, 1, p.q_proj_rows, hidden);
-            try recDispatch1D(rec, &k.split_q_gate, &.{ &sc.q_gate, &sc.q, &sc.gate_attn }, &p.split_push, p.q_dim);
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, p.kv_dim, hidden);
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, p.kv_dim, hidden);
-            try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.q, &layer.q_norm.?, &sc.q }, &p.qkn_push, p.n_q_heads);
-            try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.k, &layer.k_norm.?, &sc.k }, &p.qkn_push, p.n_kv_heads);
-            try recDispatch1D(rec, &k.rope_partial, &.{ &sc.q, &sc.qrot }, &p.rope_q_push, p.n_q_heads * p.head_dim);
-            try recDispatch1D(rec, &k.rope_partial, &.{ &sc.k, &sc.krot }, &p.rope_k_push, p.n_kv_heads * p.head_dim);
-            try recDispatch1D(rec, &k.kv_write, &.{ &sc.krot, &state.kv_k[layer_idx].? }, &p.kv_write_push, p.kv_dim);
-
-            // V write: legacy fp32 raw copy, or TQ4 quantising
-            // pack-to-cache when tq4_v is supplied.
-            if (tq4_v) |t| {
-                const pack_push = Tq4PackPush{ .dst_block_idx = @as(u32, @intCast(pos)) * t.n_blocks_per_pos };
-                try rec.dispatch(t.pack, &.{ &sc.v, &state.kv_v_tq4[layer_idx].? }, &pack_push, t.n_blocks_per_pos, 1, 1);
-            } else {
-                try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &state.kv_v[layer_idx].? }, &p.kv_write_push, p.kv_dim);
-            }
-
-            try rec.dispatch(&k.scores, &.{ &sc.qrot, &state.kv_k[layer_idx].?, &sc.scores }, &p.scores_push, p.n_q_heads * p.n_pos, 1, 1);
-            try recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, p.n_q_heads);
-
-            const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
-                const total_blocks: u32 = p.n_pos * t.n_blocks_per_pos;
-                try rec.dispatch(t.unpack, &.{ &state.kv_v_tq4[layer_idx].?, &sc.dequant_v.? }, null, total_blocks, 1, 1);
-                break :blk &sc.dequant_v.?;
-            } else &state.kv_v[layer_idx].?;
-            try rec.dispatch(&k.attn_out, &.{ &sc.scores, v_for_attn, &sc.head_out }, &p.attn_out_push, p.n_q_heads * p.head_dim, 1, 1);
-            try recDispatch1D(rec, &k.sigmoid_mul, &.{ &sc.head_out, &sc.gate_attn, &sc.head_out_gated }, &p.sigmul_push, p.q_dim);
-            try recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out_gated, &layer.o_proj.?, &sc.attn_out }, 1, hidden, p.q_dim);
-        },
-    }
-
-    try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
-    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, 1);
-    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
-    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
-    try recDispatch1D(rec, &k.swiglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.swiglu_push, inter);
-    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
-    try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, hidden);
-}
-
-fn recordHybridForwardStep(
-    rec: *gpu_recorder.Recorder,
-    sc: *const HybridChatScratch,
-    state: *const HybridChatState,
-    gm: *const gpu_model.GpuModel,
-    cfg: config_mod.Config,
-    k: *const HybridChatKernels,
-    pos: usize,
-    token_id: u32,
-    max_pos: u32,
-    tq4_v: ?HybridTq4VHooks,
-    compute_logits: bool,
-) !void {
-    const hidden: u32 = @intCast(cfg.hidden_size);
-    const vocab: u32 = @intCast(cfg.vocab_size);
-
-    const pushes = computeHybridForwardPushes(cfg, pos, max_pos);
-    const embed_push = EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
-
-    // Embed lookup → residual stream.
-    try recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
-
-    for (0..cfg.num_hidden_layers) |layer_idx| {
-        try recordOneHybridLayer(rec, sc, state, gm, cfg, k, layer_idx, pos, &pushes, tq4_v);
-    }
-
-    if (compute_logits) {
-        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
-        try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
-    }
-}
 
 /// Probed forward through the hybrid path: same dispatches as
 /// recordHybridForwardStep but split across multiple submits so the
@@ -7056,8 +6516,8 @@ fn chatTurnHybrid(
 const EmbedLookupPush = runtime.EmbedLookupPush;
 const AddInPlacePush = runtime.AddInPlacePush;
 const AttnDecodeSinglePush = extern struct { n_heads: u32, heads_per_kv: u32, head_dim: u32 };
-const ScalePush = extern struct { n: u32, scale: f32 };
-const SliceCopyPush = extern struct { src_off: u32, dst_off: u32, n_elem: u32 };
+const ScalePush = runtime_hybrid.ScalePush;
+const SliceCopyPush = runtime_hybrid.SliceCopyPush;
 
 fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);

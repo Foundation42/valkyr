@@ -55,6 +55,14 @@ pub const loader = @import("loader.zig");
 pub const gpu_scratch = @import("gpu/scratch.zig");
 pub const runtime = @import("runtime.zig");
 
+/// Hybrid (Qwen3.5-family) forward primitives. Mirrors `runtime` for
+/// dense models. Owns its own `ChatKernels`, `Scratch`, `State`,
+/// `ForwardPushes`, `recordOneLayer`, `recordForwardStep` because the
+/// hybrid path runs a different kernel set + per-layer SSM state +
+/// branched dispatch (linear vs full attention). Chunk D will teach
+/// `Session` to dispatch into here when `cfg.family.isHybrid()`.
+pub const runtime_hybrid = @import("runtime_hybrid.zig");
+
 // ── Session API (chunk 7c) ──────────────────────────────────────
 // Frame-budgeted cooperative-inference state machine. Hosts that just
 // want text-out call `Session.init` + `appendPrompt` + `tickFrame`
