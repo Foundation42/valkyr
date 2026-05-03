@@ -281,15 +281,59 @@ pub const Tokenizer = struct {
         return self.id_to_str[id];
     }
 
+    /// Display-friendly decode: returns owned UTF-8 bytes ready to
+    /// print. Picks the right unmapping for the tokenizer's `mode`:
+    ///
+    ///   - `.bytelevel` (Llama 3 / Qwen3 / Qwen3.5 family): delegate
+    ///     to `decodeByteLevel` (reverses the GPT-2 byte→codepoint
+    ///     map; `Ġ` → space, `Ċ` → newline, etc.).
+    ///   - `.sentencepiece` (Gemma): substitute `▁` (U+2581) → space,
+    ///     and decode `<0xBB>` byte-fallback tokens to their literal
+    ///     byte value.
+    ///
+    /// Use this from streaming callbacks (Session's on_token,
+    /// matryoshka's ai_demo, --session-smoke) instead of `decode`,
+    /// which only returns the raw vocab atom and leaves the unmapping
+    /// to the caller. Caller owns the returned slice.
+    pub fn decodeForDisplay(self: *const Tokenizer, gpa: std.mem.Allocator, id: usize) ![]u8 {
+        if (self.mode == .bytelevel) return self.decodeByteLevel(gpa, id);
+        if (id >= self.id_to_str.len) return error.UnknownTokenId;
+        const s = self.id_to_str[id] orelse return error.UnknownTokenId;
+
+        // Byte-fallback: 6-char `<0xBB>` → one literal byte BB. Only
+        // SentencePiece tokenizers with byte_fallback enabled emit
+        // these (e.g. Gemma for non-vocab UTF-8 bytes mid-emoji).
+        if (s.len == 6 and s[0] == '<' and s[1] == '0' and s[2] == 'x' and s[5] == '>') {
+            if (std.fmt.parseInt(u8, s[3..5], 16)) |byte| {
+                const out = try gpa.alloc(u8, 1);
+                out[0] = byte;
+                return out;
+            } else |_| {}
+        }
+
+        // ▁ (U+2581 = 0xE2 0x96 0x81) → space; everything else copied.
+        var out = std.ArrayList(u8).init(gpa);
+        errdefer out.deinit();
+        var i: usize = 0;
+        while (i < s.len) {
+            if (i + 3 <= s.len and s[i] == 0xE2 and s[i + 1] == 0x96 and s[i + 2] == 0x81) {
+                try out.append(' ');
+                i += 3;
+            } else {
+                try out.append(s[i]);
+                i += 1;
+            }
+        }
+        return out.toOwnedSlice();
+    }
+
     /// Bytelevel decoder: reverse the byte→unicode mapping by walking
     /// the raw vocab string codepoint-by-codepoint and looking each one
     /// up in `char_to_byte`. Returns the original UTF-8 bytes the BPE
     /// atom encoded. Caller owns the returned slice.
     ///
-    /// For .sentencepiece mode this is the same as `decode` plus the
-    /// '▁' → ' ' substitution; the chat layer's printDecoded already
-    /// handles that case, so this path is only ever called in
-    /// .bytelevel mode.
+    /// Most callers want `decodeForDisplay` instead — it dispatches
+    /// to this for `.bytelevel` and handles `.sentencepiece` too.
     pub fn decodeByteLevel(self: *const Tokenizer, gpa: std.mem.Allocator, id: usize) ![]u8 {
         const s = self.id_to_str[id] orelse return error.UnknownTokenId;
         var out = std.ArrayList(u8).init(gpa);

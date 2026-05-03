@@ -3997,20 +3997,10 @@ const SessionSmokeOnTokenCtx = struct {
 fn sessionSmokeOnToken(user: ?*anyopaque, tok_id: u32, decoded: []const u8) void {
     _ = tok_id;
     const ctx: *SessionSmokeOnTokenCtx = @ptrCast(@alignCast(user.?));
-    // Best-effort decode display: SentencePiece `▁` → space, byte-level
-    // BPE leaves Ġ visible (chunk E will fix that). Same shape as
-    // matryoshka's ai_demo onTokenStreamed so we exercise the same
-    // code path the host would.
-    var i: usize = 0;
-    while (i < decoded.len) {
-        if (i + 3 <= decoded.len and decoded[i] == 0xE2 and decoded[i + 1] == 0x96 and decoded[i + 2] == 0x81) {
-            ctx.stdout.print(" ", .{}) catch return;
-            i += 3;
-        } else {
-            ctx.stdout.print("{c}", .{decoded[i]}) catch return;
-            i += 1;
-        }
-    }
+    // `decoded` is already display-ready: tokenizer.decodeForDisplay
+    // resolved SentencePiece ▁ / byte-level Ġ / hex-byte fallback
+    // tokens before this callback fired.
+    ctx.stdout.print("{s}", .{decoded}) catch return;
 }
 
 fn runSessionSmoke(

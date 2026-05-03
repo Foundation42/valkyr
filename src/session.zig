@@ -76,9 +76,13 @@ pub const SamplerKind = union(enum) {
     // union shape here so the API doesn't need to break when they land.
 };
 
-/// Fired once per emitted token, with the token id and (best-effort)
-/// decoded UTF-8. The decoded slice lives in the tokenizer's vocab
-/// table — borrow only; do not free.
+/// Fired once per emitted token, with the token id and the
+/// display-ready UTF-8 bytes. The decoded slice is owned by Session
+/// (allocated per-call by `tokenizer.decodeForDisplay`) and is only
+/// valid for the duration of the callback — copy it if you need it
+/// later. SentencePiece `▁` and byte-level `Ġ` markers are already
+/// resolved to spaces; byte-fallback `<0xBB>` tokens to their
+/// literal byte values.
 pub const TokenCallback = *const fn (
     user: ?*anyopaque,
     tok_id: u32,
@@ -360,7 +364,16 @@ pub const Session = struct {
             const tok = self.sample();
             try self.generated.append(tok);
             emitted = tok;
-            if (self.cfg.on_token) |cb| cb(self.cfg.on_token_user, tok, self.tokenizer.decode(tok) orelse "");
+            if (self.cfg.on_token) |cb| {
+                // `decodeForDisplay` allocates, but only on tokens we
+                // actually emit (one per ~hundreds of dispatches), so
+                // the cost is invisible. Frees right after the
+                // callback returns — the host's job is just to
+                // print/forward the bytes synchronously.
+                const display = self.tokenizer.decodeForDisplay(self.allocator, tok) catch &[_]u8{};
+                defer if (display.len > 0) self.allocator.free(display);
+                cb(self.cfg.on_token_user, tok, display);
+            }
             self.sample_pending = false;
             self.fwd_in_flight = false;
             self.fwd_layer = 0;
