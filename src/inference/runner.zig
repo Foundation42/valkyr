@@ -265,15 +265,38 @@ pub const InferenceRunner = struct {
         return self.pp.resolve(slice);
     }
 
-    // ── Tick driver (inline mode) ────────────────────────────────
+    // ── Tick driver ──────────────────────────────────────────────
 
-    /// Advance the runner by one cycle: drain commands, run one
-    /// tickFrame on the active request (if any), emit events for
-    /// what happened, transition state.
+    /// Advance the runner by one cycle and manage the recorder
+    /// lifecycle (reset → begin → tickFrame → endAndSubmit). Use
+    /// this when the runner OWNS the recorder — standalone CLI
+    /// runner-smoke, threaded mode driving its own per-tick
+    /// submits. Errors out via Recorder if called against a
+    /// host-attached recorder (where the host manages submits).
     ///
-    /// Inline-mode hosts call this once per frame. Threaded-mode
-    /// runners call this in a loop on the worker thread.
+    /// Embed hosts (matryoshka) call `tickWork` instead, on a
+    /// recorder the host has already begun and will submit
+    /// themselves alongside their other per-frame work.
     pub fn tickInline(self: *InferenceRunner) !void {
+        try self.rec.reset();
+        try self.rec.begin();
+        try self.tickWork();
+        try self.rec.endAndSubmit();
+    }
+
+    /// Advance the state machine WITHOUT touching the recorder's
+    /// reset/begin/end lifecycle. Caller must have the recorder in
+    /// the recording state already (or be in embedded mode where
+    /// reset/begin are no-ops); caller submits the cmd buffer
+    /// themselves.
+    ///
+    /// matryoshka's per-frame aiDispatch records its own
+    /// attn_synth dispatch + the runner's per-layer LLM forward
+    /// into one host-managed VkCommandBuffer that matryoshka
+    /// submits with its render frame. tickInline's
+    /// reset/begin/endAndSubmit is the wrong shape for that case
+    /// (and would error against an attached recorder).
+    pub fn tickWork(self: *InferenceRunner) !void {
         // 1. Drain commands. Cancels match against active immediately;
         //    chat commands enter the backlog if there's already an
         //    active request.
@@ -304,10 +327,7 @@ pub const InferenceRunner = struct {
             // Drive one tickFrame. on_token + on_token_user are wired
             // to runOnToken; that callback writes to the arena and
             // pushes token events synchronously inside tickFrame.
-            try self.rec.reset();
-            try self.rec.begin();
             const r = try self.sess.tickFrame(self.rec);
-            try self.rec.endAndSubmit();
             _ = r;
 
             // Post-tick: stop-string suffix may have matched during
