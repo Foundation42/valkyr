@@ -230,10 +230,15 @@ pub fn main() !void {
         // dense AND hybrid families through the embed surface without
         // a GUI. Format:
         //   --session-smoke <model> [--prompt "..."] [--max-new N]
-        //                           [--budget K] [--q4|--q4k]
+        //                           [--budget K] [--budget-us US]
+        //                           [--q4|--q4k]
+        // --budget       → Budget.layers   (default 8)
+        // --budget-us    → Budget.microseconds
+        // both           → Budget.either
         var prompt: []const u8 = "Once upon a time";
         var smoke_max_new: u32 = 20;
-        var budget: u32 = 8;
+        var budget_layers: ?u32 = null;
+        var budget_us: ?u64 = null;
         var q4: bool = false;
         var q4k: bool = false;
         var i: usize = 3;
@@ -246,7 +251,10 @@ pub fn main() !void {
                 smoke_max_new = try std.fmt.parseInt(u32, args[i + 1], 10);
                 i += 2;
             } else if (std.mem.eql(u8, a, "--budget") and i + 1 < args.len) {
-                budget = try std.fmt.parseInt(u32, args[i + 1], 10);
+                budget_layers = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--budget-us") and i + 1 < args.len) {
+                budget_us = try std.fmt.parseInt(u64, args[i + 1], 10);
                 i += 2;
             } else if (std.mem.eql(u8, a, "--q4")) {
                 q4 = true; i += 1;
@@ -260,6 +268,12 @@ pub fn main() !void {
             std.debug.print("--q4 and --q4k are mutually exclusive\n", .{});
             return;
         }
+        const budget: session_mod.Budget = if (budget_layers != null and budget_us != null)
+            .{ .either = .{ .layers = budget_layers.?, .microseconds = budget_us.? } }
+        else if (budget_us) |us|
+            .{ .microseconds = us }
+        else
+            .{ .layers = budget_layers orelse 8 };
         const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
         try runSessionSmoke(allocator, args[2], prompt, smoke_max_new, budget, precision);
         return;
@@ -4008,7 +4022,7 @@ fn runSessionSmoke(
     model_arg: []const u8,
     prompt: []const u8,
     max_new: u32,
-    budget: u32,
+    budget: session_mod.Budget,
     precision: gpu_model.Precision,
 ) !void {
     const stdout = std.io.getStdOut().writer();
@@ -4031,7 +4045,7 @@ fn runSessionSmoke(
     var on_token_ctx = SessionSmokeOnTokenCtx{ .stdout = stdout, .family = cfg.family };
 
     var sess = try session_mod.Session.init(gpa, &ctx, &loaded.gpu_model, &loaded.tokenizer, .{
-        .budget_layers = budget,
+        .budget = budget,
         .max_new_tokens = max_new,
         .on_token = sessionSmokeOnToken,
         .on_token_user = &on_token_ctx,
@@ -4043,20 +4057,27 @@ fn runSessionSmoke(
     try stdout.print("\nprompt: \"{s}\"\n", .{prompt});
     try stdout.print("response: ", .{});
 
-    // Single shared command buffer + recorder, mirroring the host
-    // setup. Each tickFrame records into the recorder; after the
-    // budget loop we submit + wait. Real hosts overlap with frame
-    // submits; we don't bother here since we just want correctness.
-    var rec = try gpu_recorder.Recorder.init(&ctx, 512, 4096);
+    // Recorder sized for the worst-case tick in pure `--budget-us` mode:
+    // a single tick may record every layer + sample step before the time
+    // gate fires. Layer-mode default (8 layers) fits in 512/4096 easily;
+    // bump here so the smoke harness can also exercise unbounded-layer
+    // time mode without exhausting the descriptor pool.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
     defer rec.deinit();
 
     const decode_t0 = std.time.nanoTimestamp();
     var ticks: u32 = 0;
+    var sum_elapsed_us: u64 = 0;
+    var sum_residual_signed: i64 = 0;
+    var max_elapsed_us: u64 = 0;
     while (!sess.isDone() and ticks < 4096) : (ticks += 1) {
         try rec.reset();
         try rec.begin();
-        _ = try sess.tickFrame(&rec);
+        const r = try sess.tickFrame(&rec);
         try rec.endAndSubmit();
+        sum_elapsed_us += r.elapsed_us;
+        sum_residual_signed += r.residual_us;
+        if (r.elapsed_us > max_elapsed_us) max_elapsed_us = r.elapsed_us;
     }
     const decode_t1 = std.time.nanoTimestamp();
     const tokens = sess.generatedTokens();
@@ -4065,6 +4086,14 @@ fn runSessionSmoke(
         "\n[{d} tok in {d:.0} ms over {d} ticks, {d:.1} tok/s]\n",
         .{ tokens.len, wall_s * 1000.0, ticks, @as(f64, @floatFromInt(tokens.len)) / wall_s },
     );
+    if (ticks > 0) {
+        const avg_elapsed = @as(f64, @floatFromInt(sum_elapsed_us)) / @as(f64, @floatFromInt(ticks));
+        const avg_residual = @as(f64, @floatFromInt(sum_residual_signed)) / @as(f64, @floatFromInt(ticks));
+        try stdout.print(
+            "[budget={s}  per-tick: avg_elapsed={d:.1} µs  max_elapsed={d} µs  avg_residual={d:.1} µs]\n",
+            .{ @tagName(budget), avg_elapsed, max_elapsed_us, avg_residual },
+        );
+    }
 }
 
 // ── bench: cold / warm forward timing on Gemma 2B IT ───────────────

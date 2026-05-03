@@ -21,12 +21,28 @@
 //!
 //! Frame-budget contract
 //! ─────────────────────
-//! `Config.budget_layers` is the per-tickFrame work cap. Each
-//! recordOneLayer call counts as one unit. The recorded sample step
-//! also counts as one. Embeddings are free (single dispatch, sub-µs
-//! at typical sizes). The state machine carries (in_flight,
+//! `Config.budget` is the per-tickFrame work cap. Three modes:
+//!
+//!   .layers       — walk up to N layer-units (legacy default, N=8)
+//!   .microseconds — walk until wall-clock elapsed ≥ µs cap (sampled
+//!                   once per layer-unit, so a single very expensive
+//!                   layer can overshoot by one unit)
+//!   .either       — both caps active; whichever hits first wins
+//!
+//! Each recordOneLayer call counts as one unit. The recorded sample
+//! step also counts as one. Embeddings are free (single dispatch,
+//! sub-µs at typical sizes). The state machine carries (in_flight,
 //! fwd_layer, sample_pending) across frames so partial forwards
 //! resume on the next tick exactly where they left off.
+//!
+//! `TickResult` reports `elapsed_us` and signed `residual_us` (target
+//! cap minus elapsed; positive = under-budget, negative = overshot)
+//! so a host can converge on a target frame budget with a simple
+//! feedback loop. For `.layers`-only mode `residual_us` is zero
+//! (no time signal). What we budget is *recording* time on the
+//! CPU, not GPU execution — Vulkan command recording is what we
+//! steal from the host's frame; GPU work runs async on the host's
+//! submit.
 //!
 //! Sampling cadence
 //! ────────────────
@@ -136,13 +152,31 @@ pub const LayerCallback = *const fn (
     tap: *const LayerTap,
 ) anyerror!void;
 
+/// Per-tickFrame work cap. See file-level "Frame-budget contract".
+pub const Budget = union(enum) {
+    /// Walk up to N layer-units of work. Legacy mode.
+    layers: u32,
+    /// Walk until elapsed wall-clock ≥ µs cap. Sampled once per
+    /// layer-unit (cheap), so one very expensive layer can overshoot
+    /// by one unit. `microseconds = 0` is valid: tickFrame will only
+    /// consume any deferred sample from the previous frame.
+    microseconds: u64,
+    /// Both caps active; whichever fires first wins. Most embed
+    /// callers want this — coarse layer cap as backstop, fine µs cap
+    /// as the real budget.
+    either: struct { layers: u32, microseconds: u64 },
+
+    pub fn defaults() Budget {
+        return .{ .layers = 8 };
+    }
+};
+
 pub const Config = struct {
-    /// Forward-step layers per tickFrame. Default = 8: tiny models
+    /// Per-tickFrame work cap. Default `.layers = 8`: tiny models
     /// (Llama 3.2 1B at 16 layers) decode at 2 frames/token; Gemma 2B
-    /// at 18 layers also fits in 2-3 frames per token. Hosts with
-    /// strict frame budgets can drop this; hosts that want max
-    /// throughput can raise it.
-    budget_layers: u32 = 8,
+    /// at 18 layers fits in 2-3 frames/token. Hosts with strict frame
+    /// budgets should switch to `.microseconds` or `.either`.
+    budget: Budget = Budget.defaults(),
 
     /// Maximum tokens to emit before stopping.
     max_new_tokens: u32 = 256,
@@ -185,6 +219,15 @@ pub const TickResult = struct {
     /// recordSampleStep contribute; recordEmbedding does not).
     layers_done: u32,
     phase: Phase,
+    /// Wall-clock elapsed inside this tickFrame (host-side recording
+    /// only — Vulkan command recording is what we budget against;
+    /// GPU work runs async on the host's submit).
+    elapsed_us: u64,
+    /// Signed residual against the configured time budget.
+    /// Positive = under-budget by this many µs. Negative = overshot.
+    /// Zero for `.layers`-only mode (no time signal). Hosts feed
+    /// this back as a pacing input.
+    residual_us: i64,
 };
 
 /// Per-family backend. Dense (Llama / Gemma / Qwen3 dense) holds a
@@ -366,11 +409,28 @@ pub const Session = struct {
     }
 
     /// Advance the cooperative-inference state machine by up to
-    /// `cfg.budget_layers` units of work, recording dispatches into
-    /// `rec`. Returns whatever happened this frame. Caller submits
-    /// the recorder as part of its frame submit — the Session does
-    /// not submit on its own.
+    /// `cfg.budget` of work, recording dispatches into `rec`. Returns
+    /// whatever happened this frame. Caller submits the recorder as
+    /// part of its frame submit — the Session does not submit on its
+    /// own.
     pub fn tickFrame(self: *Session, rec: *recorder_mod.Recorder) !TickResult {
+        const t_start = std.time.Instant.now() catch unreachable;
+
+        // Resolve budget caps. `microseconds = 0` is honored: the
+        // first per-layer time gate fires immediately so we'll only
+        // consume any deferred sample and return.
+        const layer_cap: u32 = switch (self.cfg.budget) {
+            .layers => |n| n,
+            .microseconds => std.math.maxInt(u32),
+            .either => |e| e.layers,
+        };
+        const us_cap: u64 = switch (self.cfg.budget) {
+            .layers => std.math.maxInt(u64),
+            .microseconds => |us| us,
+            .either => |e| e.microseconds,
+        };
+        const has_us_cap = us_cap != std.math.maxInt(u64);
+
         var emitted: ?u32 = null;
         var work: u32 = 0;
 
@@ -401,12 +461,17 @@ pub const Session = struct {
                 self.pos >= @as(u32, @intCast(self.cfg.max_pos)))
             {
                 self.phase = .done;
-                return .{ .new_token = emitted, .layers_done = 0, .phase = self.phase };
+                return self.makeTickResult(emitted, 0, t_start, us_cap, has_us_cap);
             }
         }
 
-        // ── 2. Record up to budget_layers of work. ───────────────────
-        while (work < self.cfg.budget_layers and self.phase != .done) {
+        // ── 2. Record up to layer_cap units of work, gated by us_cap. ──
+        while (work < layer_cap and self.phase != .done) {
+            if (has_us_cap) {
+                const now = std.time.Instant.now() catch unreachable;
+                const elapsed_us = now.since(t_start) / std.time.ns_per_us;
+                if (elapsed_us >= us_cap) break;
+            }
             switch (self.backend) {
                 .dense => |*b| {
                     if (!self.fwd_in_flight) {
@@ -592,7 +657,30 @@ pub const Session = struct {
             }
         }
 
-        return .{ .new_token = emitted, .layers_done = work, .phase = self.phase };
+        return self.makeTickResult(emitted, work, t_start, us_cap, has_us_cap);
+    }
+
+    fn makeTickResult(
+        self: *const Session,
+        emitted: ?u32,
+        work: u32,
+        t_start: std.time.Instant,
+        us_cap: u64,
+        has_us_cap: bool,
+    ) TickResult {
+        const now = std.time.Instant.now() catch unreachable;
+        const elapsed_us: u64 = now.since(t_start) / std.time.ns_per_us;
+        const residual_us: i64 = if (has_us_cap)
+            @as(i64, @intCast(us_cap)) - @as(i64, @intCast(elapsed_us))
+        else
+            0;
+        return .{
+            .new_token = emitted,
+            .layers_done = work,
+            .phase = self.phase,
+            .elapsed_us = elapsed_us,
+            .residual_us = residual_us,
+        };
     }
 
     fn pickNextInputToken(self: *Session) ?u32 {
