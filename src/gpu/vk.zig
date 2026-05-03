@@ -66,6 +66,19 @@ pub const Context = struct {
     /// without re-querying every time.
     props: c.VkPhysicalDeviceProperties,
 
+    // Ownership flags so the same struct works for both modes:
+    //   .init()   — valkyr creates everything; deinit destroys it all.
+    //   .attach() — host engine owns instance/device/cmd_pool; deinit
+    //               must NOT touch them. (queue + physical_device are
+    //               handles, not destroyable resources, so no flag.)
+    // The reason this matters: in the embedded use case (Matryoshka
+    // hosting valkyr) the host's render loop has already set up a
+    // device + queue + cmd_pool that we share. Destroying any of them
+    // from valkyr's deinit would crash the host on next frame.
+    owns_instance: bool,
+    owns_device: bool,
+    owns_cmd_pool: bool,
+
     pub fn init(allocator: std.mem.Allocator) !Context {
         _ = allocator; // reserved — extension/layer enumeration may need it
 
@@ -197,13 +210,54 @@ pub const Context = struct {
             .queue = queue,
             .cmd_pool = cmd_pool,
             .props = picked_props,
+            .owns_instance = true,
+            .owns_device = true,
+            .owns_cmd_pool = true,
+        };
+    }
+
+    /// Embedded-mode constructor: borrow Vulkan handles from a host
+    /// (e.g. a game engine that already created its own device + queue +
+    /// command pool). Valkyr will record dispatches into the host's
+    /// world without destroying any of the host's state at deinit.
+    ///
+    /// Caller MUST guarantee the handles outlive this Context. The
+    /// `cmd_pool` must have been created with the same `queue_family`
+    /// the queue belongs to, and with `RESET_COMMAND_BUFFER_BIT` so the
+    /// recorder can recycle individual buffers per forward pass.
+    ///
+    /// The physical-device props are re-queried here rather than passed
+    /// in — `vkGetPhysicalDeviceProperties` is a cheap driver-side call
+    /// and saves the host caller from filling a `VkPhysicalDeviceProperties`
+    /// they probably don't keep around.
+    pub fn attach(
+        instance: c.VkInstance,
+        physical_device: c.VkPhysicalDevice,
+        device: c.VkDevice,
+        queue: c.VkQueue,
+        queue_family: u32,
+        cmd_pool: c.VkCommandPool,
+    ) Context {
+        var props: c.VkPhysicalDeviceProperties = undefined;
+        c.vkGetPhysicalDeviceProperties(physical_device, &props);
+        return .{
+            .instance = instance,
+            .physical_device = physical_device,
+            .device = device,
+            .queue_family = queue_family,
+            .queue = queue,
+            .cmd_pool = cmd_pool,
+            .props = props,
+            .owns_instance = false,
+            .owns_device = false,
+            .owns_cmd_pool = false,
         };
     }
 
     pub fn deinit(self: *Context) void {
-        c.vkDestroyCommandPool(self.device, self.cmd_pool, null);
-        c.vkDestroyDevice(self.device, null);
-        c.vkDestroyInstance(self.instance, null);
+        if (self.owns_cmd_pool) c.vkDestroyCommandPool(self.device, self.cmd_pool, null);
+        if (self.owns_device) c.vkDestroyDevice(self.device, null);
+        if (self.owns_instance) c.vkDestroyInstance(self.instance, null);
     }
 
     /// Human-readable device name (null-terminated, owned by Vulkan

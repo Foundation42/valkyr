@@ -350,6 +350,7 @@ pub fn main() !void {
     try runQ4_KSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
+    try runEmbeddedAttachSmoke(allocator);
     try runGpuMatmulQ4_0Smoke(allocator);
     try runGpuMatmulQ4_KSmoke(allocator);
     try runGpuRmsnormSmoke(allocator);
@@ -916,6 +917,95 @@ fn runGpuMatmulV2Smoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS GPU matmul_nt_v2 synthetic (cooperative-K, 2×3 · (4×3)ᵀ → 2×4)\n", .{});
+}
+
+// ── embedded-attach smoke: parity between Context.init and Context.attach ─
+//
+// Validates the embedded-mode entry point that lets a host engine
+// (Matryoshka) hand valkyr a pre-existing VkDevice/queue/cmd_pool to
+// share. Two checks:
+//   1. A kernel dispatched through an `attach`'d Context produces the
+//      same result as one dispatched through the `init`'d Context that
+//      owns the underlying handles.
+//   2. Tearing down the attached context first, then the host context,
+//      does NOT double-free — owns_* flags must keep the handles alive
+//      across the attached deinit.
+//
+// We use `submitOneShot` (rather than the `Recorder`) because at this
+// chunk only the device/cmd-pool ownership is being tested; recorder
+// ownership is the next chunk.
+
+fn runEmbeddedAttachSmoke(allocator: std.mem.Allocator) !void {
+    var host = try vk.Context.init(allocator);
+    defer host.deinit();
+
+    var attached = vk.Context.attach(
+        host.instance,
+        host.physical_device,
+        host.device,
+        host.queue,
+        host.queue_family,
+        host.cmd_pool,
+    );
+    // attached.deinit must be a no-op — assert via the flags so a future
+    // refactor that flips an ownership bit can't silently start
+    // double-freeing without breaking this test.
+    if (attached.owns_instance or attached.owns_device or attached.owns_cmd_pool) {
+        std.debug.print("attach() returned a Context with an ownership flag set\n", .{});
+        return error.ParityFailed;
+    }
+
+    // Same problem as runGpuMatmulSmoke: 2x3 · (4x3)ᵀ → 2x4.
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const b = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 };
+    const want = [_]f32{ 1, 2, 3, 6, 4, 5, 6, 15 };
+    const m: u32 = 2;
+    const n: u32 = 4;
+    const k: u32 = 3;
+
+    var buf_a = try buffer.Buffer.initStatic(&attached, f32, &a);
+    defer buf_a.deinit(attached.device);
+    var buf_b = try buffer.Buffer.initStatic(&attached, f32, &b);
+    defer buf_b.deinit(attached.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&attached, m * n * @sizeOf(f32));
+    defer buf_c.deinit(attached.device);
+
+    var kern = try pipeline.Kernel.init(&attached, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+    const local_xy: u32 = 16;
+    const groups_x: u32 = (m + local_xy - 1) / local_xy;
+    const groups_y: u32 = (n + local_xy - 1) / local_xy;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+
+    try buffer.submitOneShot(&attached, struct {
+        kern: *const pipeline.Kernel,
+        push: *const MatmulPush,
+        gx: u32,
+        gy: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.gx, s.gy, 1);
+        }
+    }{ .kern = &kern, .push = &push, .gx = groups_x, .gy = groups_y });
+
+    var out: [8]f32 = undefined;
+    try buf_c.readBack(&attached, f32, &out);
+    for (out, want, 0..) |got, w, i| {
+        if (got != w) {
+            std.debug.print("attach-mode matmul MISMATCH at {d}: got {d}, expected {d}\n", .{ i, got, w });
+            return error.ParityFailed;
+        }
+    }
+
+    // Tear down `attached` explicitly (rather than via defer) so that
+    // any double-free regression surfaces here, before `host.deinit`
+    // runs. With the flags zeroed it's a no-op; without them it would
+    // VkDestroy* the handles host still owns and the next call would
+    // crash inside the validation layer.
+    attached.deinit();
+
+    std.debug.print("PASS embedded-attach (matmul parity + non-owning deinit) on {s}\n", .{host.deviceName()});
 }
 
 // ── gpu matmul_nt_v2_q4_0 smoke: int4 weights vs CPU dequant oracle ─
