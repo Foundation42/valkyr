@@ -33,8 +33,23 @@ pub const Recorder = struct {
     ctx: *const vk.Context,
     pool: c.VkDescriptorPool,
     cmd: c.VkCommandBuffer,
+    /// `null` when running in embedded mode — the host owns the fence
+    /// and the submit, so the recorder has no fence of its own to
+    /// destroy or wait on.
     fence: c.VkFence,
     n_dispatched: u32,
+
+    // Ownership flags. Mirrors the pattern in `vk.Context`: in standalone
+    // mode (`init`) the recorder owns its cmd buffer + fence and
+    // begin/endAndSubmit drive the full lifecycle. In embedded mode
+    // (`attachCmd`, e.g. valkyr inside Matryoshka's drawFrame) the host
+    // already called `vkBeginCommandBuffer` and will submit with its
+    // own fence as part of its render submit; valkyr just records
+    // dispatches into the host's buffer and stays out of the way.
+    // The descriptor pool is always recorder-owned regardless of mode —
+    // its lifetime is dispatch-graph-scoped, not frame-scoped.
+    owns_cmd: bool,
+    owns_fence: bool,
 
     /// Build a recorder sized for a forward pass of up to `max_sets`
     /// dispatches and `max_descriptors` total storage-buffer bindings.
@@ -77,25 +92,77 @@ pub const Recorder = struct {
             .cmd = cmd,
             .fence = fence,
             .n_dispatched = 0,
+            .owns_cmd = true,
+            .owns_fence = true,
+        };
+    }
+
+    /// Embedded-mode constructor. The host (e.g. Matryoshka) has
+    /// already allocated a command buffer and called
+    /// `vkBeginCommandBuffer` on it; valkyr's recorder simply records
+    /// its dispatches into that buffer and lets the host submit + wait.
+    ///
+    /// `host_cmd` MUST be in the recording state when the first
+    /// dispatch fires, and MUST NOT be ended/submitted by the host
+    /// until after the final dispatch through this recorder. The host
+    /// is also responsible for any `vkCmdPipelineBarrier` that crosses
+    /// the boundary between its own dispatches and valkyr's (the
+    /// recorder still inserts barriers between *its own* dispatches).
+    pub fn attachCmd(
+        ctx: *const vk.Context,
+        host_cmd: c.VkCommandBuffer,
+        max_sets: u32,
+        max_descriptors: u32,
+    ) !Recorder {
+        var pool_size = c.VkDescriptorPoolSize{
+            .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = max_descriptors,
+        };
+        var dpci = std.mem.zeroes(c.VkDescriptorPoolCreateInfo);
+        dpci.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = max_sets;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &pool_size;
+        var pool: c.VkDescriptorPool = null;
+        try vk.check(c.vkCreateDescriptorPool(ctx.device, &dpci, null, &pool));
+
+        return .{
+            .ctx = ctx,
+            .pool = pool,
+            .cmd = host_cmd,
+            .fence = null,
+            .n_dispatched = 0,
+            .owns_cmd = false,
+            .owns_fence = false,
         };
     }
 
     pub fn deinit(self: *Recorder) void {
-        c.vkDestroyFence(self.ctx.device, self.fence, null);
-        c.vkFreeCommandBuffers(self.ctx.device, self.ctx.cmd_pool, 1, &self.cmd);
+        if (self.owns_fence) c.vkDestroyFence(self.ctx.device, self.fence, null);
+        if (self.owns_cmd) c.vkFreeCommandBuffers(self.ctx.device, self.ctx.cmd_pool, 1, &self.cmd);
         c.vkDestroyDescriptorPool(self.ctx.device, self.pool, null);
     }
 
     /// Reset the descriptor pool and command buffer for re-use across
     /// forward passes (e.g. multi-token generation). The fence is reset
-    /// inside `submit()`.
+    /// inside `submit()`. In embedded mode the host owns the cmd-buffer
+    /// reset cadence (typically per render frame), so we only reset
+    /// the descriptor pool here.
     pub fn reset(self: *Recorder) !void {
         try vk.check(c.vkResetDescriptorPool(self.ctx.device, self.pool, 0));
-        try vk.check(c.vkResetCommandBuffer(self.cmd, 0));
+        if (self.owns_cmd) try vk.check(c.vkResetCommandBuffer(self.cmd, 0));
         self.n_dispatched = 0;
     }
 
+    /// In standalone mode, calls `vkBeginCommandBuffer` on the
+    /// recorder's own buffer. In embedded mode this is a no-op — the
+    /// host already put its buffer in the recording state before
+    /// handing it over.
     pub fn begin(self: *Recorder) !void {
+        if (!self.owns_cmd) {
+            self.n_dispatched = 0;
+            return;
+        }
         var bi = std.mem.zeroes(c.VkCommandBufferBeginInfo);
         bi.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -192,7 +259,14 @@ pub const Recorder = struct {
     /// End recording, submit to the queue, and wait for the fence.
     /// After this returns, all GPU writes are visible and any output
     /// buffers can be safely read back.
+    ///
+    /// Not callable in embedded mode — the host owns the submit cadence
+    /// (a single render submit per frame) and the fence (typically one
+    /// fence per frame-in-flight). Embedded callers should let the host
+    /// `vkEndCommandBuffer` + `vkQueueSubmit` as part of its render
+    /// frame; the recorder just contributed dispatches to the buffer.
     pub fn endAndSubmit(self: *Recorder) !void {
+        if (!self.owns_cmd) return error.AttachedRecorderCannotSubmit;
         try vk.check(c.vkEndCommandBuffer(self.cmd));
         try vk.check(c.vkResetFences(self.ctx.device, 1, &self.fence));
 

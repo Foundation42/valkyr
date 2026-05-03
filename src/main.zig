@@ -351,6 +351,7 @@ pub fn main() !void {
     try runGpuMatmulSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
+    try runEmbeddedRecorderSmoke(allocator);
     try runGpuMatmulQ4_0Smoke(allocator);
     try runGpuMatmulQ4_KSmoke(allocator);
     try runGpuRmsnormSmoke(allocator);
@@ -1006,6 +1007,120 @@ fn runEmbeddedAttachSmoke(allocator: std.mem.Allocator) !void {
     attached.deinit();
 
     std.debug.print("PASS embedded-attach (matmul parity + non-owning deinit) on {s}\n", .{host.deviceName()});
+}
+
+// ── embedded-recorder smoke: valkyr records into a host-owned cmd buffer ─
+//
+// Models the Matryoshka render-loop case: the host engine has begun a
+// command buffer for its own dispatches, hands it to valkyr, valkyr
+// records its inference dispatches into the same buffer, and the host
+// ends + submits + waits with its own fence. Two checks:
+//   1. Dispatches recorded via an attachCmd'd Recorder produce the
+//      same result as the standalone `endAndSubmit` path.
+//   2. Calling endAndSubmit on an attached recorder fails cleanly
+//      rather than silently double-ending the host's buffer.
+//
+// We simulate the "host" inside this same process by allocating a
+// fresh cmd buffer + fence from the same VkDevice — that's exactly
+// what an embedded host's render loop would have already done before
+// the integration point.
+
+fn runEmbeddedRecorderSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Same problem as runGpuMatmulV2Smoke; reusing matmul_nt_v2 because
+    // the recorder + barrier path is what we actually want to exercise
+    // (matmul_nt is a single dispatch that wouldn't catch a missing
+    // barrier between two valkyr-internal kernels).
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const b = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 };
+    const want = [_]f32{ 1, 2, 3, 6, 4, 5, 6, 15 };
+    const m: u32 = 2;
+    const n: u32 = 4;
+    const k: u32 = 3;
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, &a);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, f32, &b);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+    // ── Host side: allocate cmd buffer + fence, begin recording. ────
+    // (In Matryoshka this is `Renderer.drawFrame` after acquire.)
+    var cb_ai = std.mem.zeroes(vk.c.VkCommandBufferAllocateInfo);
+    cb_ai.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = ctx.cmd_pool;
+    cb_ai.level = vk.c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    var host_cmd: vk.c.VkCommandBuffer = null;
+    try vk.check(vk.c.vkAllocateCommandBuffers(ctx.device, &cb_ai, &host_cmd));
+    defer vk.c.vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &host_cmd);
+
+    var fci = std.mem.zeroes(vk.c.VkFenceCreateInfo);
+    fci.sType = vk.c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    var host_fence: vk.c.VkFence = null;
+    try vk.check(vk.c.vkCreateFence(ctx.device, &fci, null, &host_fence));
+    defer vk.c.vkDestroyFence(ctx.device, host_fence, null);
+
+    var bi = std.mem.zeroes(vk.c.VkCommandBufferBeginInfo);
+    bi.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = vk.c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    try vk.check(vk.c.vkBeginCommandBuffer(host_cmd, &bi));
+
+    // ── Valkyr side: attach a recorder to the host's cmd buffer. ────
+    var rec = try gpu_recorder.Recorder.attachCmd(&ctx, host_cmd, 4, 16);
+    defer rec.deinit();
+
+    if (rec.owns_cmd or rec.owns_fence) {
+        std.debug.print("attachCmd returned a recorder with an ownership flag set\n", .{});
+        return error.ParityFailed;
+    }
+
+    try rec.begin(); // no-op in attached mode; resets dispatch counter
+
+    const groups: u32 = m * n;
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    try rec.dispatch(&kern, &.{ &buf_a, &buf_b, &buf_c }, &push, groups, 1, 1);
+
+    // endAndSubmit on an attached recorder must refuse — the host owns
+    // the submit. We assert that explicitly so a future regression that
+    // forgot the owns_cmd check would be caught here, not in production.
+    if (rec.endAndSubmit()) {
+        std.debug.print("attached recorder endAndSubmit() should have errored\n", .{});
+        return error.ParityFailed;
+    } else |err| {
+        if (err != error.AttachedRecorderCannotSubmit) {
+            std.debug.print("attached recorder endAndSubmit() returned wrong error: {s}\n", .{@errorName(err)});
+            return err;
+        }
+    }
+
+    // ── Host side: end + submit + wait with its own fence. ──────────
+    try vk.check(vk.c.vkEndCommandBuffer(host_cmd));
+    var submit = std.mem.zeroes(vk.c.VkSubmitInfo);
+    submit.sType = vk.c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &host_cmd;
+    try vk.check(vk.c.vkQueueSubmit(ctx.queue, 1, &submit, host_fence));
+    const timeout_ns: u64 = 10 * 1_000_000_000;
+    try vk.check(vk.c.vkWaitForFences(ctx.device, 1, &host_fence, vk.c.VK_TRUE, timeout_ns));
+
+    var out: [8]f32 = undefined;
+    try buf_c.readBack(&ctx, f32, &out);
+    for (out, want, 0..) |got, w, i| {
+        if (got != w) {
+            std.debug.print("attached-recorder matmul MISMATCH at {d}: got {d}, expected {d}\n", .{ i, got, w });
+            return error.ParityFailed;
+        }
+    }
+
+    std.debug.print("PASS embedded-recorder (host-owned cmd buffer, valkyr dispatches in, host submits) on {s}\n", .{ctx.deviceName()});
 }
 
 // ── gpu matmul_nt_v2_q4_0 smoke: int4 weights vs CPU dequant oracle ─
