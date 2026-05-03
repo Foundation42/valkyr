@@ -504,6 +504,39 @@ For Gemma 2B IT the snapshot dir is typically inside
 `~/.cache/huggingface/hub/models--google--gemma-2b-it/snapshots/<hash>/`
 after a `huggingface-cli download google/gemma-2b-it`.
 
+## Embedding in a Vulkan host
+
+valkyr ships a public Zig module (`valkyr_gpu`) for hosts that want
+LLM inference inside their own real-time Vulkan stack — game engines,
+AR/VR runtimes, embedded apps with a graphics frame loop. The
+contract is **cooperative**: valkyr attaches to the host's existing
+`VkDevice` / queue / command pool, records its forward-pass dispatches
+into the host's per-frame command buffer, and yields back inside a
+configurable layer budget. At 60 fps the model thinks across multiple
+frames cooperatively while the renderer keeps drawing.
+
+Two integration tiers are available:
+
+- **Session API** — hand valkyr a model + a prompt and call
+  `tickFrame(rec)` once per frame. The default state machine handles
+  per-layer chunking, KV/scratch lifecycle, deferred sampling, and
+  on-layer / on-token callbacks for visualization or streaming.
+- **Cooperative-compute primitives** — `Context.attach` +
+  `Recorder.attachCmd` + `runtime.recordOneLayer` etc. for hosts that
+  want to drive the per-step graph themselves (custom samplers,
+  multi-NPC scheduling, non-LM forward shapes).
+
+A worked example lives in
+[Matryoshka](https://github.com/foundation42/matryoshka)'s `ai_demo`
+Game: Gemma 2B IT generating text token-by-token inside the renderer's
+`drawFrame`, with the model's last-layer attention driving 16 point
+lights through the `on_layer` hook — all sharing one `VkDevice`, one
+queue, one submit per frame.
+
+For the full integration guide — build setup, code examples for both
+tiers, frame-budget mechanics, sampling readback strategy, lifetime
+rules, and known limitations — see **[docs/embedding.md](docs/embedding.md)**.
+
 ## Architecture
 
 ```
