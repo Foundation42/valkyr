@@ -29,12 +29,21 @@ years), and intentionally *less* than llama.cpp. So why pick it up?
   you don't want to bet on CUDA being on every machine forever, the
   one-Vulkan-binary story matters.
 
-- **Composes with your engine.** If you're already running Vulkan —
-  game engine, real-time graphics, AR/VR, Android app, embedded GPU —
-  valkyr lives on the same `VkDevice`, the same command buffers, the
-  same queues. No parallel CUDA runtime, no shared-memory split, no
-  extra GB of dynamic libraries. **The natural fit if you want
-  inference inside an app that already has a Vulkan graphics stack.**
+- **Embeds inside your render loop.** valkyr ships a public Zig
+  module (`valkyr_gpu`) for cooperative-compute integration: attach
+  to your existing `VkDevice` / queue / command pool, hand a model +
+  prompt to a `Session`, call `tickFrame(rec)` once per frame from
+  your aiDispatch hook. The state machine spreads forward passes
+  across frames within a configurable layer budget — silky-smooth
+  inference that runs alongside your render passes on the same
+  queue, in the same submit, with no parallel CUDA runtime, no
+  shared-memory split, no extra GB of dynamic libraries.
+  Token streaming, real-time tensor visualization (an `on_layer`
+  hook gives shaders direct access to attention scores / hidden
+  states), and bespoke per-step orchestration are all first-class.
+  See [docs/embedding.md](docs/embedding.md). **The natural fit if
+  you want inference inside an app that already has a Vulkan
+  graphics stack.**
 
 - **Pedagogically transparent.** Every GPU shader has a CPU reference
   in `src/cpu/*.zig` that gets parity-checked against. The full
