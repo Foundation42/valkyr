@@ -1,0 +1,75 @@
+#version 460
+// Batched forward pass for the 2-layer training MLP.
+//
+// One thread per sample. Each thread:
+//   1. Loads the sample's input vector (length dim_in) directly from
+//      the X buffer.
+//   2. Computes the hidden activations h[0..dim_hidden] = relu(W1·x + b1)
+//      into a private (per-thread) array. The hidden width is bounded
+//      by MAX_HIDDEN at compile time so the array is statically sized.
+//   3. Computes the output y[0..dim_out] = W2·h + b2 directly into the
+//      Y buffer.
+//
+// Why a single thread per sample instead of cooperative reductions
+// across hidden_dim: at our target sizes (dim_hidden ≤ 64) the inner
+// loop is tiny — fully sequential per-thread is simpler and avoids
+// shared-memory pressure. Parallelism comes from running many samples
+// at once (one workgroup = 64 threads = 64 samples).
+//
+// Used by `TrainingRunner.tickPredictBatch` to evaluate the MLP on a
+// grid of inputs in one dispatch — the natural shape for visualising
+// f(u, v) → rgb across an entire surface every frame, where N samples
+// is in the hundreds.
+
+layout(local_size_x = 64) in;
+
+// MAX_HIDDEN bounds the per-thread hidden array. At hidden_dim = 16
+// this leaves ~3× headroom; bump if larger MLPs need it. Cap is
+// enforced GPU-side (out-of-range indices early-out) and host-side
+// (the Runner asserts dim_hidden <= this constant).
+#define MAX_HIDDEN 64
+
+layout(set = 0, binding = 0, std430) readonly  buffer W1 { float w1[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer B1 { float b1[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer W2 { float w2[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer B2 { float b2[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer X  { float x[];  }; // [n_samples, dim_in]
+layout(set = 0, binding = 5, std430) writeonly buffer Y  { float y[];  }; // [n_samples, dim_out]
+
+layout(push_constant) uniform Pc {
+    uint dim_in;
+    uint dim_hidden;
+    uint dim_out;
+    uint n_samples;
+} pc;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.n_samples) return;
+    if (pc.dim_hidden > MAX_HIDDEN) return;
+
+    uint x_off = n * pc.dim_in;
+    uint y_off = n * pc.dim_out;
+
+    float hidden[MAX_HIDDEN];
+
+    // Layer 1: h = relu(W1·x + b1).
+    for (uint h = 0; h < pc.dim_hidden; h++) {
+        float acc = b1[h];
+        uint w1_row = h * pc.dim_in;
+        for (uint i = 0; i < pc.dim_in; i++) {
+            acc += w1[w1_row + i] * x[x_off + i];
+        }
+        hidden[h] = acc > 0.0 ? acc : 0.0;
+    }
+
+    // Layer 2: y = W2·h + b2.
+    for (uint o = 0; o < pc.dim_out; o++) {
+        float acc = b2[o];
+        uint w2_row = o * pc.dim_hidden;
+        for (uint h = 0; h < pc.dim_hidden; h++) {
+            acc += w2[w2_row + h] * hidden[h];
+        }
+        y[y_off + o] = acc;
+    }
+}

@@ -3,8 +3,11 @@
 The two big arcs ahead — breadth (more model families) and depth
 (TQ3, symmetric K=TQ/V=TQ, fused FlashAttention-style kernel,
 bf16 LM head + embedding, GPU-side compute quantize, TQ4-on-weights,
-and a training port). Back to [README](../README.md). See also:
-[limitations.md](limitations.md), [models.md](models.md).
+deeper training stack). Training v0 (cooperative attach + Adam +
+loss-target decay over a 2-layer MLP) is **shipped** as of
+2026-05-05; see [embedding.md § Embedding training](embedding.md#embedding-training).
+Back to [README](../README.md). See also: [limitations.md](limitations.md),
+[models.md](models.md).
 
 ## Where this can go next
 
@@ -36,7 +39,21 @@ The two big arcs:
    - **TQ4-on-weights** — TurboQuant applied to the matmul weight
      side, orthogonal to Q4_0/Q4_K. Combined with `--tq4v` gets
      Gemma 2B into a few hundred MiB total.
-   - **Training port**, the Unsloth-alternative ambition. Each forward
-     primitive gets a paired `_backward` companion CPU-first as the
-     gradient oracle, then ported to Vulkan. The architecture is built
-     for it; what's left is the implementation pass.
+   - **Training stack** — v0 **shipped**. The 2-layer-MLP surface
+     (cooperative attach, batched mean-gradient SGD/Adam, MSE/CE loss
+     heads, loss-target decay, host-mapped predict staging) lives at
+     `src/train/runner.zig` with parity smokes against the CPU oracle
+     in `src/cpu/train.zig`. Headless `valkyr --train-demo` and two
+     visual companion demos in matryoshka (`train_mlp_demo`,
+     `train_classifier_demo`) show it running at refresh rate inside
+     a render loop. **Next tiers:** multi-layer MLP generalisation
+     (drop the hardcoded 2-layer assumption), then layernorm/RMSNorm
+     backward, attention backward, embedding gradient, and finally
+     the full transformer-fine-tune arc — same parity discipline:
+     CPU oracle first, GPU shader matches it. See
+     [embedding.md § Embedding training](embedding.md#embedding-training).
+   - **Architectural blueprints (ONNX / JSON-spec).** Once the
+     primitive set has stabilised through the transformer-training
+     deepening above, a declarative graph → instantiated valkyr
+     pipeline becomes the obvious next surface. Defer until the
+     primitive library is roughly complete.

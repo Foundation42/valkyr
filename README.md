@@ -4,14 +4,17 @@
 
 # valkyr
 
-**Cross-vendor LLM inference in pure Zig + Vulkan. One SPIR-V binary
-runs on every GPU — no CUDA lock-in.**
+**Cross-vendor LLM inference *and* on-device training in pure Zig +
+Vulkan. One SPIR-V binary runs on every GPU — no CUDA lock-in.**
 
 Greedy and sampled text generation across six model families,
 multi-turn chat, parity-verified against HuggingFace `transformers`,
 OpenAI-compatible HTTP server, embeddable inside any Vulkan host.
-Supported families: Gemma, Llama, Mistral, Qwen3 (dense), Qwen3.5 /
-Qwen3.6 (hybrid Gated DeltaNet), TinyLlama / Zephyr.
+Now with **interactive in-frame training** (MLPs, MSE/CE, SGD/Adam,
+loss-target decay) — train + infer cooperatively inside a render loop
+with the same submit, the same device, zero waitIdle. Supported
+families: Gemma, Llama, Mistral, Qwen3 (dense), Qwen3.5 / Qwen3.6
+(hybrid Gated DeltaNet), TinyLlama / Zephyr.
 
 valkyr runs the same math on any GPU that supports Vulkan 1.3
 (AMD / Intel / NVIDIA / Apple via MoltenVK / Android Adreno / Mali) —
@@ -82,10 +85,17 @@ years), and intentionally *less* than llama.cpp. So why pick it up?
   references, not bolted onto an older core. The architectural
   diversity stays legible because nothing's grandfathered.
 
-- **Training is on the menu.** The plan is an Unsloth-class training
-  port on top of the same Vulkan kernels — paired forward/backward
-  primitives, parity-checked against CPU references. Not yet shipped
-  (see roadmap), but the architecture is built for it.
+- **Training, in-frame, on every GPU.** The v0 training surface ships
+  today. A `TrainingRunner` mirrors the `InferenceRunner` shape:
+  `tickFrameTrain(rec, .{ .steps = N }, n_samples)` records a batched
+  SGD or Adam step into your host's command buffer, no internal
+  submits, zero waitIdle. MSE and cross-entropy loss heads. A
+  `loss_target` decay policy lets the runtime self-throttle —
+  training stops the moment the loss drops below your target,
+  resumes the moment fresh supervision pushes it back above. **Watch
+  a sphere learn to turn red while your render loop holds 60 fps.**
+  Two playable demos in the matryoshka companion repo. Every shader
+  is parity-checked against a CPU oracle in `src/cpu/train.zig`.
 
 **Honest framing.** valkyr is younger and smaller than llama.cpp. On
 raw decode tok/s on a single CUDA card, llama.cpp's CUDA path is
@@ -114,7 +124,7 @@ The detail lives in `docs/`. Each page is self-contained.
 | [docs/embedding.md](docs/embedding.md) | Full guide for embedding valkyr in a Vulkan host — three integration tiers, frame-budget mechanics, lifetime rules. |
 | [docs/server.md](docs/server.md) | OpenAI-compatible HTTP server (`--serve`) — endpoints, streaming, multi-turn, error envelope, openai-python compatibility. |
 | [docs/limitations.md](docs/limitations.md) | What valkyr can't do today + experiments that got reverted (tiled-N matmul, Q4_0 split layout, SwiGLU sparsity skipping). |
-| [docs/roadmap.md](docs/roadmap.md) | The two big arcs ahead — breadth (more families) + depth (TQ3, fused attention, GPU-side quantize, training port). |
+| [docs/roadmap.md](docs/roadmap.md) | The two big arcs ahead — breadth (more families) + depth (TQ3, fused attention, GPU-side quantize, deeper training stack). |
 
 ## Embedding in a Vulkan host
 

@@ -1,0 +1,49 @@
+#version 460
+// Batched cross-entropy loss reduction → single scalar.
+//
+//     loss = -(1 / N) · Σ_n Σ_o target[n, o] · log(softmax(y_n)[o])
+//
+// Computed via the log-sum-exp form for numerical stability:
+//
+//     log(softmax(y)[o]) = y[o] - (max(y) + log Σ exp(y - max(y)))
+//
+// Single thread, sequential loop over the batch — same scale and
+// reasoning as `mlp2_mse_loss_batched.comp`. The shader is used by
+// the runtime's loss-target decay policy to gate training each
+// frame, so the runtime reads its scalar output back to host
+// every frame regardless of whether training ran.
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Y { float y_all[];      };
+layout(set = 0, binding = 1, std430) readonly  buffer T { float target_all[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer L { float loss_out[];   };
+
+layout(push_constant) uniform Pc {
+    uint dim_out;
+    uint n_samples;
+} pc;
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0) return;
+    float total_loss = 0.0;
+    for (uint n = 0; n < pc.n_samples; n++) {
+        uint off = n * pc.dim_out;
+        // Row-max for stable softmax.
+        float m = y_all[off];
+        for (uint o = 1; o < pc.dim_out; o++) {
+            m = max(m, y_all[off + o]);
+        }
+        float sum_e = 0.0;
+        for (uint o = 0; o < pc.dim_out; o++) {
+            sum_e += exp(y_all[off + o] - m);
+        }
+        float log_z = m + log(sum_e);
+        // Sample loss = -Σ_o target · (y - log_z) — equivalent to
+        // -Σ_o target · log(softmax(y)[o]) by definition.
+        for (uint o = 0; o < pc.dim_out; o++) {
+            total_loss -= target_all[off + o] * (y_all[off + o] - log_z);
+        }
+    }
+    loss_out[0] = total_loss / float(pc.n_samples);
+}

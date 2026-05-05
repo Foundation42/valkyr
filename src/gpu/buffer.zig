@@ -22,7 +22,7 @@ const std = @import("std");
 const vk = @import("vk.zig");
 const c = vk.c;
 
-pub const Mode = enum { static, dynamic, device_only };
+pub const Mode = enum { static, dynamic, device_only, host_readback };
 
 pub const Buffer = struct {
     handle: c.VkBuffer,
@@ -83,6 +83,42 @@ pub const Buffer = struct {
             .memory = raw.memory,
             .bytes = total,
             .mode = .dynamic,
+            .mapped = mapped,
+        };
+    }
+
+    /// Host-readback buffer — HOST_VISIBLE + HOST_COHERENT, persistent-
+    /// mapped, with TRANSFER_DST_BIT enabled so the GPU can stream
+    /// data INTO it via `vkCmdCopyBuffer` from a device-only buffer.
+    /// The CPU then reads the mapped pointer directly — no per-frame
+    /// staging dance, no submitOneShot. Used for the cooperative
+    /// inference / training paths where the host's own submit + fence
+    /// drives readback completion (CPU reads after fence wait).
+    ///
+    /// Pair with: a device-only output buffer + a recorded
+    /// `vkCmdCopyBuffer` from output → this. After the host's frame
+    /// fence signals, contents of `mapped` are guaranteed visible.
+    pub fn initHostReadback(ctx: *const vk.Context, capacity_bytes: usize) !Buffer {
+        const total = @max(capacity_bytes, 16);
+        const raw = try createBuffer(
+            ctx,
+            total,
+            c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        );
+        var mapped: ?*anyopaque = null;
+        try vk.check(c.vkMapMemory(ctx.device, raw.memory, 0, total, 0, &mapped));
+        // Vulkan doesn't guarantee zeroed memory at allocation; without
+        // this CPU readers see garbage on the first frame before the
+        // first GPU copy lands.
+        if (mapped) |m| {
+            @memset(@as([*]u8, @ptrCast(m))[0..total], 0);
+        }
+        return .{
+            .handle = raw.handle,
+            .memory = raw.memory,
+            .bytes = total,
+            .mode = .host_readback,
             .mapped = mapped,
         };
     }

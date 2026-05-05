@@ -1,0 +1,37 @@
+#version 460
+// Linear-layer input gradient: dx[j] = Σᵢ upstream[i] · W[i, j]
+//
+// Given a forward layer y = W · x + b with W ∈ ℝ^[dim_out, dim_in]
+// stored row-major, the input gradient is the transposed matvec
+// W^T · upstream, i.e. dx[j] = Σᵢ upstream[i] · W[i, j].
+//
+// Equivalent to a matmul with W treated as a non-transposed matrix
+// (matmul_nt expects the second argument's rows to align with the
+// inner dimension; here it doesn't), so this is a bespoke shader
+// rather than a reuse of matmul_nt. One thread per output element,
+// flat 1D dispatch.
+//
+// Used twice in MLP backward:
+//   - dL/dh = W2^T · dL/dy        (this shader, with W = W2)
+//   - dL/dx (input grad, optional, for chained / deeper nets)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Up { float up[];   }; // [dim_out]
+layout(set = 0, binding = 1, std430) readonly  buffer W  { float w[];    }; // [dim_out, dim_in]
+layout(set = 0, binding = 2, std430) writeonly buffer Dx { float dx[];   }; // [dim_in]
+
+layout(push_constant) uniform Pc {
+    uint dim_out;
+    uint dim_in;
+} pc;
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.dim_in) return;
+    float acc = 0.0;
+    for (uint i = 0; i < pc.dim_out; i++) {
+        acc += up[i] * w[i * pc.dim_in + j];
+    }
+    dx[j] = acc;
+}

@@ -49,6 +49,22 @@ pub fn build(b: *std.Build) void {
     const tq4_unpack128_spv = compileShader(b, "tq4_unpack128");
     const tq4_pack_to_cache128_spv = compileShader(b, "tq4_pack_to_cache128");
     const attn_synth_spv = compileShader(b, "attn_synth");
+    const relu_spv = compileShader(b, "relu");
+    const relu_backward_spv = compileShader(b, "relu_backward");
+    const linear_backward_dx_spv = compileShader(b, "linear_backward_dx");
+    const outer_product_spv = compileShader(b, "outer_product");
+    const sgd_step_spv = compileShader(b, "sgd_step");
+    const adam_step_spv = compileShader(b, "adam_step");
+    const mse_loss_grad_spv = compileShader(b, "mse_loss_grad");
+    const mlp2_forward_batched_spv = compileShader(b, "mlp2_forward_batched");
+    const mlp2_forward_train_batched_spv = compileShader(b, "mlp2_forward_train_batched");
+    const mlp2_dy_batched_spv = compileShader(b, "mlp2_dy_batched");
+    const mlp2_dh_pre_batched_spv = compileShader(b, "mlp2_dh_pre_batched");
+    const mlp2_dw_accum_spv = compileShader(b, "mlp2_dw_accum");
+    const mlp2_db_accum_spv = compileShader(b, "mlp2_db_accum");
+    const softmax_ce_loss_grad_batched_spv = compileShader(b, "softmax_ce_loss_grad_batched");
+    const mlp2_mse_loss_batched_spv = compileShader(b, "mlp2_mse_loss_batched");
+    const mlp2_ce_loss_batched_spv = compileShader(b, "mlp2_ce_loss_batched");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -95,6 +111,22 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(tq4_unpack128_spv, "tq4_unpack128.spv");
     _ = wf.addCopyFile(tq4_pack_to_cache128_spv, "tq4_pack_to_cache128.spv");
     _ = wf.addCopyFile(attn_synth_spv, "attn_synth.spv");
+    _ = wf.addCopyFile(relu_spv, "relu.spv");
+    _ = wf.addCopyFile(relu_backward_spv, "relu_backward.spv");
+    _ = wf.addCopyFile(linear_backward_dx_spv, "linear_backward_dx.spv");
+    _ = wf.addCopyFile(outer_product_spv, "outer_product.spv");
+    _ = wf.addCopyFile(sgd_step_spv, "sgd_step.spv");
+    _ = wf.addCopyFile(adam_step_spv, "adam_step.spv");
+    _ = wf.addCopyFile(mse_loss_grad_spv, "mse_loss_grad.spv");
+    _ = wf.addCopyFile(mlp2_forward_batched_spv, "mlp2_forward_batched.spv");
+    _ = wf.addCopyFile(mlp2_forward_train_batched_spv, "mlp2_forward_train_batched.spv");
+    _ = wf.addCopyFile(mlp2_dy_batched_spv, "mlp2_dy_batched.spv");
+    _ = wf.addCopyFile(mlp2_dh_pre_batched_spv, "mlp2_dh_pre_batched.spv");
+    _ = wf.addCopyFile(mlp2_dw_accum_spv, "mlp2_dw_accum.spv");
+    _ = wf.addCopyFile(mlp2_db_accum_spv, "mlp2_db_accum.spv");
+    _ = wf.addCopyFile(softmax_ce_loss_grad_batched_spv, "softmax_ce_loss_grad_batched.spv");
+    _ = wf.addCopyFile(mlp2_mse_loss_batched_spv, "mlp2_mse_loss_batched.spv");
+    _ = wf.addCopyFile(mlp2_ce_loss_batched_spv, "mlp2_ce_loss_batched.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -136,6 +168,22 @@ pub fn build(b: *std.Build) void {
         \\pub const tq4_unpack128 align(4) = @embedFile("tq4_unpack128.spv").*;
         \\pub const tq4_pack_to_cache128 align(4) = @embedFile("tq4_pack_to_cache128.spv").*;
         \\pub const attn_synth align(4) = @embedFile("attn_synth.spv").*;
+        \\pub const relu align(4) = @embedFile("relu.spv").*;
+        \\pub const relu_backward align(4) = @embedFile("relu_backward.spv").*;
+        \\pub const linear_backward_dx align(4) = @embedFile("linear_backward_dx.spv").*;
+        \\pub const outer_product align(4) = @embedFile("outer_product.spv").*;
+        \\pub const sgd_step align(4) = @embedFile("sgd_step.spv").*;
+        \\pub const adam_step align(4) = @embedFile("adam_step.spv").*;
+        \\pub const mse_loss_grad align(4) = @embedFile("mse_loss_grad.spv").*;
+        \\pub const mlp2_forward_batched align(4) = @embedFile("mlp2_forward_batched.spv").*;
+        \\pub const mlp2_forward_train_batched align(4) = @embedFile("mlp2_forward_train_batched.spv").*;
+        \\pub const mlp2_dy_batched align(4) = @embedFile("mlp2_dy_batched.spv").*;
+        \\pub const mlp2_dh_pre_batched align(4) = @embedFile("mlp2_dh_pre_batched.spv").*;
+        \\pub const mlp2_dw_accum align(4) = @embedFile("mlp2_dw_accum.spv").*;
+        \\pub const mlp2_db_accum align(4) = @embedFile("mlp2_db_accum.spv").*;
+        \\pub const softmax_ce_loss_grad_batched align(4) = @embedFile("softmax_ce_loss_grad_batched.spv").*;
+        \\pub const mlp2_mse_loss_batched align(4) = @embedFile("mlp2_mse_loss_batched.spv").*;
+        \\pub const mlp2_ce_loss_batched align(4) = @embedFile("mlp2_ce_loss_batched.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──

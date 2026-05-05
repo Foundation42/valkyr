@@ -1,0 +1,32 @@
+#version 460
+// Outer-product: dW[i, j] = a[i] · b[j]
+//
+// The weight gradient for a linear layer y = W · x + b is the outer
+// product of the upstream gradient with the layer's input:
+//     dL/dW[i, j] = (dL/dy)[i] · x[j]
+// This shader produces it directly as a row-major [dim_out, dim_in]
+// tensor, written to `dW` overwriting any prior contents (chunk-3
+// scope: one (input, target) per step, no gradient accumulation
+// across a batch — that comes when we add minibatching).
+//
+// 2D dispatch over the output grid; one thread per element. 16×16
+// workgroup matches the existing matmul_nt convention so descriptor
+// allocation patterns line up across forward and backward.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A  { float a[];  }; // [dim_out]
+layout(set = 0, binding = 1, std430) readonly  buffer B  { float b[];  }; // [dim_in]
+layout(set = 0, binding = 2, std430) writeonly buffer DW { float dw[]; }; // [dim_out, dim_in]
+
+layout(push_constant) uniform Pc {
+    uint dim_out;
+    uint dim_in;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint j = gl_GlobalInvocationID.y;
+    if (i >= pc.dim_out || j >= pc.dim_in) return;
+    dw[i * pc.dim_in + j] = a[i] * b[j];
+}

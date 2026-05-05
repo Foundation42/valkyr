@@ -1,0 +1,66 @@
+#version 460
+// Fused softmax + cross-entropy loss gradient, batched.
+//
+// For each sample n, compute the stable softmax of the logits row
+// and emit the gradient of the cross-entropy loss wrt those logits:
+//
+//     p[n, o] = softmax(y[n, *])[o]        (numerically stable form)
+//     dL/dy[n, o] = (p[n, o] − target[n, o]) / N
+//
+// Where `target` is one-hot for hard-class labels (or a soft
+// distribution for label-smoothing / distillation — both work).
+// Pre-dividing by N has the same role here as in the MSE variant:
+// every downstream gradient is automatically averaged across the
+// batch, so the SGD / Adam step doesn't need a separate scale.
+//
+// Stable softmax: subtract row-max before exp to keep e^x finite
+// even when logits are large in absolute value. Matches the
+// existing `softmax.comp` numerical form so logits read identically
+// for inference and training.
+//
+// One thread per sample. Each thread loops over `dim_out` twice
+// (once for max + sum, once to write). That's two passes per row
+// of length dim_out — at typical sizes (3–256 classes) this is
+// fine; for vocab-size logits (32 K) we'd want a cooperative
+// reduction instead.
+
+layout(local_size_x = 64) in;
+
+#define MAX_OUT 1024  // covers small classifiers + reasonable vocab sizes
+
+layout(set = 0, binding = 0, std430) readonly  buffer Y { float y_all[];      }; // [N, dim_out]
+layout(set = 0, binding = 1, std430) readonly  buffer T { float target_all[]; }; // [N, dim_out]
+layout(set = 0, binding = 2, std430) writeonly buffer D { float dy_all[];     }; // [N, dim_out]
+
+layout(push_constant) uniform Pc {
+    uint dim_out;
+    uint n_samples;
+} pc;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.n_samples) return;
+    if (pc.dim_out > MAX_OUT) return;
+
+    uint off = n * pc.dim_out;
+
+    // Pass 1: row max for stable softmax.
+    float m = y_all[off];
+    for (uint i = 1; i < pc.dim_out; i++) {
+        m = max(m, y_all[off + i]);
+    }
+
+    // Pass 2: sum of e^(y - m).
+    float sum_e = 0.0;
+    for (uint i = 0; i < pc.dim_out; i++) {
+        sum_e += exp(y_all[off + i] - m);
+    }
+    float inv_sum = 1.0 / sum_e;
+    float inv_n = 1.0 / float(pc.n_samples);
+
+    // Pass 3: emit (softmax − target) / N.
+    for (uint i = 0; i < pc.dim_out; i++) {
+        float p = exp(y_all[off + i] - m) * inv_sum;
+        dy_all[off + i] = (p - target_all[off + i]) * inv_n;
+    }
+}

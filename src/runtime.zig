@@ -106,6 +106,73 @@ pub const AttnOutputPush = extern struct {
 
 pub const AddInPlacePush = extern struct { n: u32 };
 
+pub const ReluPush = extern struct { n: u32 };
+
+pub const ReluBackwardPush = extern struct { n: u32 };
+
+pub const LinearBackwardDxPush = extern struct { dim_out: u32, dim_in: u32 };
+
+pub const OuterProductPush = extern struct { dim_out: u32, dim_in: u32 };
+
+pub const SgdStepPush = extern struct { n: u32, lr: f32 };
+
+pub const AdamStepPush = extern struct {
+    n: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    t: u32,
+};
+
+pub const MseLossGradPush = extern struct { n: u32 };
+
+pub const Mlp2ForwardBatchedPush = extern struct {
+    dim_in: u32,
+    dim_hidden: u32,
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2ForwardTrainBatchedPush = extern struct {
+    dim_in: u32,
+    dim_hidden: u32,
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DyBatchedPush = extern struct {
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DhPreBatchedPush = extern struct {
+    dim_hidden: u32,
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DwAccumPush = extern struct {
+    dim_i: u32,
+    dim_j: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DbAccumPush = extern struct {
+    dim_i: u32,
+    n_samples: u32,
+};
+
+pub const SoftmaxCeLossGradPush = extern struct {
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2LossBatchedPush = extern struct {
+    dim_out: u32,
+    n_samples: u32,
+};
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {

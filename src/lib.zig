@@ -90,6 +90,17 @@ pub const inference = struct {
     pub const runner = @import("inference/runner.zig");
 };
 
+// ── Training (chunk 5 of training-v0) ───────────────────────────
+// On-device per-frame MLP training. Symmetric to `inference.runner`
+// but scoped to the training use case: persistent parameter buffers,
+// `tickStep(x, target)` updates them inside one submit. Real-time
+// learning inside a host frame budget — the visual click-to-red
+// demo built on top of this.
+pub const train = struct {
+    pub const runner = @import("train/runner.zig");
+    pub const cpu = @import("cpu/train.zig");
+};
+
 // ── HTTP server (Sketch #4) ─────────────────────────────────────
 // OpenAI-compatible `/v1/chat/completions` + `/v1/models`. Thin
 // adapter over inference.runner. valkyr --serve is the canonical
