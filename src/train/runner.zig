@@ -27,25 +27,42 @@ const runtime = @import("../runtime.zig");
 const cpu_train = @import("../cpu/train.zig");
 const shaders = @import("shaders");
 
+pub const OptimizerKind = enum { sgd, adam };
+
 pub const Mlp2Config = struct {
     dim_in: u32,
     dim_hidden: u32,
     dim_out: u32,
-    /// SGD learning rate. Mutable across frames — write directly to
-    /// `runner.lr` between `tickStep` calls if you want a schedule.
+    /// Optimizer learning rate. Sensible defaults differ by choice:
+    /// SGD wants ~0.05 for our toy MLPs, Adam ~1e-3 for the same.
+    /// Mutable across frames — write `runner.lr` between ticks for
+    /// schedules.
     lr: f32,
     /// Initial weight scale: weights drawn from U(-init_scale, +init_scale).
-    /// 0.3 lands the click-to-red toy task in the well of convergence
-    /// without hiding bugs behind clever init; bump up for harder tasks.
+    /// 0.3 lands the toy task in the well of convergence without hiding
+    /// bugs behind clever init; bump up for harder tasks.
     init_scale: f32 = 0.3,
     /// Seed for the initial weight RNG. Same seed → same starting MLP,
     /// matching the CPU oracle's `Mlp.init`.
     init_seed: u64 = 0xCAFE,
-    /// Max sample count for `tickPredictBatch`. Sized 0 disables the
-    /// batched-predict surface entirely (and skips allocating its
-    /// host-mapped X / device-only Y buffers). Visualisation use
-    /// cases set this to N×N for a UV-grid overlay.
+    /// Max sample count for `tickPredictBatch` / `tickStepBatch`. Sized
+    /// 0 disables the batched surface entirely (and skips its buffers).
+    /// Visualisation use cases set this to N × N for a UV-grid overlay.
     max_batch_size: u32 = 0,
+    /// Optimizer choice. `.sgd` is the simplest — `param ← param − lr·grad`.
+    /// `.adam` adds running mean + running variance (per-parameter
+    /// momentum buffers) and is far more sample-efficient for small
+    /// MLPs. SGD path stays bit-exact when `.sgd` is selected.
+    optimizer: OptimizerKind = .sgd,
+    /// Adam exponential-decay rate for the first moment (mean).
+    /// Standard ML default. Ignored under `.sgd`.
+    adam_beta1: f32 = 0.9,
+    /// Adam exponential-decay rate for the second moment (variance).
+    /// Standard ML default. Ignored under `.sgd`.
+    adam_beta2: f32 = 0.999,
+    /// Adam denominator stabiliser. Standard ML default. Ignored under
+    /// `.sgd`.
+    adam_eps: f32 = 1e-8,
 };
 
 /// Compile-time cap on `dim_hidden` enforced by the batched forward
@@ -117,6 +134,8 @@ pub const TrainingRunner = struct {
     k_train_dh_pre_batch: ?pipeline.Kernel,
     k_train_dw_accum: ?pipeline.Kernel,
     k_train_db_accum: ?pipeline.Kernel,
+    /// Adam optimizer pipeline (only built when `cfg.optimizer == .adam`).
+    k_adam: ?pipeline.Kernel,
 
     // ── Parameter buffers (DEVICE_LOCAL, mutated by SGD) ──
     w1: buffer.Buffer,
@@ -152,6 +171,20 @@ pub const TrainingRunner = struct {
     /// frame fence signals, CPU reads via `readPredictStaging`. No
     /// runner-side submits, no waitIdle.
     y_batch_staging: ?buffer.Buffer,
+
+    /// Adam optimizer state. One pair (m, v) per parameter buffer.
+    /// Allocated only when `cfg.optimizer == .adam`. Step counter
+    /// is host-side and 1-indexed at dispatch time so the bias-
+    /// correction terms work out the first call after init.
+    adam_m_w1: ?buffer.Buffer,
+    adam_v_w1: ?buffer.Buffer,
+    adam_m_b1: ?buffer.Buffer,
+    adam_v_b1: ?buffer.Buffer,
+    adam_m_w2: ?buffer.Buffer,
+    adam_v_w2: ?buffer.Buffer,
+    adam_m_b2: ?buffer.Buffer,
+    adam_v_b2: ?buffer.Buffer,
+    adam_step: u32,
 
     /// Batched-training inputs (HOST_VISIBLE) and per-sample
     /// activations / per-sample backward scratch (DEVICE_LOCAL). Sized
@@ -220,6 +253,11 @@ pub const TrainingRunner = struct {
         errdefer if (k_train_dh_pre_batch) |*k| k.deinit();
         errdefer if (k_train_dw_accum) |*k| k.deinit();
         errdefer if (k_train_db_accum) |*k| k.deinit();
+        var k_adam: ?pipeline.Kernel = null;
+        if (cfg.optimizer == .adam) {
+            k_adam = try pipeline.Kernel.init(ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
+        }
+        errdefer if (k_adam) |*k| k.deinit();
 
         // ── Parameter buffers (start populated from seed_mlp) ──
         const w1 = try buffer.Buffer.initStatic(ctx, f32, seed_mlp.w1);
@@ -296,6 +334,36 @@ pub const TrainingRunner = struct {
             errdefer if (dh_pre_train_batch) |*b| b.deinit(ctx.device);
         }
 
+        var adam_m_w1: ?buffer.Buffer = null;
+        var adam_v_w1: ?buffer.Buffer = null;
+        var adam_m_b1: ?buffer.Buffer = null;
+        var adam_v_b1: ?buffer.Buffer = null;
+        var adam_m_w2: ?buffer.Buffer = null;
+        var adam_v_w2: ?buffer.Buffer = null;
+        var adam_m_b2: ?buffer.Buffer = null;
+        var adam_v_b2: ?buffer.Buffer = null;
+        if (cfg.optimizer == .adam) {
+            // Adam moment buffers — same shape as their parameter
+            // buffers, zero-initialised (initDeviceOnly does that
+            // for us via vkCmdFillBuffer).
+            adam_m_w1 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.w1.len * @sizeOf(f32));
+            errdefer if (adam_m_w1) |*b| b.deinit(ctx.device);
+            adam_v_w1 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.w1.len * @sizeOf(f32));
+            errdefer if (adam_v_w1) |*b| b.deinit(ctx.device);
+            adam_m_b1 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.b1.len * @sizeOf(f32));
+            errdefer if (adam_m_b1) |*b| b.deinit(ctx.device);
+            adam_v_b1 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.b1.len * @sizeOf(f32));
+            errdefer if (adam_v_b1) |*b| b.deinit(ctx.device);
+            adam_m_w2 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.w2.len * @sizeOf(f32));
+            errdefer if (adam_m_w2) |*b| b.deinit(ctx.device);
+            adam_v_w2 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.w2.len * @sizeOf(f32));
+            errdefer if (adam_v_w2) |*b| b.deinit(ctx.device);
+            adam_m_b2 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.b2.len * @sizeOf(f32));
+            errdefer if (adam_m_b2) |*b| b.deinit(ctx.device);
+            adam_v_b2 = try buffer.Buffer.initDeviceOnly(ctx, seed_mlp.b2.len * @sizeOf(f32));
+            errdefer if (adam_v_b2) |*b| b.deinit(ctx.device);
+        }
+
         return .{
             .ctx = ctx,
             .cfg = cfg,
@@ -315,6 +383,7 @@ pub const TrainingRunner = struct {
             .k_train_dh_pre_batch = k_train_dh_pre_batch,
             .k_train_dw_accum = k_train_dw_accum,
             .k_train_db_accum = k_train_db_accum,
+            .k_adam = k_adam,
             .w1 = w1,
             .b1 = b1,
             .w2 = w2,
@@ -341,6 +410,15 @@ pub const TrainingRunner = struct {
             .y_train_batch = y_train_batch,
             .dy_train_batch = dy_train_batch,
             .dh_pre_train_batch = dh_pre_train_batch,
+            .adam_m_w1 = adam_m_w1,
+            .adam_v_w1 = adam_v_w1,
+            .adam_m_b1 = adam_m_b1,
+            .adam_v_b1 = adam_v_b1,
+            .adam_m_w2 = adam_m_w2,
+            .adam_v_w2 = adam_v_w2,
+            .adam_m_b2 = adam_m_b2,
+            .adam_v_b2 = adam_v_b2,
+            .adam_step = 0,
         };
     }
 
@@ -372,6 +450,14 @@ pub const TrainingRunner = struct {
         if (self.y_train_batch) |*b| b.deinit(dev);
         if (self.dy_train_batch) |*b| b.deinit(dev);
         if (self.dh_pre_train_batch) |*b| b.deinit(dev);
+        if (self.adam_m_w1) |*b| b.deinit(dev);
+        if (self.adam_v_w1) |*b| b.deinit(dev);
+        if (self.adam_m_b1) |*b| b.deinit(dev);
+        if (self.adam_v_b1) |*b| b.deinit(dev);
+        if (self.adam_m_w2) |*b| b.deinit(dev);
+        if (self.adam_v_w2) |*b| b.deinit(dev);
+        if (self.adam_m_b2) |*b| b.deinit(dev);
+        if (self.adam_v_b2) |*b| b.deinit(dev);
         self.k_matmul.deinit();
         self.k_add.deinit();
         self.k_relu.deinit();
@@ -387,6 +473,7 @@ pub const TrainingRunner = struct {
         if (self.k_train_dh_pre_batch) |*k| k.deinit();
         if (self.k_train_dw_accum) |*k| k.deinit();
         if (self.k_train_db_accum) |*k| k.deinit();
+        if (self.k_adam) |*k| k.deinit();
     }
 
     /// Run one full training step: upload x/target, record forward +
@@ -769,11 +856,12 @@ pub const TrainingRunner = struct {
         try rec.dispatch(&self.k_add, &.{ &self.y, &self.b2 }, &add2_push, ceilDiv(dim_out, 256), 1, 1);
     }
 
-    /// Record a complete batched SGD step into `rec`. 9 dispatches:
+    /// Record a complete batched optimizer step into `rec`. 11 dispatches:
     /// forward, dy, dh_pre, dw2 accum, db2 accum, dw1 accum, db1 accum,
-    /// then 4× sgd_step (W1, b1, W2, b2). Caller must have populated
-    /// `x_train_batch` and `target_batch` already.
-    fn recordTrainBatch(self: *const TrainingRunner, rec: *recorder_mod.Recorder, n_samples: u32) !void {
+    /// then 4× optimizer step (W1, b1, W2, b2 — SGD or Adam depending
+    /// on `cfg.optimizer`). Caller must have populated `x_train_batch`
+    /// and `target_batch` already.
+    fn recordTrainBatch(self: *TrainingRunner, rec: *recorder_mod.Recorder, n_samples: u32) !void {
         const dim_in = self.cfg.dim_in;
         const dim_h = self.cfg.dim_hidden;
         const dim_out = self.cfg.dim_out;
@@ -885,17 +973,57 @@ pub const TrainingRunner = struct {
             1,
         );
 
-        // 8. SGD on all four params.
+        // 8. Optimizer step on all four params.
         const w1_n: u32 = dim_h * dim_in;
         const w2_n: u32 = dim_out * dim_h;
-        const sgd_w1 = runtime.SgdStepPush{ .n = w1_n, .lr = self.lr };
-        const sgd_b1 = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr };
-        const sgd_w2 = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr };
-        const sgd_b2 = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr };
-        try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1, ceilDiv(w1_n, 256), 1, 1);
-        try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1, ceilDiv(dim_h, 256), 1, 1);
-        try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2, ceilDiv(w2_n, 256), 1, 1);
-        try rec.dispatch(&self.k_sgd, &.{ &self.b2, &self.db2 }, &sgd_b2, ceilDiv(dim_out, 256), 1, 1);
+        switch (self.cfg.optimizer) {
+            .sgd => {
+                const sgd_w1 = runtime.SgdStepPush{ .n = w1_n, .lr = self.lr };
+                const sgd_b1 = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr };
+                const sgd_w2 = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr };
+                const sgd_b2 = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr };
+                try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1, ceilDiv(w1_n, 256), 1, 1);
+                try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1, ceilDiv(dim_h, 256), 1, 1);
+                try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2, ceilDiv(w2_n, 256), 1, 1);
+                try rec.dispatch(&self.k_sgd, &.{ &self.b2, &self.db2 }, &sgd_b2, ceilDiv(dim_out, 256), 1, 1);
+            },
+            .adam => {
+                // Step counter is 1-indexed at dispatch — host bumps it
+                // BEFORE scheduling the dispatch so the bias-correction
+                // terms work out the first call after init / reset.
+                const k_adam = &(self.k_adam.?);
+                const m_w1 = &(self.adam_m_w1.?);
+                const v_w1 = &(self.adam_v_w1.?);
+                const m_b1 = &(self.adam_m_b1.?);
+                const v_b1 = &(self.adam_v_b1.?);
+                const m_w2 = &(self.adam_m_w2.?);
+                const v_w2 = &(self.adam_v_w2.?);
+                const m_b2 = &(self.adam_m_b2.?);
+                const v_b2 = &(self.adam_v_b2.?);
+                self.adam_step +%= 1;
+                const t = self.adam_step;
+                const adam_w1 = runtime.AdamStepPush{
+                    .n = w1_n, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
+                    .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                };
+                const adam_b1 = runtime.AdamStepPush{
+                    .n = dim_h, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
+                    .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                };
+                const adam_w2 = runtime.AdamStepPush{
+                    .n = w2_n, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
+                    .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                };
+                const adam_b2 = runtime.AdamStepPush{
+                    .n = dim_out, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
+                    .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                };
+                try rec.dispatch(k_adam, &.{ &self.w1, &self.dw1, m_w1, v_w1 }, &adam_w1, ceilDiv(w1_n, 256), 1, 1);
+                try rec.dispatch(k_adam, &.{ &self.b1, &self.db1, m_b1, v_b1 }, &adam_b1, ceilDiv(dim_h, 256), 1, 1);
+                try rec.dispatch(k_adam, &.{ &self.w2, &self.dw2, m_w2, v_w2 }, &adam_w2, ceilDiv(w2_n, 256), 1, 1);
+                try rec.dispatch(k_adam, &.{ &self.b2, &self.db2, m_b2, v_b2 }, &adam_b2, ceilDiv(dim_out, 256), 1, 1);
+            },
+        }
     }
 
     fn recordStep(self: *const TrainingRunner, rec: *recorder_mod.Recorder) !void {

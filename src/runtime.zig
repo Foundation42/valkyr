@@ -116,6 +116,15 @@ pub const OuterProductPush = extern struct { dim_out: u32, dim_in: u32 };
 
 pub const SgdStepPush = extern struct { n: u32, lr: f32 };
 
+pub const AdamStepPush = extern struct {
+    n: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    t: u32,
+};
+
 pub const MseLossGradPush = extern struct { n: u32 };
 
 pub const Mlp2ForwardBatchedPush = extern struct {

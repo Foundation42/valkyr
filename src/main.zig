@@ -571,6 +571,7 @@ pub fn main() !void {
     try runTrainingRunnerBatchedTrainSmoke(allocator);
     try runTrainingRunnerCoopSmoke(allocator);
     try runTrainingRunnerStagingSmoke(allocator);
+    try runTrainingRunnerAdamSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2522,6 +2523,202 @@ fn runTrainingRunnerStagingSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner staging readback ({d} samples; vs synchronous tickPredictBatch max |Δ| = {e})\n",
         .{ n_samples, max_abs },
+    );
+}
+
+// ── TrainingRunner Adam-optimizer parity smoke ──────────────────────
+//
+// CPU oracle does the canonical Adam update step-by-step:
+//
+//   m ← β₁·m + (1 − β₁)·g
+//   v ← β₂·v + (1 − β₂)·g²
+//   m̂ = m / (1 − β₁ᵗ)
+//   v̂ = v / (1 − β₂ᵗ)
+//   param ← param − lr · m̂ / (√v̂ + ε)
+//
+// Same averaged-batch gradients as the SGD smoke (chunk 8). Verifies
+// GPU adam_step.comp matches the standard formulation within fp32
+// tolerance over K consecutive steps. Tolerance is looser than SGD
+// because the bias-correction terms involve `pow(beta, t)` which
+// rounds slightly differently CPU vs GPU.
+
+const adamCpuOracle = struct {
+    fn step(
+        param: []f32,
+        grad: []const f32,
+        m: []f32,
+        v: []f32,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        t: u32,
+    ) void {
+        const tf: f32 = @floatFromInt(t);
+        const bc1 = 1.0 - std.math.pow(f32, beta1, tf);
+        const bc2 = 1.0 - std.math.pow(f32, beta2, tf);
+        for (param, grad, m, v) |*p, g, *mi, *vi| {
+            mi.* = beta1 * mi.* + (1.0 - beta1) * g;
+            vi.* = beta2 * vi.* + (1.0 - beta2) * g * g;
+            const m_hat = mi.* / bc1;
+            const v_hat = vi.* / bc2;
+            p.* -= lr * m_hat / (@sqrt(v_hat) + eps);
+        }
+    }
+}.step;
+
+fn runTrainingRunnerAdamSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_samples: u32 = 16;
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 8,
+        .dim_out = 3,
+        .lr = 0.01,
+        .init_seed = 0xADA70A50,
+        .max_batch_size = n_samples,
+        .optimizer = .adam,
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    var cpu_mlp = try cpu_train.Mlp.init(allocator, cfg.dim_in, cfg.dim_hidden, cfg.dim_out, cfg.init_scale, cfg.init_seed);
+    defer cpu_mlp.deinit(allocator);
+
+    // Adam state on CPU.
+    const m_w1 = try allocator.alloc(f32, cpu_mlp.w1.len);
+    defer allocator.free(m_w1);
+    @memset(m_w1, 0);
+    const v_w1 = try allocator.alloc(f32, cpu_mlp.w1.len);
+    defer allocator.free(v_w1);
+    @memset(v_w1, 0);
+    const m_b1 = try allocator.alloc(f32, cpu_mlp.b1.len);
+    defer allocator.free(m_b1);
+    @memset(m_b1, 0);
+    const v_b1 = try allocator.alloc(f32, cpu_mlp.b1.len);
+    defer allocator.free(v_b1);
+    @memset(v_b1, 0);
+    const m_w2 = try allocator.alloc(f32, cpu_mlp.w2.len);
+    defer allocator.free(m_w2);
+    @memset(m_w2, 0);
+    const v_w2 = try allocator.alloc(f32, cpu_mlp.w2.len);
+    defer allocator.free(v_w2);
+    @memset(v_w2, 0);
+    const m_b2 = try allocator.alloc(f32, cpu_mlp.b2.len);
+    defer allocator.free(m_b2);
+    @memset(m_b2, 0);
+    const v_b2 = try allocator.alloc(f32, cpu_mlp.b2.len);
+    defer allocator.free(v_b2);
+    @memset(v_b2, 0);
+
+    var rng = std.Random.DefaultPrng.init(0x5EED5);
+    const r = rng.random();
+    const x_batch = try allocator.alloc(f32, n_samples * cfg.dim_in);
+    defer allocator.free(x_batch);
+    const target_batch = try allocator.alloc(f32, n_samples * cfg.dim_out);
+    defer allocator.free(target_batch);
+    for (x_batch) |*vv| vv.* = r.float(f32) * 2 - 1;
+    for (target_batch) |*vv| vv.* = r.float(f32);
+
+    const grads = try cpu_train.Grads.init(allocator, &cpu_mlp);
+    defer @constCast(&grads).deinit(allocator);
+    const acc_dw1 = try allocator.alloc(f32, cpu_mlp.w1.len);
+    defer allocator.free(acc_dw1);
+    const acc_db1 = try allocator.alloc(f32, cpu_mlp.b1.len);
+    defer allocator.free(acc_db1);
+    const acc_dw2 = try allocator.alloc(f32, cpu_mlp.w2.len);
+    defer allocator.free(acc_dw2);
+    const acc_db2 = try allocator.alloc(f32, cpu_mlp.b2.len);
+    defer allocator.free(acc_db2);
+    const cpu_h_pre = try allocator.alloc(f32, cfg.dim_hidden);
+    defer allocator.free(cpu_h_pre);
+    const cpu_h = try allocator.alloc(f32, cfg.dim_hidden);
+    defer allocator.free(cpu_h);
+    const cpu_y = try allocator.alloc(f32, cfg.dim_out);
+    defer allocator.free(cpu_y);
+    const cpu_dy = try allocator.alloc(f32, cfg.dim_out);
+    defer allocator.free(cpu_dy);
+
+    const K: u32 = 5;
+    var step: u32 = 0;
+    while (step < K) : (step += 1) {
+        @memset(acc_dw1, 0);
+        @memset(acc_db1, 0);
+        @memset(acc_dw2, 0);
+        @memset(acc_db2, 0);
+        for (0..n_samples) |i| {
+            const x_row = x_batch[i * cfg.dim_in ..][0..cfg.dim_in];
+            const t_row = target_batch[i * cfg.dim_out ..][0..cfg.dim_out];
+            var act: cpu_train.Activations = .{ .x = x_row, .h_pre = cpu_h_pre, .h = cpu_h, .y = cpu_y };
+            cpu_train.forward(&cpu_mlp, &act);
+            cpu_train.mseLossGrad(cpu_dy, cpu_y, t_row);
+            var sample_grads: cpu_train.Grads = .{
+                .dw1 = grads.dw1, .db1 = grads.db1, .dw2 = grads.dw2, .db2 = grads.db2,
+            };
+            try cpu_train.backward(allocator, &cpu_mlp, &act, cpu_dy, &sample_grads);
+            for (acc_dw1, sample_grads.dw1) |*a, gi| a.* += gi;
+            for (acc_db1, sample_grads.db1) |*a, gi| a.* += gi;
+            for (acc_dw2, sample_grads.dw2) |*a, gi| a.* += gi;
+            for (acc_db2, sample_grads.db2) |*a, gi| a.* += gi;
+        }
+        const inv_n: f32 = 1.0 / @as(f32, @floatFromInt(n_samples));
+        for (acc_dw1) |*vv| vv.* *= inv_n;
+        for (acc_db1) |*vv| vv.* *= inv_n;
+        for (acc_dw2) |*vv| vv.* *= inv_n;
+        for (acc_db2) |*vv| vv.* *= inv_n;
+
+        const t_idx = step + 1;
+        adamCpuOracle(cpu_mlp.w1, acc_dw1, m_w1, v_w1, cfg.lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, t_idx);
+        adamCpuOracle(cpu_mlp.b1, acc_db1, m_b1, v_b1, cfg.lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, t_idx);
+        adamCpuOracle(cpu_mlp.w2, acc_dw2, m_w2, v_w2, cfg.lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, t_idx);
+        adamCpuOracle(cpu_mlp.b2, acc_db2, m_b2, v_b2, cfg.lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, t_idx);
+
+        try runner.tickStepBatch(x_batch, target_batch);
+    }
+
+    const gpu_w1 = try allocator.alloc(f32, cpu_mlp.w1.len);
+    defer allocator.free(gpu_w1);
+    const gpu_b1 = try allocator.alloc(f32, cpu_mlp.b1.len);
+    defer allocator.free(gpu_b1);
+    const gpu_w2 = try allocator.alloc(f32, cpu_mlp.w2.len);
+    defer allocator.free(gpu_w2);
+    const gpu_b2 = try allocator.alloc(f32, cpu_mlp.b2.len);
+    defer allocator.free(gpu_b2);
+    var gpu_mlp: cpu_train.Mlp = .{
+        .dim_in = cfg.dim_in,
+        .dim_hidden = cfg.dim_hidden,
+        .dim_out = cfg.dim_out,
+        .w1 = gpu_w1,
+        .b1 = gpu_b1,
+        .w2 = gpu_w2,
+        .b2 = gpu_b2,
+    };
+    try runner.readWeights(&gpu_mlp);
+
+    const tol: f32 = 1e-4;
+    var max_abs: f32 = 0;
+    const ParamCase = struct { name: []const u8, gpu: []const f32, cpu: []const f32 };
+    const cases = [_]ParamCase{
+        .{ .name = "W1", .gpu = gpu_w1, .cpu = cpu_mlp.w1 },
+        .{ .name = "b1", .gpu = gpu_b1, .cpu = cpu_mlp.b1 },
+        .{ .name = "W2", .gpu = gpu_w2, .cpu = cpu_mlp.w2 },
+        .{ .name = "b2", .gpu = gpu_b2, .cpu = cpu_mlp.b2 },
+    };
+    for (cases) |cs| {
+        for (cs.gpu, cs.cpu, 0..) |g, cv, i| {
+            const d = @abs(g - cv);
+            if (d > tol) {
+                std.debug.print("Adam MISMATCH on {s}[{d}] @ step {d}: gpu={d:.7} cpu={d:.7}\n", .{ cs.name, i, K, g, cv });
+                return error.ParityFailed;
+            }
+            if (d > max_abs) max_abs = d;
+        }
+    }
+    std.debug.print(
+        "PASS TrainingRunner Adam ({d} samples × {d} steps, dim 4→8→3; max |Δ| vs CPU oracle = {e})\n",
+        .{ n_samples, K, max_abs },
     );
 }
 

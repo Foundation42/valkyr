@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
     const linear_backward_dx_spv = compileShader(b, "linear_backward_dx");
     const outer_product_spv = compileShader(b, "outer_product");
     const sgd_step_spv = compileShader(b, "sgd_step");
+    const adam_step_spv = compileShader(b, "adam_step");
     const mse_loss_grad_spv = compileShader(b, "mse_loss_grad");
     const mlp2_forward_batched_spv = compileShader(b, "mlp2_forward_batched");
     const mlp2_forward_train_batched_spv = compileShader(b, "mlp2_forward_train_batched");
@@ -112,6 +113,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(linear_backward_dx_spv, "linear_backward_dx.spv");
     _ = wf.addCopyFile(outer_product_spv, "outer_product.spv");
     _ = wf.addCopyFile(sgd_step_spv, "sgd_step.spv");
+    _ = wf.addCopyFile(adam_step_spv, "adam_step.spv");
     _ = wf.addCopyFile(mse_loss_grad_spv, "mse_loss_grad.spv");
     _ = wf.addCopyFile(mlp2_forward_batched_spv, "mlp2_forward_batched.spv");
     _ = wf.addCopyFile(mlp2_forward_train_batched_spv, "mlp2_forward_train_batched.spv");
@@ -165,6 +167,7 @@ pub fn build(b: *std.Build) void {
         \\pub const linear_backward_dx align(4) = @embedFile("linear_backward_dx.spv").*;
         \\pub const outer_product align(4) = @embedFile("outer_product.spv").*;
         \\pub const sgd_step align(4) = @embedFile("sgd_step.spv").*;
+        \\pub const adam_step align(4) = @embedFile("adam_step.spv").*;
         \\pub const mse_loss_grad align(4) = @embedFile("mse_loss_grad.spv").*;
         \\pub const mlp2_forward_batched align(4) = @embedFile("mlp2_forward_batched.spv").*;
         \\pub const mlp2_forward_train_batched align(4) = @embedFile("mlp2_forward_train_batched.spv").*;
