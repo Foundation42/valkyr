@@ -18,6 +18,7 @@ const cpu_full_attn = @import("cpu/full_attn.zig");
 const turboquant = @import("cpu/turboquant.zig");
 const q4_0 = @import("cpu/q4_0.zig");
 const q4_k = @import("cpu/q4_k.zig");
+const cpu_train = @import("cpu/train.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
@@ -526,6 +527,7 @@ pub fn main() !void {
     try runTurboquantSmoke(allocator);
     try runQ4_0Smoke(allocator);
     try runQ4_KSmoke(allocator);
+    try runTrainCpuSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
@@ -991,6 +993,130 @@ fn runSoftmaxSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS softmax stable form (handles +100 without overflow)\n", .{});
+}
+
+// ── tiny-MLP training smoke: forward + backward + SGD converge ──────
+//
+// Chunk 1 of training-v0. Drives the CPU oracle in src/cpu/train.zig
+// hard enough to catch a sign error or off-by-one anywhere in the
+// derivative chain: a 2-layer MLP fits a single (input, target) pair
+// and we assert loss drops by ≥ 100×. The numbers are tight on
+// purpose — the only way for the loss curve to plateau here is if a
+// gradient is wrong.
+//
+// We also do an explicit numerical-gradient check on one weight in
+// each layer; that's the surest test that backward(...) is consistent
+// with forward(...), independent of how well SGD converges.
+
+fn runTrainCpuSmoke(allocator: std.mem.Allocator) !void {
+    // Tiny on purpose — total weights = 4·8 + 8 + 4·8 + 4 = 76. Big
+    // enough to need a hidden layer with ReLU active on some neurons,
+    // small enough to land convergence in a few hundred steps.
+    const dim_in: usize = 4;
+    const dim_h: usize = 8;
+    const dim_out: usize = 4;
+
+    var mlp = try cpu_train.Mlp.init(allocator, dim_in, dim_h, dim_out, 0.3, 0xC0FFEE);
+    defer mlp.deinit(allocator);
+
+    var grads = try cpu_train.Grads.init(allocator, &mlp);
+    defer grads.deinit(allocator);
+
+    const x = [_]f32{ 1.0, 0.5, -0.3, 0.2 };
+    const target = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+
+    var h_pre: [dim_h]f32 = undefined;
+    var h: [dim_h]f32 = undefined;
+    var y: [dim_out]f32 = undefined;
+    var act: cpu_train.Activations = .{
+        .x = &x,
+        .h_pre = &h_pre,
+        .h = &h,
+        .y = &y,
+    };
+
+    // ── Loss-decrease check ────────────────────────────────────────
+    cpu_train.forward(&mlp, &act);
+    const loss_initial = cpu_train.mseLoss(act.y, &target);
+
+    const lr: f32 = 0.05;
+    const n_steps: u32 = 400;
+    var loss_final: f32 = 0;
+    for (0..n_steps) |_| {
+        loss_final = try cpu_train.trainStep(allocator, &mlp, &act, &grads, &target, lr);
+    }
+
+    if (!(loss_final < loss_initial / 100.0)) {
+        std.debug.print(
+            "training did not converge: loss[0] = {d:.6}, loss[{d}] = {d:.6}\n",
+            .{ loss_initial, n_steps, loss_final },
+        );
+        return error.ParityFailed;
+    }
+
+    // ── Numerical-gradient parity check ────────────────────────────
+    // For a fresh MLP and one (x, target), pick a single weight in W2
+    // and a single weight in W1, perturb it by eps in each direction,
+    // diff the losses, and compare to the analytic gradient. If the
+    // chain rule in backward() is right these match within fp32
+    // tolerance. The check is the truest kind — it doesn't trust SGD,
+    // doesn't trust the loss being convex, just the calculus.
+    var probe_mlp = try cpu_train.Mlp.init(allocator, dim_in, dim_h, dim_out, 0.3, 0xBEEF1234);
+    defer probe_mlp.deinit(allocator);
+    var probe_grads = try cpu_train.Grads.init(allocator, &probe_mlp);
+    defer probe_grads.deinit(allocator);
+
+    var probe_h_pre: [dim_h]f32 = undefined;
+    var probe_h: [dim_h]f32 = undefined;
+    var probe_y: [dim_out]f32 = undefined;
+    var probe_act: cpu_train.Activations = .{
+        .x = &x,
+        .h_pre = &probe_h_pre,
+        .h = &probe_h,
+        .y = &probe_y,
+    };
+
+    // Analytic gradients at this point.
+    cpu_train.forward(&probe_mlp, &probe_act);
+    var dL_dy: [dim_out]f32 = undefined;
+    cpu_train.mseLossGrad(&dL_dy, probe_act.y, &target);
+    try cpu_train.backward(allocator, &probe_mlp, &probe_act, &dL_dy, &probe_grads);
+
+    const eps: f32 = 1e-3;
+    // Test one element from each parameter buffer.
+    const probe_targets = [_]struct { name: []const u8, buf: []f32, grad: []const f32, idx: usize }{
+        .{ .name = "W2[1, 3]", .buf = probe_mlp.w2, .grad = probe_grads.dw2, .idx = 1 * dim_h + 3 },
+        .{ .name = "W1[2, 0]", .buf = probe_mlp.w1, .grad = probe_grads.dw1, .idx = 2 * dim_in + 0 },
+        .{ .name = "b2[2]", .buf = probe_mlp.b2, .grad = probe_grads.db2, .idx = 2 },
+        .{ .name = "b1[5]", .buf = probe_mlp.b1, .grad = probe_grads.db1, .idx = 5 },
+    };
+    for (probe_targets) |t| {
+        const orig = t.buf[t.idx];
+        t.buf[t.idx] = orig + eps;
+        cpu_train.forward(&probe_mlp, &probe_act);
+        const loss_plus = cpu_train.mseLoss(probe_act.y, &target);
+        t.buf[t.idx] = orig - eps;
+        cpu_train.forward(&probe_mlp, &probe_act);
+        const loss_minus = cpu_train.mseLoss(probe_act.y, &target);
+        t.buf[t.idx] = orig;
+
+        const numeric = (loss_plus - loss_minus) / (2.0 * eps);
+        const analytic = t.grad[t.idx];
+        const denom = @max(@abs(numeric), @abs(analytic));
+        const rel_err = if (denom > 0) @abs(numeric - analytic) / denom else @abs(numeric - analytic);
+        if (rel_err > 1e-2) {
+            std.debug.print(
+                "grad mismatch on {s}: analytic = {d:.6}, numeric = {d:.6}, rel_err = {d:.4}\n",
+                .{ t.name, analytic, numeric, rel_err },
+            );
+            return error.ParityFailed;
+        }
+    }
+
+    std.debug.print(
+        "PASS train MLP CPU oracle: loss {d:.6} → {d:.6} over {d} SGD steps; numeric grad parity ≤ 1%\n",
+        .{ loss_initial, loss_final, n_steps },
+    );
 }
 
 // ── gpu matmul_nt smoke: synthetic A·Bᵀ on the GPU vs CPU expected ──
