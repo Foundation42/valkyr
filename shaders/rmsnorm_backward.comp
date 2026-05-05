@@ -1,0 +1,100 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// rmsnorm_backward: per-row backward through the RMSNorm forward in
+// `rmsnorm.comp`. Given the forward
+//
+//     ri      = 1 / sqrt(mean(x²) + eps)            (scalar per row)
+//     γᵢ      = wᵢ                                  (or wᵢ + 1 if gemma_quirk)
+//     yᵢ      = γᵢ · ri · xᵢ
+//
+// emits
+//
+//     A             = Σⱼ dyⱼ · γⱼ · xⱼ              (scalar per row)
+//     dxᵢ           = ri · γᵢ · dyᵢ − (ri³ · xᵢ / D) · A
+//     dw_partialᵢ   = dyᵢ · ri · xᵢ
+//
+// `dw_partial[r, :]` is the row's contribution to the shared gain
+// gradient. Caller sums across rows (host side or a follow-up reduce
+// kernel — same shape pattern as `mlp2_db_accum.comp` if you want to
+// keep it on the GPU).
+//
+// One workgroup per row. The whole workgroup cooperates on TWO
+// reductions (s for ri, A for dx). The two reductions share the same
+// subgroup_sums shared array, run sequentially with a barrier between
+// them — same perf shape as the forward kernel.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dy { float dy[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer X  { float x[];  };
+layout(set = 0, binding = 2, std430) readonly  buffer W  { float w[];  };
+layout(set = 0, binding = 3, std430) writeonly buffer Dx { float dx[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Dw { float dw_partial[]; };
+
+layout(push_constant) uniform Pc {
+    uint  dim;
+    float eps;
+    uint  gemma_quirk;
+} pc;
+
+// Reused across both reductions (s, then A) — barrier between them.
+shared float subgroup_sums[32];
+shared float reduced_shared;
+
+float rowReduce(float local_value) {
+    float sg_sum = subgroupAdd(local_value);
+    if (subgroupElect()) {
+        subgroup_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sums[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            reduced_shared = total;
+        }
+    }
+    barrier();
+    return reduced_shared;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint row_off = row * pc.dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    // ── Phase 1: rms_inv from Σ x² ───────────────────────────────
+    float local_sum_sq = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = x[row_off + i];
+        local_sum_sq += v * v;
+    }
+    float total_sq = rowReduce(local_sum_sq);
+    float ri = inversesqrt(total_sq / float(pc.dim) + pc.eps);
+
+    // ── Phase 2: A = Σ dy · γ · x ────────────────────────────────
+    barrier();
+    float local_A = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float gain = w[i];
+        if (pc.gemma_quirk != 0u) gain += 1.0;
+        local_A += dy[row_off + i] * gain * x[row_off + i];
+    }
+    float A = rowReduce(local_A);
+
+    // ── Phase 3: per-thread output write ─────────────────────────
+    float ri3_over_D = ri * ri * ri / float(pc.dim);
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float gain = w[i];
+        if (pc.gemma_quirk != 0u) gain += 1.0;
+        float xi = x[row_off + i];
+        float dyi = dy[row_off + i];
+        dx[row_off + i] = ri * gain * dyi - ri3_over_D * xi * A;
+        dw_partial[row_off + i] = dyi * ri * xi;
+    }
+}

@@ -619,6 +619,7 @@ pub fn main() !void {
     try runGpuMatmulQ4_0Smoke(allocator);
     try runGpuMatmulQ4_KSmoke(allocator);
     try runGpuRmsnormSmoke(allocator);
+    try runGpuRmsnormBackwardSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -4658,6 +4659,118 @@ fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS GPU rmsnorm synthetic (Llama + Gemma variants, dim=1024)\n", .{});
+}
+
+// ── GPU rmsnorm_backward parity smoke ──────────────────────────────
+//
+// Tier-2 chunk 2 — verifies the new shader against the CPU oracle in
+// `cpu/train_transformer.zig` on a multi-row batch with both
+// gemma_quirk variants. Reads dx[N×D] and dw_partial[N×D] back, sums
+// dw_partial across rows on the host, and diffs vs CPU multi-row
+// rmsNormBackward. Cross-row sum on host is fine for the smoke; a
+// dedicated reduce kernel is a follow-up if perf demands it.
+
+fn runGpuRmsnormBackwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim: usize = 256;
+    const n_rows: usize = 4;
+    const eps: f32 = 1e-6;
+
+    var prng = std.Random.DefaultPrng.init(0xBA66110C);
+    const rng = prng.random();
+
+    const x = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(x);
+    const dy = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dy);
+    const w = try allocator.alloc(f32, dim);
+    defer allocator.free(w);
+    for (x) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (dy) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (w) |*v| v.* = 0.5 + rng.float(f32) * 0.5;
+
+    inline for (.{ false, true }) |gemma_quirk| {
+        // ── CPU oracle ────────────────────────────────────────────
+        const dx_cpu = try allocator.alloc(f32, n_rows * dim);
+        defer allocator.free(dx_cpu);
+        const dw_cpu = try allocator.alloc(f32, dim);
+        defer allocator.free(dw_cpu);
+        @memset(dw_cpu, 0);
+        cpu_train_transformer.rmsNormBackward(dy, x, w, eps, gemma_quirk, n_rows, dx_cpu, dw_cpu);
+
+        // ── GPU dispatch ──────────────────────────────────────────
+        var buf_dy = try buffer.Buffer.initStatic(&ctx, f32, dy);
+        defer buf_dy.deinit(ctx.device);
+        var buf_x = try buffer.Buffer.initStatic(&ctx, f32, x);
+        defer buf_x.deinit(ctx.device);
+        var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+        defer buf_w.deinit(ctx.device);
+        var buf_dx = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
+        defer buf_dx.deinit(ctx.device);
+        var buf_dw_partial = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
+        defer buf_dw_partial.deinit(ctx.device);
+
+        var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_backward, 5, @sizeOf(RmsnormPush));
+        defer kern.deinit();
+        try kern.bind(&.{ &buf_dy, &buf_x, &buf_w, &buf_dx, &buf_dw_partial });
+
+        const push = RmsnormPush{
+            .dim = @intCast(dim),
+            .eps = eps,
+            .gemma_quirk = if (gemma_quirk) 1 else 0,
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const RmsnormPush,
+            n_rows: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.n_rows, 1, 1);
+            }
+        }{ .kern = &kern, .push = &push, .n_rows = @intCast(n_rows) });
+
+        const dx_gpu = try allocator.alloc(f32, n_rows * dim);
+        defer allocator.free(dx_gpu);
+        const dw_partial_gpu = try allocator.alloc(f32, n_rows * dim);
+        defer allocator.free(dw_partial_gpu);
+        try buf_dx.readBack(&ctx, f32, dx_gpu);
+        try buf_dw_partial.readBack(&ctx, f32, dw_partial_gpu);
+
+        // Sum dw_partial across rows on the host.
+        const dw_gpu = try allocator.alloc(f32, dim);
+        defer allocator.free(dw_gpu);
+        @memset(dw_gpu, 0);
+        for (0..n_rows) |r| {
+            const off = r * dim;
+            for (0..dim) |i| dw_gpu[i] += dw_partial_gpu[off + i];
+        }
+
+        var max_dx: f32 = 0;
+        for (dx_gpu, dx_cpu) |g, c| {
+            const d = @abs(g - c);
+            if (d > max_dx) max_dx = d;
+        }
+        if (max_dx > 1e-4) {
+            std.debug.print("rmsnorm_backward dx (gq={any}): max |Δ| = {e}\n", .{ gemma_quirk, max_dx });
+            return error.ParityFailed;
+        }
+
+        var max_dw: f32 = 0;
+        for (dw_gpu, dw_cpu) |g, c| {
+            const d = @abs(g - c);
+            if (d > max_dw) max_dw = d;
+        }
+        if (max_dw > 1e-4) {
+            std.debug.print("rmsnorm_backward dw (gq={any}): max |Δ| = {e}\n", .{ gemma_quirk, max_dw });
+            return error.ParityFailed;
+        }
+    }
+
+    std.debug.print(
+        "PASS GPU rmsnorm_backward (Llama + Gemma variants, {d}×{d}; dx + dw match CPU oracle ≤ 1e-4)\n",
+        .{ n_rows, dim },
+    );
 }
 
 // ── gpu geglu smoke: synthetic vs CPU geglu ─────────────────────────
