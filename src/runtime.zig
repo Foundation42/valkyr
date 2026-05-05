@@ -118,6 +118,13 @@ pub const SgdStepPush = extern struct { n: u32, lr: f32 };
 
 pub const MseLossGradPush = extern struct { n: u32 };
 
+pub const Mlp2ForwardBatchedPush = extern struct {
+    dim_in: u32,
+    dim_hidden: u32,
+    dim_out: u32,
+    n_samples: u32,
+};
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {

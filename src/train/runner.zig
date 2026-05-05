@@ -41,7 +41,17 @@ pub const Mlp2Config = struct {
     /// Seed for the initial weight RNG. Same seed → same starting MLP,
     /// matching the CPU oracle's `Mlp.init`.
     init_seed: u64 = 0xCAFE,
+    /// Max sample count for `tickPredictBatch`. Sized 0 disables the
+    /// batched-predict surface entirely (and skips allocating its
+    /// host-mapped X / device-only Y buffers). Visualisation use
+    /// cases set this to N×N for a UV-grid overlay.
+    max_batch_size: u32 = 0,
 };
+
+/// Compile-time cap on `dim_hidden` enforced by the batched forward
+/// shader (it stores the hidden vector in a per-thread fp32 array of
+/// this size). Mirrors the GLSL `MAX_HIDDEN` constant.
+pub const MLP2_MAX_HIDDEN: u32 = 64;
 
 pub const TrainingRunner = struct {
     ctx: *const vk.Context,
@@ -58,6 +68,8 @@ pub const TrainingRunner = struct {
     k_outer: pipeline.Kernel,
     k_copy: pipeline.Kernel,
     k_sgd: pipeline.Kernel,
+    /// Batched forward (only built when cfg.max_batch_size > 0).
+    k_predict_batch: ?pipeline.Kernel,
 
     // ── Parameter buffers (DEVICE_LOCAL, mutated by SGD) ──
     w1: buffer.Buffer,
@@ -81,7 +93,15 @@ pub const TrainingRunner = struct {
     dw2: buffer.Buffer,
     db2: buffer.Buffer,
 
+    /// Batched-predict input + output (only allocated when
+    /// `cfg.max_batch_size > 0`). `x_batch` is dynamic (host-mapped)
+    /// so callers stream a fresh grid per frame; `y_batch` is
+    /// device-only and read back to fill the visualisation tiles.
+    x_batch: ?buffer.Buffer,
+    y_batch: ?buffer.Buffer,
+
     pub fn init(allocator: std.mem.Allocator, ctx: *const vk.Context, cfg: Mlp2Config) !TrainingRunner {
+        if (cfg.dim_hidden > MLP2_MAX_HIDDEN) return error.HiddenDimExceedsMax;
         // ── Initial weights via the CPU oracle ─────────────────────
         // Reusing `cpu_train.Mlp.init` guarantees the GPU runner starts
         // from a known starting point we can also recreate on the CPU
@@ -115,6 +135,11 @@ pub const TrainingRunner = struct {
         errdefer @constCast(&k_copy).deinit();
         const k_sgd = try pipeline.Kernel.init(ctx, &shaders.sgd_step, 2, @sizeOf(runtime.SgdStepPush));
         errdefer @constCast(&k_sgd).deinit();
+        var k_predict_batch: ?pipeline.Kernel = null;
+        if (cfg.max_batch_size > 0) {
+            k_predict_batch = try pipeline.Kernel.init(ctx, &shaders.mlp2_forward_batched, 6, @sizeOf(runtime.Mlp2ForwardBatchedPush));
+        }
+        errdefer if (k_predict_batch) |*k| k.deinit();
 
         // ── Parameter buffers (start populated from seed_mlp) ──
         const w1 = try buffer.Buffer.initStatic(ctx, f32, seed_mlp.w1);
@@ -158,6 +183,15 @@ pub const TrainingRunner = struct {
         const db2 = try buffer.Buffer.initDeviceOnly(ctx, cfg.dim_out * @sizeOf(f32));
         errdefer @constCast(&db2).deinit(ctx.device);
 
+        var x_batch: ?buffer.Buffer = null;
+        var y_batch: ?buffer.Buffer = null;
+        if (cfg.max_batch_size > 0) {
+            x_batch = try buffer.Buffer.initDynamic(ctx, cfg.max_batch_size * cfg.dim_in * @sizeOf(f32));
+            errdefer if (x_batch) |*xb| xb.deinit(ctx.device);
+            y_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
+            errdefer if (y_batch) |*yb| yb.deinit(ctx.device);
+        }
+
         return .{
             .ctx = ctx,
             .cfg = cfg,
@@ -171,6 +205,7 @@ pub const TrainingRunner = struct {
             .k_outer = k_outer,
             .k_copy = k_copy,
             .k_sgd = k_sgd,
+            .k_predict_batch = k_predict_batch,
             .w1 = w1,
             .b1 = b1,
             .w2 = w2,
@@ -187,6 +222,8 @@ pub const TrainingRunner = struct {
             .db1 = db1,
             .dw2 = dw2,
             .db2 = db2,
+            .x_batch = x_batch,
+            .y_batch = y_batch,
         };
     }
 
@@ -208,6 +245,8 @@ pub const TrainingRunner = struct {
         self.db1.deinit(dev);
         self.dw2.deinit(dev);
         self.db2.deinit(dev);
+        if (self.x_batch) |*xb| xb.deinit(dev);
+        if (self.y_batch) |*yb| yb.deinit(dev);
         self.k_matmul.deinit();
         self.k_add.deinit();
         self.k_relu.deinit();
@@ -217,6 +256,7 @@ pub const TrainingRunner = struct {
         self.k_outer.deinit();
         self.k_copy.deinit();
         self.k_sgd.deinit();
+        if (self.k_predict_batch) |*k| k.deinit();
     }
 
     /// Run one full training step: upload x/target, record forward +
@@ -319,6 +359,80 @@ pub const TrainingRunner = struct {
         try self.b1.readBack(self.ctx, f32, dst.b1);
         try self.w2.readBack(self.ctx, f32, dst.w2);
         try self.b2.readBack(self.ctx, f32, dst.b2);
+    }
+
+    /// Run one forward pass on a batch of `n_samples` inputs in a
+    /// single dispatch and read the outputs back. Far cheaper than N
+    /// sequential `tickPredict` calls — one submit, one waitIdle, one
+    /// readBack regardless of N.
+    ///
+    /// `x_batch.len` must equal `n * dim_in`; `out_y.len` must equal
+    /// `n * dim_out`. `n` may be ≤ `cfg.max_batch_size`. `cfg.max_batch_size`
+    /// must have been > 0 at init time.
+    ///
+    /// Visualisation use case: pass the UV grid for a 16×16 tile
+    /// surface and write the resulting RGB into per-tile materials.
+    pub fn tickPredictBatch(self: *TrainingRunner, x_batch: []const f32, out_y: []f32) !void {
+        const xb = self.x_batch orelse return error.BatchSizeNotConfigured;
+        const yb = self.y_batch orelse return error.BatchSizeNotConfigured;
+        const k = self.k_predict_batch orelse return error.BatchSizeNotConfigured;
+        if (x_batch.len % self.cfg.dim_in != 0) return error.XBatchDimMismatch;
+        const n: u32 = @intCast(x_batch.len / self.cfg.dim_in);
+        if (n == 0) return;
+        if (n > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+        if (out_y.len != n * self.cfg.dim_out) return error.OutBatchDimMismatch;
+
+        @constCast(&xb).update(f32, x_batch);
+
+        var rec = try recorder_mod.Recorder.init(self.ctx, 8, 32);
+        defer rec.deinit();
+        try rec.begin();
+
+        const push = runtime.Mlp2ForwardBatchedPush{
+            .dim_in = self.cfg.dim_in,
+            .dim_hidden = self.cfg.dim_hidden,
+            .dim_out = self.cfg.dim_out,
+            .n_samples = n,
+        };
+        try rec.dispatch(
+            &k,
+            &.{ &self.w1, &self.b1, &self.w2, &self.b2, &xb, &yb },
+            &push,
+            ceilDiv(n, 64),
+            1,
+            1,
+        );
+        try rec.endAndSubmit();
+
+        try yb.readBack(self.ctx, f32, out_y);
+    }
+
+    /// Attach-mode batched predict: record the dispatch into an
+    /// existing host-owned Recorder. Caller must upload `x_batch`
+    /// data into `runner.x_batch` (HOST_VISIBLE) themselves before
+    /// the host's submit, and read `runner.y_batch` after submit
+    /// completes. Provided for hosts that want zero per-frame submits
+    /// from valkyr.
+    pub fn tickPredictBatchRecord(self: *TrainingRunner, rec: *recorder_mod.Recorder, n_samples: u32) !void {
+        const xb = self.x_batch orelse return error.BatchSizeNotConfigured;
+        const yb = self.y_batch orelse return error.BatchSizeNotConfigured;
+        const k = self.k_predict_batch orelse return error.BatchSizeNotConfigured;
+        if (n_samples == 0) return;
+        if (n_samples > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+        const push = runtime.Mlp2ForwardBatchedPush{
+            .dim_in = self.cfg.dim_in,
+            .dim_hidden = self.cfg.dim_hidden,
+            .dim_out = self.cfg.dim_out,
+            .n_samples = n_samples,
+        };
+        try rec.dispatch(
+            &k,
+            &.{ &self.w1, &self.b1, &self.w2, &self.b2, &xb, &yb },
+            &push,
+            ceilDiv(n_samples, 64),
+            1,
+            1,
+        );
     }
 
     // ── Internal: dispatch sequences ───────────────────────────────

@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
     const outer_product_spv = compileShader(b, "outer_product");
     const sgd_step_spv = compileShader(b, "sgd_step");
     const mse_loss_grad_spv = compileShader(b, "mse_loss_grad");
+    const mlp2_forward_batched_spv = compileShader(b, "mlp2_forward_batched");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -107,6 +108,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(outer_product_spv, "outer_product.spv");
     _ = wf.addCopyFile(sgd_step_spv, "sgd_step.spv");
     _ = wf.addCopyFile(mse_loss_grad_spv, "mse_loss_grad.spv");
+    _ = wf.addCopyFile(mlp2_forward_batched_spv, "mlp2_forward_batched.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -154,6 +156,7 @@ pub fn build(b: *std.Build) void {
         \\pub const outer_product align(4) = @embedFile("outer_product.spv").*;
         \\pub const sgd_step align(4) = @embedFile("sgd_step.spv").*;
         \\pub const mse_loss_grad align(4) = @embedFile("mse_loss_grad.spv").*;
+        \\pub const mlp2_forward_batched align(4) = @embedFile("mlp2_forward_batched.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──

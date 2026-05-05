@@ -567,6 +567,7 @@ pub fn main() !void {
     try runGpuMlpTrainSmoke(allocator);
     try runTrainingRunnerSmoke(allocator);
     try runTrainingRunnerAttachedSmoke(allocator);
+    try runTrainingRunnerBatchedSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2003,6 +2004,84 @@ fn runTrainingRunnerAttachedSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner attached ({d} host-submitted frames; loss {d:.6} → {d:.6}, valkyr-record + host-submit OK)\n",
         .{ n_frames, initial_loss, final_loss },
+    );
+}
+
+// ── TrainingRunner batched-predict parity smoke ─────────────────────
+//
+// Verifies the new `tickPredictBatch` against N sequential
+// `tickPredict` calls. Both should be bit-identical because the
+// batched shader is just N independent applications of the same
+// forward formula — same fp32 ops, same accumulation order.
+
+fn runTrainingRunnerBatchedSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_samples: u32 = 256;
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 5,
+        .dim_hidden = 16,
+        .dim_out = 3,
+        .lr = 0.0,
+        .init_seed = 0xBA7CCED,
+        .max_batch_size = n_samples,
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // Build a dense input grid: U-grid × V-grid plus the Fourier-style
+    // features the matryoshka demo will use. Same shape so the smoke
+    // exercises the realistic path.
+    const grid: u32 = 16;
+    if (grid * grid != n_samples) return error.SetupBug;
+    var x_batch = try allocator.alloc(f32, n_samples * cfg.dim_in);
+    defer allocator.free(x_batch);
+    for (0..grid) |gv| {
+        for (0..grid) |gu| {
+            const idx = (gv * grid + gu) * cfg.dim_in;
+            const u = @as(f32, @floatFromInt(gu)) / @as(f32, @floatFromInt(grid - 1));
+            const v = @as(f32, @floatFromInt(gv)) / @as(f32, @floatFromInt(grid - 1));
+            x_batch[idx + 0] = u;
+            x_batch[idx + 1] = v;
+            x_batch[idx + 2] = @sin(2 * std.math.pi * u);
+            x_batch[idx + 3] = @cos(2 * std.math.pi * u);
+            x_batch[idx + 4] = @sin(2 * std.math.pi * v);
+        }
+    }
+
+    // ── Batched predict ────────────────────────────────────────────
+    const y_batched = try allocator.alloc(f32, n_samples * cfg.dim_out);
+    defer allocator.free(y_batched);
+    try runner.tickPredictBatch(x_batch, y_batched);
+
+    // ── Sequential predict, sample by sample ───────────────────────
+    const y_sequential = try allocator.alloc(f32, n_samples * cfg.dim_out);
+    defer allocator.free(y_sequential);
+    var x_one: [5]f32 = undefined;
+    var y_one: [3]f32 = undefined;
+    for (0..n_samples) |i| {
+        @memcpy(&x_one, x_batch[i * cfg.dim_in ..][0..cfg.dim_in]);
+        try runner.tickPredict(&x_one, &y_one);
+        @memcpy(y_sequential[i * cfg.dim_out ..][0..cfg.dim_out], &y_one);
+    }
+
+    // ── Parity ────────────────────────────────────────────────────
+    var max_abs: f32 = 0;
+    for (y_batched, y_sequential, 0..) |b, s, i| {
+        const d = @abs(b - s);
+        if (d > 1e-5) {
+            std.debug.print(
+                "tickPredictBatch MISMATCH at {d}: batched={d:.7} sequential={d:.7}\n",
+                .{ i, b, s },
+            );
+            return error.ParityFailed;
+        }
+        if (d > max_abs) max_abs = d;
+    }
+    std.debug.print(
+        "PASS TrainingRunner batched predict ({d} samples, dim 5→16→3; max |Δ| vs sequential = {e})\n",
+        .{ n_samples, max_abs },
     );
 }
 
