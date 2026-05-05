@@ -902,16 +902,23 @@ fresh hardware without any external assets. ~1.4 ms/step on RTX
 
 ## Visual demos
 
-Two playable matryoshka games sit on top of this surface:
+Two playable matryoshka games sit on top of this surface.
 
-- `matryoshka train_mlp_demo` — UV → RGB regression. Click on the
-  16×16 tile grid to teach a continuous colour field. The MLP
+<p align="center">
+  <img src="images/train_mlp_demo.png" alt="train_mlp_demo — smooth UV→RGB regression with green convergence bar" width="44%" />
+  &nbsp;&nbsp;
+  <img src="images/train_classifier_demo.png" alt="train_classifier_demo — sharp Voronoi class regions from CE loss" width="44%" />
+</p>
+
+- **`matryoshka train_mlp_demo`** (left) — UV → RGB regression. Click
+  on the 16×16 tile grid to teach a continuous colour field. The MLP
   interpolates smoothly between supervision points; the convergence
-  bar in front of the grid tracks the optimization state.
-- `matryoshka train_classifier_demo` — same scene, same click
-  mechanics, but the loss head is cross-entropy and the display is
-  argmax. Watch sharp Voronoi class boundaries form between
-  supervision regions.
+  bar in front of the grid tracks the optimization state (green =
+  loss ≤ target, red = catching up to a fresh click).
+- **`matryoshka train_classifier_demo`** (right) — same scene, same
+  click mechanics, but the loss head is cross-entropy and the display
+  is `argmax`. Sharp Voronoi class boundaries form between supervision
+  regions, carving non-trivial shapes.
 
 Both run at locked refresh rate with cooperative attach + Adam +
 loss-target decay. The category-level shape difference (smooth

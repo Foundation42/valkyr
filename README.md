@@ -79,6 +79,17 @@ years), and intentionally *less* than llama.cpp. So why pick it up?
   device, a CI runner, or a single static binary deployment without
   dragging a Python stack.
 
+<p align="center">
+  <img src="docs/images/train_mlp_demo.png" alt="train_mlp_demo — smooth UV→RGB regression converged" width="44%" />
+  &nbsp;&nbsp;
+  <img src="docs/images/train_classifier_demo.png" alt="train_classifier_demo — sharp Voronoi class boundaries" width="44%" />
+</p>
+
+<p align="center"><em>Two demos on the same training stack — left: MSE
+regression (smooth interpolation); right: cross-entropy classifier
+(sharp partition). Same scene, same click mechanics, one config
+switch. Both at refresh rate. <a href="docs/embedding.md#visual-demos">More</a>.</em></p>
+
 - **Modern architectures, built clean.** Qwen3.5 hybrid (Gated
   DeltaNet + full-attention), TurboQuant Q4 KV cache, llama.cpp-
   compatible Q4_0 and Q4_K_M weights — all built fresh from CPU
