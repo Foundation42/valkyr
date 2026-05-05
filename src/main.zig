@@ -630,6 +630,7 @@ pub fn main() !void {
     try runGpuAttentionBackwardSmoke(allocator);
     try runRopeBackwardSmoke(allocator);
     try runDecoderFineTuneCpuSmoke(allocator);
+    try runDecoderStackFineTuneCpuSmoke(allocator);
     try runDecoderBackwardGpuParitySmoke(allocator);
     try runDecoderTrainGpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
@@ -5987,6 +5988,148 @@ fn runDecoderFineTuneCpuSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS decoder fine-tune CPU (dim={d} heads={d} ff_dim={d} n_pos={d}; loss {d:.6} → {d:.6} ({e:.2}× drop) over {d} Adam steps)\n",
         .{ dim, cfg.n_heads, cfg.ff_dim, cfg.n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps },
+    );
+}
+
+// ── chunk 8c-α-1: stack of decoder layers + lm_head + softmax-CE,
+// CPU oracle. Validates that the stack-level gradient chain composes
+// correctly: chunk-8a single-layer `backwardFromDy` chains via
+// `d_x_in → next layer's d_y`, plus the new pieces (embedding + final
+// rmsnorm + lm_head linear + softmax-CE). Same convergence-on-a-
+// reachable-target shape as 8a — only the architecture and loss
+// changed.
+fn runDecoderStackFineTuneCpuSmoke(allocator: std.mem.Allocator) !void {
+    const cfg = cpu_train_decoder.StackConfig{
+        .base = .{
+            .dim = 16,
+            .n_heads = 2,
+            .n_kv_heads = 2,
+            .head_dim = 8,
+            .ff_dim = 32,
+            .n_pos = 4,
+            .rms_eps = 1e-5,
+            .causal = true,
+        },
+        .n_layers = 2,
+        .vocab_size = 8,
+    };
+    const dim = cfg.base.dim;
+    const n_pos = cfg.base.n_pos;
+    const vocab = cfg.vocab_size;
+    const q_dim = cfg.base.n_heads * cfg.base.head_dim;
+    const kv_dim = cfg.base.n_kv_heads * cfg.base.head_dim;
+
+    var prng = std.Random.DefaultPrng.init(0xC0_DE_AC_01);
+    const rng = prng.random();
+    const initScale: f32 = 0.1;
+
+    // ── Embedding + final norm + lm_head.
+    const w_embed = try allocator.alloc(f32, vocab * dim);
+    defer allocator.free(w_embed);
+    for (w_embed) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    const w_final_norm = try allocator.alloc(f32, dim);
+    defer allocator.free(w_final_norm);
+    for (w_final_norm) |*v| v.* = 1.0;
+    const w_lm_head = try allocator.alloc(f32, vocab * dim);
+    defer allocator.free(w_lm_head);
+    for (w_lm_head) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+
+    // ── Per-layer weight buffers.
+    const layers = try allocator.alloc(cpu_train_decoder.Layer, cfg.n_layers);
+    defer allocator.free(layers);
+    const layer_weight_buffers = try allocator.alloc([8][]f32, cfg.n_layers);
+    defer allocator.free(layer_weight_buffers);
+    defer for (layer_weight_buffers) |slots| for (slots) |s| allocator.free(s);
+
+    for (layers, layer_weight_buffers) |*layer, *slots| {
+        const w_n1 = try allocator.alloc(f32, dim);
+        const w_q = try allocator.alloc(f32, q_dim * dim);
+        const w_k = try allocator.alloc(f32, kv_dim * dim);
+        const w_v = try allocator.alloc(f32, kv_dim * dim);
+        const w_o = try allocator.alloc(f32, dim * q_dim);
+        const w_n2 = try allocator.alloc(f32, dim);
+        const w_ff1 = try allocator.alloc(f32, cfg.base.ff_dim * dim);
+        const w_ff2 = try allocator.alloc(f32, dim * cfg.base.ff_dim);
+        for (w_n1) |*v| v.* = 1.0;
+        for (w_n2) |*v| v.* = 1.0;
+        for (w_q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+        for (w_k) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+        for (w_v) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+        for (w_o) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+        for (w_ff1) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+        for (w_ff2) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+        slots.* = .{ w_n1, w_q, w_k, w_v, w_o, w_n2, w_ff1, w_ff2 };
+        layer.* = .{
+            .cfg = cfg.base,
+            .w_n1 = w_n1,
+            .w_q = w_q,
+            .w_k = w_k,
+            .w_v = w_v,
+            .w_o = w_o,
+            .w_n2 = w_n2,
+            .w_ff1 = w_ff1,
+            .w_ff2 = w_ff2,
+        };
+    }
+
+    var stack = cpu_train_decoder.Stack{
+        .cfg = cfg,
+        .embed = w_embed,
+        .layers = layers,
+        .final_norm = w_final_norm,
+        .lm_head = w_lm_head,
+    };
+
+    var acts = try cpu_train_decoder.allocStackActs(allocator, cfg);
+    defer cpu_train_decoder.freeStackActs(allocator, &acts);
+
+    // ── Synthetic input + reachable target.
+    // Random token IDs in [0, vocab); target IDs likewise.
+    const token_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(token_ids);
+    for (token_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, @intCast(vocab));
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    for (target_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, @intCast(vocab));
+
+    acts.token_ids = token_ids;
+    cpu_train_decoder.stackForward(&stack, &acts);
+    const initial_loss = cpu_train_decoder.softmaxCeLoss(acts.logits, target_ids, n_pos, vocab);
+
+    // ── Grads + Adam.
+    var grads = try cpu_train_decoder.allocStackGrads(allocator, &stack);
+    defer cpu_train_decoder.freeStackGrads(allocator, &grads);
+
+    var adam = try cpu_train_decoder.stackAdamInit(allocator, &stack, 1e-2);
+    defer cpu_train_decoder.stackAdamDeinit(&adam, allocator);
+
+    // ── Train.
+    const n_steps: usize = 200;
+    var final_loss = initial_loss;
+    for (1..n_steps + 1) |_| {
+        cpu_train_decoder.stackForward(&stack, &acts);
+        final_loss = cpu_train_decoder.softmaxCeLoss(acts.logits, target_ids, n_pos, vocab);
+        grads.zero();
+        try cpu_train_decoder.stackBackward(allocator, &stack, &acts, target_ids, &grads);
+        cpu_train_decoder.stackAdamStep(&adam, &stack, &grads);
+    }
+
+    // Cross-entropy on a tiny vocab with a reachable target should
+    // collapse loss by orders of magnitude. The single-layer 8a smoke
+    // hit 5+ orders of magnitude in 100 steps; CE through a 2-layer
+    // stack is somewhat slower but should still clear 1e-2 inside 200.
+    const ratio = final_loss / initial_loss;
+    if (ratio > 1e-2) {
+        std.debug.print(
+            "stack fine-tune: initial_loss={d:.6} final_loss={d:.6} ratio={d:.4}\n",
+            .{ initial_loss, final_loss, ratio },
+        );
+        return error.LossDidNotDecrease;
+    }
+
+    std.debug.print(
+        "PASS decoder stack fine-tune CPU (n_layers={d} dim={d} vocab={d} n_pos={d}; CE loss {d:.6} → {d:.6} ({e:.2}× drop) over {d} Adam steps)\n",
+        .{ cfg.n_layers, dim, vocab, n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps },
     );
 }
 
