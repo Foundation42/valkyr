@@ -610,6 +610,7 @@ pub fn main() !void {
     try runTrainingRunnerDecaySmoke(allocator);
     try runTrainingRunnerNSmoke(allocator);
     try runTrainingRunnerNAttachedSmoke(allocator);
+    try runWeightDecayCosineLrSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2659,6 +2660,124 @@ fn runTrainingRunnerNAttachedSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS MlpNRunner attached (n={d} layers, dims [4,12,8,4]; {d} host-submitted frames; loss {d:.6} → {d:.6})\n",
         .{ runner.nLayers(), n_frames, initial_loss, final_loss },
+    );
+}
+
+// ── Weight-decay + cosine-LR smoke ─────────────────────────────────
+//
+// Tier-1 chunk 5 of the post-v0 training arc. Two claims:
+//
+//   (1) Weight-decay shrinks W toward zero in the absence of a
+//       gradient signal. We feed a constant (x=0, target=0) every step;
+//       MSE loss is then 0 and the gradient is identically zero, so
+//       any change in ‖W‖ comes entirely from the wd shrinkage. After
+//       N steps the weight L2 norm should equal ‖W₀‖·(1 − lr·wd)^N.
+//
+//   (2) `cosineLr` returns lr_max at step 0, lr_min at step ≥ T, and
+//       the half-cosine in between. Pure host-side helper — sanity
+//       check three sample points.
+//
+// Both runners share the SGD shader, so testing on MlpNRunner covers
+// the TrainingRunner path too. (Adam shader gets the same wd push;
+// Adam parity vs CPU is left for chunk 5b — math is straightforward
+// AdamW, the more interesting test is a longer-horizon convergence
+// run.)
+
+fn runWeightDecayCosineLrSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // ── (1) Weight-decay shrinkage with zero gradient ─────────────
+    const layer_dims = [_]u32{ 4, 8, 4 };
+    const lr: f32 = 0.05;
+    const wd: f32 = 0.1;
+    const n_steps: u32 = 30;
+
+    var runner = try train_runner_n.MlpNRunner.init(allocator, &ctx, .{
+        .layer_dims = &layer_dims,
+        .lr = lr,
+        .weight_decay = wd,
+        .init_seed = 0xCDDECA1,
+    });
+    defer runner.deinit();
+
+    // Snapshot initial L2 norms per layer.
+    const seed_dims = [_]usize{ 4, 8, 4 };
+    var mirror = try cpu_train.MlpN.init(allocator, &seed_dims, 0.0, 0);
+    defer mirror.deinit(allocator);
+    try runner.readWeights(&mirror);
+
+    var w_norm0: [2]f32 = undefined;
+    for (mirror.weights, 0..) |w, L| {
+        var s: f64 = 0;
+        for (w) |v| s += @as(f64, v) * @as(f64, v);
+        w_norm0[L] = @floatCast(@sqrt(s));
+    }
+
+    // Step with zero (x, target). Loss-grad is zero, so the only
+    // change to W is the decoupled shrinkage W ← W·(1 − lr·wd).
+    const zero_x = [_]f32{ 0, 0, 0, 0 };
+    const zero_t = [_]f32{ 0, 0, 0, 0 };
+    var s: u32 = 0;
+    while (s < n_steps) : (s += 1) {
+        try runner.tickStep(&zero_x, &zero_t, null);
+    }
+
+    try runner.readWeights(&mirror);
+    const expected_factor: f32 = std.math.pow(f32, 1.0 - lr * wd, @as(f32, @floatFromInt(n_steps)));
+    var max_rel_err: f32 = 0;
+    for (mirror.weights, 0..) |w, L| {
+        var s2: f64 = 0;
+        for (w) |v| s2 += @as(f64, v) * @as(f64, v);
+        const norm_after: f32 = @floatCast(@sqrt(s2));
+        const expected = w_norm0[L] * expected_factor;
+        const rel_err = @abs(norm_after - expected) / expected;
+        if (rel_err > max_rel_err) max_rel_err = rel_err;
+        if (rel_err > 1e-3) {
+            std.debug.print(
+                "weight-decay shrinkage off on layer W[{d}]: ‖W‖={d:.6}, expected={d:.6}, rel_err={d:.4}\n",
+                .{ L, norm_after, expected, rel_err },
+            );
+            return error.ParityFailed;
+        }
+    }
+
+    // Biases must be untouched (wd = 0 on bias dispatches).
+    for (mirror.biases) |b| {
+        for (b) |v| {
+            if (v != 0.0) {
+                std.debug.print("bias drift under wd: expected 0, got {d:.6}\n", .{v});
+                return error.ParityFailed;
+            }
+        }
+    }
+
+    // ── (2) cosineLr endpoints + midpoint ─────────────────────────
+    const lr_max: f32 = 0.1;
+    const lr_min: f32 = 0.01;
+    const total: u32 = 1000;
+    const lr0 = train_runner_n.cosineLr(0, total, lr_max, lr_min);
+    const lrT = train_runner_n.cosineLr(total, total, lr_max, lr_min);
+    const lrMid = train_runner_n.cosineLr(total / 2, total, lr_max, lr_min);
+
+    if (@abs(lr0 - lr_max) > 1e-6) {
+        std.debug.print("cosineLr(0) = {d:.6}, expected {d:.6}\n", .{ lr0, lr_max });
+        return error.ParityFailed;
+    }
+    if (@abs(lrT - lr_min) > 1e-6) {
+        std.debug.print("cosineLr(T) = {d:.6}, expected {d:.6}\n", .{ lrT, lr_min });
+        return error.ParityFailed;
+    }
+    // At step T/2 the cosine = 0, so lr = lr_min + (lr_max - lr_min)/2.
+    const mid_expected = lr_min + (lr_max - lr_min) * 0.5;
+    if (@abs(lrMid - mid_expected) > 1e-3) {
+        std.debug.print("cosineLr(T/2) = {d:.6}, expected {d:.6}\n", .{ lrMid, mid_expected });
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS weight decay + cosine LR (W shrunk by (1 − lr·wd)^{d} = {d:.4}, max rel-err = {e}; cosine LR endpoints + mid OK)\n",
+        .{ n_steps, expected_factor, max_rel_err },
     );
 }
 

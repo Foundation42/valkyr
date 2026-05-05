@@ -37,14 +37,34 @@ pub const MlpNConfig = struct {
     layer_dims: []const u32,
     /// SGD learning rate. Sensible default for the toy demos: 0.05.
     /// Mutable across frames — write `runner.lr` between ticks for
-    /// schedules.
+    /// schedules (see `cosineLr` for a one-liner cosine policy).
     lr: f32,
+    /// Decoupled L2 weight decay coefficient. When > 0, weights are
+    /// shrunk toward zero on every SGD step: W ← W·(1 − lr·wd) − lr·g.
+    /// Biases are left alone (no shrinkage). 0 disables decay.
+    /// Mutable across frames — write `runner.weight_decay` between
+    /// ticks if you want to schedule it independently of lr.
+    weight_decay: f32 = 0.0,
     /// Initial weight scale: weights drawn from U(-init_scale, +init_scale).
     init_scale: f32 = 0.3,
     /// RNG seed for initial weights. Same seed → bit-identical starting
     /// MLP, matching `cpu_train.MlpN.init`.
     init_seed: u64 = 0xCAFE_4E_01,
 };
+
+/// Cosine learning-rate schedule. Returns
+///   lr_min + (lr_max − lr_min) · (1 + cos(π·t/T)) / 2
+/// clamped at lr_min for `step ≥ total_steps`. Plug into `runner.lr`
+/// between ticks for a no-fuss decay; set lr_min = 0 for the classic
+/// "decay to zero" form. Independent of which runner you're driving —
+/// pure host-side helper.
+pub fn cosineLr(step: u32, total_steps: u32, lr_max: f32, lr_min: f32) f32 {
+    if (total_steps == 0 or step >= total_steps) return lr_min;
+    const t: f32 = @floatFromInt(step);
+    const T: f32 = @floatFromInt(total_steps);
+    const c = @cos(std.math.pi * t / T);
+    return lr_min + (lr_max - lr_min) * 0.5 * (1.0 + c);
+}
 
 /// Multi-layer MLP runner. Persistent parameter, activation, and
 /// gradient buffers across the runner's lifetime; one submit per
@@ -55,6 +75,7 @@ pub const MlpNRunner = struct {
     allocator: std.mem.Allocator,
     layer_dims: []u32, // owned; length n+1
     lr: f32,
+    weight_decay: f32,
     init_seed: u64,
 
     // ── Pipelines (built once, reused across every step) ──
@@ -217,6 +238,7 @@ pub const MlpNRunner = struct {
             .allocator = allocator,
             .layer_dims = layer_dims,
             .lr = cfg.lr,
+            .weight_decay = cfg.weight_decay,
             .init_seed = cfg.init_seed,
             .k_matmul = k_matmul,
             .k_add = k_add,
@@ -440,13 +462,15 @@ pub const MlpNRunner = struct {
 
         // SGD updates run after all gradients are computed using the
         // pre-update weights. Order across layers doesn't matter.
+        // Weight decay applies only to W; biases are left alone (the
+        // standard "no decay on biases" convention).
         for (0..n) |L| {
             const dim_o: u32 = self.layer_dims[L + 1];
             const dim_i: u32 = self.layer_dims[L];
             const w_n: u32 = dim_o * dim_i;
-            const sgd_w_push = runtime.SgdStepPush{ .n = w_n, .lr = self.lr };
+            const sgd_w_push = runtime.SgdStepPush{ .n = w_n, .lr = self.lr, .weight_decay = self.weight_decay };
             try rec.dispatch(&self.k_sgd, &.{ &self.weights[L], &self.dw[L] }, &sgd_w_push, ceilDiv(w_n, 256), 1, 1);
-            const sgd_b_push = runtime.SgdStepPush{ .n = dim_o, .lr = self.lr };
+            const sgd_b_push = runtime.SgdStepPush{ .n = dim_o, .lr = self.lr, .weight_decay = 0.0 };
             try rec.dispatch(&self.k_sgd, &.{ &self.biases[L], &self.db[L] }, &sgd_b_push, ceilDiv(dim_o, 256), 1, 1);
         }
     }

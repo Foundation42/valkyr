@@ -15,6 +15,11 @@
 // `t` is the 1-indexed Adam step counter, pushed each call so the bias-
 // correction terms stay correct after model resets — which clear m/v
 // and reset t to 0 host-side.
+//
+// `weight_decay` implements the decoupled "AdamW" variant: the L2
+// shrinkage applies directly to the parameter, NOT to the gradient
+// fed into m/v. This is the modern default — see Loshchilov &
+// Hutter 2019. Pass 0 to recover plain Adam.
 
 layout(local_size_x = 256) in;
 
@@ -30,6 +35,7 @@ layout(push_constant) uniform Pc {
     float beta2;
     float eps;
     uint  t;
+    float weight_decay;
 } pc;
 
 void main() {
@@ -48,5 +54,9 @@ void main() {
     float m_hat = new_m / bc1;
     float v_hat = new_v / bc2;
 
-    param[i] -= pc.lr * m_hat / (sqrt(v_hat) + pc.eps);
+    float p = param[i];
+    if (pc.weight_decay > 0.0) {
+        p = p * (1.0 - pc.lr * pc.weight_decay);
+    }
+    param[i] = p - pc.lr * m_hat / (sqrt(v_hat) + pc.eps);
 }

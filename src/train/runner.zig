@@ -111,6 +111,13 @@ pub const Mlp2Config = struct {
     /// `LossDecay` for the details. Loss eval shaders are only built
     /// when this is non-`.none`.
     decay: LossDecay = .none,
+    /// Decoupled L2 weight decay coefficient. When > 0, weights (W1,
+    /// W2 — never biases) are shrunk toward zero each step:
+    ///   SGD:  W ← W·(1 − lr·wd) − lr·g
+    ///   Adam: AdamW form (Loshchilov & Hutter 2019)
+    /// 0 disables decay. Mutable across frames — write
+    /// `runner.weight_decay` between ticks for a schedule.
+    weight_decay: f32 = 0.0,
 };
 
 /// Compile-time cap on `dim_hidden` enforced by the batched forward
@@ -171,6 +178,10 @@ pub const TrainingRunner = struct {
     ctx: *const vk.Context,
     cfg: Mlp2Config,
     lr: f32,
+    /// Live weight-decay coefficient. Initialised from `cfg.weight_decay`.
+    /// Mutable across frames — only the W dispatches read this; the
+    /// bias dispatches always pass `weight_decay = 0`.
+    weight_decay: f32,
 
     // ── Pipelines (built once, reused across every step) ──
     k_matmul: pipeline.Kernel,
@@ -471,6 +482,7 @@ pub const TrainingRunner = struct {
             .ctx = ctx,
             .cfg = cfg,
             .lr = cfg.lr,
+            .weight_decay = cfg.weight_decay,
             .k_matmul = k_matmul,
             .k_add = k_add,
             .k_relu = k_relu,
@@ -1168,10 +1180,10 @@ pub const TrainingRunner = struct {
         const w2_n: u32 = dim_out * dim_h;
         switch (self.cfg.optimizer) {
             .sgd => {
-                const sgd_w1 = runtime.SgdStepPush{ .n = w1_n, .lr = self.lr };
-                const sgd_b1 = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr };
-                const sgd_w2 = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr };
-                const sgd_b2 = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr };
+                const sgd_w1 = runtime.SgdStepPush{ .n = w1_n, .lr = self.lr, .weight_decay = self.weight_decay };
+                const sgd_b1 = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr, .weight_decay = 0.0 };
+                const sgd_w2 = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr, .weight_decay = self.weight_decay };
+                const sgd_b2 = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr, .weight_decay = 0.0 };
                 try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1, ceilDiv(w1_n, 256), 1, 1);
                 try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1, ceilDiv(dim_h, 256), 1, 1);
                 try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2, ceilDiv(w2_n, 256), 1, 1);
@@ -1195,18 +1207,22 @@ pub const TrainingRunner = struct {
                 const adam_w1 = runtime.AdamStepPush{
                     .n = w1_n, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
                     .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                    .weight_decay = self.weight_decay,
                 };
                 const adam_b1 = runtime.AdamStepPush{
                     .n = dim_h, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
                     .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                    .weight_decay = 0.0,
                 };
                 const adam_w2 = runtime.AdamStepPush{
                     .n = w2_n, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
                     .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                    .weight_decay = self.weight_decay,
                 };
                 const adam_b2 = runtime.AdamStepPush{
                     .n = dim_out, .lr = self.lr, .beta1 = self.cfg.adam_beta1,
                     .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
+                    .weight_decay = 0.0,
                 };
                 try rec.dispatch(k_adam, &.{ &self.w1, &self.dw1, m_w1, v_w1 }, &adam_w1, ceilDiv(w1_n, 256), 1, 1);
                 try rec.dispatch(k_adam, &.{ &self.b1, &self.db1, m_b1, v_b1 }, &adam_b1, ceilDiv(dim_h, 256), 1, 1);
@@ -1305,10 +1321,10 @@ pub const TrainingRunner = struct {
         // SGD: param[i] -= lr · grad[i]. Same shader for every buffer.
         const w1_n: u32 = dim_h * dim_in;
         const w2_n: u32 = dim_out * dim_h;
-        const sgd_w1_push = runtime.SgdStepPush{ .n = w1_n, .lr = self.lr };
-        const sgd_b1_push = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr };
-        const sgd_w2_push = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr };
-        const sgd_b2_push = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr };
+        const sgd_w1_push = runtime.SgdStepPush{ .n = w1_n, .lr = self.lr, .weight_decay = self.weight_decay };
+        const sgd_b1_push = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr, .weight_decay = 0.0 };
+        const sgd_w2_push = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr, .weight_decay = self.weight_decay };
+        const sgd_b2_push = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr, .weight_decay = 0.0 };
 
         try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1_push, ceilDiv(w1_n, 256), 1, 1);
         try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1_push, ceilDiv(dim_h, 256), 1, 1);
