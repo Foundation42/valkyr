@@ -573,6 +573,7 @@ pub fn main() !void {
     try runTrainingRunnerStagingSmoke(allocator);
     try runTrainingRunnerAdamSmoke(allocator);
     try runTrainingRunnerCrossEntropySmoke(allocator);
+    try runTrainingRunnerDecaySmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2834,6 +2835,157 @@ fn runTrainingRunnerCrossEntropySmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner cross-entropy loss-grad ({d} samples × {d} classes; max |Δ| vs CPU oracle = {e})\n",
         .{ n_samples, dim_out, max_abs },
+    );
+}
+
+// ── TrainingRunner loss-target decay smoke ──────────────────────────
+//
+// Verifies the runtime self-throttling logic:
+//   1. With decay = .loss_target { target = 0.05 }, training runs
+//      until loss < target, then `tickFrameTrain` reports idle = true
+//      and steps_completed = 0.
+//   2. last_loss caches a real value (> 0, ≤ target by the time idle).
+//   3. Resumption: changing target_batch to break the fit causes
+//      next frame's tickFrameTrain to report idle = false again.
+
+fn runTrainingRunnerDecaySmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_train: u32 = 8;
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 16,
+        .dim_out = 3,
+        .lr = 0.05,
+        .init_seed = 0xDECA1A77,
+        .max_batch_size = n_train,
+        .optimizer = .adam,
+        .decay = .{ .loss_target = .{ .target = 0.001 } },
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // Non-trivial supervision: targets ∈ [-2, 2], well outside the
+    // initial MLP's near-zero output range. Initial loss is large so
+    // we actually exercise the converge-then-idle path; a target of
+    // 0.001 is reachable in a few dozen Adam steps but not on frame 1.
+    var rng = std.Random.DefaultPrng.init(0xDECAD0);
+    const r = rng.random();
+    const x_train = try allocator.alloc(f32, n_train * cfg.dim_in);
+    defer allocator.free(x_train);
+    const t_train = try allocator.alloc(f32, n_train * cfg.dim_out);
+    defer allocator.free(t_train);
+    for (x_train) |*v| v.* = r.float(f32) * 2 - 1;
+    for (t_train) |*v| v.* = r.float(f32) * 4 - 2;
+
+    try runner.uploadTrainBatch(x_train, t_train);
+
+    var cb_ai = std.mem.zeroes(vk.c.VkCommandBufferAllocateInfo);
+    cb_ai.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = ctx.cmd_pool;
+    cb_ai.level = vk.c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    var host_cmd: vk.c.VkCommandBuffer = null;
+    try vk.check(vk.c.vkAllocateCommandBuffers(ctx.device, &cb_ai, &host_cmd));
+    defer vk.c.vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &host_cmd);
+    var fci = std.mem.zeroes(vk.c.VkFenceCreateInfo);
+    fci.sType = vk.c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    var host_fence: vk.c.VkFence = null;
+    try vk.check(vk.c.vkCreateFence(ctx.device, &fci, null, &host_fence));
+    defer vk.c.vkDestroyFence(ctx.device, host_fence, null);
+
+    const runFrame = struct {
+        fn f(
+            rn: *train_runner.TrainingRunner,
+            ct: *const vk.Context,
+            cmd: vk.c.VkCommandBuffer,
+            fnc: vk.c.VkFence,
+            n: u32,
+        ) !train_runner.TrainTickResult {
+            try vk.check(vk.c.vkResetCommandBuffer(cmd, 0));
+            try vk.check(vk.c.vkResetFences(ct.device, 1, &fnc));
+            var bi = std.mem.zeroes(vk.c.VkCommandBufferBeginInfo);
+            bi.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = vk.c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            try vk.check(vk.c.vkBeginCommandBuffer(cmd, &bi));
+            var rec = try gpu_recorder.Recorder.attachCmd(ct, cmd, 64, 256);
+            defer rec.deinit();
+            try rec.begin();
+            const result = try rn.tickFrameTrain(&rec, .{ .steps = 4 }, n);
+            try vk.check(vk.c.vkEndCommandBuffer(cmd));
+            var submit = std.mem.zeroes(vk.c.VkSubmitInfo);
+            submit.sType = vk.c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &cmd;
+            try vk.check(vk.c.vkQueueSubmit(ct.queue, 1, &submit, fnc));
+            const timeout_ns: u64 = 10 * 1_000_000_000;
+            try vk.check(vk.c.vkWaitForFences(ct.device, 1, &fnc, vk.c.VK_TRUE, timeout_ns));
+            return result;
+        }
+    }.f;
+
+    // ── Phase 1: train until idle ──
+    var idle_at: ?u32 = null;
+    var loss_at_idle: ?f32 = null;
+    var f: u32 = 0;
+    while (f < 200) : (f += 1) {
+        const result = try runFrame(&runner, &ctx, host_cmd, host_fence, n_train);
+        if (result.idle) {
+            idle_at = f;
+            loss_at_idle = result.last_loss;
+            break;
+        }
+    }
+    if (idle_at == null) {
+        std.debug.print("decay never reached idle within 200 frames; last_loss={?}\n", .{runner.getLastLoss()});
+        return error.ParityFailed;
+    }
+    if (loss_at_idle == null or loss_at_idle.? > 0.001) {
+        std.debug.print("idle reported but last_loss = {?} > target=0.001\n", .{loss_at_idle});
+        return error.ParityFailed;
+    }
+    // Convergence (not lucky-init) check: idle should land after at
+    // least a handful of training frames.
+    if (idle_at.? < 3) {
+        std.debug.print("idle reached on frame {d} — too early; init likely already met target. Bump targets.\n", .{idle_at.?});
+        return error.ParityFailed;
+    }
+
+    // Confirm subsequent frames stay idle (training really paused).
+    var f2: u32 = 0;
+    while (f2 < 5) : (f2 += 1) {
+        const result = try runFrame(&runner, &ctx, host_cmd, host_fence, n_train);
+        if (!result.idle or result.steps_completed != 0) {
+            std.debug.print("decay didn't stay idle at frame +{d}: idle={any} steps={d}\n", .{ f2, result.idle, result.steps_completed });
+            return error.ParityFailed;
+        }
+    }
+
+    // ── Phase 2: break the fit, training should resume ──
+    // Stomp the targets with very different values that the network
+    // hasn't seen — loss should jump above target and tickFrameTrain
+    // should return idle = false.
+    for (t_train) |*v| v.* = 5.0; // wildly different from the trained targets
+    try runner.uploadTrainBatch(x_train, t_train);
+
+    // First post-stomp frame: staging still has old loss (low), so
+    // runtime gates training off and records loss eval. Need TWO
+    // frames for the resumption signal to propagate (eval frame N
+    // measures fresh loss; frame N+1 reads it and trains).
+    _ = try runFrame(&runner, &ctx, host_cmd, host_fence, n_train);
+    const resume_result = try runFrame(&runner, &ctx, host_cmd, host_fence, n_train);
+    if (resume_result.idle or resume_result.steps_completed == 0) {
+        std.debug.print(
+            "decay didn't resume after target stomp: idle={any} steps={d} last_loss={?}\n",
+            .{ resume_result.idle, resume_result.steps_completed, resume_result.last_loss },
+        );
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS TrainingRunner loss-target decay (idle at frame {?d}, loss={d:.6}; resumed cleanly after target stomp)\n",
+        .{ idle_at, loss_at_idle.? },
     );
 }
 

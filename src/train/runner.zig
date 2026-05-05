@@ -45,6 +45,27 @@ pub const LossKind = enum {
     cross_entropy,
 };
 
+/// Convergence policy. The runtime can self-throttle training when
+/// the function has fit the supervision well enough — once loss is
+/// at or below the target, `tickFrameTrain` becomes a no-op (no
+/// recorded dispatches) on the training side. Predict + readback
+/// continue. Resumes automatically as soon as loss climbs above
+/// the target again — e.g. the host added a fresh supervision
+/// sample that the function doesn't yet satisfy.
+///
+/// The runtime always evaluates the loss every frame (cheap — one
+/// 1-thread dispatch) and stages it into a host-readback buffer, so
+/// the gating decision uses last frame's measurement under the same
+/// 1-frame-latency model as the predict readback. No extra waitIdle.
+pub const LossDecay = union(enum) {
+    /// Train at full budget every frame; no automatic backoff. Host
+    /// is responsible for any decay schedule it wants.
+    none: void,
+    /// Skip training when measured loss ≤ `target`. Resume when it
+    /// exceeds the target again.
+    loss_target: struct { target: f32 },
+};
+
 pub const Mlp2Config = struct {
     dim_in: u32,
     dim_hidden: u32,
@@ -83,6 +104,13 @@ pub const Mlp2Config = struct {
     /// fits categorical / token-prediction targets via stable softmax
     /// inside the loss-grad shader.
     loss: LossKind = .mse,
+    /// Convergence-decay policy. `.none` (default) trains at full
+    /// budget every frame. `.loss_target` lets the runtime self-
+    /// throttle once loss has fallen below the target — zero training
+    /// dispatches recorded until loss climbs back above. See
+    /// `LossDecay` for the details. Loss eval shaders are only built
+    /// when this is non-`.none`.
+    decay: LossDecay = .none,
 };
 
 /// Compile-time cap on `dim_hidden` enforced by the batched forward
@@ -124,11 +152,19 @@ pub const TrainBudget = union(enum) {
 /// stability frame-to-frame without sampling wall-clock themselves.
 pub const TrainTickResult = struct {
     /// Number of batched SGD steps actually recorded this tick.
+    /// Zero when the loss-target decay policy gated training off.
     steps_completed: u32,
     /// Wall-clock spent in `tickFrameTrain` recording, microseconds.
     /// Includes barrier emission and dispatch recording for every
     /// step that ran.
     elapsed_us: u64,
+    /// Last measured loss read from staging at the start of this
+    /// tick. `null` before the first measurement has cycled through.
+    last_loss: ?f32 = null,
+    /// True when the runtime gated training off this frame because
+    /// loss is at or below the target. Predict + readback continue
+    /// uninterrupted; only the training dispatches are skipped.
+    idle: bool = false,
 };
 
 pub const TrainingRunner = struct {
@@ -160,6 +196,11 @@ pub const TrainingRunner = struct {
     /// `cfg.loss == .cross_entropy`). MSE reuses the existing
     /// `k_train_dy_batch`.
     k_train_ce_loss_grad: ?pipeline.Kernel,
+    /// Loss-eval reduction pipeline (only built when
+    /// `cfg.decay != .none`). One of `mlp2_mse_loss_batched` or
+    /// `mlp2_ce_loss_batched` selected per `cfg.loss`. Output is a
+    /// single scalar staged via `loss_buf` → `loss_staging`.
+    k_loss_eval: ?pipeline.Kernel,
 
     // ── Parameter buffers (DEVICE_LOCAL, mutated by SGD) ──
     w1: buffer.Buffer,
@@ -209,6 +250,16 @@ pub const TrainingRunner = struct {
     adam_m_b2: ?buffer.Buffer,
     adam_v_b2: ?buffer.Buffer,
     adam_step: u32,
+
+    /// Single-scalar device-side loss output (only allocated when
+    /// `cfg.decay != .none`). Each frame the loss-eval kernel writes
+    /// here, and `recordLossReadback` stages it into `loss_staging`.
+    loss_buf: ?buffer.Buffer,
+    loss_staging: ?buffer.Buffer,
+    /// Most recent loss reading. `null` until the first staging copy
+    /// has cycled through (the runtime sees `null` and trains, which
+    /// is the right "haven't measured yet" behaviour).
+    last_loss: ?f32,
 
     /// Batched-training inputs (HOST_VISIBLE) and per-sample
     /// activations / per-sample backward scratch (DEVICE_LOCAL). Sized
@@ -292,6 +343,15 @@ pub const TrainingRunner = struct {
             );
         }
         errdefer if (k_train_ce_loss_grad) |*k| k.deinit();
+        var k_loss_eval: ?pipeline.Kernel = null;
+        if (cfg.decay != .none and cfg.max_batch_size > 0) {
+            const spv = switch (cfg.loss) {
+                .mse => &shaders.mlp2_mse_loss_batched,
+                .cross_entropy => &shaders.mlp2_ce_loss_batched,
+            };
+            k_loss_eval = try pipeline.Kernel.init(ctx, spv, 3, @sizeOf(runtime.Mlp2LossBatchedPush));
+        }
+        errdefer if (k_loss_eval) |*k| k.deinit();
 
         // ── Parameter buffers (start populated from seed_mlp) ──
         const w1 = try buffer.Buffer.initStatic(ctx, f32, seed_mlp.w1);
@@ -398,6 +458,15 @@ pub const TrainingRunner = struct {
             errdefer if (adam_v_b2) |*b| b.deinit(ctx.device);
         }
 
+        var loss_buf: ?buffer.Buffer = null;
+        var loss_staging: ?buffer.Buffer = null;
+        if (cfg.decay != .none and cfg.max_batch_size > 0) {
+            loss_buf = try buffer.Buffer.initDeviceOnly(ctx, @sizeOf(f32));
+            errdefer if (loss_buf) |*b| b.deinit(ctx.device);
+            loss_staging = try buffer.Buffer.initHostReadback(ctx, @sizeOf(f32));
+            errdefer if (loss_staging) |*b| b.deinit(ctx.device);
+        }
+
         return .{
             .ctx = ctx,
             .cfg = cfg,
@@ -419,6 +488,7 @@ pub const TrainingRunner = struct {
             .k_train_db_accum = k_train_db_accum,
             .k_adam = k_adam,
             .k_train_ce_loss_grad = k_train_ce_loss_grad,
+            .k_loss_eval = k_loss_eval,
             .w1 = w1,
             .b1 = b1,
             .w2 = w2,
@@ -454,6 +524,9 @@ pub const TrainingRunner = struct {
             .adam_m_b2 = adam_m_b2,
             .adam_v_b2 = adam_v_b2,
             .adam_step = 0,
+            .loss_buf = loss_buf,
+            .loss_staging = loss_staging,
+            .last_loss = null,
         };
     }
 
@@ -493,6 +566,8 @@ pub const TrainingRunner = struct {
         if (self.adam_v_w2) |*b| b.deinit(dev);
         if (self.adam_m_b2) |*b| b.deinit(dev);
         if (self.adam_v_b2) |*b| b.deinit(dev);
+        if (self.loss_buf) |*b| b.deinit(dev);
+        if (self.loss_staging) |*b| b.deinit(dev);
         self.k_matmul.deinit();
         self.k_add.deinit();
         self.k_relu.deinit();
@@ -510,6 +585,7 @@ pub const TrainingRunner = struct {
         if (self.k_train_db_accum) |*k| k.deinit();
         if (self.k_adam) |*k| k.deinit();
         if (self.k_train_ce_loss_grad) |*k| k.deinit();
+        if (self.k_loss_eval) |*k| k.deinit();
     }
 
     /// Run one full training step: upload x/target, record forward +
@@ -800,10 +876,18 @@ pub const TrainingRunner = struct {
     /// supervision data that updates slowly and wants to spend more
     /// GPU budget when there's frame-time headroom.
     ///
+    /// When `cfg.decay` is `.loss_target`, the runtime reads last
+    /// frame's measured loss from staging and skips recording any
+    /// training dispatches when loss ≤ target. A fresh loss eval
+    /// (forward + scalar reduction + buffer copy to staging) is
+    /// recorded EVERY frame regardless, so the next frame's gating
+    /// decision sees current data and resumption is automatic when
+    /// the host posts new supervision that pushes loss above target.
+    ///
     /// Mirrors `Session.tickFrame` shape: caller passes the budget,
     /// runner decides how many units to actually do based on wall-
-    /// clock sampling between units. Returns step-count + elapsed for
-    /// telemetry / schedule stability.
+    /// clock sampling between units. Returns step-count + elapsed +
+    /// last measured loss + an `idle` flag for telemetry.
     pub fn tickFrameTrain(
         self: *TrainingRunner,
         rec: *recorder_mod.Recorder,
@@ -811,7 +895,7 @@ pub const TrainingRunner = struct {
         n_samples: u32,
     ) !TrainTickResult {
         if (self.x_train_batch == null) return error.BatchSizeNotConfigured;
-        if (n_samples == 0) return .{ .steps_completed = 0, .elapsed_us = 0 };
+        if (n_samples == 0) return .{ .steps_completed = 0, .elapsed_us = 0, .last_loss = self.last_loss, .idle = true };
         if (n_samples > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
 
         const max_steps: u32 = switch (budget) {
@@ -825,23 +909,74 @@ pub const TrainingRunner = struct {
             .steps => std.math.maxInt(u64),
         };
         if (max_steps == 0 or us_cap == 0) {
-            return .{ .steps_completed = 0, .elapsed_us = 0 };
+            return .{ .steps_completed = 0, .elapsed_us = 0, .last_loss = self.last_loss, .idle = true };
         }
+
+        // ── Read last frame's measured loss into the cache ──
+        // Cheap memcpy from the host-mapped staging — the host's
+        // previous-frame submit signalled before this frame began
+        // recording, so the staged value is current.
+        if (self.cfg.decay != .none and self.loss_staging != null) {
+            var cached: [1]f32 = undefined;
+            const staging = self.loss_staging.?;
+            if (staging.mapped) |m| {
+                @memcpy(std.mem.sliceAsBytes(&cached), @as([*]u8, @ptrCast(m))[0..@sizeOf(f32)]);
+                // Only treat as "real" after the first measurement —
+                // initHostReadback memsets to zero, so without this
+                // the first frame would observe loss = 0 ≤ target and
+                // never train.
+                if (self.last_loss != null or cached[0] != 0.0) {
+                    self.last_loss = cached[0];
+                }
+            }
+        }
+
+        // ── Decide whether to train this frame ──
+        const should_train = switch (self.cfg.decay) {
+            .none => true,
+            .loss_target => |lt| blk: {
+                if (self.last_loss) |l| break :blk l > lt.target;
+                // Haven't measured yet — train this frame so the
+                // next staging readback has real data.
+                break :blk true;
+            },
+        };
 
         const t0 = std.time.nanoTimestamp();
         var steps_done: u32 = 0;
-        while (steps_done < max_steps) {
-            try self.recordTrainBatch(rec, n_samples);
-            steps_done += 1;
-            const elapsed_ns = std.time.nanoTimestamp() - t0;
-            const elapsed_us: u64 = @intCast(@divTrunc(elapsed_ns, 1000));
-            if (elapsed_us >= us_cap) break;
+        if (should_train) {
+            while (steps_done < max_steps) {
+                try self.recordTrainBatch(rec, n_samples);
+                steps_done += 1;
+                const elapsed_ns = std.time.nanoTimestamp() - t0;
+                const elapsed_us: u64 = @intCast(@divTrunc(elapsed_ns, 1000));
+                if (elapsed_us >= us_cap) break;
+            }
         }
+
+        // ── Always record a fresh loss eval when decay is active ──
+        // Cost: 1 forward dispatch + 1 reduction + 1 buffer copy.
+        // Without this, a freshly-uploaded supervision sample that
+        // breaks the current fit would never reflect in staging and
+        // training would never resume.
+        if (self.cfg.decay != .none) {
+            try self.recordLossEval(rec, n_samples);
+        }
+
         const final_ns = std.time.nanoTimestamp() - t0;
         return .{
             .steps_completed = steps_done,
             .elapsed_us = @intCast(@divTrunc(final_ns, 1000)),
+            .last_loss = self.last_loss,
+            .idle = !should_train,
         };
+    }
+
+    /// Most recent loss measurement read from staging. `null` until
+    /// the first frame's eval has cycled through. Mainly useful for
+    /// host-side telemetry / loss-curve overlays.
+    pub fn getLastLoss(self: *const TrainingRunner) ?f32 {
+        return self.last_loss;
     }
 
     /// Attach-mode batched predict: record the dispatch into an
@@ -1079,6 +1214,65 @@ pub const TrainingRunner = struct {
                 try rec.dispatch(k_adam, &.{ &self.b2, &self.db2, m_b2, v_b2 }, &adam_b2, ceilDiv(dim_out, 256), 1, 1);
             },
         }
+    }
+
+    /// Record forward + scalar loss reduction + staging copy. Used
+    /// by `tickFrameTrain` to keep the loss measurement current
+    /// regardless of whether training ran. Re-runs forward against
+    /// current weights so the loss reflects the post-update state
+    /// when training did happen this frame.
+    fn recordLossEval(self: *const TrainingRunner, rec: *recorder_mod.Recorder, n_samples: u32) !void {
+        const k_fwd = &(self.k_train_fwd_batch.?);
+        const k_loss = &(self.k_loss_eval.?);
+        const x_train = &(self.x_train_batch.?);
+        const h_pre_b = &(self.h_pre_train_batch.?);
+        const h_b = &(self.h_train_batch.?);
+        const y_b = &(self.y_train_batch.?);
+        const tgt = &(self.target_batch.?);
+        const lb = &(self.loss_buf.?);
+
+        const fwd_push = runtime.Mlp2ForwardTrainBatchedPush{
+            .dim_in = self.cfg.dim_in,
+            .dim_hidden = self.cfg.dim_hidden,
+            .dim_out = self.cfg.dim_out,
+            .n_samples = n_samples,
+        };
+        try rec.dispatch(
+            k_fwd,
+            &.{ &self.w1, &self.b1, &self.w2, &self.b2, x_train, h_pre_b, h_b, y_b },
+            &fwd_push,
+            ceilDiv(n_samples, 64),
+            1,
+            1,
+        );
+
+        const loss_push = runtime.Mlp2LossBatchedPush{
+            .dim_out = self.cfg.dim_out,
+            .n_samples = n_samples,
+        };
+        try rec.dispatch(k_loss, &.{ y_b, tgt, lb }, &loss_push, 1, 1, 1);
+
+        // Compute → transfer barrier, then copy scalar to host-mapped
+        // staging. Same pattern as `recordPredictReadback`.
+        const cmd = rec.cmd;
+        var mb = std.mem.zeroes(vk.c.VkMemoryBarrier);
+        mb.sType = vk.c.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = vk.c.VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = vk.c.VK_ACCESS_TRANSFER_READ_BIT;
+        vk.c.vkCmdPipelineBarrier(
+            cmd,
+            vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            1,
+            &mb,
+            0,
+            null,
+            0,
+            null,
+        );
+        const region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = @sizeOf(f32) };
+        vk.c.vkCmdCopyBuffer(cmd, lb.handle, self.loss_staging.?.handle, 1, &region);
     }
 
     fn recordStep(self: *const TrainingRunner, rec: *recorder_mod.Recorder) !void {

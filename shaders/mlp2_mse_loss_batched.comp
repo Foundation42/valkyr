@@ -1,0 +1,37 @@
+#version 460
+// Batched MSE loss reduction → single scalar.
+//
+//     loss = (1 / 2N) · Σ_n ||y[n] − target[n]||²
+//
+// Single thread, sequential loop over the batch. At our N (≤ 256)
+// the reduction is microseconds — paying for atomics or workgroup
+// shared-memory reductions would be more code than it's worth. If
+// future N grows, this shader is the natural place to swap in a
+// proper cooperative reduction.
+//
+// Used by the runtime's loss-target decay policy: the runtime reads
+// the staged scalar each frame and skips the training dispatches
+// when loss has fallen below the host-supplied target. Pair with
+// `mlp2_ce_loss_batched.comp` for the CE-loss equivalent.
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Y { float y_all[];      };
+layout(set = 0, binding = 1, std430) readonly  buffer T { float target_all[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer L { float loss_out[];   };
+
+layout(push_constant) uniform Pc {
+    uint dim_out;
+    uint n_samples;
+} pc;
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0) return;
+    float sum_sq = 0.0;
+    uint total = pc.dim_out * pc.n_samples;
+    for (uint i = 0; i < total; i++) {
+        float d = y_all[i] - target_all[i];
+        sum_sq += d * d;
+    }
+    loss_out[0] = (sum_sq * 0.5) / float(pc.n_samples);
+}

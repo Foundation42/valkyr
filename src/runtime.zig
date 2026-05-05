@@ -168,6 +168,11 @@ pub const SoftmaxCeLossGradPush = extern struct {
     n_samples: u32,
 };
 
+pub const Mlp2LossBatchedPush = extern struct {
+    dim_out: u32,
+    n_samples: u32,
+};
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {
