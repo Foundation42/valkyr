@@ -570,6 +570,7 @@ pub fn main() !void {
     try runTrainingRunnerBatchedSmoke(allocator);
     try runTrainingRunnerBatchedTrainSmoke(allocator);
     try runTrainingRunnerCoopSmoke(allocator);
+    try runTrainingRunnerStagingSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2424,6 +2425,103 @@ fn runTrainingRunnerCoopSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner cooperative tickFrame (budget shapes ok; loss {d:.6} → {d:.6} over 30 host frames)\n",
         .{ loss_initial, loss_final },
+    );
+}
+
+// ── TrainingRunner staging-readback parity smoke ────────────────────
+//
+// Verifies that predict outputs written via the host-mapped staging
+// buffer (chunk 10) match the synchronous `tickPredictBatch` readback.
+// Cooperative path: host records predict + readback into its own cmd
+// buffer, submits, waits on its own fence, then reads the staging
+// region directly. Should be bit-identical to the standalone path
+// since it's the same dispatch with a vkCmdCopyBuffer appended.
+
+fn runTrainingRunnerStagingSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_samples: u32 = 64;
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 16,
+        .dim_out = 3,
+        .lr = 0.0,
+        .init_seed = 0x57A661D6,
+        .max_batch_size = n_samples,
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // Random input grid.
+    var rng = std.Random.DefaultPrng.init(0xCAFE57AD);
+    const r = rng.random();
+    const x_batch = try allocator.alloc(f32, n_samples * cfg.dim_in);
+    defer allocator.free(x_batch);
+    for (x_batch) |*v| v.* = r.float(f32) * 2 - 1;
+
+    // ── Reference: synchronous tickPredictBatch ──
+    const y_sync = try allocator.alloc(f32, n_samples * cfg.dim_out);
+    defer allocator.free(y_sync);
+    try runner.tickPredictBatch(x_batch, y_sync);
+
+    // ── Cooperative: stage inputs, record predict + readback into a
+    // host-owned cmd buffer, submit, wait on host fence, read staging.
+    try runner.uploadPredictInputs(x_batch);
+
+    var cb_ai = std.mem.zeroes(vk.c.VkCommandBufferAllocateInfo);
+    cb_ai.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = ctx.cmd_pool;
+    cb_ai.level = vk.c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    var host_cmd: vk.c.VkCommandBuffer = null;
+    try vk.check(vk.c.vkAllocateCommandBuffers(ctx.device, &cb_ai, &host_cmd));
+    defer vk.c.vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &host_cmd);
+    var fci = std.mem.zeroes(vk.c.VkFenceCreateInfo);
+    fci.sType = vk.c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    var host_fence: vk.c.VkFence = null;
+    try vk.check(vk.c.vkCreateFence(ctx.device, &fci, null, &host_fence));
+    defer vk.c.vkDestroyFence(ctx.device, host_fence, null);
+
+    var bi = std.mem.zeroes(vk.c.VkCommandBufferBeginInfo);
+    bi.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = vk.c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    try vk.check(vk.c.vkBeginCommandBuffer(host_cmd, &bi));
+
+    var rec = try gpu_recorder.Recorder.attachCmd(&ctx, host_cmd, 8, 32);
+    defer rec.deinit();
+    try rec.begin();
+    try runner.tickPredictBatchRecord(&rec, n_samples);
+    try runner.recordPredictReadback(&rec, n_samples);
+
+    try vk.check(vk.c.vkEndCommandBuffer(host_cmd));
+    var submit = std.mem.zeroes(vk.c.VkSubmitInfo);
+    submit.sType = vk.c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &host_cmd;
+    try vk.check(vk.c.vkQueueSubmit(ctx.queue, 1, &submit, host_fence));
+    const timeout_ns: u64 = 10 * 1_000_000_000;
+    try vk.check(vk.c.vkWaitForFences(ctx.device, 1, &host_fence, vk.c.VK_TRUE, timeout_ns));
+
+    const y_staging = try allocator.alloc(f32, n_samples * cfg.dim_out);
+    defer allocator.free(y_staging);
+    try runner.readPredictStaging(y_staging);
+
+    var max_abs: f32 = 0;
+    for (y_sync, y_staging, 0..) |a, b, i| {
+        const d = @abs(a - b);
+        if (d > 1e-6) {
+            std.debug.print(
+                "staging readback MISMATCH at {d}: sync={d:.7} staging={d:.7}\n",
+                .{ i, a, b },
+            );
+            return error.ParityFailed;
+        }
+        if (d > max_abs) max_abs = d;
+    }
+    std.debug.print(
+        "PASS TrainingRunner staging readback ({d} samples; vs synchronous tickPredictBatch max |Δ| = {e})\n",
+        .{ n_samples, max_abs },
     );
 }
 

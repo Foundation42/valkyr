@@ -146,6 +146,12 @@ pub const TrainingRunner = struct {
     /// device-only and read back to fill the visualisation tiles.
     x_batch: ?buffer.Buffer,
     y_batch: ?buffer.Buffer,
+    /// Host-readback staging for predict outputs. Pair: GPU records
+    /// `vkCmdCopyBuffer y_batch → y_batch_staging` into the host's
+    /// cmd buffer (via `recordPredictReadback`); after the host's
+    /// frame fence signals, CPU reads via `readPredictStaging`. No
+    /// runner-side submits, no waitIdle.
+    y_batch_staging: ?buffer.Buffer,
 
     /// Batched-training inputs (HOST_VISIBLE) and per-sample
     /// activations / per-sample backward scratch (DEVICE_LOCAL). Sized
@@ -266,11 +272,14 @@ pub const TrainingRunner = struct {
         var y_train_batch: ?buffer.Buffer = null;
         var dy_train_batch: ?buffer.Buffer = null;
         var dh_pre_train_batch: ?buffer.Buffer = null;
+        var y_batch_staging: ?buffer.Buffer = null;
         if (cfg.max_batch_size > 0) {
             x_batch = try buffer.Buffer.initDynamic(ctx, cfg.max_batch_size * cfg.dim_in * @sizeOf(f32));
             errdefer if (x_batch) |*b| b.deinit(ctx.device);
             y_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
             errdefer if (y_batch) |*b| b.deinit(ctx.device);
+            y_batch_staging = try buffer.Buffer.initHostReadback(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
+            errdefer if (y_batch_staging) |*b| b.deinit(ctx.device);
             x_train_batch = try buffer.Buffer.initDynamic(ctx, cfg.max_batch_size * cfg.dim_in * @sizeOf(f32));
             errdefer if (x_train_batch) |*b| b.deinit(ctx.device);
             target_batch = try buffer.Buffer.initDynamic(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
@@ -324,6 +333,7 @@ pub const TrainingRunner = struct {
             .db2 = db2,
             .x_batch = x_batch,
             .y_batch = y_batch,
+            .y_batch_staging = y_batch_staging,
             .x_train_batch = x_train_batch,
             .target_batch = target_batch,
             .h_pre_train_batch = h_pre_train_batch,
@@ -354,6 +364,7 @@ pub const TrainingRunner = struct {
         self.db2.deinit(dev);
         if (self.x_batch) |*b| b.deinit(dev);
         if (self.y_batch) |*b| b.deinit(dev);
+        if (self.y_batch_staging) |*b| b.deinit(dev);
         if (self.x_train_batch) |*b| b.deinit(dev);
         if (self.target_batch) |*b| b.deinit(dev);
         if (self.h_pre_train_batch) |*b| b.deinit(dev);
@@ -590,6 +601,71 @@ pub const TrainingRunner = struct {
         const n: u32 = @intCast(x_batch.len / self.cfg.dim_in);
         if (n > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
         @constCast(&self.x_batch.?).update(f32, x_batch);
+    }
+
+    /// Record a transfer-stage copy of `y_batch` (device-only) into
+    /// `y_batch_staging` (host-mapped). Insert AFTER
+    /// `tickPredictBatchRecord`, BEFORE the host ends + submits the
+    /// command buffer. Emits the compute→transfer barrier between the
+    /// predict dispatch's writes and this copy's reads.
+    ///
+    /// After the host's frame fence signals, the staging buffer's
+    /// mapped region is guaranteed visible to the CPU; read it via
+    /// `readPredictStaging`.
+    pub fn recordPredictReadback(
+        self: *const TrainingRunner,
+        rec: *recorder_mod.Recorder,
+        n_samples: u32,
+    ) !void {
+        if (self.y_batch == null or self.y_batch_staging == null) return error.BatchSizeNotConfigured;
+        if (n_samples == 0) return;
+        if (n_samples > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+
+        const cmd = rec.cmd;
+
+        // Compute-write → transfer-read barrier on the predict output.
+        var mb = std.mem.zeroes(vk.c.VkMemoryBarrier);
+        mb.sType = vk.c.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = vk.c.VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = vk.c.VK_ACCESS_TRANSFER_READ_BIT;
+        vk.c.vkCmdPipelineBarrier(
+            cmd,
+            vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            1,
+            &mb,
+            0,
+            null,
+            0,
+            null,
+        );
+
+        const bytes: usize = @as(usize, n_samples) * @as(usize, self.cfg.dim_out) * @sizeOf(f32);
+        const region = vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = @intCast(bytes),
+        };
+        vk.c.vkCmdCopyBuffer(
+            cmd,
+            self.y_batch.?.handle,
+            self.y_batch_staging.?.handle,
+            1,
+            &region,
+        );
+    }
+
+    /// Read predictions from the host-mapped staging buffer. Caller
+    /// MUST have waited on the fence covering the submit that issued
+    /// the recorded `recordPredictReadback` — otherwise the read may
+    /// observe stale or partially-written data.
+    pub fn readPredictStaging(self: *const TrainingRunner, out_y: []f32) !void {
+        const staging = self.y_batch_staging orelse return error.BatchSizeNotConfigured;
+        const mapped = staging.mapped orelse return error.StagingNotMapped;
+        const bytes = out_y.len * @sizeOf(f32);
+        if (bytes > staging.bytes) return error.OutputTooLarge;
+        @memcpy(std.mem.sliceAsBytes(out_y), @as([*]u8, @ptrCast(mapped))[0..bytes]);
     }
 
     /// Cooperative training tick. Records up to `budget` batched SGD
