@@ -631,6 +631,7 @@ pub fn main() !void {
     try runRopeBackwardSmoke(allocator);
     try runDecoderFineTuneCpuSmoke(allocator);
     try runDecoderBackwardGpuParitySmoke(allocator);
+    try runDecoderTrainGpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -6461,6 +6462,609 @@ fn runDecoderBackwardGpuParitySmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU decoder backward parity (dim={d} heads={d} ff_dim={d} n_pos={d}; 23 dispatches, worst rel-err {e:.2} on {s})\n",
         .{ dim, n_heads, ff_dim, n_pos, worst_rel, worst_label },
+    );
+}
+
+// ── chunk 8b stage B: full-GPU toy decoder fine-tune ────────────────
+//
+// Runs the same toy decoder as runDecoderFineTuneCpuSmoke / Stage A, but
+// every operation lives on the GPU: forward, MSE loss-grad, backward,
+// and Adam. The training loop is self-sustaining across 100 steps and
+// the assertion is the same as 8a — `final_loss / initial_loss ≤ 1e-2`.
+//
+// This is the first transformer-trainer pipeline to live entirely on
+// the GPU. It's intentionally inlined into the smoke (not a Runner) —
+// the eventual TransformerTrainerRunner shape decision lives outside
+// chunk 8b's scope; what this proves is that the kernel inventory is
+// complete and that one decoder layer composes correctly under
+// repeated optimizer steps.
+//
+// Per-step dispatch count: 14 forward + 1 loss-grad + 23 backward +
+// 8 Adam = 46 dispatches. The recorder is reset and re-recorded
+// every step. The same kernels are reused across all 100 steps —
+// only the buffer contents change.
+
+fn runDecoderTrainGpuSmoke(allocator: std.mem.Allocator) !void {
+    const cfg = cpu_train_decoder.Config{
+        .dim = 16,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 8,
+        .ff_dim = 32,
+        .n_pos = 4,
+        .rms_eps = 1e-5,
+        .causal = true,
+    };
+    const dim = cfg.dim;
+    const n_pos = cfg.n_pos;
+    const n_heads = cfg.n_heads;
+    const n_kv_heads = cfg.n_kv_heads;
+    const head_dim = cfg.head_dim;
+    const ff_dim = cfg.ff_dim;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv_heads * head_dim;
+    const heads_per_kv: u32 = @intCast(n_heads / n_kv_heads);
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scores_total = n_pos * n_heads * n_pos;
+
+    // ── Identical RNG sequence to runDecoderFineTuneCpuSmoke so the
+    //    initial weights + input + target are bit-equal to that smoke.
+    var prng = std.Random.DefaultPrng.init(0xDEC0_DE01);
+    const rng = prng.random();
+    const initScale: f32 = 0.1;
+
+    const w_n1 = try allocator.alloc(f32, dim);
+    defer allocator.free(w_n1);
+    const w_q = try allocator.alloc(f32, q_dim * dim);
+    defer allocator.free(w_q);
+    const w_k = try allocator.alloc(f32, kv_dim * dim);
+    defer allocator.free(w_k);
+    const w_v = try allocator.alloc(f32, kv_dim * dim);
+    defer allocator.free(w_v);
+    const w_o = try allocator.alloc(f32, dim * q_dim);
+    defer allocator.free(w_o);
+    const w_n2 = try allocator.alloc(f32, dim);
+    defer allocator.free(w_n2);
+    const w_ff1 = try allocator.alloc(f32, ff_dim * dim);
+    defer allocator.free(w_ff1);
+    const w_ff2 = try allocator.alloc(f32, dim * ff_dim);
+    defer allocator.free(w_ff2);
+
+    for (w_n1) |*v| v.* = 1.0;
+    for (w_n2) |*v| v.* = 1.0;
+    for (w_q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_k) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_v) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_o) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_ff1) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_ff2) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+
+    var layer = cpu_train_decoder.Layer{
+        .cfg = cfg,
+        .w_n1 = w_n1,
+        .w_q = w_q,
+        .w_k = w_k,
+        .w_v = w_v,
+        .w_o = w_o,
+        .w_n2 = w_n2,
+        .w_ff1 = w_ff1,
+        .w_ff2 = w_ff2,
+    };
+
+    var acts_cpu = try cpu_train_decoder.allocActs(allocator, cfg);
+    defer cpu_train_decoder.freeActs(allocator, &acts_cpu);
+    for (acts_cpu.x_in) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    cpu_train_decoder.forward(&layer, &acts_cpu);
+
+    const target = try allocator.alloc(f32, n_pos * dim);
+    defer allocator.free(target);
+    for (target, acts_cpu.y) |*tv, yv| tv.* = yv + (rng.float(f32) * 2.0 - 1.0) * 0.5;
+
+    const initial_loss = cpu_train_decoder.mseLoss(acts_cpu.y, target);
+
+    // ── GPU bring-up.
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Pipelines (one per shader; bindings vary per dispatch via Recorder).
+    var k_rms = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(runtime.RmsnormPush));
+    defer k_rms.deinit();
+    var k_rms_bw = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_backward, 5, @sizeOf(runtime.RmsnormPush));
+    defer k_rms_bw.deinit();
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(runtime.MatmulPush));
+    defer k_matmul.deinit();
+    var k_attn_scores = try pipeline.Kernel.init(&ctx, &shaders.attn_scores_train, 3, @sizeOf(runtime.AttnScoresTrainPush));
+    defer k_attn_scores.deinit();
+    var k_attn_output = try pipeline.Kernel.init(&ctx, &shaders.attn_output_train, 3, @sizeOf(runtime.AttnOutputTrainPush));
+    defer k_attn_output.deinit();
+    var k_softmax = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(runtime.SoftmaxPush));
+    defer k_softmax.deinit();
+    var k_softmax_bw = try pipeline.Kernel.init(&ctx, &shaders.softmax_backward, 3, @sizeOf(runtime.SoftmaxPush));
+    defer k_softmax_bw.deinit();
+    var k_attn_dattn = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dattn, 3, @sizeOf(runtime.AttnBackwardDattnPush));
+    defer k_attn_dattn.deinit();
+    var k_attn_dv = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dv, 3, @sizeOf(runtime.AttnBackwardDvPush));
+    defer k_attn_dv.deinit();
+    var k_attn_dq = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dq, 3, @sizeOf(runtime.AttnBackwardDqPush));
+    defer k_attn_dq.deinit();
+    var k_attn_dk = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dk, 3, @sizeOf(runtime.AttnBackwardDkPush));
+    defer k_attn_dk.deinit();
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(runtime.ReluPush));
+    defer k_relu.deinit();
+    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(runtime.ReluBackwardPush));
+    defer k_relu_bw.deinit();
+    var k_vec_add = try pipeline.Kernel.init(&ctx, &shaders.vec_add, 3, @sizeOf(runtime.AddInPlacePush));
+    defer k_vec_add.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dx.deinit();
+    var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dw.deinit();
+    var k_loss = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad_scaled, 3, @sizeOf(runtime.MseLossGradScaledPush));
+    defer k_loss.deinit();
+    var k_adam = try pipeline.Kernel.init(&ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
+    defer k_adam.deinit();
+
+    // ── Buffers.
+    const f32sz = @sizeOf(f32);
+
+    // Weights: initStatic uploads them once and the buffers are
+    // device-local + writable, so adam_step can update them in place.
+    var buf_w_n1 = try buffer.Buffer.initStatic(&ctx, f32, w_n1);
+    defer buf_w_n1.deinit(ctx.device);
+    var buf_w_q = try buffer.Buffer.initStatic(&ctx, f32, w_q);
+    defer buf_w_q.deinit(ctx.device);
+    var buf_w_k = try buffer.Buffer.initStatic(&ctx, f32, w_k);
+    defer buf_w_k.deinit(ctx.device);
+    var buf_w_v = try buffer.Buffer.initStatic(&ctx, f32, w_v);
+    defer buf_w_v.deinit(ctx.device);
+    var buf_w_o = try buffer.Buffer.initStatic(&ctx, f32, w_o);
+    defer buf_w_o.deinit(ctx.device);
+    var buf_w_n2 = try buffer.Buffer.initStatic(&ctx, f32, w_n2);
+    defer buf_w_n2.deinit(ctx.device);
+    var buf_w_ff1 = try buffer.Buffer.initStatic(&ctx, f32, w_ff1);
+    defer buf_w_ff1.deinit(ctx.device);
+    var buf_w_ff2 = try buffer.Buffer.initStatic(&ctx, f32, w_ff2);
+    defer buf_w_ff2.deinit(ctx.device);
+
+    // Inputs (uploaded once, never written by GPU).
+    var buf_x_in = try buffer.Buffer.initStatic(&ctx, f32, acts_cpu.x_in);
+    defer buf_x_in.deinit(ctx.device);
+    var buf_target = try buffer.Buffer.initStatic(&ctx, f32, target);
+    defer buf_target.deinit(ctx.device);
+
+    // Forward activations (rewritten each forward).
+    var buf_n1 = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_n1.deinit(ctx.device);
+    var buf_q = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * q_dim * f32sz);
+    defer buf_q.deinit(ctx.device);
+    var buf_k = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * kv_dim * f32sz);
+    defer buf_k.deinit(ctx.device);
+    var buf_v = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * kv_dim * f32sz);
+    defer buf_v.deinit(ctx.device);
+    var buf_scores = try buffer.Buffer.initDeviceOnly(&ctx, scores_total * f32sz);
+    defer buf_scores.deinit(ctx.device);
+    var buf_attn = try buffer.Buffer.initDeviceOnly(&ctx, scores_total * f32sz);
+    defer buf_attn.deinit(ctx.device);
+    var buf_attn_out = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * q_dim * f32sz);
+    defer buf_attn_out.deinit(ctx.device);
+    var buf_o = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_o.deinit(ctx.device);
+    var buf_mid = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_mid.deinit(ctx.device);
+    var buf_n2 = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_n2.deinit(ctx.device);
+    var buf_ff_pre = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * ff_dim * f32sz);
+    defer buf_ff_pre.deinit(ctx.device);
+    var buf_ff_h = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * ff_dim * f32sz);
+    defer buf_ff_h.deinit(ctx.device);
+    var buf_ff_out = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_ff_out.deinit(ctx.device);
+    var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_y.deinit(ctx.device);
+
+    // Backward scratch — d_y doubles as d_mid (backward path mutates it
+    // in-place via add_in_place from d_mid_norm, mirroring the CPU
+    // oracle's `d_mid` aliasing).
+    var buf_d_mid = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_d_mid.deinit(ctx.device);
+    var buf_d_ff_h = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * ff_dim * f32sz);
+    defer buf_d_ff_h.deinit(ctx.device);
+    var buf_d_ff_pre = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * ff_dim * f32sz);
+    defer buf_d_ff_pre.deinit(ctx.device);
+    var buf_d_n2 = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_d_n2.deinit(ctx.device);
+    var buf_d_mid_norm = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_d_mid_norm.deinit(ctx.device);
+    var buf_d_attn_out = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * q_dim * f32sz);
+    defer buf_d_attn_out.deinit(ctx.device);
+    var buf_d_attn = try buffer.Buffer.initDeviceOnly(&ctx, scores_total * f32sz);
+    defer buf_d_attn.deinit(ctx.device);
+    var buf_d_scores = try buffer.Buffer.initDeviceOnly(&ctx, scores_total * f32sz);
+    defer buf_d_scores.deinit(ctx.device);
+    var buf_dQ = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * q_dim * f32sz);
+    defer buf_dQ.deinit(ctx.device);
+    var buf_dK = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * kv_dim * f32sz);
+    defer buf_dK.deinit(ctx.device);
+    var buf_dV = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * kv_dim * f32sz);
+    defer buf_dV.deinit(ctx.device);
+    var buf_d_n1 = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_d_n1.deinit(ctx.device);
+    var buf_d_n1_k = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_d_n1_k.deinit(ctx.device);
+    var buf_d_n1_v = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_d_n1_v.deinit(ctx.device);
+    var buf_d_x_in_dummy = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_d_x_in_dummy.deinit(ctx.device);
+
+    // Gradient buffers (overwritten each step by the linear-dW + rmsnorm
+    // backward kernels; consumed by adam_step).
+    var buf_dw_n1_partial = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_dw_n1_partial.deinit(ctx.device);
+    var buf_dw_n2_partial = try buffer.Buffer.initDeviceOnly(&ctx, n_pos * dim * f32sz);
+    defer buf_dw_n2_partial.deinit(ctx.device);
+    // For the RMSNorm gain gradient, Adam consumes a flat dim-sized
+    // tensor — the per-row dw_partial needs reducing first. We do that
+    // host-side once per step, mirroring runGpuRmsnormBackwardSmoke;
+    // the reduced dw is uploaded into a `dynamic` buffer that adam_step
+    // then reads. Keeps the dispatch graph simple — no on-GPU reduce
+    // shader for a `dim` of 16.
+    var buf_dw_n1 = try buffer.Buffer.initDynamic(&ctx, dim * f32sz);
+    defer buf_dw_n1.deinit(ctx.device);
+    var buf_dw_n2 = try buffer.Buffer.initDynamic(&ctx, dim * f32sz);
+    defer buf_dw_n2.deinit(ctx.device);
+    var buf_dw_q = try buffer.Buffer.initDeviceOnly(&ctx, w_q.len * f32sz);
+    defer buf_dw_q.deinit(ctx.device);
+    var buf_dw_k = try buffer.Buffer.initDeviceOnly(&ctx, w_k.len * f32sz);
+    defer buf_dw_k.deinit(ctx.device);
+    var buf_dw_v = try buffer.Buffer.initDeviceOnly(&ctx, w_v.len * f32sz);
+    defer buf_dw_v.deinit(ctx.device);
+    var buf_dw_o = try buffer.Buffer.initDeviceOnly(&ctx, w_o.len * f32sz);
+    defer buf_dw_o.deinit(ctx.device);
+    var buf_dw_ff1 = try buffer.Buffer.initDeviceOnly(&ctx, w_ff1.len * f32sz);
+    defer buf_dw_ff1.deinit(ctx.device);
+    var buf_dw_ff2 = try buffer.Buffer.initDeviceOnly(&ctx, w_ff2.len * f32sz);
+    defer buf_dw_ff2.deinit(ctx.device);
+
+    // Adam first/second-moment buffers (8 parameters × 2 tensors).
+    var buf_m_n1 = try buffer.Buffer.initDeviceOnly(&ctx, dim * f32sz);
+    defer buf_m_n1.deinit(ctx.device);
+    var buf_v_n1 = try buffer.Buffer.initDeviceOnly(&ctx, dim * f32sz);
+    defer buf_v_n1.deinit(ctx.device);
+    var buf_m_q = try buffer.Buffer.initDeviceOnly(&ctx, w_q.len * f32sz);
+    defer buf_m_q.deinit(ctx.device);
+    var buf_v_q = try buffer.Buffer.initDeviceOnly(&ctx, w_q.len * f32sz);
+    defer buf_v_q.deinit(ctx.device);
+    var buf_m_k = try buffer.Buffer.initDeviceOnly(&ctx, w_k.len * f32sz);
+    defer buf_m_k.deinit(ctx.device);
+    var buf_v_k = try buffer.Buffer.initDeviceOnly(&ctx, w_k.len * f32sz);
+    defer buf_v_k.deinit(ctx.device);
+    var buf_m_v = try buffer.Buffer.initDeviceOnly(&ctx, w_v.len * f32sz);
+    defer buf_m_v.deinit(ctx.device);
+    var buf_v_v = try buffer.Buffer.initDeviceOnly(&ctx, w_v.len * f32sz);
+    defer buf_v_v.deinit(ctx.device);
+    var buf_m_o = try buffer.Buffer.initDeviceOnly(&ctx, w_o.len * f32sz);
+    defer buf_m_o.deinit(ctx.device);
+    var buf_v_o = try buffer.Buffer.initDeviceOnly(&ctx, w_o.len * f32sz);
+    defer buf_v_o.deinit(ctx.device);
+    var buf_m_n2 = try buffer.Buffer.initDeviceOnly(&ctx, dim * f32sz);
+    defer buf_m_n2.deinit(ctx.device);
+    var buf_v_n2 = try buffer.Buffer.initDeviceOnly(&ctx, dim * f32sz);
+    defer buf_v_n2.deinit(ctx.device);
+    var buf_m_ff1 = try buffer.Buffer.initDeviceOnly(&ctx, w_ff1.len * f32sz);
+    defer buf_m_ff1.deinit(ctx.device);
+    var buf_v_ff1 = try buffer.Buffer.initDeviceOnly(&ctx, w_ff1.len * f32sz);
+    defer buf_v_ff1.deinit(ctx.device);
+    var buf_m_ff2 = try buffer.Buffer.initDeviceOnly(&ctx, w_ff2.len * f32sz);
+    defer buf_m_ff2.deinit(ctx.device);
+    var buf_v_ff2 = try buffer.Buffer.initDeviceOnly(&ctx, w_ff2.len * f32sz);
+    defer buf_v_ff2.deinit(ctx.device);
+
+    // ── Push-constant payloads.
+    const push_rms = runtime.RmsnormPush{ .dim = @intCast(dim), .eps = cfg.rms_eps, .gemma_quirk = 0 };
+    const push_n_pos_dim = runtime.AddInPlacePush{ .n = @intCast(n_pos * dim) };
+    const push_n_pos_ff = runtime.ReluBackwardPush{ .n = @intCast(n_pos * ff_dim) };
+    const push_softmax = runtime.SoftmaxPush{ .dim = @intCast(n_pos), .stride = @intCast(n_pos) };
+    const push_loss = runtime.MseLossGradScaledPush{
+        .n = @intCast(n_pos * dim),
+        .scale = 2.0 / @as(f32, @floatFromInt(n_pos * dim)),
+    };
+
+    // matmul_nt_v2 push: { M, N, K } where output = a @ bᵀ; a is [M, K],
+    // b is [N, K], out is [M, N]. Same contract as the CPU oracle
+    // `matmulNt`, so the projection shapes line up directly.
+    const push_mm_q = runtime.MatmulPush{ .m = @intCast(n_pos), .n = @intCast(q_dim), .k = @intCast(dim) };
+    const push_mm_k = runtime.MatmulPush{ .m = @intCast(n_pos), .n = @intCast(kv_dim), .k = @intCast(dim) };
+    const push_mm_v = runtime.MatmulPush{ .m = @intCast(n_pos), .n = @intCast(kv_dim), .k = @intCast(dim) };
+    const push_mm_o = runtime.MatmulPush{ .m = @intCast(n_pos), .n = @intCast(dim), .k = @intCast(q_dim) };
+    const push_mm_ff1 = runtime.MatmulPush{ .m = @intCast(n_pos), .n = @intCast(ff_dim), .k = @intCast(dim) };
+    const push_mm_ff2 = runtime.MatmulPush{ .m = @intCast(n_pos), .n = @intCast(dim), .k = @intCast(ff_dim) };
+
+    const push_attn_scores = runtime.AttnScoresTrainPush{
+        .n_q = @intCast(n_pos),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = heads_per_kv,
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_pos),
+        .kv_stride = @intCast(kv_dim),
+        .scores_stride = @intCast(n_pos),
+        .causal = if (cfg.causal) 1 else 0,
+        .inv_sqrt_dim = inv_sqrt_d,
+    };
+    const push_attn_output = runtime.AttnOutputTrainPush{
+        .n_q = @intCast(n_pos),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = heads_per_kv,
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_pos),
+        .kv_stride = @intCast(kv_dim),
+        .attn_stride = @intCast(n_pos),
+    };
+
+    const push_lin_ff2 = runtime.LinearBatchedPush{ .M = @intCast(n_pos), .N = @intCast(dim), .K = @intCast(ff_dim) };
+    const push_lin_ff1 = runtime.LinearBatchedPush{ .M = @intCast(n_pos), .N = @intCast(ff_dim), .K = @intCast(dim) };
+    const push_lin_o = runtime.LinearBatchedPush{ .M = @intCast(n_pos), .N = @intCast(dim), .K = @intCast(q_dim) };
+    const push_lin_q = runtime.LinearBatchedPush{ .M = @intCast(n_pos), .N = @intCast(q_dim), .K = @intCast(dim) };
+    const push_lin_k = runtime.LinearBatchedPush{ .M = @intCast(n_pos), .N = @intCast(kv_dim), .K = @intCast(dim) };
+    const push_lin_v = runtime.LinearBatchedPush{ .M = @intCast(n_pos), .N = @intCast(kv_dim), .K = @intCast(dim) };
+
+    const push_dattn = runtime.AttnBackwardDattnPush{
+        .n_q = @intCast(n_pos),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = heads_per_kv,
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_pos),
+        .kv_stride = @intCast(kv_dim),
+        .attn_stride = @intCast(n_pos),
+    };
+    const push_dv = runtime.AttnBackwardDvPush{
+        .n_q = @intCast(n_pos),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = heads_per_kv,
+        .n_kv_heads = @intCast(n_kv_heads),
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_pos),
+        .attn_stride = @intCast(n_pos),
+    };
+    const push_dq = runtime.AttnBackwardDqPush{
+        .n_q = @intCast(n_pos),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = heads_per_kv,
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_pos),
+        .kv_stride = @intCast(kv_dim),
+        .scores_stride = @intCast(n_pos),
+        .inv_sqrt_dim = inv_sqrt_d,
+    };
+    const push_dk = runtime.AttnBackwardDkPush{
+        .n_q = @intCast(n_pos),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = heads_per_kv,
+        .n_kv_heads = @intCast(n_kv_heads),
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_pos),
+        .scores_stride = @intCast(n_pos),
+        .inv_sqrt_dim = inv_sqrt_d,
+    };
+
+    const lr: f32 = 1e-2;
+    const beta1: f32 = 0.9;
+    const beta2: f32 = 0.999;
+    const eps_adam: f32 = 1e-8;
+
+    // ── Recorder. 46 dispatches per step, each up to 5 descriptor
+    //    bindings → ~230 descriptors per record cycle. Round up.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 64, 320);
+    defer rec.deinit();
+
+    const lwg: u32 = 16;
+    const groupsCeil = struct {
+        fn f(n: u32) u32 {
+            return (n + lwg - 1) / lwg;
+        }
+    }.f;
+    const groupsLin: u32 = 256;
+
+    // Helper buffers for host-side dw_partial reduction (allocated once).
+    const dw_n1_partial_host = try allocator.alloc(f32, n_pos * dim);
+    defer allocator.free(dw_n1_partial_host);
+    const dw_n2_partial_host = try allocator.alloc(f32, n_pos * dim);
+    defer allocator.free(dw_n2_partial_host);
+    const dw_n1_host = try allocator.alloc(f32, dim);
+    defer allocator.free(dw_n1_host);
+    const dw_n2_host = try allocator.alloc(f32, dim);
+    defer allocator.free(dw_n2_host);
+
+    // ── Training loop.
+    const n_steps: usize = 100;
+    var step_t: u32 = 1;
+    while (step_t <= n_steps) : (step_t += 1) {
+        // ── Phase 1: forward + loss-grad + backward (excluding RMSNorm
+        //    dw_partial reduce, which lives between this submit and the
+        //    Adam submit).
+        try rec.reset();
+        try rec.begin();
+
+        // Forward: rmsnorm n1.
+        try rec.dispatch(&k_rms, &.{ &buf_x_in, &buf_w_n1, &buf_n1 }, &push_rms, @intCast(n_pos), 1, 1);
+
+        // Forward: Q/K/V projections.
+        try rec.dispatch(&k_matmul, &.{ &buf_n1, &buf_w_q, &buf_q }, &push_mm_q, @intCast(n_pos * q_dim), 1, 1);
+        try rec.dispatch(&k_matmul, &.{ &buf_n1, &buf_w_k, &buf_k }, &push_mm_k, @intCast(n_pos * kv_dim), 1, 1);
+        try rec.dispatch(&k_matmul, &.{ &buf_n1, &buf_w_v, &buf_v }, &push_mm_v, @intCast(n_pos * kv_dim), 1, 1);
+
+        // Forward: attention (scores → softmax → attn_out).
+        try rec.dispatch(&k_attn_scores, &.{ &buf_q, &buf_k, &buf_scores }, &push_attn_scores, @intCast(n_pos * n_heads * n_pos), 1, 1);
+        try rec.dispatch(&k_softmax, &.{ &buf_scores, &buf_attn }, &push_softmax, @intCast(n_pos * n_heads), 1, 1);
+        try rec.dispatch(&k_attn_output, &.{ &buf_attn, &buf_v, &buf_attn_out }, &push_attn_output, @intCast(n_pos * n_heads * head_dim), 1, 1);
+
+        // Forward: O projection + residual mid = x_in + o.
+        try rec.dispatch(&k_matmul, &.{ &buf_attn_out, &buf_w_o, &buf_o }, &push_mm_o, @intCast(n_pos * dim), 1, 1);
+        {
+            const n: u32 = push_n_pos_dim.n;
+            try rec.dispatch(&k_vec_add, &.{ &buf_x_in, &buf_o, &buf_mid }, &push_n_pos_dim, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+
+        // Forward: rmsnorm n2 + FF1 + ReLU + FF2 + residual y = mid + ff_out.
+        try rec.dispatch(&k_rms, &.{ &buf_mid, &buf_w_n2, &buf_n2 }, &push_rms, @intCast(n_pos), 1, 1);
+        try rec.dispatch(&k_matmul, &.{ &buf_n2, &buf_w_ff1, &buf_ff_pre }, &push_mm_ff1, @intCast(n_pos * ff_dim), 1, 1);
+        {
+            const n: u32 = push_n_pos_ff.n;
+            const push_relu = runtime.ReluPush{ .n = n };
+            try rec.dispatch(&k_relu, &.{ &buf_ff_pre, &buf_ff_h }, &push_relu, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+        try rec.dispatch(&k_matmul, &.{ &buf_ff_h, &buf_w_ff2, &buf_ff_out }, &push_mm_ff2, @intCast(n_pos * dim), 1, 1);
+        {
+            const n: u32 = push_n_pos_dim.n;
+            try rec.dispatch(&k_vec_add, &.{ &buf_mid, &buf_ff_out, &buf_y }, &push_n_pos_dim, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+
+        // Loss grad: d_y = (2/N) (y − target). Writes into buf_d_mid;
+        // backward chain treats it as both d_y and d_mid (mutated by the
+        // residual add_in_place a few dispatches later, mirroring the
+        // CPU oracle's aliasing).
+        {
+            const n: u32 = push_loss.n;
+            try rec.dispatch(&k_loss, &.{ &buf_y, &buf_target, &buf_d_mid }, &push_loss, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+
+        // Backward (mirrors the Stage A parity smoke): FF2-dx/dW.
+        try rec.dispatch(&k_lin_dx, &.{ &buf_d_mid, &buf_w_ff2, &buf_d_ff_h }, &push_lin_ff2, groupsCeil(push_lin_ff2.M), groupsCeil(push_lin_ff2.K), 1);
+        try rec.dispatch(&k_lin_dw, &.{ &buf_d_mid, &buf_ff_h, &buf_dw_ff2 }, &push_lin_ff2, groupsCeil(push_lin_ff2.N), groupsCeil(push_lin_ff2.K), 1);
+
+        {
+            const n: u32 = push_n_pos_ff.n;
+            try rec.dispatch(&k_relu_bw, &.{ &buf_d_ff_h, &buf_ff_pre, &buf_d_ff_pre }, &push_n_pos_ff, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+
+        try rec.dispatch(&k_lin_dx, &.{ &buf_d_ff_pre, &buf_w_ff1, &buf_d_n2 }, &push_lin_ff1, groupsCeil(push_lin_ff1.M), groupsCeil(push_lin_ff1.K), 1);
+        try rec.dispatch(&k_lin_dw, &.{ &buf_d_ff_pre, &buf_n2, &buf_dw_ff1 }, &push_lin_ff1, groupsCeil(push_lin_ff1.N), groupsCeil(push_lin_ff1.K), 1);
+
+        try rec.dispatch(&k_rms_bw, &.{ &buf_d_n2, &buf_mid, &buf_w_n2, &buf_d_mid_norm, &buf_dw_n2_partial }, &push_rms, @intCast(n_pos), 1, 1);
+
+        {
+            const n: u32 = push_n_pos_dim.n;
+            try rec.dispatch(&k_add, &.{ &buf_d_mid, &buf_d_mid_norm }, &push_n_pos_dim, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+
+        try rec.dispatch(&k_lin_dx, &.{ &buf_d_mid, &buf_w_o, &buf_d_attn_out }, &push_lin_o, groupsCeil(push_lin_o.M), groupsCeil(push_lin_o.K), 1);
+        try rec.dispatch(&k_lin_dw, &.{ &buf_d_mid, &buf_attn_out, &buf_dw_o }, &push_lin_o, groupsCeil(push_lin_o.N), groupsCeil(push_lin_o.K), 1);
+
+        try rec.dispatch(&k_attn_dattn, &.{ &buf_d_attn_out, &buf_v, &buf_d_attn }, &push_dattn, @intCast(n_pos * n_heads * n_pos), 1, 1);
+        try rec.dispatch(&k_attn_dv, &.{ &buf_attn, &buf_d_attn_out, &buf_dV }, &push_dv, @intCast(n_pos * n_kv_heads * head_dim), 1, 1);
+        try rec.dispatch(&k_softmax_bw, &.{ &buf_d_attn, &buf_attn, &buf_d_scores }, &push_softmax, @intCast(n_pos * n_heads), 1, 1);
+        try rec.dispatch(&k_attn_dq, &.{ &buf_d_scores, &buf_k, &buf_dQ }, &push_dq, @intCast(n_pos * n_heads * head_dim), 1, 1);
+        try rec.dispatch(&k_attn_dk, &.{ &buf_d_scores, &buf_q, &buf_dK }, &push_dk, @intCast(n_pos * n_kv_heads * head_dim), 1, 1);
+
+        try rec.dispatch(&k_lin_dx, &.{ &buf_dQ, &buf_w_q, &buf_d_n1 }, &push_lin_q, groupsCeil(push_lin_q.M), groupsCeil(push_lin_q.K), 1);
+        try rec.dispatch(&k_lin_dw, &.{ &buf_dQ, &buf_n1, &buf_dw_q }, &push_lin_q, groupsCeil(push_lin_q.N), groupsCeil(push_lin_q.K), 1);
+
+        try rec.dispatch(&k_lin_dx, &.{ &buf_dK, &buf_w_k, &buf_d_n1_k }, &push_lin_k, groupsCeil(push_lin_k.M), groupsCeil(push_lin_k.K), 1);
+        try rec.dispatch(&k_lin_dw, &.{ &buf_dK, &buf_n1, &buf_dw_k }, &push_lin_k, groupsCeil(push_lin_k.N), groupsCeil(push_lin_k.K), 1);
+        {
+            const n: u32 = push_n_pos_dim.n;
+            try rec.dispatch(&k_add, &.{ &buf_d_n1, &buf_d_n1_k }, &push_n_pos_dim, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+
+        try rec.dispatch(&k_lin_dx, &.{ &buf_dV, &buf_w_v, &buf_d_n1_v }, &push_lin_v, groupsCeil(push_lin_v.M), groupsCeil(push_lin_v.K), 1);
+        try rec.dispatch(&k_lin_dw, &.{ &buf_dV, &buf_n1, &buf_dw_v }, &push_lin_v, groupsCeil(push_lin_v.N), groupsCeil(push_lin_v.K), 1);
+        {
+            const n: u32 = push_n_pos_dim.n;
+            try rec.dispatch(&k_add, &.{ &buf_d_n1, &buf_d_n1_v }, &push_n_pos_dim, (n + groupsLin - 1) / groupsLin, 1, 1);
+        }
+
+        try rec.dispatch(&k_rms_bw, &.{ &buf_d_n1, &buf_x_in, &buf_w_n1, &buf_d_x_in_dummy, &buf_dw_n1_partial }, &push_rms, @intCast(n_pos), 1, 1);
+
+        try rec.endAndSubmit();
+
+        // ── Phase 2: row-reduce RMSNorm dw partials → dim-sized dw,
+        //    then upload into the dw_n1/dw_n2 dynamic buffers Adam reads.
+        try buf_dw_n1_partial.readBack(&ctx, f32, dw_n1_partial_host);
+        try buf_dw_n2_partial.readBack(&ctx, f32, dw_n2_partial_host);
+        @memset(dw_n1_host, 0);
+        @memset(dw_n2_host, 0);
+        for (0..n_pos) |row| {
+            const off = row * dim;
+            for (0..dim) |i| {
+                dw_n1_host[i] += dw_n1_partial_host[off + i];
+                dw_n2_host[i] += dw_n2_partial_host[off + i];
+            }
+        }
+        buf_dw_n1.update(f32, dw_n1_host);
+        buf_dw_n2.update(f32, dw_n2_host);
+
+        // ── Phase 3: Adam step on each parameter.
+        try rec.reset();
+        try rec.begin();
+
+        const adam_push_rms_n1 = runtime.AdamStepPush{ .n = @intCast(dim), .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps_adam, .t = step_t };
+        const adam_push_rms_n2 = adam_push_rms_n1;
+        const adam_push_q = runtime.AdamStepPush{ .n = @intCast(w_q.len), .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps_adam, .t = step_t };
+        const adam_push_k = runtime.AdamStepPush{ .n = @intCast(w_k.len), .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps_adam, .t = step_t };
+        const adam_push_v = runtime.AdamStepPush{ .n = @intCast(w_v.len), .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps_adam, .t = step_t };
+        const adam_push_o = runtime.AdamStepPush{ .n = @intCast(w_o.len), .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps_adam, .t = step_t };
+        const adam_push_ff1 = runtime.AdamStepPush{ .n = @intCast(w_ff1.len), .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps_adam, .t = step_t };
+        const adam_push_ff2 = runtime.AdamStepPush{ .n = @intCast(w_ff2.len), .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps_adam, .t = step_t };
+
+        try rec.dispatch(&k_adam, &.{ &buf_w_n1, &buf_dw_n1, &buf_m_n1, &buf_v_n1 }, &adam_push_rms_n1, (adam_push_rms_n1.n + groupsLin - 1) / groupsLin, 1, 1);
+        try rec.dispatch(&k_adam, &.{ &buf_w_q, &buf_dw_q, &buf_m_q, &buf_v_q }, &adam_push_q, (adam_push_q.n + groupsLin - 1) / groupsLin, 1, 1);
+        try rec.dispatch(&k_adam, &.{ &buf_w_k, &buf_dw_k, &buf_m_k, &buf_v_k }, &adam_push_k, (adam_push_k.n + groupsLin - 1) / groupsLin, 1, 1);
+        try rec.dispatch(&k_adam, &.{ &buf_w_v, &buf_dw_v, &buf_m_v, &buf_v_v }, &adam_push_v, (adam_push_v.n + groupsLin - 1) / groupsLin, 1, 1);
+        try rec.dispatch(&k_adam, &.{ &buf_w_o, &buf_dw_o, &buf_m_o, &buf_v_o }, &adam_push_o, (adam_push_o.n + groupsLin - 1) / groupsLin, 1, 1);
+        try rec.dispatch(&k_adam, &.{ &buf_w_n2, &buf_dw_n2, &buf_m_n2, &buf_v_n2 }, &adam_push_rms_n2, (adam_push_rms_n2.n + groupsLin - 1) / groupsLin, 1, 1);
+        try rec.dispatch(&k_adam, &.{ &buf_w_ff1, &buf_dw_ff1, &buf_m_ff1, &buf_v_ff1 }, &adam_push_ff1, (adam_push_ff1.n + groupsLin - 1) / groupsLin, 1, 1);
+        try rec.dispatch(&k_adam, &.{ &buf_w_ff2, &buf_dw_ff2, &buf_m_ff2, &buf_v_ff2 }, &adam_push_ff2, (adam_push_ff2.n + groupsLin - 1) / groupsLin, 1, 1);
+
+        try rec.endAndSubmit();
+    }
+
+    // ── Final loss: one extra forward + readback y, compute mse on host.
+    try rec.reset();
+    try rec.begin();
+    try rec.dispatch(&k_rms, &.{ &buf_x_in, &buf_w_n1, &buf_n1 }, &push_rms, @intCast(n_pos), 1, 1);
+    try rec.dispatch(&k_matmul, &.{ &buf_n1, &buf_w_q, &buf_q }, &push_mm_q, @intCast(n_pos * q_dim), 1, 1);
+    try rec.dispatch(&k_matmul, &.{ &buf_n1, &buf_w_k, &buf_k }, &push_mm_k, @intCast(n_pos * kv_dim), 1, 1);
+    try rec.dispatch(&k_matmul, &.{ &buf_n1, &buf_w_v, &buf_v }, &push_mm_v, @intCast(n_pos * kv_dim), 1, 1);
+    try rec.dispatch(&k_attn_scores, &.{ &buf_q, &buf_k, &buf_scores }, &push_attn_scores, @intCast(n_pos * n_heads * n_pos), 1, 1);
+    try rec.dispatch(&k_softmax, &.{ &buf_scores, &buf_attn }, &push_softmax, @intCast(n_pos * n_heads), 1, 1);
+    try rec.dispatch(&k_attn_output, &.{ &buf_attn, &buf_v, &buf_attn_out }, &push_attn_output, @intCast(n_pos * n_heads * head_dim), 1, 1);
+    try rec.dispatch(&k_matmul, &.{ &buf_attn_out, &buf_w_o, &buf_o }, &push_mm_o, @intCast(n_pos * dim), 1, 1);
+    {
+        const n: u32 = push_n_pos_dim.n;
+        try rec.dispatch(&k_vec_add, &.{ &buf_x_in, &buf_o, &buf_mid }, &push_n_pos_dim, (n + groupsLin - 1) / groupsLin, 1, 1);
+    }
+    try rec.dispatch(&k_rms, &.{ &buf_mid, &buf_w_n2, &buf_n2 }, &push_rms, @intCast(n_pos), 1, 1);
+    try rec.dispatch(&k_matmul, &.{ &buf_n2, &buf_w_ff1, &buf_ff_pre }, &push_mm_ff1, @intCast(n_pos * ff_dim), 1, 1);
+    {
+        const n: u32 = push_n_pos_ff.n;
+        const push_relu = runtime.ReluPush{ .n = n };
+        try rec.dispatch(&k_relu, &.{ &buf_ff_pre, &buf_ff_h }, &push_relu, (n + groupsLin - 1) / groupsLin, 1, 1);
+    }
+    try rec.dispatch(&k_matmul, &.{ &buf_ff_h, &buf_w_ff2, &buf_ff_out }, &push_mm_ff2, @intCast(n_pos * dim), 1, 1);
+    {
+        const n: u32 = push_n_pos_dim.n;
+        try rec.dispatch(&k_vec_add, &.{ &buf_mid, &buf_ff_out, &buf_y }, &push_n_pos_dim, (n + groupsLin - 1) / groupsLin, 1, 1);
+    }
+    try rec.endAndSubmit();
+
+    const y_final = try allocator.alloc(f32, n_pos * dim);
+    defer allocator.free(y_final);
+    try buf_y.readBack(&ctx, f32, y_final);
+
+    const final_loss = cpu_train_decoder.mseLoss(y_final, target);
+    const ratio = final_loss / initial_loss;
+    if (ratio > 1e-2) {
+        std.debug.print(
+            "GPU decoder fine-tune: initial_loss={d:.6} final_loss={d:.6} ratio={d:.4}\n",
+            .{ initial_loss, final_loss, ratio },
+        );
+        return error.LossDidNotDecrease;
+    }
+
+    std.debug.print(
+        "PASS GPU decoder fine-tune (dim={d} heads={d} ff_dim={d} n_pos={d}; loss {d:.6} → {d:.6} ({e:.2}× drop) over {d} Adam steps, 46 dispatches/step)\n",
+        .{ dim, n_heads, ff_dim, n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps },
     );
 }
 

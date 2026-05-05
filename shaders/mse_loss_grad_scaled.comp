@@ -1,0 +1,29 @@
+#version 460
+// Scaled MSE loss gradient: dL/dy[i] = scale · (pred[i] − target[i])
+//
+// Pairs with the full-MSE loss `L = (1/N) Σ (y − t)²` used by the
+// transformer training oracle. The chain-rule factor of 2/N is baked
+// into the `scale` push so callers don't need a follow-up scale-pass.
+//
+// Distinct from `mse_loss_grad.comp` (which produces unscaled
+// `pred − target` for the half-MSE convention used by MlpN). Two
+// shaders rather than overloading one push struct: the existing
+// MlpN runner ships a `MseLossGradPush { n }` and we don't want to
+// rev that struct's binary layout.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer P { float pred[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer T { float target[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer G { float grad[];   };
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    float scale;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    grad[i] = pc.scale * (pred[i] - target[i]);
+}

@@ -191,6 +191,35 @@ pub const AdamStepPush = extern struct {
 
 pub const MseLossGradPush = extern struct { n: u32 };
 
+/// Scaled MSE loss gradient. Bakes the (2/N) factor into the kernel
+/// so the transformer-training side doesn't need a follow-up scale.
+pub const MseLossGradScaledPush = extern struct { n: u32, scale: f32 };
+
+/// Multi-query attention forward (training-style). Push fields mirror
+/// the cpu_train_transformer.attentionForward signature; setting
+/// `causal != 0` enables the `k > q + (n_kv − n_q)` mask.
+pub const AttnScoresTrainPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_kv: u32,
+    kv_stride: u32,
+    scores_stride: u32,
+    causal: u32,
+    inv_sqrt_dim: f32,
+};
+
+pub const AttnOutputTrainPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_kv: u32,
+    kv_stride: u32,
+    attn_stride: u32,
+};
+
 pub const Mlp2ForwardBatchedPush = extern struct {
     dim_in: u32,
     dim_hidden: u32,

@@ -1,0 +1,68 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Training-style attention output (multi-query):
+//
+//     out[q, h, d] = Σ_k attn[q, h, k] · V[k, kv_h(h), d]
+//
+// Mirror of attn_backward_dq's pattern: one workgroup per (q, h, d)
+// output cell, 256 threads cooperate over the n_kv dimension.
+// Causal masking is implicit — softmax of −inf score produced 0 in
+// attn[q, h, k] for masked keys, so the dot-product picks up nothing.
+//
+// Shapes:
+//   attn  [n_q, n_heads, n_kv]      row stride = attn_stride (== n_kv)
+//   V     [n_kv, n_kv_heads, head_dim]   stride = kv_stride
+//   out   [n_q, n_heads, head_dim]
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A { float attn[];  };
+layout(set = 0, binding = 1, std430) readonly  buffer V { float v[];     };
+layout(set = 0, binding = 2, std430) writeonly buffer O { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_q;
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint n_kv;
+    uint kv_stride;
+    uint attn_stride;
+} pc;
+
+shared float sg_partials[32];
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint qh = cell / pc.head_dim;
+    uint d = cell - qh * pc.head_dim;
+    uint q = qh / pc.n_heads;
+    uint h = qh - q * pc.n_heads;
+    if (q >= pc.n_q) return;
+
+    uint kv_h = h / pc.heads_per_kv;
+    uint attn_off = (q * pc.n_heads + h) * pc.attn_stride;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.n_kv; k += gl_WorkGroupSize.x) {
+        uint v_off = k * pc.kv_stride + kv_h * pc.head_dim + d;
+        acc += attn[attn_off + k] * v[v_off];
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v_red = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? sg_partials[gl_SubgroupInvocationID]
+                        : 0.0;
+        float total = subgroupAdd(v_red);
+        if (subgroupElect()) {
+            out_v[(q * pc.n_heads + h) * pc.head_dim + d] = total;
+        }
+    }
+}

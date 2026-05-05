@@ -44,7 +44,9 @@ pub fn build(b: *std.Build) void {
     const add_in_place_spv = compileShader(b, "add_in_place");
     const attn_decode_single_spv = compileShader(b, "attn_decode_single");
     const attn_scores_spv = compileShader(b, "attn_scores");
+    const attn_scores_train_spv = compileShader(b, "attn_scores_train");
     const attn_output_spv = compileShader(b, "attn_output");
+    const attn_output_train_spv = compileShader(b, "attn_output_train");
     const kv_write_spv = compileShader(b, "kv_write");
     const fwht256_spv = compileShader(b, "fwht256");
     const rht_pre256_spv = compileShader(b, "rht_pre256");
@@ -68,6 +70,7 @@ pub fn build(b: *std.Build) void {
     const sgd_step_spv = compileShader(b, "sgd_step");
     const adam_step_spv = compileShader(b, "adam_step");
     const mse_loss_grad_spv = compileShader(b, "mse_loss_grad");
+    const mse_loss_grad_scaled_spv = compileShader(b, "mse_loss_grad_scaled");
     const mlp2_forward_batched_spv = compileShader(b, "mlp2_forward_batched");
     const mlp2_forward_train_batched_spv = compileShader(b, "mlp2_forward_train_batched");
     const mlp2_dy_batched_spv = compileShader(b, "mlp2_dy_batched");
@@ -118,7 +121,9 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(add_in_place_spv, "add_in_place.spv");
     _ = wf.addCopyFile(attn_decode_single_spv, "attn_decode_single.spv");
     _ = wf.addCopyFile(attn_scores_spv, "attn_scores.spv");
+    _ = wf.addCopyFile(attn_scores_train_spv, "attn_scores_train.spv");
     _ = wf.addCopyFile(attn_output_spv, "attn_output.spv");
+    _ = wf.addCopyFile(attn_output_train_spv, "attn_output_train.spv");
     _ = wf.addCopyFile(kv_write_spv, "kv_write.spv");
     _ = wf.addCopyFile(fwht256_spv, "fwht256.spv");
     _ = wf.addCopyFile(rht_pre256_spv, "rht_pre256.spv");
@@ -142,6 +147,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(sgd_step_spv, "sgd_step.spv");
     _ = wf.addCopyFile(adam_step_spv, "adam_step.spv");
     _ = wf.addCopyFile(mse_loss_grad_spv, "mse_loss_grad.spv");
+    _ = wf.addCopyFile(mse_loss_grad_scaled_spv, "mse_loss_grad_scaled.spv");
     _ = wf.addCopyFile(mlp2_forward_batched_spv, "mlp2_forward_batched.spv");
     _ = wf.addCopyFile(mlp2_forward_train_batched_spv, "mlp2_forward_train_batched.spv");
     _ = wf.addCopyFile(mlp2_dy_batched_spv, "mlp2_dy_batched.spv");
@@ -187,7 +193,9 @@ pub fn build(b: *std.Build) void {
         \\pub const add_in_place align(4) = @embedFile("add_in_place.spv").*;
         \\pub const attn_decode_single align(4) = @embedFile("attn_decode_single.spv").*;
         \\pub const attn_scores align(4) = @embedFile("attn_scores.spv").*;
+        \\pub const attn_scores_train align(4) = @embedFile("attn_scores_train.spv").*;
         \\pub const attn_output align(4) = @embedFile("attn_output.spv").*;
+        \\pub const attn_output_train align(4) = @embedFile("attn_output_train.spv").*;
         \\pub const kv_write align(4) = @embedFile("kv_write.spv").*;
         \\pub const fwht256 align(4) = @embedFile("fwht256.spv").*;
         \\pub const rht_pre256 align(4) = @embedFile("rht_pre256.spv").*;
@@ -211,6 +219,7 @@ pub fn build(b: *std.Build) void {
         \\pub const sgd_step align(4) = @embedFile("sgd_step.spv").*;
         \\pub const adam_step align(4) = @embedFile("adam_step.spv").*;
         \\pub const mse_loss_grad align(4) = @embedFile("mse_loss_grad.spv").*;
+        \\pub const mse_loss_grad_scaled align(4) = @embedFile("mse_loss_grad_scaled.spv").*;
         \\pub const mlp2_forward_batched align(4) = @embedFile("mlp2_forward_batched.spv").*;
         \\pub const mlp2_forward_train_batched align(4) = @embedFile("mlp2_forward_train_batched.spv").*;
         \\pub const mlp2_dy_batched align(4) = @embedFile("mlp2_dy_batched.spv").*;
