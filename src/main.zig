@@ -623,6 +623,7 @@ pub fn main() !void {
     try runGpuRmsnormBackwardSmoke(allocator);
     try runGpuLayerNormSmoke(allocator);
     try runGpuLayerNormBackwardSmoke(allocator);
+    try runEmbeddingBackwardSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -5042,6 +5043,108 @@ fn runGpuLayerNormBackwardSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU layernorm_backward ({d}×{d}; dx + dw + dbias match CPU oracle ≤ 1e-4)\n",
         .{ n_rows, dim },
+    );
+}
+
+// ── Embedding gradient (sparse scatter) smoke ──────────────────────
+//
+// Tier-2 chunk 4 — backward through embed_lookup. The forward pass
+// is `x[p, :] = E[token_ids[p], :]`; backward scatters the per-position
+// upstream gradient `dy[p, :]` back into `dE[token_ids[p], :]`. Tokens
+// that appear more than once in the sequence sum into the same row.
+//
+// Two claims:
+//   1. Multi-occurrence sums are correctly accumulated (a hand-built
+//      sequence with deliberately repeated tokens is checked against
+//      a manual reference sum).
+//   2. GPU vocab-major scatter shader matches the CPU oracle bit-exact
+//      across a synthetic batch.
+
+fn runEmbeddingBackwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim: usize = 8;
+    const vocab_size: usize = 16;
+    const n_pos: usize = 6;
+    // Deliberately reused token ids: 3, 7, 3, 11, 7, 3 — token 3 appears
+    // 3×, token 7 twice, token 11 once. dE[3] should sum dy[0]+dy[2]+dy[5];
+    // dE[7] sums dy[1]+dy[4]; dE[11] = dy[3]; all others zero.
+    const token_ids = [_]u32{ 3, 7, 3, 11, 7, 3 };
+
+    const dy = try allocator.alloc(f32, n_pos * dim);
+    defer allocator.free(dy);
+    var prng = std.Random.DefaultPrng.init(0xE0B570BE);
+    const rng = prng.random();
+    for (dy) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    // ── (1) CPU oracle vs hand-built reference ────────────────────
+    const dE_cpu = try allocator.alloc(f32, vocab_size * dim);
+    defer allocator.free(dE_cpu);
+    @memset(dE_cpu, 0);
+    cpu_train_transformer.embeddingBackward(dy, &token_ids, vocab_size, dim, dE_cpu);
+
+    // Manual reference: for each unique token, sum the dy rows where it
+    // appears. Compare bit-exact to the oracle.
+    const ref = try allocator.alloc(f32, vocab_size * dim);
+    defer allocator.free(ref);
+    @memset(ref, 0);
+    for (token_ids, 0..) |tok, p| {
+        const off = @as(usize, tok) * dim;
+        for (0..dim) |i| ref[off + i] += dy[p * dim + i];
+    }
+    for (dE_cpu, ref) |a, b| {
+        if (a != b) {
+            std.debug.print("CPU oracle != reference\n", .{});
+            return error.ParityFailed;
+        }
+    }
+
+    // ── (2) GPU shader vs CPU oracle ──────────────────────────────
+    var buf_dy = try buffer.Buffer.initStatic(&ctx, f32, dy);
+    defer buf_dy.deinit(ctx.device);
+    var buf_ti = try buffer.Buffer.initStatic(&ctx, u32, &token_ids);
+    defer buf_ti.deinit(ctx.device);
+    var buf_dE = try buffer.Buffer.initDeviceOnly(&ctx, vocab_size * dim * @sizeOf(f32));
+    defer buf_dE.deinit(ctx.device);
+    // initDeviceOnly already zeroes via vkCmdFillBuffer — relying on
+    // that pre-zeroing is exactly the dE_cpu @memset(0) above.
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.embedding_backward, 3, @sizeOf(runtime.EmbeddingBackwardPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_dy, &buf_ti, &buf_dE });
+
+    const push = runtime.EmbeddingBackwardPush{
+        .dim = @intCast(dim),
+        .n_pos = @intCast(n_pos),
+        .vocab_size = @intCast(vocab_size),
+    };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.EmbeddingBackwardPush,
+        n_groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.n_groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .n_groups = @intCast(vocab_size) });
+
+    const got = try allocator.alloc(f32, vocab_size * dim);
+    defer allocator.free(got);
+    try buf_dE.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    for (got, dE_cpu) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_abs) max_abs = d;
+    }
+    if (max_abs > 1e-6) {
+        std.debug.print("embedding_backward GPU: max |Δ| vs CPU = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS embedding gradient (vocab={d}, dim={d}, n_pos={d} with reused tokens; CPU oracle bit-exact vs reference; GPU max |Δ| = {e})\n",
+        .{ vocab_size, dim, n_pos, max_abs },
     );
 }
 

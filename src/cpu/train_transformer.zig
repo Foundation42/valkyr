@@ -328,3 +328,39 @@ pub fn layerNormBackward(
         );
     }
 }
+
+// ── Embedding gradient ─────────────────────────────────────────────
+//
+// Forward (in inference) does `x[t, :] = E[token_ids[t], :]`. Backward
+// scatters the per-position upstream gradient back into the embedding
+// table at the same indexed rows. Only rows whose vocab id appears in
+// `token_ids` get a non-zero contribution; rows not referenced this
+// step stay at zero (fresh-zeroed by the caller before the call).
+//
+// When the same token appears at multiple positions, all those
+// position contributions sum into the same `dE[token_id, :]` row.
+//
+// API mirrors the rmsnorm/layernorm dw_accum pattern: caller
+// zero-fills `dE` before the call; we accumulate into it. Lets a
+// host stack multiple sequences into one update if it wants.
+//
+// `dy` shape:        [n_pos, dim]
+// `token_ids` shape: [n_pos], values in [0, vocab_size)
+// `dE` shape:        [vocab_size, dim]
+
+pub fn embeddingBackward(
+    dy: []const f32,
+    token_ids: []const u32,
+    vocab_size: usize,
+    dim: usize,
+    dE: []f32,
+) void {
+    std.debug.assert(dy.len == token_ids.len * dim);
+    std.debug.assert(dE.len == vocab_size * dim);
+    for (token_ids, 0..) |tok, p| {
+        std.debug.assert(tok < vocab_size);
+        const src = dy[p * dim .. (p + 1) * dim];
+        const dst = dE[@as(usize, tok) * dim .. (@as(usize, tok) + 1) * dim];
+        for (dst, src) |*d, s| d.* += s;
+    }
+}

@@ -1,0 +1,48 @@
+#version 460
+
+// Embedding-table gradient scatter — vocab-major variant.
+//
+// Forward: `x[p, :] = E[token_ids[p], :]`. Backward: for each
+// vocab id v, compute `dE[v, :] += Σ_p [token_ids[p] == v] · dy[p, :]`.
+//
+// One workgroup per vocab entry. Each thread inside the workgroup
+// owns a slice of dim and scans all `n_pos` positions, accumulating
+// dy contributions for matching token ids. The output is overwritten
+// (NOT atomic-added), so the caller is responsible for zeroing dE
+// before the dispatch if they want a fresh accumulation.
+//
+// Why vocab-major instead of position-major-with-atomicAdd:
+// avoiding `VK_EXT_shader_atomic_float` keeps the device feature
+// requirement minimal (no extension chain in vk.zig). The cost is
+// O(vocab_size · n_pos) instead of O(n_pos), which is only painful
+// when vocab >> n_pos — fine for training-scale (vocab ≤ ~256K,
+// n_pos ≤ a few thousand). A sort-by-key + segmented-sum variant
+// is a perf chunk for later.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dy { float dy[];        };
+layout(set = 0, binding = 1, std430) readonly  buffer Ti { uint  token_ids[]; };
+layout(set = 0, binding = 2, std430)          buffer DE { float dE[];        };
+
+layout(push_constant) uniform Pc {
+    uint dim;
+    uint n_pos;
+    uint vocab_size;  // unused at dispatch — workgroup count drives this
+} pc;
+
+void main() {
+    uint vocab_id = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint dE_off = vocab_id * pc.dim;
+
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float acc = 0.0;
+        for (uint p = 0; p < pc.n_pos; p++) {
+            if (token_ids[p] == vocab_id) {
+                acc += dy[p * pc.dim + i];
+            }
+        }
+        dE[dE_off + i] += acc;
+    }
+}

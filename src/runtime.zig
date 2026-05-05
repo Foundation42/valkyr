@@ -58,6 +58,15 @@ pub const LayernormPush = extern struct {
     eps: f32,
 };
 
+/// Embedding-table gradient scatter. `vocab_size` is included for
+/// shader-side bounds checks but the actual workgroup count is set
+/// by the caller's dispatch and must equal vocab_size.
+pub const EmbeddingBackwardPush = extern struct {
+    dim: u32,
+    n_pos: u32,
+    vocab_size: u32,
+};
+
 pub const RopePush = extern struct {
     n_heads: u32,
     head_dim: u32,
