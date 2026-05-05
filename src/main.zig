@@ -20,6 +20,7 @@ const q4_0 = @import("cpu/q4_0.zig");
 const q4_k = @import("cpu/q4_k.zig");
 const cpu_train = @import("cpu/train.zig");
 const train_runner = @import("train/runner.zig");
+const train_runner_n = @import("train/runner_n.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
@@ -576,6 +577,8 @@ pub fn main() !void {
     try runTrainingRunnerAdamSmoke(allocator);
     try runTrainingRunnerCrossEntropySmoke(allocator);
     try runTrainingRunnerDecaySmoke(allocator);
+    try runTrainingRunnerNSmoke(allocator);
+    try runTrainingRunnerNAttachedSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2446,6 +2449,185 @@ fn runTrainingRunnerAttachedSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner attached ({d} host-submitted frames; loss {d:.6} → {d:.6}, valkyr-record + host-submit OK)\n",
         .{ n_frames, initial_loss, final_loss },
+    );
+}
+
+// ── MlpNRunner standalone smoke ─────────────────────────────────────
+//
+// Tier-1 chunk 3a of the post-v0 training arc. Exercises the new
+// multi-layer runner on a 4 → 8 → 6 → 4 net (n=3) using the same
+// alternating-pair convergence shape as the 2-layer
+// `runTrainingRunnerSmoke`. Standalone path: each tick owns its own
+// Recorder and submits.
+
+fn runTrainingRunnerNSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const layer_dims = [_]u32{ 4, 8, 6, 4 };
+    const cfg = train_runner_n.MlpNConfig{
+        .layer_dims = &layer_dims,
+        .lr = 0.05,
+        .init_seed = 0x70077077,
+    };
+
+    var runner = try train_runner_n.MlpNRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    const x_a = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const t_a = [_]f32{ 1.0, 0.2, 0.0, 0.0 };
+    const x_b = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
+    const t_b = [_]f32{ 0.0, 0.0, 0.7, 0.3 };
+
+    var pred: [4]f32 = undefined;
+
+    try runner.tickPredict(&x_a, &pred);
+    var initial_loss = cpu_train.mseLoss(&pred, &t_a);
+    try runner.tickPredict(&x_b, &pred);
+    initial_loss += cpu_train.mseLoss(&pred, &t_b);
+
+    // Deeper net + vanilla SGD on a 2-pair alternating task is slower
+    // to converge than the 2-layer counterpart — gradient attenuation
+    // through the extra ReLU stage. 600 steps at lr=0.05 lands an
+    // 8× drop comfortably; tightening past that is an Adam discussion
+    // (chunk 3b), not a runner correctness one.
+    const n_steps: u32 = 600;
+    var s: u32 = 0;
+    while (s < n_steps) : (s += 1) {
+        if (s & 1 == 0) {
+            try runner.tickStep(&x_a, &t_a, &pred);
+        } else {
+            try runner.tickStep(&x_b, &t_b, &pred);
+        }
+    }
+
+    try runner.tickPredict(&x_a, &pred);
+    var final_loss = cpu_train.mseLoss(&pred, &t_a);
+    try runner.tickPredict(&x_b, &pred);
+    final_loss += cpu_train.mseLoss(&pred, &t_b);
+
+    if (!(final_loss < initial_loss * 0.125)) {
+        std.debug.print(
+            "MlpNRunner did not converge: loss[0] = {d:.6}, loss[{d}] = {d:.6}\n",
+            .{ initial_loss, n_steps, final_loss },
+        );
+        return error.ParityFailed;
+    }
+
+    // readWeights round-trip: build a CPU MlpN of matching shape and
+    // pull weights back. Verifies dimensions agree and the staging
+    // path runs through cleanly.
+    const seed_dims = [_]usize{ 4, 8, 6, 4 };
+    var cpu_mirror = try cpu_train.MlpN.init(allocator, &seed_dims, 0.0, 0);
+    defer cpu_mirror.deinit(allocator);
+    try runner.readWeights(&cpu_mirror);
+    var nan_count: usize = 0;
+    for (cpu_mirror.weights) |w| for (w) |v| if (std.math.isNan(v)) {
+        nan_count += 1;
+    };
+    if (nan_count != 0) {
+        std.debug.print("MlpNRunner readWeights returned NaNs: {d}\n", .{nan_count});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS MlpNRunner standalone (n={d} layers, dims [4,8,6,4]; {d} alternating steps; loss {d:.6} → {d:.6}, readWeights OK)\n",
+        .{ runner.nLayers(), n_steps, initial_loss, final_loss },
+    );
+}
+
+// ── MlpNRunner attach-mode smoke ────────────────────────────────────
+//
+// Same setup as `runTrainingRunnerAttachedSmoke` but on the multi-layer
+// runner — host owns the cmd buffer + fence, valkyr records into it.
+
+fn runTrainingRunnerNAttachedSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const layer_dims = [_]u32{ 4, 12, 8, 4 };
+    const cfg = train_runner_n.MlpNConfig{
+        .layer_dims = &layer_dims,
+        .lr = 0.05,
+        .init_seed = 0xA77ACED2,
+    };
+    var runner = try train_runner_n.MlpNRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    var cb_ai = std.mem.zeroes(vk.c.VkCommandBufferAllocateInfo);
+    cb_ai.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = ctx.cmd_pool;
+    cb_ai.level = vk.c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    var host_cmd: vk.c.VkCommandBuffer = null;
+    try vk.check(vk.c.vkAllocateCommandBuffers(ctx.device, &cb_ai, &host_cmd));
+    defer vk.c.vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &host_cmd);
+
+    var fci = std.mem.zeroes(vk.c.VkFenceCreateInfo);
+    fci.sType = vk.c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    var host_fence: vk.c.VkFence = null;
+    try vk.check(vk.c.vkCreateFence(ctx.device, &fci, null, &host_fence));
+    defer vk.c.vkDestroyFence(ctx.device, host_fence, null);
+
+    const dt: f32 = 0.05;
+    var pred: [4]f32 = undefined;
+    var input: [4]f32 = undefined;
+    var target: [4]f32 = undefined;
+
+    try runner.tickPredict(&[_]f32{ 1, 0, 0, 0 }, &pred);
+    const initial_loss = cpu_train.mseLoss(&pred, &[_]f32{ 0.5, 0.5, 0.5, 0 });
+
+    const n_frames: u32 = 60;
+    var f: u32 = 0;
+    while (f < n_frames) : (f += 1) {
+        const t = @as(f32, @floatFromInt(f)) * dt;
+        input[0] = @sin(t);
+        input[1] = @cos(t);
+        input[2] = @sin(2 * t);
+        input[3] = @cos(2 * t);
+        target[0] = 0.5 + 0.5 * @sin(t);
+        target[1] = 0.5 + 0.5 * @cos(t);
+        target[2] = 0.5;
+        target[3] = 0.0;
+
+        try vk.check(vk.c.vkResetCommandBuffer(host_cmd, 0));
+        try vk.check(vk.c.vkResetFences(ctx.device, 1, &host_fence));
+
+        var bi = std.mem.zeroes(vk.c.VkCommandBufferBeginInfo);
+        bi.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = vk.c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try vk.check(vk.c.vkBeginCommandBuffer(host_cmd, &bi));
+
+        var rec = try gpu_recorder.Recorder.attachCmd(&ctx, host_cmd, 48, 192);
+        defer rec.deinit();
+        try rec.begin();
+
+        try runner.tickStepRecord(&rec, &input, &target);
+
+        try vk.check(vk.c.vkEndCommandBuffer(host_cmd));
+        var submit = std.mem.zeroes(vk.c.VkSubmitInfo);
+        submit.sType = vk.c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &host_cmd;
+        try vk.check(vk.c.vkQueueSubmit(ctx.queue, 1, &submit, host_fence));
+        const timeout_ns: u64 = 10 * 1_000_000_000;
+        try vk.check(vk.c.vkWaitForFences(ctx.device, 1, &host_fence, vk.c.VK_TRUE, timeout_ns));
+    }
+
+    try runner.tickPredict(&input, &pred);
+    const final_loss = cpu_train.mseLoss(&pred, &target);
+
+    if (!(final_loss < initial_loss * 0.5)) {
+        std.debug.print(
+            "MlpNRunner attached did not converge: loss[0] = {d:.6}, loss[{d}] = {d:.6}\n",
+            .{ initial_loss, n_frames, final_loss },
+        );
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS MlpNRunner attached (n={d} layers, dims [4,12,8,4]; {d} host-submitted frames; loss {d:.6} → {d:.6})\n",
+        .{ runner.nLayers(), n_frames, initial_loss, final_loss },
     );
 }
 

@@ -98,6 +98,7 @@ pub const inference = struct {
 // demo built on top of this.
 pub const train = struct {
     pub const runner = @import("train/runner.zig");
+    pub const runner_n = @import("train/runner_n.zig");
     pub const cpu = @import("cpu/train.zig");
 };
 
