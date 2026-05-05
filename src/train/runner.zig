@@ -29,6 +29,22 @@ const shaders = @import("shaders");
 
 pub const OptimizerKind = enum { sgd, adam };
 
+/// Loss head selection. The loss-grad shader runs first in the
+/// backward chain; everything downstream (`mlp2_dh_pre_batched`,
+/// outer-product accumulators, optimizer step) is identical across
+/// loss kinds because they all consume `dy = ∂L/∂y` regardless of
+/// which L produced it.
+pub const LossKind = enum {
+    /// L = ½·Σ(y - target)² / N. Continuous regression; target is
+    /// the desired output values directly.
+    mse,
+    /// L = -Σ target·log(softmax(y)) / N. Categorical classification
+    /// or token prediction; target is the desired probability
+    /// distribution (one-hot for hard labels). Logits y are passed
+    /// raw — softmax happens inside the loss-grad shader.
+    cross_entropy,
+};
+
 pub const Mlp2Config = struct {
     dim_in: u32,
     dim_hidden: u32,
@@ -63,6 +79,10 @@ pub const Mlp2Config = struct {
     /// Adam denominator stabiliser. Standard ML default. Ignored under
     /// `.sgd`.
     adam_eps: f32 = 1e-8,
+    /// Loss head. `.mse` regresses continuous targets; `.cross_entropy`
+    /// fits categorical / token-prediction targets via stable softmax
+    /// inside the loss-grad shader.
+    loss: LossKind = .mse,
 };
 
 /// Compile-time cap on `dim_hidden` enforced by the batched forward
@@ -136,6 +156,10 @@ pub const TrainingRunner = struct {
     k_train_db_accum: ?pipeline.Kernel,
     /// Adam optimizer pipeline (only built when `cfg.optimizer == .adam`).
     k_adam: ?pipeline.Kernel,
+    /// Cross-entropy loss-grad pipeline (only built when
+    /// `cfg.loss == .cross_entropy`). MSE reuses the existing
+    /// `k_train_dy_batch`.
+    k_train_ce_loss_grad: ?pipeline.Kernel,
 
     // ── Parameter buffers (DEVICE_LOCAL, mutated by SGD) ──
     w1: buffer.Buffer,
@@ -258,6 +282,16 @@ pub const TrainingRunner = struct {
             k_adam = try pipeline.Kernel.init(ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
         }
         errdefer if (k_adam) |*k| k.deinit();
+        var k_train_ce_loss_grad: ?pipeline.Kernel = null;
+        if (cfg.loss == .cross_entropy and cfg.max_batch_size > 0) {
+            k_train_ce_loss_grad = try pipeline.Kernel.init(
+                ctx,
+                &shaders.softmax_ce_loss_grad_batched,
+                3,
+                @sizeOf(runtime.SoftmaxCeLossGradPush),
+            );
+        }
+        errdefer if (k_train_ce_loss_grad) |*k| k.deinit();
 
         // ── Parameter buffers (start populated from seed_mlp) ──
         const w1 = try buffer.Buffer.initStatic(ctx, f32, seed_mlp.w1);
@@ -384,6 +418,7 @@ pub const TrainingRunner = struct {
             .k_train_dw_accum = k_train_dw_accum,
             .k_train_db_accum = k_train_db_accum,
             .k_adam = k_adam,
+            .k_train_ce_loss_grad = k_train_ce_loss_grad,
             .w1 = w1,
             .b1 = b1,
             .w2 = w2,
@@ -474,6 +509,7 @@ pub const TrainingRunner = struct {
         if (self.k_train_dw_accum) |*k| k.deinit();
         if (self.k_train_db_accum) |*k| k.deinit();
         if (self.k_adam) |*k| k.deinit();
+        if (self.k_train_ce_loss_grad) |*k| k.deinit();
     }
 
     /// Run one full training step: upload x/target, record forward +
@@ -895,16 +931,35 @@ pub const TrainingRunner = struct {
             1,
         );
 
-        // 2. dy = (y - target) / N
-        const dy_push = runtime.Mlp2DyBatchedPush{ .dim_out = dim_out, .n_samples = n_samples };
-        try rec.dispatch(
-            k_dy,
-            &.{ y_b, tgt, dy_b },
-            &dy_push,
-            ceilDiv(dim_out * n_samples, 256),
-            1,
-            1,
-        );
+        // 2. dy = ∂L/∂y, scaled by 1/N (mean over batch).
+        //    MSE: dy = (y − target) / N — `mlp2_dy_batched`
+        //    CE:  dy = (softmax(y) − target) / N — `softmax_ce_loss_grad_batched`
+        // Downstream backward chain is identical across loss kinds.
+        switch (self.cfg.loss) {
+            .mse => {
+                const dy_push = runtime.Mlp2DyBatchedPush{ .dim_out = dim_out, .n_samples = n_samples };
+                try rec.dispatch(
+                    k_dy,
+                    &.{ y_b, tgt, dy_b },
+                    &dy_push,
+                    ceilDiv(dim_out * n_samples, 256),
+                    1,
+                    1,
+                );
+            },
+            .cross_entropy => {
+                const k_ce = &(self.k_train_ce_loss_grad.?);
+                const ce_push = runtime.SoftmaxCeLossGradPush{ .dim_out = dim_out, .n_samples = n_samples };
+                try rec.dispatch(
+                    k_ce,
+                    &.{ y_b, tgt, dy_b },
+                    &ce_push,
+                    ceilDiv(n_samples, 64),
+                    1,
+                    1,
+                );
+            },
+        }
 
         // 3. dh_pre = (W2^T · dy) · 1[h_pre > 0]
         const dhp_push = runtime.Mlp2DhPreBatchedPush{

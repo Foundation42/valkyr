@@ -163,6 +163,11 @@ pub const Mlp2DbAccumPush = extern struct {
     n_samples: u32,
 };
 
+pub const SoftmaxCeLossGradPush = extern struct {
+    dim_out: u32,
+    n_samples: u32,
+};
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {

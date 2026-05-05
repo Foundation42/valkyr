@@ -572,6 +572,7 @@ pub fn main() !void {
     try runTrainingRunnerCoopSmoke(allocator);
     try runTrainingRunnerStagingSmoke(allocator);
     try runTrainingRunnerAdamSmoke(allocator);
+    try runTrainingRunnerCrossEntropySmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2719,6 +2720,120 @@ fn runTrainingRunnerAdamSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner Adam ({d} samples × {d} steps, dim 4→8→3; max |Δ| vs CPU oracle = {e})\n",
         .{ n_samples, K, max_abs },
+    );
+}
+
+// ── TrainingRunner cross-entropy loss-grad parity smoke ─────────────
+//
+// CPU oracle does the canonical stable softmax + CE-grad:
+//   m = max(y)
+//   p = exp(y - m) / Σ exp(y - m)
+//   dy = (p − target) / N
+// then compares against the GPU shader's output. Catches any sign or
+// off-by-one in the softmax + scale-by-1/N chain. Two scenarios:
+// hard-label (one-hot target) and soft-label (mixed distribution), so
+// the test exercises both classifier and distillation use cases.
+
+fn runTrainingRunnerCrossEntropySmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_samples: u32 = 32;
+    const dim_out: u32 = 5;
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 8,
+        .dim_out = dim_out,
+        .lr = 0.0,
+        .init_seed = 0xC10557E,
+        .max_batch_size = n_samples,
+        .loss = .cross_entropy,
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // Build synthetic batch + target.
+    var rng = std.Random.DefaultPrng.init(0xCEED57A);
+    const r = rng.random();
+    const x_batch = try allocator.alloc(f32, n_samples * cfg.dim_in);
+    defer allocator.free(x_batch);
+    const target_batch = try allocator.alloc(f32, n_samples * cfg.dim_out);
+    defer allocator.free(target_batch);
+    for (x_batch) |*v| v.* = r.float(f32) * 2 - 1;
+    // Half samples one-hot (hard label), half soft (Dirichlet-ish).
+    var i: u32 = 0;
+    while (i < n_samples) : (i += 1) {
+        const off = i * dim_out;
+        if (i < n_samples / 2) {
+            const cls = r.uintLessThan(u32, dim_out);
+            for (0..dim_out) |o| target_batch[off + o] = if (o == cls) 1.0 else 0.0;
+        } else {
+            var sum: f32 = 0;
+            for (0..dim_out) |o| {
+                const v = r.float(f32);
+                target_batch[off + o] = v;
+                sum += v;
+            }
+            for (0..dim_out) |o| target_batch[off + o] /= sum;
+        }
+    }
+
+    // Run forward via tickPredictBatch to get logits, then run our
+    // CE-grad shader by triggering one batched train step (dy is the
+    // first thing recordTrainBatch dispatches).
+    //
+    // Approach: read y_train_batch directly after a single batched
+    // train step. But that requires staging or a peek. Simplest: use
+    // a minimal run that lets us readBack y_b. Our recordTrainBatch
+    // already writes h_pre/h/y to dedicated buffers; we can readBack
+    // y_train_batch after the dispatch.
+    try runner.uploadTrainBatch(x_batch, target_batch);
+
+    // Manually drive forward + dy + readback into a recorder. This
+    // lets us isolate the dy output for parity-checking without the
+    // rest of the train chain mutating weights (lr=0 already takes
+    // care of that, but it's cleaner this way).
+    try runner.tickStepBatch(x_batch, target_batch);
+
+    // Pull the y_train_batch logits + dy_train_batch back to host.
+    const y_gpu = try allocator.alloc(f32, n_samples * dim_out);
+    defer allocator.free(y_gpu);
+    const dy_gpu = try allocator.alloc(f32, n_samples * dim_out);
+    defer allocator.free(dy_gpu);
+    try runner.y_train_batch.?.readBack(&ctx, f32, y_gpu);
+    try runner.dy_train_batch.?.readBack(&ctx, f32, dy_gpu);
+
+    // CPU oracle: stable softmax + CE-grad, /N pre-divide.
+    const dy_cpu = try allocator.alloc(f32, n_samples * dim_out);
+    defer allocator.free(dy_cpu);
+    const inv_n: f32 = 1.0 / @as(f32, @floatFromInt(n_samples));
+    for (0..n_samples) |n| {
+        const off = n * dim_out;
+        var m: f32 = y_gpu[off];
+        for (1..dim_out) |o| m = @max(m, y_gpu[off + o]);
+        var sum_e: f32 = 0;
+        for (0..dim_out) |o| sum_e += @exp(y_gpu[off + o] - m);
+        for (0..dim_out) |o| {
+            const p = @exp(y_gpu[off + o] - m) / sum_e;
+            dy_cpu[off + o] = (p - target_batch[off + o]) * inv_n;
+        }
+    }
+
+    var max_abs: f32 = 0;
+    for (dy_gpu, dy_cpu, 0..) |g, c, idx| {
+        const d = @abs(g - c);
+        if (d > 1e-5) {
+            std.debug.print(
+                "CE loss-grad MISMATCH at {d}: gpu={d:.7} cpu={d:.7}\n",
+                .{ idx, g, c },
+            );
+            return error.ParityFailed;
+        }
+        if (d > max_abs) max_abs = d;
+    }
+    std.debug.print(
+        "PASS TrainingRunner cross-entropy loss-grad ({d} samples × {d} classes; max |Δ| vs CPU oracle = {e})\n",
+        .{ n_samples, dim_out, max_abs },
     );
 }
 

@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     const mlp2_dh_pre_batched_spv = compileShader(b, "mlp2_dh_pre_batched");
     const mlp2_dw_accum_spv = compileShader(b, "mlp2_dw_accum");
     const mlp2_db_accum_spv = compileShader(b, "mlp2_db_accum");
+    const softmax_ce_loss_grad_batched_spv = compileShader(b, "softmax_ce_loss_grad_batched");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -121,6 +122,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(mlp2_dh_pre_batched_spv, "mlp2_dh_pre_batched.spv");
     _ = wf.addCopyFile(mlp2_dw_accum_spv, "mlp2_dw_accum.spv");
     _ = wf.addCopyFile(mlp2_db_accum_spv, "mlp2_db_accum.spv");
+    _ = wf.addCopyFile(softmax_ce_loss_grad_batched_spv, "softmax_ce_loss_grad_batched.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -175,6 +177,7 @@ pub fn build(b: *std.Build) void {
         \\pub const mlp2_dh_pre_batched align(4) = @embedFile("mlp2_dh_pre_batched.spv").*;
         \\pub const mlp2_dw_accum align(4) = @embedFile("mlp2_dw_accum.spv").*;
         \\pub const mlp2_db_accum align(4) = @embedFile("mlp2_db_accum.spv").*;
+        \\pub const softmax_ce_loss_grad_batched align(4) = @embedFile("softmax_ce_loss_grad_batched.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──
