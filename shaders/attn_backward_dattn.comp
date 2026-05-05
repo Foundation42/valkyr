@@ -1,0 +1,68 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// SDPA backward — d_attn[q, h, k] = Σ_d d_out[q, h, d] · V[k, kv_h(h), d]
+//
+// Mirrors `attn_scores.comp`'s pattern with V instead of K_cache:
+//
+//     d_out      [n_q, n_heads, head_dim]                       flat
+//     V          [n_kv, n_kv_heads, head_dim]                   flat
+//                stride between kv positions = n_kv_heads * head_dim
+//                                            = kv_stride
+//     d_attn_out [n_q, n_heads, n_kv]                           flat
+//                row stride per (q, h) = n_kv (== `attn_stride`)
+//
+// One workgroup per (q, h, k) cell, 256 threads cooperate over
+// head_dim with subgroup reduction.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dout { float d_out[];  };
+layout(set = 0, binding = 1, std430) readonly  buffer V    { float v[];      };
+layout(set = 0, binding = 2, std430) writeonly buffer Da   { float d_attn[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_q;
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint n_kv;
+    uint kv_stride;       // n_kv_heads * head_dim
+    uint attn_stride;     // row stride in d_attn buffer (typically n_kv)
+} pc;
+
+shared float sg_partials[32];
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint qh = cell / pc.n_kv;
+    uint k = cell - qh * pc.n_kv;
+    uint q = qh / pc.n_heads;
+    uint h = qh - q * pc.n_heads;
+    if (q >= pc.n_q) return;
+
+    uint kv_h = h / pc.heads_per_kv;
+    uint dout_off = q * pc.n_heads * pc.head_dim + h * pc.head_dim;
+    uint v_off    = k * pc.kv_stride + kv_h * pc.head_dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint d = tid; d < pc.head_dim; d += gl_WorkGroupSize.x) {
+        acc += d_out[dout_off + d] * v[v_off + d];
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v_red = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? sg_partials[gl_SubgroupInvocationID]
+                        : 0.0;
+        float total = subgroupAdd(v_red);
+        if (subgroupElect()) {
+            d_attn[(q * pc.n_heads + h) * pc.attn_stride + k] = total;
+        }
+    }
+}

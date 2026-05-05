@@ -121,6 +121,48 @@ pub const AttnOutputPush = extern struct {
     scores_stride: u32,
 };
 
+pub const AttnBackwardDattnPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_kv: u32,
+    kv_stride: u32,       // n_kv_heads * head_dim
+    attn_stride: u32,     // row stride per (q, h) in d_attn (== n_kv typically)
+};
+
+pub const AttnBackwardDvPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_kv: u32,
+    attn_stride: u32,
+};
+
+pub const AttnBackwardDqPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_kv: u32,
+    kv_stride: u32,
+    scores_stride: u32,
+    inv_sqrt_dim: f32,
+};
+
+pub const AttnBackwardDkPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_kv: u32,
+    scores_stride: u32,
+    inv_sqrt_dim: f32,
+};
+
 pub const AddInPlacePush = extern struct { n: u32 };
 
 pub const ReluPush = extern struct { n: u32 };

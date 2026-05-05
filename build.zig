@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
     const layernorm_backward_spv = compileShader(b, "layernorm_backward");
     const embedding_backward_spv = compileShader(b, "embedding_backward");
     const softmax_backward_spv = compileShader(b, "softmax_backward");
+    const attn_backward_dattn_spv = compileShader(b, "attn_backward_dattn");
+    const attn_backward_dv_spv = compileShader(b, "attn_backward_dv");
+    const attn_backward_dq_spv = compileShader(b, "attn_backward_dq");
+    const attn_backward_dk_spv = compileShader(b, "attn_backward_dk");
     const geglu_spv = compileShader(b, "geglu");
     const swiglu_spv = compileShader(b, "swiglu");
     const rope_spv = compileShader(b, "rope");
@@ -88,6 +92,10 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(layernorm_backward_spv, "layernorm_backward.spv");
     _ = wf.addCopyFile(embedding_backward_spv, "embedding_backward.spv");
     _ = wf.addCopyFile(softmax_backward_spv, "softmax_backward.spv");
+    _ = wf.addCopyFile(attn_backward_dattn_spv, "attn_backward_dattn.spv");
+    _ = wf.addCopyFile(attn_backward_dv_spv, "attn_backward_dv.spv");
+    _ = wf.addCopyFile(attn_backward_dq_spv, "attn_backward_dq.spv");
+    _ = wf.addCopyFile(attn_backward_dk_spv, "attn_backward_dk.spv");
     _ = wf.addCopyFile(geglu_spv, "geglu.spv");
     _ = wf.addCopyFile(swiglu_spv, "swiglu.spv");
     _ = wf.addCopyFile(rope_spv, "rope.spv");
@@ -150,6 +158,10 @@ pub fn build(b: *std.Build) void {
         \\pub const layernorm_backward align(4) = @embedFile("layernorm_backward.spv").*;
         \\pub const embedding_backward align(4) = @embedFile("embedding_backward.spv").*;
         \\pub const softmax_backward align(4) = @embedFile("softmax_backward.spv").*;
+        \\pub const attn_backward_dattn align(4) = @embedFile("attn_backward_dattn.spv").*;
+        \\pub const attn_backward_dv align(4) = @embedFile("attn_backward_dv.spv").*;
+        \\pub const attn_backward_dq align(4) = @embedFile("attn_backward_dq.spv").*;
+        \\pub const attn_backward_dk align(4) = @embedFile("attn_backward_dk.spv").*;
         \\pub const geglu align(4) = @embedFile("geglu.spv").*;
         \\pub const swiglu align(4) = @embedFile("swiglu.spv").*;
         \\pub const rope align(4) = @embedFile("rope.spv").*;

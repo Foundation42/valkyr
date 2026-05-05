@@ -1,0 +1,65 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// SDPA backward — dQ[q, h, d] = inv_sqrt_d · Σ_k d_scores[q, h, k] · K[k, kv_h(h), d]
+//
+//     d_scores   [n_q, n_heads, n_kv]   row stride (q, h) = scores_stride
+//     K          [n_kv, n_kv_heads, head_dim]
+//     dQ_out     [n_q, n_heads, head_dim]    (overwritten)
+//
+// Mirror of `attn_output.comp` with d_scores instead of attn and the
+// inv_sqrt_d scaling baked in. One workgroup per (q, h, d) output
+// cell, 256 threads cooperate over the n_kv axis.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Ds { float d_scores[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer K  { float k_buf[];    };
+layout(set = 0, binding = 2, std430) writeonly buffer Dq { float dq[];       };
+
+layout(push_constant) uniform Pc {
+    uint n_q;
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint n_kv;
+    uint kv_stride;        // n_kv_heads * head_dim
+    uint scores_stride;    // row stride per (q, h) in d_scores
+    float inv_sqrt_dim;
+} pc;
+
+shared float sg_partials[32];
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint qh = cell / pc.head_dim;
+    uint d = cell - qh * pc.head_dim;
+    uint q = qh / pc.n_heads;
+    uint h = qh - q * pc.n_heads;
+    if (q >= pc.n_q) return;
+
+    uint kv_h = h / pc.heads_per_kv;
+    uint ds_row = (q * pc.n_heads + h) * pc.scores_stride;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.n_kv; k += gl_WorkGroupSize.x) {
+        uint k_off = k * pc.kv_stride + kv_h * pc.head_dim + d;
+        acc += d_scores[ds_row + k] * k_buf[k_off];
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            dq[(q * pc.n_heads + h) * pc.head_dim + d] = total * pc.inv_sqrt_dim;
+        }
+    }
+}

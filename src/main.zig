@@ -626,6 +626,7 @@ pub fn main() !void {
     try runEmbeddingBackwardSmoke(allocator);
     try runSoftmaxBackwardSmoke(allocator);
     try runAttentionBackwardCpuSmoke(allocator);
+    try runGpuAttentionBackwardSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -5473,6 +5474,240 @@ fn runAttentionBackwardCpuSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS attention backward CPU (n_q={d} n_kv={d} heads={d}/{d} d={d} causal numeric-grad ≤ {e})\n",
         .{ n_q, n_kv, n_heads, n_kv_heads, head_dim, max_rel_err },
+    );
+}
+
+// ── GPU attention-backward smoke: dV / d_attn / dQ / dK vs CPU oracle ─
+
+fn runGpuAttentionBackwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Bigger shape than CPU oracle smoke — exercises both head-axis and
+    // position-axis with subgroup-reduction'd kernels.
+    const n_q: usize = 4;
+    const n_kv: usize = 8;
+    const n_heads: usize = 8;
+    const n_kv_heads: usize = 4; // heads_per_kv = 2
+    const head_dim: usize = 64;
+    const heads_per_kv: usize = n_heads / n_kv_heads;
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    const q_total = n_q * n_heads * head_dim;
+    const kv_total = n_kv * n_kv_heads * head_dim;
+    const scores_total = n_q * n_heads * n_kv;
+
+    const Q = try allocator.alloc(f32, q_total);
+    defer allocator.free(Q);
+    const K = try allocator.alloc(f32, kv_total);
+    defer allocator.free(K);
+    const V = try allocator.alloc(f32, kv_total);
+    defer allocator.free(V);
+    const d_out = try allocator.alloc(f32, q_total);
+    defer allocator.free(d_out);
+
+    var prng = std.Random.DefaultPrng.init(0xA77B_AC_02);
+    const rng = prng.random();
+    for (Q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (K) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (V) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (d_out) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    // ── CPU reference: forward + full backward ────────────────────
+    const scores = try allocator.alloc(f32, scores_total);
+    defer allocator.free(scores);
+    const attn = try allocator.alloc(f32, scores_total);
+    defer allocator.free(attn);
+    const out = try allocator.alloc(f32, q_total);
+    defer allocator.free(out);
+    const d_scores_cpu = try allocator.alloc(f32, scores_total);
+    defer allocator.free(d_scores_cpu);
+    const dQ_cpu = try allocator.alloc(f32, q_total);
+    defer allocator.free(dQ_cpu);
+    const dK_cpu = try allocator.alloc(f32, kv_total);
+    defer allocator.free(dK_cpu);
+    const dV_cpu = try allocator.alloc(f32, kv_total);
+    defer allocator.free(dV_cpu);
+
+    cpu_train_transformer.attentionForward(Q, K, V, n_q, n_kv, n_heads, n_kv_heads, head_dim, true, scores, attn, out);
+    cpu_train_transformer.attentionBackward(d_out, Q, K, V, attn, n_q, n_kv, n_heads, n_kv_heads, head_dim, true, d_scores_cpu, dQ_cpu, dK_cpu, dV_cpu);
+
+    // Also stage d_attn (pre-softmax-backward) for shader-level parity
+    // on the d_attn shader specifically.
+    const d_attn_cpu = try allocator.alloc(f32, scores_total);
+    defer allocator.free(d_attn_cpu);
+    for (0..n_q) |q| {
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const dout_off = q * n_heads * head_dim + h * head_dim;
+            const da_off = q * n_heads * n_kv + h * n_kv;
+            for (0..n_kv) |k| {
+                const v_off = k * n_kv_heads * head_dim + kv_h * head_dim;
+                var s: f64 = 0;
+                for (0..head_dim) |d| s += @as(f64, d_out[dout_off + d]) * @as(f64, V[v_off + d]);
+                d_attn_cpu[da_off + k] = @floatCast(s);
+            }
+        }
+    }
+
+    // ── GPU buffers ───────────────────────────────────────────────
+    var buf_Q = try buffer.Buffer.initStatic(&ctx, f32, Q);
+    defer buf_Q.deinit(ctx.device);
+    var buf_K = try buffer.Buffer.initStatic(&ctx, f32, K);
+    defer buf_K.deinit(ctx.device);
+    var buf_V = try buffer.Buffer.initStatic(&ctx, f32, V);
+    defer buf_V.deinit(ctx.device);
+    var buf_dout = try buffer.Buffer.initStatic(&ctx, f32, d_out);
+    defer buf_dout.deinit(ctx.device);
+    var buf_attn = try buffer.Buffer.initStatic(&ctx, f32, attn);
+    defer buf_attn.deinit(ctx.device);
+    // We need d_scores upload for dQ/dK kernels — load CPU d_scores now.
+    var buf_dscores = try buffer.Buffer.initStatic(&ctx, f32, d_scores_cpu);
+    defer buf_dscores.deinit(ctx.device);
+
+    var buf_dattn_gpu = try buffer.Buffer.initDeviceOnly(&ctx, scores_total * @sizeOf(f32));
+    defer buf_dattn_gpu.deinit(ctx.device);
+    var buf_dV_gpu = try buffer.Buffer.initDeviceOnly(&ctx, kv_total * @sizeOf(f32));
+    defer buf_dV_gpu.deinit(ctx.device);
+    var buf_dQ_gpu = try buffer.Buffer.initDeviceOnly(&ctx, q_total * @sizeOf(f32));
+    defer buf_dQ_gpu.deinit(ctx.device);
+    var buf_dK_gpu = try buffer.Buffer.initDeviceOnly(&ctx, kv_total * @sizeOf(f32));
+    defer buf_dK_gpu.deinit(ctx.device);
+
+    // ── Pipelines ─────────────────────────────────────────────────
+    var k_dattn = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dattn, 3, @sizeOf(runtime.AttnBackwardDattnPush));
+    defer k_dattn.deinit();
+    try k_dattn.bind(&.{ &buf_dout, &buf_V, &buf_dattn_gpu });
+
+    var k_dv = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dv, 3, @sizeOf(runtime.AttnBackwardDvPush));
+    defer k_dv.deinit();
+    try k_dv.bind(&.{ &buf_attn, &buf_dout, &buf_dV_gpu });
+
+    var k_dq = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dq, 3, @sizeOf(runtime.AttnBackwardDqPush));
+    defer k_dq.deinit();
+    try k_dq.bind(&.{ &buf_dscores, &buf_K, &buf_dQ_gpu });
+
+    var k_dk = try pipeline.Kernel.init(&ctx, &shaders.attn_backward_dk, 3, @sizeOf(runtime.AttnBackwardDkPush));
+    defer k_dk.deinit();
+    try k_dk.bind(&.{ &buf_dscores, &buf_Q, &buf_dK_gpu });
+
+    const push_dattn = runtime.AttnBackwardDattnPush{
+        .n_q = @intCast(n_q),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = @intCast(heads_per_kv),
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_kv),
+        .kv_stride = @intCast(n_kv_heads * head_dim),
+        .attn_stride = @intCast(n_kv),
+    };
+    const push_dv = runtime.AttnBackwardDvPush{
+        .n_q = @intCast(n_q),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = @intCast(heads_per_kv),
+        .n_kv_heads = @intCast(n_kv_heads),
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_kv),
+        .attn_stride = @intCast(n_kv),
+    };
+    const push_dq = runtime.AttnBackwardDqPush{
+        .n_q = @intCast(n_q),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = @intCast(heads_per_kv),
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_kv),
+        .kv_stride = @intCast(n_kv_heads * head_dim),
+        .scores_stride = @intCast(n_kv),
+        .inv_sqrt_dim = inv_sqrt_d,
+    };
+    const push_dk = runtime.AttnBackwardDkPush{
+        .n_q = @intCast(n_q),
+        .n_heads = @intCast(n_heads),
+        .heads_per_kv = @intCast(heads_per_kv),
+        .n_kv_heads = @intCast(n_kv_heads),
+        .head_dim = @intCast(head_dim),
+        .n_kv = @intCast(n_kv),
+        .scores_stride = @intCast(n_kv),
+        .inv_sqrt_dim = inv_sqrt_d,
+    };
+
+    try buffer.submitOneShot(&ctx, struct {
+        k_dattn: *const pipeline.Kernel,
+        k_dv: *const pipeline.Kernel,
+        k_dq: *const pipeline.Kernel,
+        k_dk: *const pipeline.Kernel,
+        p_dattn: *const runtime.AttnBackwardDattnPush,
+        p_dv: *const runtime.AttnBackwardDvPush,
+        p_dq: *const runtime.AttnBackwardDqPush,
+        p_dk: *const runtime.AttnBackwardDkPush,
+        n_q: u32,
+        n_kv: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            // d_attn[q, h, k]
+            s.k_dattn.dispatch(cmd, s.p_dattn, s.n_q * s.n_heads * s.n_kv, 1, 1);
+            // dV[k, kv_h, d]
+            s.k_dv.dispatch(cmd, s.p_dv, s.n_kv * s.n_kv_heads * s.head_dim, 1, 1);
+            // dQ[q, h, d]
+            s.k_dq.dispatch(cmd, s.p_dq, s.n_q * s.n_heads * s.head_dim, 1, 1);
+            // dK[k, kv_h, d]
+            s.k_dk.dispatch(cmd, s.p_dk, s.n_kv * s.n_kv_heads * s.head_dim, 1, 1);
+        }
+    }{
+        .k_dattn = &k_dattn,
+        .k_dv = &k_dv,
+        .k_dq = &k_dq,
+        .k_dk = &k_dk,
+        .p_dattn = &push_dattn,
+        .p_dv = &push_dv,
+        .p_dq = &push_dq,
+        .p_dk = &push_dk,
+        .n_q = @intCast(n_q),
+        .n_kv = @intCast(n_kv),
+        .n_heads = @intCast(n_heads),
+        .n_kv_heads = @intCast(n_kv_heads),
+        .head_dim = @intCast(head_dim),
+    });
+
+    const dattn_gpu = try allocator.alloc(f32, scores_total);
+    defer allocator.free(dattn_gpu);
+    const dV_gpu = try allocator.alloc(f32, kv_total);
+    defer allocator.free(dV_gpu);
+    const dQ_gpu = try allocator.alloc(f32, q_total);
+    defer allocator.free(dQ_gpu);
+    const dK_gpu = try allocator.alloc(f32, kv_total);
+    defer allocator.free(dK_gpu);
+    try buf_dattn_gpu.readBack(&ctx, f32, dattn_gpu);
+    try buf_dV_gpu.readBack(&ctx, f32, dV_gpu);
+    try buf_dQ_gpu.readBack(&ctx, f32, dQ_gpu);
+    try buf_dK_gpu.readBack(&ctx, f32, dK_gpu);
+
+    const tol: f32 = 1e-4;
+    const Pair = struct { name: []const u8, gpu: []const f32, cpu: []const f32 };
+    const pairs = [_]Pair{
+        .{ .name = "d_attn", .gpu = dattn_gpu, .cpu = d_attn_cpu },
+        .{ .name = "dV", .gpu = dV_gpu, .cpu = dV_cpu },
+        .{ .name = "dQ", .gpu = dQ_gpu, .cpu = dQ_cpu },
+        .{ .name = "dK", .gpu = dK_gpu, .cpu = dK_cpu },
+    };
+    var max_abs: f32 = 0;
+    for (pairs) |p| {
+        var p_max: f32 = 0;
+        for (p.gpu, p.cpu) |g, c| {
+            const d = @abs(g - c);
+            if (d > p_max) p_max = d;
+        }
+        if (p_max > tol) {
+            std.debug.print("attn_backward {s}: max |Δ| = {e}\n", .{ p.name, p_max });
+            return error.ParityFailed;
+        }
+        if (p_max > max_abs) max_abs = p_max;
+    }
+
+    std.debug.print(
+        "PASS GPU attention backward (n_q={d} n_kv={d} heads={d}/{d} d={d}; d_attn+dV+dQ+dK max |Δ| = {e})\n",
+        .{ n_q, n_kv, n_heads, n_kv_heads, head_dim, max_abs },
     );
 }
 
