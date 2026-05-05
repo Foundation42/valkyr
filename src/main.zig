@@ -19,6 +19,7 @@ const turboquant = @import("cpu/turboquant.zig");
 const q4_0 = @import("cpu/q4_0.zig");
 const q4_k = @import("cpu/q4_k.zig");
 const cpu_train = @import("cpu/train.zig");
+const cpu_train_transformer = @import("cpu/train_transformer.zig");
 const train_runner = @import("train/runner.zig");
 const train_runner_n = @import("train/runner_n.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -594,6 +595,7 @@ pub fn main() !void {
     try runQ4_KSmoke(allocator);
     try runTrainCpuSmoke(allocator);
     try runTrainCpuMultiLayerSmoke(allocator);
+    try runRmsNormBackwardCpuSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMlpForwardSmoke(allocator);
     try runGpuMlpBackwardSmoke(allocator);
@@ -1353,6 +1355,163 @@ fn runTrainCpuMultiLayerSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS train MLP CPU oracle (multi-layer): n=2 equivalent to Mlp; n=3 loss {d:.6} → {d:.6} over {d} SGD steps; numeric grad parity ≤ 1% across all 3 layers\n",
         .{ loss_initial, loss_final, n_steps },
+    );
+}
+
+// ── RMSNorm backward CPU oracle smoke ──────────────────────────────
+//
+// Tier-2 chunk 1 of the post-v0 training arc — first transformer
+// primitive backward. RMSNorm forward is a row-wise scaling by
+// `γ · rms_inv`; the backward involves a cross-row scalar reduction
+// that the analytic derivation has to nail exactly.
+//
+// Three claims, each verified to ≤ 1% rel-err vs central-difference
+// numeric gradient:
+//   - dL/dx in the plain case (gemma_quirk=false)
+//   - dL/dx with the gemma_quirk offset (γ = w + 1)
+//   - dL/dw — same formula in both cases since (w + 1) and w have
+//     identical derivatives w.r.t. w
+//
+// Probes one element from each gradient buffer; that's enough to
+// catch any sign/shape mistake in the chain rule. The whole-buffer
+// numeric grad is too noisy at fp32 to use as a parity oracle —
+// per-element probes with a moderate eps are the right shape.
+
+fn runRmsNormBackwardCpuSmoke(allocator: std.mem.Allocator) !void {
+    _ = allocator; // reserved for future heap fallbacks at larger dim
+    const dim: usize = 16;
+    const eps: f32 = 1e-6;
+
+    var x: [dim]f32 = undefined;
+    var w: [dim]f32 = undefined;
+    var dy: [dim]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xCAFE5EED);
+    const rng = prng.random();
+    for (&x) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 1.5;
+    for (&w) |*v| v.* = 0.5 + rng.float(f32) * 0.5;
+    for (&dy) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    var dx: [dim]f32 = undefined;
+    var dw: [dim]f32 = undefined;
+    var y_buf: [dim]f32 = undefined;
+    var probe_y: [dim]f32 = undefined;
+
+    // Cases: (gemma_quirk = false), (gemma_quirk = true).
+    const cases = [_]bool{ false, true };
+    var max_rel_err_overall: f32 = 0;
+    for (cases) |gq| {
+        // Analytic gradients.
+        @memset(&dw, 0);
+        cpu_train_transformer.rmsNormBackwardRow(&dy, &x, &w, eps, gq, &dx, &dw);
+
+        // Loss = Σ dy_i · y_i (so dL/dy_i = dy_i exactly).
+        // For numeric grad we re-evaluate the loss with x or w perturbed.
+        const eps_h: f32 = 1e-3;
+
+        // Probe several positions in dx and dw.
+        const probes_x = [_]usize{ 0, 3, 7, 12 };
+        const probes_w = [_]usize{ 1, 5, 9, 14 };
+
+        for (probes_x) |i| {
+            const orig = x[i];
+            x[i] = orig + eps_h;
+            _ = cpu_train_transformer.rmsNormForwardRow(&x, &w, eps, gq, &probe_y);
+            var l_plus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_plus += d * yi;
+            x[i] = orig - eps_h;
+            _ = cpu_train_transformer.rmsNormForwardRow(&x, &w, eps, gq, &probe_y);
+            var l_minus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_minus += d * yi;
+            x[i] = orig;
+
+            const numeric = (l_plus - l_minus) / (2.0 * eps_h);
+            const analytic = dx[i];
+            const denom = @max(@abs(numeric), @abs(analytic));
+            const rel_err = if (denom > 0) @abs(numeric - analytic) / denom else @abs(numeric - analytic);
+            if (rel_err > 1e-2) {
+                std.debug.print(
+                    "rmsnorm dx[{d}] (gq={}): analytic={d:.6} numeric={d:.6} rel_err={d:.4}\n",
+                    .{ i, gq, analytic, numeric, rel_err },
+                );
+                return error.ParityFailed;
+            }
+            if (rel_err > max_rel_err_overall) max_rel_err_overall = rel_err;
+        }
+
+        for (probes_w) |i| {
+            const orig = w[i];
+            w[i] = orig + eps_h;
+            _ = cpu_train_transformer.rmsNormForwardRow(&x, &w, eps, gq, &probe_y);
+            var l_plus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_plus += d * yi;
+            w[i] = orig - eps_h;
+            _ = cpu_train_transformer.rmsNormForwardRow(&x, &w, eps, gq, &probe_y);
+            var l_minus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_minus += d * yi;
+            w[i] = orig;
+
+            const numeric = (l_plus - l_minus) / (2.0 * eps_h);
+            const analytic = dw[i];
+            const denom = @max(@abs(numeric), @abs(analytic));
+            const rel_err = if (denom > 0) @abs(numeric - analytic) / denom else @abs(numeric - analytic);
+            if (rel_err > 1e-2) {
+                std.debug.print(
+                    "rmsnorm dw[{d}] (gq={}): analytic={d:.6} numeric={d:.6} rel_err={d:.4}\n",
+                    .{ i, gq, analytic, numeric, rel_err },
+                );
+                return error.ParityFailed;
+            }
+            if (rel_err > max_rel_err_overall) max_rel_err_overall = rel_err;
+        }
+    }
+
+    // Multi-row sanity: dw must accumulate across rows.
+    const n_rows: usize = 3;
+    var x_multi: [n_rows * dim]f32 = undefined;
+    var dy_multi: [n_rows * dim]f32 = undefined;
+    var dx_multi: [n_rows * dim]f32 = undefined;
+    var dw_multi: [dim]f32 = undefined;
+    for (&x_multi) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (&dy_multi) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    @memset(&dw_multi, 0);
+    cpu_train_transformer.rmsNormBackward(&dy_multi, &x_multi, &w, eps, false, n_rows, &dx_multi, &dw_multi);
+
+    // Compare against summing per-row backward calls explicitly.
+    var dw_ref: [dim]f32 = undefined;
+    @memset(&dw_ref, 0);
+    var dx_ref_row: [dim]f32 = undefined;
+    for (0..n_rows) |r| {
+        const off = r * dim;
+        cpu_train_transformer.rmsNormBackwardRow(
+            dy_multi[off .. off + dim],
+            x_multi[off .. off + dim],
+            &w,
+            eps,
+            false,
+            &dx_ref_row,
+            &dw_ref,
+        );
+        for (dx_multi[off .. off + dim], dx_ref_row) |a, b| {
+            if (a != b) {
+                std.debug.print("multi-row dx mismatch at row {d}\n", .{r});
+                return error.ParityFailed;
+            }
+        }
+    }
+    for (dw_multi, dw_ref) |a, b| {
+        if (a != b) {
+            std.debug.print("multi-row dw accumulation off\n", .{});
+            return error.ParityFailed;
+        }
+    }
+
+    // Suppress unused-variable warning for y_buf.
+    _ = &y_buf;
+
+    std.debug.print(
+        "PASS rmsnorm backward CPU oracle (numeric-grad parity ≤ {e} on dx + dw, gemma_quirk on/off; multi-row dw accum bit-exact)\n",
+        .{max_rel_err_overall},
     );
 }
 
