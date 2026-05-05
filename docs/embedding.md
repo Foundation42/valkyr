@@ -647,3 +647,294 @@ a host.
 
 If something here is wrong or unclear, the source is the source of
 truth — these files are short enough to read top-to-bottom.
+
+---
+
+# Embedding training
+
+Inference embedding (above) lets the host *consume* a frozen model.
+**Training embedding** lets the host *teach* one — adapt parameters
+in-frame from supervision the host produces (clicks, sensor data,
+target values from a controller, …). Same cooperative contract, same
+device sharing, same one-submit-per-frame discipline.
+
+The v0 training surface fits a 2-layer MLP with a configurable loss
+head. Tens of weights, learns a function in real time, runs at
+refresh rate alongside graphics. Larger architectures (multi-layer
+MLPs, transformer fine-tuning) are the natural next tiers built on
+the same primitive set.
+
+## When to use this surface
+
+- A character whose appearance/behaviour learns from runtime input
+  (the canonical "click to teach the agent" demo).
+- A small calibration model that fits a UV→colour, time→signal, or
+  state→action mapping per session.
+- A research vehicle for studying optimization dynamics — visible
+  Adam steps at 60 fps with a click as your gradient source.
+
+If the function is fixed and known offline, just train via PyTorch
+or any other host and load the weights into valkyr inference. The
+training surface earns its complexity when the supervision is
+*runtime*-produced.
+
+## Mental model
+
+```
+Frame N:
+  engine.beginFrame();
+  host.uploadTrainBatch(samples);                   // CPU memcpy, no submit
+  host.uploadPredictInputs(viz_grid);               // CPU memcpy, no submit
+  engine.recordRenderPass(cmd);                     // graphics
+  runner.tickFrameTrain(rec, .{ .steps = 2 }, n);   // train (gated by decay policy)
+  runner.tickPredictBatchRecord(rec, viz_grid_n);   // forward over the viz UVs
+  runner.recordPredictReadback(rec, viz_grid_n);    // → host-mapped staging
+  engine.submit(cmd);                               // single submit on one queue
+Frame N + 1:
+  runner.readPredictStaging(out);                   // CPU memcpy from mapped
+  // out[] holds frame N's predictions; drive materials, lights, …
+```
+
+Training records *into* the host's existing command buffer. The
+runner never submits on its own. Predictions come back through a
+host-mapped staging buffer with one frame of latency — invisible at
+60 fps and worth the trade vs the per-frame `vkQueueWaitIdle` a
+synchronous readback would force.
+
+## Public API
+
+The module is `valkyr_gpu.train`. Two namespaces inside:
+
+- `valkyr_gpu.train.cpu` — the CPU oracle (`Mlp`, `forward`,
+  `backward`, `sgdStep`, `mseLoss`, `mseLossGrad`, `Grads`,
+  `Activations`, `trainStep`). Not the host's hot path; useful for
+  parity tests and to seed the GPU runner with deterministic weights.
+
+- `valkyr_gpu.train.runner` — the per-frame surface. Hosts touch:
+
+```zig
+pub const Mlp2Config = struct {
+    dim_in: u32,
+    dim_hidden: u32,
+    dim_out: u32,
+    lr: f32,
+    init_scale: f32 = 0.3,
+    init_seed: u64 = 0xCAFE,
+    max_batch_size: u32 = 0,         // 0 disables batched surface
+    optimizer: OptimizerKind = .sgd, // sgd | adam
+    adam_beta1: f32 = 0.9,
+    adam_beta2: f32 = 0.999,
+    adam_eps: f32 = 1e-8,
+    loss: LossKind = .mse,           // mse | cross_entropy
+    decay: LossDecay = .none,        // .none | .loss_target { target }
+};
+
+pub const TrainBudget = union(enum) {
+    steps: u32,
+    microseconds: u64,
+    either: struct { steps: u32, microseconds: u64 },
+};
+
+pub const TrainTickResult = struct {
+    steps_completed: u32,
+    elapsed_us: u64,
+    last_loss: ?f32 = null,    // populated when decay != .none
+    idle: bool = false,         // true when decay gated training off
+};
+
+pub const TrainingRunner = struct {
+    pub fn init(allocator, ctx: *const vk.Context, cfg: Mlp2Config) !TrainingRunner;
+    pub fn deinit(self: *TrainingRunner) void;
+
+    // ── CPU staging (HOST_VISIBLE memcpy, no submit) ──
+    pub fn uploadTrainBatch(self, x_batch, target_batch) !void;
+    pub fn uploadPredictInputs(self, x_batch) !void;
+
+    // ── Cooperative attach (record into host's cmd buffer) ──
+    pub fn tickFrameTrain(self, rec, budget, n_samples) !TrainTickResult;
+    pub fn tickPredictBatchRecord(self, rec, n_samples) !void;
+    pub fn recordPredictReadback(self, rec, n_samples) !void;
+
+    // ── Read back results (after host's frame fence signals) ──
+    pub fn readPredictStaging(self, out_y) !void;
+    pub fn getLastLoss(self) ?f32;
+
+    // ── Standalone mode (own submit + waitIdle) ──
+    // For headless tests / scripts, not the per-frame path.
+    pub fn tickStep(self, x, target, out_pred) !void;
+    pub fn tickPredict(self, x, out_pred) !void;
+    pub fn tickPredictBatch(self, x_batch, out_y) !void;
+    pub fn tickStepBatch(self, x_batch, target_batch) !void;
+};
+```
+
+## A worked example: f(uv) → rgb in real time
+
+End-to-end shape of a host that learns a UV-conditioned colour field
+from clicks (the matryoshka `train_mlp_demo` does exactly this). The
+host owns: the device + queue, the per-frame command buffer, the
+input event loop, a CPU-side replay buffer of clicks. valkyr owns:
+the parameter buffers, the activation scratch, the optimizer state,
+the predict staging.
+
+```zig
+// At scene build.
+var ctx = vkr.vk.Context.attach(host.instance, host.physical_device,
+    host.device, host.queue, host.queue_family, host.cmd_pool);
+
+var runner = try vkr.train.runner.TrainingRunner.init(allocator, &ctx, .{
+    .dim_in = 5, .dim_hidden = 16, .dim_out = 3,
+    .lr = 5e-3,
+    .max_batch_size = @max(N_TILES, REPLAY_CAP),
+    .optimizer = .adam,
+    .loss = .mse,
+    .decay = .{ .loss_target = .{ .target = 0.005 } },
+});
+defer runner.deinit();
+
+// Pre-built static UV-grid input (display path); never changes.
+const x_predict_grid: []f32 = ...;  // [N_TILES, dim_in]
+
+// Per frame, in update() — runs after the host's frame fence has
+// signalled, so reading staging from the previous frame is safe.
+// (Renderer's swapchain acquire is the natural sync point.)
+fn update(host: *Host, input: Input) void {
+    // Drain previous frame's predictions into materials.
+    var pred: [N_TILES * 3]f32 = undefined;
+    runner.readPredictStaging(&pred) catch return;
+    for (host.materials, 0..) |*mat, i|
+        mat.base_color = .{ pred[i*3], pred[i*3+1], pred[i*3+2], 1.0 };
+
+    // Optionally: surface getLastLoss() in a UI element.
+    if (runner.getLastLoss()) |l| host.ui.loss_bar = l;
+
+    // On click: append (uv, target_color) to the host's replay buffer.
+    if (input.left_click) {
+        const uv = host.raycastToGrid(input.cursor);
+        host.replay.append(.{ .uv = uv, .target = host.palette[host.active] });
+    }
+}
+
+// Per frame, in aiDispatch — runs inside the host's command-buffer
+// recording window. `cmd` is the host's already-began VkCommandBuffer.
+fn aiDispatch(host: *Host, cmd: VkCommandBuffer) !void {
+    // CPU staging — cheap memcpy into HOST_VISIBLE buffers.
+    if (host.replay.dirty()) {
+        const x_train = host.replay.featuriseInputs();   // [N, dim_in]
+        const targets = host.replay.targets();           // [N, dim_out]
+        try runner.uploadTrainBatch(x_train, targets);
+        host.replay.dirty = false;
+    }
+    try runner.uploadPredictInputs(x_predict_grid);
+
+    // Attach a recorder to the host's cmd buffer. Recorder.attachCmd
+    // is non-owning — host owns the submit + fence.
+    var rec = try vkr.recorder.Recorder.attachCmd(&ctx, cmd, 64, 256);
+    defer rec.deinit();
+    try rec.begin();
+
+    // 1. Train: budget gated by loss-target decay.
+    const result = try runner.tickFrameTrain(&rec,
+        .{ .steps = 2 }, @intCast(host.replay.len));
+    // result.idle = true when training was paused (loss ≤ target).
+    // Host can render that state if it wants (we do, via a bar).
+
+    // 2. Predict over the visualisation grid + stage for next frame.
+    try runner.tickPredictBatchRecord(&rec, N_TILES);
+    try runner.recordPredictReadback(&rec, N_TILES);
+
+    // Host calls vkEndCommandBuffer + vkQueueSubmit downstream.
+}
+```
+
+## Convergence-decay policy
+
+The most engine-friendly bit of the surface. When you set
+`cfg.decay = .{ .loss_target = .{ .target = X } }`, the runtime:
+
+1. Always records a tiny forward + scalar-loss-reduction + buffer
+   copy at the end of every `tickFrameTrain` call. Cost: ~1 µs of
+   recording + 3 GPU dispatches.
+2. Reads last frame's measured loss from a host-mapped staging
+   buffer at the start of the next `tickFrameTrain`.
+3. Skips the training dispatches entirely if measured loss ≤ target.
+4. Resumes automatically when fresh supervision pushes loss back
+   above target. The transition is one frame of latency.
+
+For an interactive demo this means **the GPU goes quiet when the
+function has settled**. No background SGD eating frame time on a
+solved problem. The host just sets a target and forgets — no
+host-side decay schedule, no frame-counter heuristic, no manual
+gating.
+
+Same shape applies to game characters that should "stop adapting
+when their behaviour matches the player's expectations" — set a
+target loss against a teacher signal, and they auto-throttle.
+
+## Standalone mode
+
+For headless tests and scripts that don't need cooperative submit
+cadence, the same `TrainingRunner` exposes synchronous variants:
+
+- `tickStep(x, target, out_pred?)` — single-sample step, owns
+  submit + waitIdle.
+- `tickPredict(x, out_pred)` — single-sample forward.
+- `tickPredictBatch(x_batch, out_y)` — batched forward; one submit.
+- `tickStepBatch(x_batch, target_batch)` — batched mean-gradient
+  step; one submit.
+
+These exist primarily so parity smokes can drive the runner without
+fixture command buffers. In a real-time host, prefer the cooperative
+attach methods above — they're the only ones that scale to multiple
+training characters in one frame on one queue.
+
+## CLI demo
+
+```
+valkyr --train-demo [--steps N] [--hidden H] [--lr L] [--print-every K]
+```
+
+Headless convergence demo that doesn't load a model — streams a
+time-dependent (input, target) signal through `tickStep` and prints
+a loss curve. Useful for verifying the training pipeline works on
+fresh hardware without any external assets. ~1.4 ms/step on RTX
+3090 in Debug build, ~730 steps/s.
+
+## Visual demos
+
+Two playable matryoshka games sit on top of this surface:
+
+- `matryoshka train_mlp_demo` — UV → RGB regression. Click on the
+  16×16 tile grid to teach a continuous colour field. The MLP
+  interpolates smoothly between supervision points; the convergence
+  bar in front of the grid tracks the optimization state.
+- `matryoshka train_classifier_demo` — same scene, same click
+  mechanics, but the loss head is cross-entropy and the display is
+  argmax. Watch sharp Voronoi class boundaries form between
+  supervision regions.
+
+Both run at locked refresh rate with cooperative attach + Adam +
+loss-target decay. The category-level shape difference (smooth
+gradient vs sharp partition) comes from one config switch:
+`cfg.loss = .mse` vs `.cross_entropy`. Same training pipeline.
+
+## Files
+
+- `src/cpu/train.zig` — CPU oracle (`Mlp`, `forward`, `backward`,
+  `Grads`, `Activations`, `mseLoss`, `mseLossGrad`, `sgdStep`,
+  `trainStep`).
+- `src/train/runner.zig` — `TrainingRunner`, `Mlp2Config`,
+  `OptimizerKind`, `LossKind`, `LossDecay`, `TrainBudget`,
+  `TrainTickResult`. Cooperative attach + standalone surfaces.
+- `shaders/mlp2_*.comp` — batched forward, dy, dh_pre, dW accum,
+  db accum.
+- `shaders/sgd_step.comp`, `shaders/adam_step.comp` — optimizer
+  step kernels.
+- `shaders/softmax_ce_loss_grad_batched.comp` — fused stable
+  softmax + CE loss-grad.
+- `shaders/mlp2_{mse,ce}_loss_batched.comp` — scalar loss reductions
+  for the decay policy.
+
+Every shader has a CPU oracle counterpart in `src/cpu/train.zig` or
+inlined in the relevant smoke; the default `valkyr` run sweeps them
+all.
