@@ -417,6 +417,70 @@ pub fn softmaxBackward(
     }
 }
 
+// ── RoPE backward ──────────────────────────────────────────────────
+//
+// Forward applies a 2D rotation by +θ to each (j, j+R/2) pair within
+// the first `rotary_dim = R` channels of every head:
+//     out_j         = aⱼ · cos − bⱼ · sin
+//     out_{j+R/2}   = aⱼ · sin + bⱼ · cos
+// where (aⱼ, bⱼ) = (in_j, in_{j+R/2}). The Jacobian is the rotation
+// matrix [[c, −s], [s, c]]; backward is its transpose, i.e. rotation
+// by −θ:
+//     d_in_j        = cos · d_out_j     + sin · d_out_{j+R/2}
+//     d_in_{j+R/2}  = −sin · d_out_j    + cos · d_out_{j+R/2}
+//
+// Pass-through tail (channels i ≥ rotary_dim) is identity in forward,
+// so backward is also identity: d_in_i = d_out_i.
+//
+// No parameters — RoPE has no learnable weights.
+
+pub fn ropeBackwardPartial(
+    d_in: []f32,
+    d_out: []const f32,
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    theta_base: f32,
+) !void {
+    const total = n_heads * head_dim;
+    if (d_in.len != total or d_out.len != total) return error.LengthMismatch;
+    if (rotary_dim > head_dim) return error.RotaryDimTooLarge;
+    if (rotary_dim % 2 != 0) return error.OddRotaryDim;
+    const half = rotary_dim / 2;
+
+    const pos_f: f32 = @floatFromInt(pos);
+    const rdim_f: f32 = @floatFromInt(rotary_dim);
+
+    for (0..n_heads) |h| {
+        const off = h * head_dim;
+        for (0..half) |j| {
+            const freq = 1.0 / std.math.pow(f32, theta_base, (2.0 * @as(f32, @floatFromInt(j))) / rdim_f);
+            const angle = pos_f * freq;
+            const cos_a = @cos(angle);
+            const sin_a = @sin(angle);
+            const da = d_out[off + j];
+            const db = d_out[off + j + half];
+            d_in[off + j] = cos_a * da + sin_a * db;
+            d_in[off + j + half] = -sin_a * da + cos_a * db;
+        }
+        if (rotary_dim < head_dim) {
+            for (rotary_dim..head_dim) |i| d_in[off + i] = d_out[off + i];
+        }
+    }
+}
+
+pub fn ropeBackward(
+    d_in: []f32,
+    d_out: []const f32,
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    theta_base: f32,
+) !void {
+    return ropeBackwardPartial(d_in, d_out, n_heads, head_dim, head_dim, pos, theta_base);
+}
+
 // ── Scaled-dot-product attention forward + backward ────────────────
 //
 // Generic shape covers both training-style multi-query and decode-style

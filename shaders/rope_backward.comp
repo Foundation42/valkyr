@@ -1,0 +1,61 @@
+#version 460
+// RoPE backward — transpose of the forward Jacobian.
+//
+// Forward (rope_partial.comp) rotates pair (j, j + R/2) by +θ; the
+// Jacobian is [[c, −s], [s, c]] and its transpose is [[c, s], [−s, c]],
+// i.e. rotation by −θ:
+//
+//     d_in_j         = cos · d_out_j         + sin · d_out_{j+R/2}
+//     d_in_{j+R/2}   = −sin · d_out_j        + cos · d_out_{j+R/2}
+//
+// Pass-through tail (i ≥ rotary_dim) is identity in forward → identity
+// in backward.
+//
+// Same dispatch shape as the forward kernel: one thread per (head,
+// dim) cell. Setting rotary_dim = head_dim collapses to full-RoPE
+// backward.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dout { float d_out[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Din  { float d_in[];  };
+
+layout(push_constant) uniform Pc {
+    uint n_heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint pos;
+    float theta_base;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint total = pc.n_heads * pc.head_dim;
+    if (g >= total) return;
+
+    uint i = g % pc.head_dim;
+
+    if (i >= pc.rotary_dim) {
+        d_in[g] = d_out[g];
+        return;
+    }
+
+    uint half_r = pc.rotary_dim / 2;
+    uint freq_idx = (i < half_r) ? i : (i - half_r);
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
+    float angle = float(pc.pos) * freq;
+    float c_a = cos(angle);
+    float s_a = sin(angle);
+
+    if (i < half_r) {
+        // d_in_j = c · d_out_j + s · d_out_{j + half_r}
+        float da = d_out[g];
+        float db = d_out[g + half_r];
+        d_in[g] = c_a * da + s_a * db;
+    } else {
+        // d_in_{j + half_r} = −s · d_out_j + c · d_out_{j + half_r}
+        float da = d_out[g - half_r];
+        float db = d_out[g];
+        d_in[g] = -s_a * da + c_a * db;
+    }
+}

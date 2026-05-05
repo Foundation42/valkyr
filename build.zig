@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     const attn_backward_dv_spv = compileShader(b, "attn_backward_dv");
     const attn_backward_dq_spv = compileShader(b, "attn_backward_dq");
     const attn_backward_dk_spv = compileShader(b, "attn_backward_dk");
+    const rope_backward_spv = compileShader(b, "rope_backward");
     const geglu_spv = compileShader(b, "geglu");
     const swiglu_spv = compileShader(b, "swiglu");
     const rope_spv = compileShader(b, "rope");
@@ -96,6 +97,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(attn_backward_dv_spv, "attn_backward_dv.spv");
     _ = wf.addCopyFile(attn_backward_dq_spv, "attn_backward_dq.spv");
     _ = wf.addCopyFile(attn_backward_dk_spv, "attn_backward_dk.spv");
+    _ = wf.addCopyFile(rope_backward_spv, "rope_backward.spv");
     _ = wf.addCopyFile(geglu_spv, "geglu.spv");
     _ = wf.addCopyFile(swiglu_spv, "swiglu.spv");
     _ = wf.addCopyFile(rope_spv, "rope.spv");
@@ -162,6 +164,7 @@ pub fn build(b: *std.Build) void {
         \\pub const attn_backward_dv align(4) = @embedFile("attn_backward_dv.spv").*;
         \\pub const attn_backward_dq align(4) = @embedFile("attn_backward_dq.spv").*;
         \\pub const attn_backward_dk align(4) = @embedFile("attn_backward_dk.spv").*;
+        \\pub const rope_backward align(4) = @embedFile("rope_backward.spv").*;
         \\pub const geglu align(4) = @embedFile("geglu.spv").*;
         \\pub const swiglu align(4) = @embedFile("swiglu.spv").*;
         \\pub const rope align(4) = @embedFile("rope.spv").*;

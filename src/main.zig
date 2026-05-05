@@ -627,6 +627,7 @@ pub fn main() !void {
     try runSoftmaxBackwardSmoke(allocator);
     try runAttentionBackwardCpuSmoke(allocator);
     try runGpuAttentionBackwardSmoke(allocator);
+    try runRopeBackwardSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -5708,6 +5709,135 @@ fn runGpuAttentionBackwardSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU attention backward (n_q={d} n_kv={d} heads={d}/{d} d={d}; d_attn+dV+dQ+dK max |Δ| = {e})\n",
         .{ n_q, n_kv, n_heads, n_kv_heads, head_dim, max_abs },
+    );
+}
+
+// ── RoPE backward smoke: CPU oracle (round-trip + numeric) + GPU parity ─
+
+fn runRopeBackwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_heads: usize = 8;
+    const head_dim: usize = 64;
+    const rotary_dim: usize = 16; // partial — exercise the pass-through tail
+    const pos: usize = 17;
+    const theta_base: f32 = 10000.0;
+    const total = n_heads * head_dim;
+
+    const x = try allocator.alloc(f32, total);
+    defer allocator.free(x);
+    const d_out = try allocator.alloc(f32, total);
+    defer allocator.free(d_out);
+    const d_in_cpu = try allocator.alloc(f32, total);
+    defer allocator.free(d_in_cpu);
+
+    var prng = std.Random.DefaultPrng.init(0x70BE_BAC1);
+    const rng = prng.random();
+    for (x) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (d_out) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    try cpu_train_transformer.ropeBackwardPartial(d_in_cpu, d_out, n_heads, head_dim, rotary_dim, pos, theta_base);
+
+    // ── (1) Round-trip parity: backward(forward(x)) == x for any x.
+    // Rotation by +θ then -θ is identity → ropeBackwardPartial(rope(x)) == x.
+    {
+        const fwd = try allocator.alloc(f32, total);
+        defer allocator.free(fwd);
+        const rt = try allocator.alloc(f32, total);
+        defer allocator.free(rt);
+        try cpu_math.applyRopePartial(fwd, x, n_heads, head_dim, rotary_dim, pos, theta_base);
+        try cpu_train_transformer.ropeBackwardPartial(rt, fwd, n_heads, head_dim, rotary_dim, pos, theta_base);
+        var max_rt: f32 = 0;
+        for (x, rt) |a, b| {
+            const d = @abs(a - b);
+            if (d > max_rt) max_rt = d;
+        }
+        if (max_rt > 1e-5) {
+            std.debug.print("rope backward round-trip max |Δ| = {e}\n", .{max_rt});
+            return error.ParityFailed;
+        }
+    }
+
+    // ── (2) Numeric-grad on L = Σ d_out · forward(x).
+    {
+        const eps_h: f32 = 1e-3;
+        const probes = [_]usize{ 0, 5, 8, 21, 47, 63, 100, 255 };
+        const fwd = try allocator.alloc(f32, total);
+        defer allocator.free(fwd);
+
+        var max_rel: f32 = 0;
+        for (probes) |i| {
+            const orig = x[i];
+            x[i] = orig + eps_h;
+            try cpu_math.applyRopePartial(fwd, x, n_heads, head_dim, rotary_dim, pos, theta_base);
+            var Lp: f64 = 0;
+            for (fwd, d_out) |f, d| Lp += @as(f64, f) * @as(f64, d);
+            x[i] = orig - eps_h;
+            try cpu_math.applyRopePartial(fwd, x, n_heads, head_dim, rotary_dim, pos, theta_base);
+            var Lm: f64 = 0;
+            for (fwd, d_out) |f, d| Lm += @as(f64, f) * @as(f64, d);
+            x[i] = orig;
+            const numeric: f32 = @floatCast((Lp - Lm) / (2.0 * @as(f64, eps_h)));
+            const analytic = d_in_cpu[i];
+            const denom = @max(@abs(numeric), @abs(analytic));
+            if (denom < 1e-6) continue;
+            const rel = @abs(numeric - analytic) / denom;
+            if (rel > 1e-2) {
+                std.debug.print("rope d_in[{d}] analytic={d:.6} numeric={d:.6} rel_err={d:.4}\n", .{ i, analytic, numeric, rel });
+                return error.ParityFailed;
+            }
+            if (rel > max_rel) max_rel = rel;
+        }
+    }
+
+    // ── (3) GPU parity ─────────────────────────────────────────────
+    var buf_dout = try buffer.Buffer.initStatic(&ctx, f32, d_out);
+    defer buf_dout.deinit(ctx.device);
+    var buf_din = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
+    defer buf_din.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope_backward, 2, @sizeOf(runtime.RopePartialPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_dout, &buf_din });
+
+    const push = runtime.RopePartialPush{
+        .n_heads = @intCast(n_heads),
+        .head_dim = @intCast(head_dim),
+        .rotary_dim = @intCast(rotary_dim),
+        .pos = @intCast(pos),
+        .theta_base = theta_base,
+    };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.RopePartialPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{
+        .kern = &kern,
+        .push = &push,
+        .groups = @intCast((total + 255) / 256),
+    });
+
+    const d_in_gpu = try allocator.alloc(f32, total);
+    defer allocator.free(d_in_gpu);
+    try buf_din.readBack(&ctx, f32, d_in_gpu);
+
+    var max_abs: f32 = 0;
+    for (d_in_gpu, d_in_cpu) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_abs) max_abs = d;
+    }
+    if (max_abs > 1e-5) {
+        std.debug.print("rope_backward GPU max |Δ| = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS RoPE backward (n_heads={d} head_dim={d} rotary_dim={d}; round-trip OK, numeric-grad ≤ 1%, GPU max |Δ| = {e})\n",
+        .{ n_heads, head_dim, rotary_dim, max_abs },
     );
 }
 
