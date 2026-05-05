@@ -247,6 +247,37 @@ pub fn main() !void {
         try runTrainDemo(allocator, steps, hidden, lr, print_every);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--train-demo-n")) {
+        // Multi-layer headless training demo. Same task and CLI shape as
+        // --train-demo but driven by MlpNRunner with `--layers d0,d1,...`.
+        // Default: 4,16,12,4 (n=3).
+        //   --train-demo-n [--steps N] [--layers a,b,...] [--lr L] [--print-every K]
+        var steps: u32 = 1200;
+        var layers_csv: []const u8 = "4,16,12,4";
+        var lr: f32 = 0.05;
+        var print_every: u32 = 100;
+        var i: usize = 2;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--steps") and i + 1 < args.len) {
+                steps = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--layers") and i + 1 < args.len) {
+                layers_csv = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lr") and i + 1 < args.len) {
+                lr = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--print-every") and i + 1 < args.len) {
+                print_every = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        try runTrainDemoN(allocator, steps, layers_csv, lr, print_every);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--bench")) {
         var n: usize = 64;
         var i: usize = 3;
@@ -3644,6 +3675,101 @@ fn runTrainDemo(allocator: std.mem.Allocator, steps: u32, hidden: u32, lr: f32, 
     // signal is intentionally smooth (so SGD on a single-sample stream
     // sees a moving but locally-flat target) but non-trivial (the
     // network must combine all 4 inputs to predict the 3rd component).
+    const dt: f32 = 0.05;
+    var pred: [4]f32 = undefined;
+    var target: [4]f32 = undefined;
+    var input: [4]f32 = undefined;
+
+    var step: u32 = 0;
+    var ema_loss: f32 = 0;
+    const ema_alpha: f32 = 0.05;
+    const t_start = std.time.nanoTimestamp();
+
+    while (step < steps) : (step += 1) {
+        const t = @as(f32, @floatFromInt(step)) * dt;
+        input[0] = @sin(t);
+        input[1] = @cos(t);
+        input[2] = @sin(2 * t);
+        input[3] = @cos(2 * t);
+        target[0] = 0.5 + 0.5 * @sin(t);
+        target[1] = 0.5 + 0.5 * @cos(t);
+        target[2] = 0.5 + 0.333 * @sin(3 * t);
+        target[3] = 0.0;
+
+        try runner.tickStep(&input, &target, &pred);
+        const loss = cpu_train.mseLoss(&pred, &target);
+        ema_loss = if (step == 0) loss else ema_alpha * loss + (1 - ema_alpha) * ema_loss;
+
+        if ((step + 1) % print_every == 0 or step == 0) {
+            std.debug.print(
+                "  step {d:>5}  loss={d:.6}  ema={d:.6}  pred=({d:.3},{d:.3},{d:.3},{d:.3})\n",
+                .{ step + 1, loss, ema_loss, pred[0], pred[1], pred[2], pred[3] },
+            );
+        }
+    }
+    const t_end = std.time.nanoTimestamp();
+    const elapsed_us = @divTrunc(t_end - t_start, 1000);
+    const us_per_step = @divTrunc(elapsed_us, @as(i128, steps));
+    std.debug.print(
+        "done: {d} steps in {d} µs ({d} µs/step, {d:.0} steps/s)\n",
+        .{ steps, elapsed_us, us_per_step, 1.0e6 / @as(f64, @floatFromInt(us_per_step)) },
+    );
+}
+
+// ── --train-demo-n: headless multi-layer training demo ──────────────
+//
+// Mirrors `--train-demo` but routed through MlpNRunner with a
+// `--layers a,b,c,d` CSV controlling depth. End-user-facing reach
+// for the multi-layer surface introduced in chunk 3a of the post-v0
+// training arc. Same streaming (input, target) signal and same
+// per-step loss / EMA print pattern as the 2-layer version, so the
+// loss curves are visually comparable across depths.
+
+fn runTrainDemoN(
+    allocator: std.mem.Allocator,
+    steps: u32,
+    layers_csv: []const u8,
+    lr: f32,
+    print_every: u32,
+) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Parse `layers_csv` into a u32 slice. Errors on empty / invalid
+    // entries; first entry must be 4 and last must be 4 to match the
+    // input/target signal shape below.
+    var dims = std.ArrayList(u32).init(allocator);
+    defer dims.deinit();
+    var it = std.mem.splitScalar(u8, layers_csv, ',');
+    while (it.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t");
+        if (trimmed.len == 0) continue;
+        try dims.append(try std.fmt.parseInt(u32, trimmed, 10));
+    }
+    if (dims.items.len < 2) {
+        std.debug.print("--train-demo-n: --layers needs at least 2 dims, got '{s}'\n", .{layers_csv});
+        return error.InvalidArgs;
+    }
+    if (dims.items[0] != 4 or dims.items[dims.items.len - 1] != 4) {
+        std.debug.print("--train-demo-n: signal is fixed at dim_in=4 and dim_out=4; got [{d}, ..., {d}]\n", .{ dims.items[0], dims.items[dims.items.len - 1] });
+        return error.InvalidArgs;
+    }
+
+    const cfg = train_runner_n.MlpNConfig{
+        .layer_dims = dims.items,
+        .lr = lr,
+        .init_seed = 0xDEDEDED1,
+    };
+    var runner = try train_runner_n.MlpNRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    std.debug.print("valkyr --train-demo-n on {s}\n  cfg: layers", .{ctx.deviceName()});
+    for (dims.items, 0..) |d, idx| {
+        std.debug.print("{s}{d}", .{ if (idx == 0) " " else "→", d });
+    }
+    std.debug.print(", lr={d}, steps={d}\n", .{ lr, steps });
+    std.debug.print("  task: regress (sin t, cos t, sin 2t, cos 2t) → (½+½ sin t, ½+½ cos t, ½ + ⅓ sin 3t, 0)\n", .{});
+
     const dt: f32 = 0.05;
     var pred: [4]f32 = undefined;
     var target: [4]f32 = undefined;
