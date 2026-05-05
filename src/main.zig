@@ -529,6 +529,7 @@ pub fn main() !void {
     try runQ4_KSmoke(allocator);
     try runTrainCpuSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
+    try runGpuMlpForwardSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -1117,6 +1118,145 @@ fn runTrainCpuSmoke(allocator: std.mem.Allocator) !void {
         "PASS train MLP CPU oracle: loss {d:.6} → {d:.6} over {d} SGD steps; numeric grad parity ≤ 1%\n",
         .{ loss_initial, loss_final, n_steps },
     );
+}
+
+// ── tiny-MLP GPU forward smoke: matmul → bias → relu → matmul → bias ──
+//
+// Chunk 2 of training-v0. Composes existing kernels (matmul_nt,
+// add_in_place, plus the new relu.comp) into a 2-layer MLP forward
+// pass on the GPU and parity-checks against the CPU oracle in
+// `cpu_train.forward`. The MLP is built deterministically so the GPU
+// dispatch and the CPU reference both see bit-identical weights.
+//
+// Why compose existing matmuls instead of writing a fused mlp_forward
+// shader: chunk 2 is a parity proof, not a perf milestone. A fused
+// shader is a ~30-line port once the composition is verified, but the
+// composition exposes the building blocks the upcoming backward
+// shaders also need (matmul, transposed matmul, relu).
+
+const ReluPush = runtime.ReluPush;
+
+fn runGpuMlpForwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim_in: usize = 4;
+    const dim_h: usize = 8;
+    const dim_out: usize = 4;
+
+    // Same construction as the CPU smoke: deterministic weights so we
+    // can run forward both places and diff. Different seed than chunk 1
+    // — exercising the same shape on a fresh init catches any "smoke
+    // happened to pass on lucky weights" failure modes.
+    var mlp = try cpu_train.Mlp.init(allocator, dim_in, dim_h, dim_out, 0.3, 0xF0DDA1A);
+    defer mlp.deinit(allocator);
+    // Bias at zero from init() is too forgiving — set b1 and b2 to
+    // distinct nonzero values so a "bias never applied" bug surfaces.
+    for (mlp.b1, 0..) |*v, i| v.* = 0.1 - 0.05 * @as(f32, @floatFromInt(i));
+    for (mlp.b2, 0..) |*v, i| v.* = -0.2 + 0.07 * @as(f32, @floatFromInt(i));
+
+    const x = [_]f32{ 1.0, 0.5, -0.3, 0.2 };
+
+    // ── CPU oracle ─────────────────────────────────────────────────
+    var h_pre_cpu: [dim_h]f32 = undefined;
+    var h_cpu: [dim_h]f32 = undefined;
+    var y_cpu: [dim_out]f32 = undefined;
+    var act: cpu_train.Activations = .{
+        .x = &x,
+        .h_pre = &h_pre_cpu,
+        .h = &h_cpu,
+        .y = &y_cpu,
+    };
+    cpu_train.forward(&mlp, &act);
+
+    // ── GPU buffers ────────────────────────────────────────────────
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, &x);
+    defer buf_x.deinit(ctx.device);
+    var buf_w1 = try buffer.Buffer.initStatic(&ctx, f32, mlp.w1);
+    defer buf_w1.deinit(ctx.device);
+    var buf_b1 = try buffer.Buffer.initStatic(&ctx, f32, mlp.b1);
+    defer buf_b1.deinit(ctx.device);
+    var buf_w2 = try buffer.Buffer.initStatic(&ctx, f32, mlp.w2);
+    defer buf_w2.deinit(ctx.device);
+    var buf_b2 = try buffer.Buffer.initStatic(&ctx, f32, mlp.b2);
+    defer buf_b2.deinit(ctx.device);
+    var buf_h_pre = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_h_pre.deinit(ctx.device);
+    var buf_h = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_h.deinit(ctx.device);
+    var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * @sizeOf(f32));
+    defer buf_y.deinit(ctx.device);
+
+    // ── Pipelines ──────────────────────────────────────────────────
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    defer k_relu.deinit();
+
+    // ── Record + submit ────────────────────────────────────────────
+    // Treat x and h as 1×K row matrices so matmul_nt computes
+    // y_pre[1, N] = x[1, K] · W[N, K]ᵀ. That's exactly W·x for the
+    // row vector x, which is the layer formulation we want.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 16, 64);
+    defer rec.deinit();
+    try rec.begin();
+
+    const matmul1_push = MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
+    const matmul2_push = MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
+    const add1_push = runtime.AddInPlacePush{ .n = @intCast(dim_h) };
+    const add2_push = runtime.AddInPlacePush{ .n = @intCast(dim_out) };
+    const relu_push = ReluPush{ .n = @intCast(dim_h) };
+
+    // matmul_nt grid is (ceil(M/16), ceil(N/16)) — for M=1, N≤16 the
+    // whole work is one workgroup, which is correct (threads outside
+    // bound early-out).
+    try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+
+    try rec.endAndSubmit();
+
+    // ── Compare ───────────────────────────────────────────────────
+    var h_pre_gpu: [dim_h]f32 = undefined;
+    var h_gpu: [dim_h]f32 = undefined;
+    var y_gpu: [dim_out]f32 = undefined;
+    try buf_h_pre.readBack(&ctx, f32, &h_pre_gpu);
+    try buf_h.readBack(&ctx, f32, &h_gpu);
+    try buf_y.readBack(&ctx, f32, &y_gpu);
+
+    const tol: f32 = 1e-5;
+    const ParityCase = struct { name: []const u8, got: []const f32, want: []const f32 };
+    const cases = [_]ParityCase{
+        .{ .name = "h_pre", .got = &h_pre_gpu, .want = &h_pre_cpu },
+        .{ .name = "h", .got = &h_gpu, .want = &h_cpu },
+        .{ .name = "y", .got = &y_gpu, .want = &y_cpu },
+    };
+    var max_abs: f32 = 0;
+    for (cases) |cs| {
+        for (cs.got, cs.want, 0..) |g, w, i| {
+            const d = @abs(g - w);
+            if (d > tol) {
+                std.debug.print(
+                    "GPU MLP forward MISMATCH on {s}[{d}]: got {d:.7}, expected {d:.7}\n",
+                    .{ cs.name, i, g, w },
+                );
+                return error.ParityFailed;
+            }
+            if (d > max_abs) max_abs = d;
+        }
+    }
+    std.debug.print(
+        "PASS GPU MLP forward (4→8→4, matmul+bias+relu+matmul+bias, max |Δ| vs CPU = {e})\n",
+        .{max_abs},
+    );
+}
+
+fn ceilDiv(num: u32, den: u32) u32 {
+    return (num + den - 1) / den;
 }
 
 // ── gpu matmul_nt smoke: synthetic A·Bᵀ on the GPU vs CPU expected ──

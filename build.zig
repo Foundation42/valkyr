@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
     const tq4_unpack128_spv = compileShader(b, "tq4_unpack128");
     const tq4_pack_to_cache128_spv = compileShader(b, "tq4_pack_to_cache128");
     const attn_synth_spv = compileShader(b, "attn_synth");
+    const relu_spv = compileShader(b, "relu");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -95,6 +96,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(tq4_unpack128_spv, "tq4_unpack128.spv");
     _ = wf.addCopyFile(tq4_pack_to_cache128_spv, "tq4_pack_to_cache128.spv");
     _ = wf.addCopyFile(attn_synth_spv, "attn_synth.spv");
+    _ = wf.addCopyFile(relu_spv, "relu.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -136,6 +138,7 @@ pub fn build(b: *std.Build) void {
         \\pub const tq4_unpack128 align(4) = @embedFile("tq4_unpack128.spv").*;
         \\pub const tq4_pack_to_cache128 align(4) = @embedFile("tq4_pack_to_cache128.spv").*;
         \\pub const attn_synth align(4) = @embedFile("attn_synth.spv").*;
+        \\pub const relu align(4) = @embedFile("relu.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──

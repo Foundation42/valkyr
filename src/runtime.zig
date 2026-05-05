@@ -106,6 +106,8 @@ pub const AttnOutputPush = extern struct {
 
 pub const AddInPlacePush = extern struct { n: u32 };
 
+pub const ReluPush = extern struct { n: u32 };
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {
