@@ -566,6 +566,7 @@ pub fn main() !void {
     try runGpuMlpBackwardSmoke(allocator);
     try runGpuMlpTrainSmoke(allocator);
     try runTrainingRunnerSmoke(allocator);
+    try runTrainingRunnerAttachedSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -1891,6 +1892,117 @@ fn runTrainingRunnerSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner ({d} alternating steps; loss {d:.6} → {d:.6}, readWeights OK)\n",
         .{ n_steps, initial_loss, final_loss },
+    );
+}
+
+// ── TrainingRunner attach-mode smoke: host owns submit, valkyr records ─
+//
+// Chunk 7 (valkyr-side) of training-v0. Demonstrates the attach
+// surface that a host engine like Matryoshka uses: the host owns the
+// VkContext, the per-frame VkCommandBuffer, and the submit cadence;
+// valkyr's TrainingRunner records its forward + loss-grad + backward
+// + SGD into the host's command buffer via `tickStepRecord`. No
+// per-step submit from valkyr's side — the host bundles everything
+// into one render submit.
+//
+// The smoke runs 60 attached steps (a "second of frames at 60 fps"
+// cadence) and asserts loss converges. Visual click-to-red sphere
+// demo lives in the matryoshka repo on top of this surface.
+
+fn runTrainingRunnerAttachedSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 16,
+        .dim_out = 4,
+        .lr = 0.05,
+        .init_seed = 0xA77ACED,
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // ── Host-owned cmd buffer + fence (matryoshka-equivalent setup) ──
+    var cb_ai = std.mem.zeroes(vk.c.VkCommandBufferAllocateInfo);
+    cb_ai.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = ctx.cmd_pool;
+    cb_ai.level = vk.c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    var host_cmd: vk.c.VkCommandBuffer = null;
+    try vk.check(vk.c.vkAllocateCommandBuffers(ctx.device, &cb_ai, &host_cmd));
+    defer vk.c.vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &host_cmd);
+
+    var fci = std.mem.zeroes(vk.c.VkFenceCreateInfo);
+    fci.sType = vk.c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    var host_fence: vk.c.VkFence = null;
+    try vk.check(vk.c.vkCreateFence(ctx.device, &fci, null, &host_fence));
+    defer vk.c.vkDestroyFence(ctx.device, host_fence, null);
+
+    // Streaming target signal: same shape as the headless demo, just
+    // 60 frames worth.
+    const dt: f32 = 0.05;
+    var pred: [4]f32 = undefined;
+    var input: [4]f32 = undefined;
+    var target: [4]f32 = undefined;
+
+    // Initial loss for convergence check.
+    try runner.tickPredict(&[_]f32{ 1, 0, 0, 0 }, &pred);
+    const initial_loss = cpu_train.mseLoss(&pred, &[_]f32{ 0.5, 0.5, 0.5, 0 });
+
+    const n_frames: u32 = 60;
+    var f: u32 = 0;
+    while (f < n_frames) : (f += 1) {
+        const t = @as(f32, @floatFromInt(f)) * dt;
+        input[0] = @sin(t);
+        input[1] = @cos(t);
+        input[2] = @sin(2 * t);
+        input[3] = @cos(2 * t);
+        target[0] = 0.5 + 0.5 * @sin(t);
+        target[1] = 0.5 + 0.5 * @cos(t);
+        target[2] = 0.5;
+        target[3] = 0.0;
+
+        // Per-frame: reset + begin + attach + record + end + submit + wait.
+        try vk.check(vk.c.vkResetCommandBuffer(host_cmd, 0));
+        try vk.check(vk.c.vkResetFences(ctx.device, 1, &host_fence));
+
+        var bi = std.mem.zeroes(vk.c.VkCommandBufferBeginInfo);
+        bi.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = vk.c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try vk.check(vk.c.vkBeginCommandBuffer(host_cmd, &bi));
+
+        var rec = try gpu_recorder.Recorder.attachCmd(&ctx, host_cmd, 24, 96);
+        defer rec.deinit();
+        try rec.begin();
+
+        try runner.tickStepRecord(&rec, &input, &target);
+
+        try vk.check(vk.c.vkEndCommandBuffer(host_cmd));
+        var submit = std.mem.zeroes(vk.c.VkSubmitInfo);
+        submit.sType = vk.c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &host_cmd;
+        try vk.check(vk.c.vkQueueSubmit(ctx.queue, 1, &submit, host_fence));
+        const timeout_ns: u64 = 10 * 1_000_000_000;
+        try vk.check(vk.c.vkWaitForFences(ctx.device, 1, &host_fence, vk.c.VK_TRUE, timeout_ns));
+    }
+
+    // Final loss against the last frame's target.
+    try runner.tickPredict(&input, &pred);
+    const final_loss = cpu_train.mseLoss(&pred, &target);
+
+    if (!(final_loss < initial_loss * 0.5)) {
+        std.debug.print(
+            "TrainingRunner attached did not converge: loss[0] = {d:.6}, loss[{d}] = {d:.6}\n",
+            .{ initial_loss, n_frames, final_loss },
+        );
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS TrainingRunner attached ({d} host-submitted frames; loss {d:.6} → {d:.6}, valkyr-record + host-submit OK)\n",
+        .{ n_frames, initial_loss, final_loss },
     );
 }
 

@@ -267,6 +267,49 @@ pub const TrainingRunner = struct {
         try self.y.readBack(self.ctx, f32, out_pred);
     }
 
+    /// Attach-mode step: record forward + loss-grad + backward + SGD
+    /// into an existing host-owned Recorder, **without** submitting.
+    /// The host (e.g. matryoshka's render thread) owns the command
+    /// buffer and the submit cadence; this contributes a small block
+    /// of dispatches to the host's per-frame command buffer.
+    ///
+    /// Buffer.update on the dynamic x/target buffers is safe to call
+    /// here because those buffers are HOST_COHERENT; no extra barrier
+    /// needed — the next dispatch sees the bytes.
+    ///
+    /// No `out_pred` parameter: a readback inside attach mode would
+    /// need to block on the host's submit, breaking the cooperative
+    /// model. Hosts that want the prediction should bind `runner.y`
+    /// directly as an input SSBO to a downstream compute pass — keeps
+    /// the prediction GPU-resident, which is exactly the engine-
+    /// integration story.
+    pub fn tickStepRecord(
+        self: *TrainingRunner,
+        rec: *recorder_mod.Recorder,
+        x_in: []const f32,
+        target_in: []const f32,
+    ) !void {
+        if (x_in.len != self.cfg.dim_in) return error.XDimMismatch;
+        if (target_in.len != self.cfg.dim_out) return error.TargetDimMismatch;
+        self.x_buf.update(f32, x_in);
+        self.target_buf.update(f32, target_in);
+        try self.recordStep(rec);
+    }
+
+    /// Attach-mode forward-only counterpart to `tickStepRecord`.
+    /// Records just the forward pass into the host's recorder; weights
+    /// are not modified. Pair this with a downstream pass that binds
+    /// `runner.y` as input.
+    pub fn tickPredictRecord(
+        self: *TrainingRunner,
+        rec: *recorder_mod.Recorder,
+        x_in: []const f32,
+    ) !void {
+        if (x_in.len != self.cfg.dim_in) return error.XDimMismatch;
+        self.x_buf.update(f32, x_in);
+        try self.recordForward(rec);
+    }
+
     /// Read back current weights into a CPU-side `cpu_train.Mlp`. Slow
     /// (one staging round-trip per parameter); intended for inspection,
     /// checkpointing, parity tests — not the hot path. Caller must have
