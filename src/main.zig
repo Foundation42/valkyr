@@ -19,6 +19,7 @@ const turboquant = @import("cpu/turboquant.zig");
 const q4_0 = @import("cpu/q4_0.zig");
 const q4_k = @import("cpu/q4_k.zig");
 const cpu_train = @import("cpu/train.zig");
+const train_runner = @import("train/runner.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
@@ -532,6 +533,7 @@ pub fn main() !void {
     try runGpuMlpForwardSmoke(allocator);
     try runGpuMlpBackwardSmoke(allocator);
     try runGpuMlpTrainSmoke(allocator);
+    try runTrainingRunnerSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -1765,6 +1767,98 @@ fn runGpuMlpTrainSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU MLP train ({d} SGD steps; step-1 |Δ|={e}, after-{d} |Δ|={e}, all on-device)\n",
         .{ n_steps, max_step1, n_steps, max_traj },
+    );
+}
+
+// ── TrainingRunner smoke: persistent buffers, streamed inputs ───────
+//
+// Chunk 5 of training-v0. Exercises the public TrainingRunner API:
+// init() builds pipelines + buffers once, tickStep() streams a fresh
+// (input, target) per call and returns the prediction, tickPredict()
+// is forward-only. The smoke runs a small training schedule against
+// two distinct (x, target) pairs alternating each step (mimicking a
+// streaming task) and asserts loss converges; final readWeights()
+// shape-checks the buffers can be pulled back to a CPU `Mlp`.
+//
+// Single submit per tick: this is the same call shape the engine-
+// integration `aiTrain` hook will use, just with a Recorder.attachCmd
+// in chunk 7 instead of a standalone Recorder.
+
+fn runTrainingRunnerSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 8,
+        .dim_out = 4,
+        .lr = 0.05,
+        .init_seed = 0x70077077,
+    };
+
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // Two streaming (input, target) pairs — alternating per step.
+    // Single-pair convergence already covered in earlier smokes; here
+    // we want to see the runner handle a moving target without state
+    // smearing between calls.
+    const x_a = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const t_a = [_]f32{ 1.0, 0.2, 0.0, 0.0 };
+    const x_b = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
+    const t_b = [_]f32{ 0.0, 0.0, 0.7, 0.3 };
+
+    var pred: [4]f32 = undefined;
+
+    // Initial loss across both pairs.
+    try runner.tickPredict(&x_a, &pred);
+    var initial_loss = cpu_train.mseLoss(&pred, &t_a);
+    try runner.tickPredict(&x_b, &pred);
+    initial_loss += cpu_train.mseLoss(&pred, &t_b);
+
+    // Run a handful of steps alternating between the two pairs.
+    const n_steps: u32 = 200;
+    var s: u32 = 0;
+    while (s < n_steps) : (s += 1) {
+        if (s & 1 == 0) {
+            try runner.tickStep(&x_a, &t_a, &pred);
+        } else {
+            try runner.tickStep(&x_b, &t_b, &pred);
+        }
+    }
+
+    // Final loss across both pairs.
+    try runner.tickPredict(&x_a, &pred);
+    var final_loss = cpu_train.mseLoss(&pred, &t_a);
+    try runner.tickPredict(&x_b, &pred);
+    final_loss += cpu_train.mseLoss(&pred, &t_b);
+
+    if (!(final_loss < initial_loss * 0.1)) {
+        std.debug.print(
+            "TrainingRunner did not converge: loss[0] = {d:.6}, loss[{d}] = {d:.6}\n",
+            .{ initial_loss, n_steps, final_loss },
+        );
+        return error.ParityFailed;
+    }
+
+    // readWeights round-trip: build a CPU MLP of matching shape and
+    // pull weights back. Sanity check that dimensions agree and the
+    // staging path works.
+    var cpu_mirror = try cpu_train.Mlp.init(allocator, cfg.dim_in, cfg.dim_hidden, cfg.dim_out, 0.0, 0);
+    defer cpu_mirror.deinit(allocator);
+    try runner.readWeights(&cpu_mirror);
+    var nan_count: usize = 0;
+    for (cpu_mirror.w1) |v| if (std.math.isNan(v)) {
+        nan_count += 1;
+    };
+    if (nan_count != 0) {
+        std.debug.print("TrainingRunner readWeights returned NaNs in W1: {d}\n", .{nan_count});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS TrainingRunner ({d} alternating steps; loss {d:.6} → {d:.6}, readWeights OK)\n",
+        .{ n_steps, initial_loss, final_loss },
     );
 }
 
