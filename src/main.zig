@@ -20,6 +20,7 @@ const q4_0 = @import("cpu/q4_0.zig");
 const q4_k = @import("cpu/q4_k.zig");
 const cpu_train = @import("cpu/train.zig");
 const cpu_train_transformer = @import("cpu/train_transformer.zig");
+const cpu_train_decoder = @import("cpu/train_decoder.zig");
 const train_runner = @import("train/runner.zig");
 const train_runner_n = @import("train/runner_n.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -628,6 +629,7 @@ pub fn main() !void {
     try runAttentionBackwardCpuSmoke(allocator);
     try runGpuAttentionBackwardSmoke(allocator);
     try runRopeBackwardSmoke(allocator);
+    try runDecoderFineTuneCpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -5838,6 +5840,151 @@ fn runRopeBackwardSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS RoPE backward (n_heads={d} head_dim={d} rotary_dim={d}; round-trip OK, numeric-grad ≤ 1%, GPU max |Δ| = {e})\n",
         .{ n_heads, head_dim, rotary_dim, max_abs },
+    );
+}
+
+// ── End-to-end toy-decoder fine-tune smoke (Tier-2 chunk 8a) ────────
+//
+// Wires the chunk 1-7 backward primitives into a single decoder layer
+// and trains it with Adam against a synthetic target. The target is
+// the layer's *own initial output* with a small random perturbation,
+// so loss must reach near zero for any working backward chain — proves
+// gradients flow correctly through:
+//
+//   x → RMSNorm → Q/K/V projections → SDPA(causal) → o-proj → +residual
+//     → RMSNorm → FF1 → ReLU → FF2 → +residual → y
+//
+// If any single piece's gradient is wrong, loss plateaus or diverges.
+// 100 steps of Adam is plenty to drive a fresh-initialized layer onto
+// a single fixed (input, target) pair when the chain is correct.
+
+fn runDecoderFineTuneCpuSmoke(allocator: std.mem.Allocator) !void {
+    const cfg = cpu_train_decoder.Config{
+        .dim = 16,
+        .n_heads = 2,
+        .n_kv_heads = 2, // no GQA — exercise the simpler path here
+        .head_dim = 8,
+        .ff_dim = 32,
+        .n_pos = 4,
+        .rms_eps = 1e-5,
+        .causal = true,
+    };
+    const dim = cfg.dim;
+    const q_dim = cfg.n_heads * cfg.head_dim;
+    const kv_dim = cfg.n_kv_heads * cfg.head_dim;
+
+    // ── Initialize layer weights with small Gaussian-ish noise.
+    var prng = std.Random.DefaultPrng.init(0xDEC0_DE01);
+    const rng = prng.random();
+    const initScale: f32 = 0.1;
+
+    const w_n1 = try allocator.alloc(f32, dim);
+    defer allocator.free(w_n1);
+    const w_q = try allocator.alloc(f32, q_dim * dim);
+    defer allocator.free(w_q);
+    const w_k = try allocator.alloc(f32, kv_dim * dim);
+    defer allocator.free(w_k);
+    const w_v = try allocator.alloc(f32, kv_dim * dim);
+    defer allocator.free(w_v);
+    const w_o = try allocator.alloc(f32, dim * q_dim);
+    defer allocator.free(w_o);
+    const w_n2 = try allocator.alloc(f32, dim);
+    defer allocator.free(w_n2);
+    const w_ff1 = try allocator.alloc(f32, cfg.ff_dim * dim);
+    defer allocator.free(w_ff1);
+    const w_ff2 = try allocator.alloc(f32, dim * cfg.ff_dim);
+    defer allocator.free(w_ff2);
+
+    for (w_n1) |*v| v.* = 1.0; // RMSNorm gain init = 1
+    for (w_n2) |*v| v.* = 1.0;
+    for (w_q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_k) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_v) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_o) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_ff1) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+    for (w_ff2) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
+
+    var layer = cpu_train_decoder.Layer{
+        .cfg = cfg,
+        .w_n1 = w_n1,
+        .w_q = w_q,
+        .w_k = w_k,
+        .w_v = w_v,
+        .w_o = w_o,
+        .w_n2 = w_n2,
+        .w_ff1 = w_ff1,
+        .w_ff2 = w_ff2,
+    };
+
+    var acts = try cpu_train_decoder.allocActs(allocator, cfg);
+    defer cpu_train_decoder.freeActs(allocator, &acts);
+
+    // Random fixed input.
+    for (acts.x_in) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    // Run a forward pass with the fresh weights to capture y_init,
+    // then perturb to define the target. This guarantees the target
+    // is reachable in principle (it's a small step away from the
+    // initial output).
+    cpu_train_decoder.forward(&layer, &acts);
+    const target = try allocator.alloc(f32, cfg.n_pos * dim);
+    defer allocator.free(target);
+    for (target, acts.y) |*tv, yv| tv.* = yv + (rng.float(f32) * 2.0 - 1.0) * 0.5;
+
+    const initial_loss = cpu_train_decoder.mseLoss(acts.y, target);
+
+    // ── Allocate grads + Adam state.
+    var grads = cpu_train_decoder.Grads{
+        .dw_n1 = try allocator.alloc(f32, w_n1.len),
+        .dw_q = try allocator.alloc(f32, w_q.len),
+        .dw_k = try allocator.alloc(f32, w_k.len),
+        .dw_v = try allocator.alloc(f32, w_v.len),
+        .dw_o = try allocator.alloc(f32, w_o.len),
+        .dw_n2 = try allocator.alloc(f32, w_n2.len),
+        .dw_ff1 = try allocator.alloc(f32, w_ff1.len),
+        .dw_ff2 = try allocator.alloc(f32, w_ff2.len),
+    };
+    defer {
+        allocator.free(grads.dw_n1);
+        allocator.free(grads.dw_q);
+        allocator.free(grads.dw_k);
+        allocator.free(grads.dw_v);
+        allocator.free(grads.dw_o);
+        allocator.free(grads.dw_n2);
+        allocator.free(grads.dw_ff1);
+        allocator.free(grads.dw_ff2);
+    }
+
+    var adam = try cpu_train_decoder.AdamState.init(allocator, &layer, 1e-2);
+    defer adam.deinit(allocator);
+
+    // ── Train.
+    const n_steps: usize = 100;
+    var final_loss = initial_loss;
+    for (1..n_steps + 1) |_| {
+        cpu_train_decoder.forward(&layer, &acts);
+        final_loss = cpu_train_decoder.mseLoss(acts.y, target);
+        grads.zero();
+        try cpu_train_decoder.backward(allocator, &layer, &acts, target, &grads);
+        cpu_train_decoder.adamStep(&adam, &layer, &grads);
+    }
+
+    // Loss must drop by at least 100× over 100 Adam steps on a
+    // reachable target. If the gradient chain is broken, loss either
+    // plateaus or diverges. Adam's mid-descent momentum bumps don't
+    // matter — only the start-vs-end ratio does.
+    const ratio = final_loss / initial_loss;
+    if (ratio > 1e-2) {
+        std.debug.print(
+            "decoder fine-tune: initial_loss={d:.6} final_loss={d:.6} ratio={d:.4}\n",
+            .{ initial_loss, final_loss, ratio },
+        );
+        return error.LossDidNotDecrease;
+    }
+
+    std.debug.print(
+        "PASS decoder fine-tune CPU (dim={d} heads={d} ff_dim={d} n_pos={d}; loss {d:.6} → {d:.6} ({e:.2}× drop) over {d} Adam steps)\n",
+        .{ dim, cfg.n_heads, cfg.ff_dim, cfg.n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps },
     );
 }
 
