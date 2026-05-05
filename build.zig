@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
     const softmax_spv = compileShader(b, "softmax");
     const embed_lookup_spv = compileShader(b, "embed_lookup");
     const embed_lookup_bf16_spv = compileShader(b, "embed_lookup_bf16");
+    const embed_lookup_batched_spv = compileShader(b, "embed_lookup_batched");
     const add_in_place_spv = compileShader(b, "add_in_place");
     const attn_decode_single_spv = compileShader(b, "attn_decode_single");
     const attn_scores_spv = compileShader(b, "attn_scores");
@@ -118,6 +119,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(softmax_spv, "softmax.spv");
     _ = wf.addCopyFile(embed_lookup_spv, "embed_lookup.spv");
     _ = wf.addCopyFile(embed_lookup_bf16_spv, "embed_lookup_bf16.spv");
+    _ = wf.addCopyFile(embed_lookup_batched_spv, "embed_lookup_batched.spv");
     _ = wf.addCopyFile(add_in_place_spv, "add_in_place.spv");
     _ = wf.addCopyFile(attn_decode_single_spv, "attn_decode_single.spv");
     _ = wf.addCopyFile(attn_scores_spv, "attn_scores.spv");
@@ -190,6 +192,7 @@ pub fn build(b: *std.Build) void {
         \\pub const softmax align(4) = @embedFile("softmax.spv").*;
         \\pub const embed_lookup align(4) = @embedFile("embed_lookup.spv").*;
         \\pub const embed_lookup_bf16 align(4) = @embedFile("embed_lookup_bf16.spv").*;
+        \\pub const embed_lookup_batched align(4) = @embedFile("embed_lookup_batched.spv").*;
         \\pub const add_in_place align(4) = @embedFile("add_in_place.spv").*;
         \\pub const attn_decode_single align(4) = @embedFile("attn_decode_single.spv").*;
         \\pub const attn_scores align(4) = @embedFile("attn_scores.spv").*;

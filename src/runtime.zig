@@ -274,6 +274,15 @@ pub const EmbedLookupPush = extern struct {
     scale: f32,
 };
 
+/// Batched embedding lookup over n_pos token positions. Distinct from
+/// `EmbedLookupPush` (decode-style single-token); used by the
+/// transformer-training forward pass.
+pub const EmbedLookupBatchedPush = extern struct {
+    dim: u32,
+    n_pos: u32,
+    scale: f32,
+};
+
 pub const MatmulPush = extern struct { m: u32, n: u32, k: u32 };
 
 // ── ChatKernels: pre-built compute pipelines ──────────────────────

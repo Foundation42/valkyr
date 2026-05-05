@@ -1,0 +1,35 @@
+#version 460
+// Batched embedding lookup over n_pos token positions:
+//
+//     out[p, i] = embed[token_ids[p] * dim + i] * scale
+//
+// One flat thread per (p, i) cell — same shape pattern as the
+// existing per-element kernels (relu, vec_add, etc.). Distinct from
+// `embed_lookup.comp` (which is decode-style: a single token row
+// per dispatch). The training pipeline calls this once per forward
+// pass; for n_pos=4 dim=16 the dispatch is trivial, but the same
+// kernel scales unchanged when both grow.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Embed  { float embed[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer TIds   { uint  token_ids[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Out    { float outv[];   };
+
+layout(push_constant) uniform Pc {
+    uint  dim;
+    uint  n_pos;
+    float scale;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint total = pc.n_pos * pc.dim;
+    if (g >= total) return;
+
+    uint p = g / pc.dim;
+    uint i = g - p * pc.dim;
+    uint tok = token_ids[p];
+
+    outv[g] = embed[tok * pc.dim + i] * pc.scale;
+}
