@@ -561,6 +561,7 @@ pub fn main() !void {
     try runQ4_0Smoke(allocator);
     try runQ4_KSmoke(allocator);
     try runTrainCpuSmoke(allocator);
+    try runTrainCpuMultiLayerSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMlpForwardSmoke(allocator);
     try runGpuMlpBackwardSmoke(allocator);
@@ -1160,6 +1161,161 @@ fn runTrainCpuSmoke(allocator: std.mem.Allocator) !void {
 
     std.debug.print(
         "PASS train MLP CPU oracle: loss {d:.6} → {d:.6} over {d} SGD steps; numeric grad parity ≤ 1%\n",
+        .{ loss_initial, loss_final, n_steps },
+    );
+}
+
+// ── Multi-layer MLP CPU oracle smoke ──────────────────────────────
+//
+// Tier-1 of the post-v0 training arc: generalise the 2-layer Mlp to
+// any depth. This smoke exercises three things on `MlpN`:
+//
+//   1. n=2 numerical equivalence with `Mlp` — same dims, same seed →
+//      forward output bit-identical (to fp32 rounding noise). This is
+//      the strongest cross-check that the new code path doesn't drift
+//      from the proven 2-layer reference.
+//
+//   2. n=3 numeric-gradient parity — perturb a single weight in each
+//      of the three layers, diff the loss; the central-difference
+//      slope must agree with the analytic gradient to ≤ 1%. This
+//      proves the chain rule is right at depth.
+//
+//   3. n=3 convergence — 500 SGD steps must drop the loss by ≥ 100×
+//      on the same toy (x, target) pair the 2-layer test uses.
+
+fn runTrainCpuMultiLayerSmoke(allocator: std.mem.Allocator) !void {
+    // ── (1) n=2 equivalence with `Mlp` ────────────────────────────
+    {
+        const dim_in: usize = 4;
+        const dim_h: usize = 8;
+        const dim_out: usize = 4;
+        const seed: u64 = 0xC0FFEE;
+        const init_scale: f32 = 0.3;
+
+        var ref = try cpu_train.Mlp.init(allocator, dim_in, dim_h, dim_out, init_scale, seed);
+        defer ref.deinit(allocator);
+
+        var gen = try cpu_train.MlpN.init(allocator, &.{ dim_in, dim_h, dim_out }, init_scale, seed);
+        defer gen.deinit(allocator);
+
+        // Same RNG order: weights[0] should equal w1, weights[1] equal w2.
+        for (ref.w1, gen.weights[0]) |a, b| {
+            if (a != b) {
+                std.debug.print("MlpN W1 != Mlp W1\n", .{});
+                return error.ParityFailed;
+            }
+        }
+        for (ref.w2, gen.weights[1]) |a, b| {
+            if (a != b) {
+                std.debug.print("MlpN W2 != Mlp W2\n", .{});
+                return error.ParityFailed;
+            }
+        }
+
+        const x = [_]f32{ 1.0, 0.5, -0.3, 0.2 };
+
+        var ref_h_pre: [dim_h]f32 = undefined;
+        var ref_h: [dim_h]f32 = undefined;
+        var ref_y: [dim_out]f32 = undefined;
+        var ref_act: cpu_train.Activations = .{ .x = &x, .h_pre = &ref_h_pre, .h = &ref_h, .y = &ref_y };
+        cpu_train.forward(&ref, &ref_act);
+
+        var gen_act = try cpu_train.ActivationsN.init(allocator, &gen);
+        defer gen_act.deinit(allocator);
+        gen_act.x = &x;
+        cpu_train.forwardN(&gen, &gen_act);
+
+        for (ref_y, gen_act.y()) |a, b| {
+            if (a != b) {
+                std.debug.print("MlpN forward != Mlp forward (n=2)\n", .{});
+                return error.ParityFailed;
+            }
+        }
+    }
+
+    // ── (2)/(3) n=3 numeric grad + convergence ────────────────────
+    const dim_in: usize = 4;
+    const dim_h1: usize = 8;
+    const dim_h2: usize = 6;
+    const dim_out: usize = 4;
+    const layer_dims = [_]usize{ dim_in, dim_h1, dim_h2, dim_out };
+
+    var mlp = try cpu_train.MlpN.init(allocator, &layer_dims, 0.3, 0xCAFE2026);
+    defer mlp.deinit(allocator);
+
+    var grads = try cpu_train.GradsN.init(allocator, &mlp);
+    defer grads.deinit(allocator);
+
+    const x = [_]f32{ 1.0, 0.5, -0.3, 0.2 };
+    const target = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+
+    var act = try cpu_train.ActivationsN.init(allocator, &mlp);
+    defer act.deinit(allocator);
+    act.x = &x;
+
+    cpu_train.forwardN(&mlp, &act);
+    const loss_initial = cpu_train.mseLoss(act.y(), &target);
+
+    // Numeric-grad probe BEFORE training (so we measure analytic vs
+    // numeric on the un-trained network, where weights haven't drifted
+    // toward zero gradient).
+    var dL_dy: [dim_out]f32 = undefined;
+    cpu_train.mseLossGrad(&dL_dy, act.y(), &target);
+    try cpu_train.backwardN(allocator, &mlp, &act, &dL_dy, &grads);
+
+    const eps: f32 = 1e-3;
+    // One probe per layer: layer 0 hits W[0], layer 1 hits W[1] (and a bias),
+    // layer 2 hits W[2] (and a bias on the output).
+    const probes = [_]struct { name: []const u8, layer: usize, is_bias: bool, idx: usize }{
+        .{ .name = "W[0][3, 0]", .layer = 0, .is_bias = false, .idx = 3 * dim_in + 0 },
+        .{ .name = "W[1][2, 5]", .layer = 1, .is_bias = false, .idx = 2 * dim_h1 + 5 },
+        .{ .name = "W[2][1, 4]", .layer = 2, .is_bias = false, .idx = 1 * dim_h2 + 4 },
+        .{ .name = "b[1][3]", .layer = 1, .is_bias = true, .idx = 3 },
+        .{ .name = "b[2][2]", .layer = 2, .is_bias = true, .idx = 2 },
+    };
+    for (probes) |p| {
+        const buf = if (p.is_bias) mlp.biases[p.layer] else mlp.weights[p.layer];
+        const grad = if (p.is_bias) grads.db[p.layer] else grads.dw[p.layer];
+        const orig = buf[p.idx];
+
+        buf[p.idx] = orig + eps;
+        cpu_train.forwardN(&mlp, &act);
+        const loss_plus = cpu_train.mseLoss(act.y(), &target);
+        buf[p.idx] = orig - eps;
+        cpu_train.forwardN(&mlp, &act);
+        const loss_minus = cpu_train.mseLoss(act.y(), &target);
+        buf[p.idx] = orig;
+
+        const numeric = (loss_plus - loss_minus) / (2.0 * eps);
+        const analytic = grad[p.idx];
+        const denom = @max(@abs(numeric), @abs(analytic));
+        const rel_err = if (denom > 0) @abs(numeric - analytic) / denom else @abs(numeric - analytic);
+        if (rel_err > 1e-2) {
+            std.debug.print(
+                "MlpN grad mismatch on {s}: analytic = {d:.6}, numeric = {d:.6}, rel_err = {d:.4}\n",
+                .{ p.name, analytic, numeric, rel_err },
+            );
+            return error.ParityFailed;
+        }
+    }
+
+    // Convergence run.
+    const lr: f32 = 0.05;
+    const n_steps: u32 = 500;
+    var loss_final: f32 = 0;
+    for (0..n_steps) |_| {
+        loss_final = try cpu_train.trainStepN(allocator, &mlp, &act, &grads, &target, lr);
+    }
+    if (!(loss_final < loss_initial / 100.0)) {
+        std.debug.print(
+            "MlpN n=3 did not converge: loss[0] = {d:.6}, loss[{d}] = {d:.6}\n",
+            .{ loss_initial, n_steps, loss_final },
+        );
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS train MLP CPU oracle (multi-layer): n=2 equivalent to Mlp; n=3 loss {d:.6} → {d:.6} over {d} SGD steps; numeric grad parity ≤ 1% across all 3 layers\n",
         .{ loss_initial, loss_final, n_steps },
     );
 }

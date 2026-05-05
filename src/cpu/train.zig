@@ -297,3 +297,308 @@ pub fn trainStep(
     sgdStep(mlp, grads, lr);
     return loss;
 }
+
+// ── Multi-layer MLP (n ≥ 1) ───────────────────────────────────────
+//
+// `MlpN` generalises `Mlp` to any depth. Hidden layers use ReLU;
+// the output layer is raw (the loss head — MSE or softmax+CE — does
+// any final activation). The 2-layer case (`MlpN.layerDims = .{4,
+// 8, 4}`) is numerically equivalent to `Mlp(4, 8, 4)`; the difference
+// is the storage shape: `MlpN.weights[0]` corresponds to `Mlp.w1`,
+// `MlpN.weights[1]` to `Mlp.w2`, etc.
+//
+// Used as the CPU parity oracle for the upcoming multi-layer GPU
+// runner, same way `Mlp` underpins the 2-layer `TrainingRunner`.
+
+/// N-layer MLP. `layer_dims` has length n+1: [dim_in, h_1, …, h_{n-1},
+/// dim_out]. `weights[i]` is shape [layer_dims[i+1], layer_dims[i]],
+/// row-major. `biases[i]` is length layer_dims[i+1].
+pub const MlpN = struct {
+    layer_dims: []usize,
+    weights: [][]f32,
+    biases: [][]f32,
+
+    pub fn nLayers(self: *const MlpN) usize {
+        return self.weights.len;
+    }
+    pub fn dimIn(self: *const MlpN) usize {
+        return self.layer_dims[0];
+    }
+    pub fn dimOut(self: *const MlpN) usize {
+        return self.layer_dims[self.layer_dims.len - 1];
+    }
+
+    /// Initialise with weights drawn from U(-init_scale, +init_scale)
+    /// and biases zeroed. RNG advances layer-by-layer, weight-row-by-
+    /// row, so a 2-layer MlpN with the same seed and dims as a 2-layer
+    /// `Mlp` produces bit-identical W1 then W2.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        layer_dims: []const usize,
+        init_scale: f32,
+        seed: u64,
+    ) !MlpN {
+        std.debug.assert(layer_dims.len >= 2);
+
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+
+        const dims = try allocator.alloc(usize, layer_dims.len);
+        errdefer allocator.free(dims);
+        @memcpy(dims, layer_dims);
+
+        const n = layer_dims.len - 1;
+        const weights = try allocator.alloc([]f32, n);
+        errdefer allocator.free(weights);
+        const biases = try allocator.alloc([]f32, n);
+        errdefer allocator.free(biases);
+
+        // Two-pass alloc with rollback-on-error to keep the partial
+        // state cleanable. Allocate all weights first, then biases —
+        // simpler errdefer story.
+        var allocated: usize = 0;
+        errdefer for (weights[0..allocated]) |w| allocator.free(w);
+        for (0..n) |i| {
+            const w = try allocator.alloc(f32, layer_dims[i + 1] * layer_dims[i]);
+            weights[i] = w;
+            allocated += 1;
+        }
+
+        var bias_allocated: usize = 0;
+        errdefer for (biases[0..bias_allocated]) |b| allocator.free(b);
+        for (0..n) |i| {
+            const b = try allocator.alloc(f32, layer_dims[i + 1]);
+            biases[i] = b;
+            bias_allocated += 1;
+        }
+
+        for (weights) |w| for (w) |*v| {
+            v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        };
+        for (biases) |b| @memset(b, 0);
+
+        return .{ .layer_dims = dims, .weights = weights, .biases = biases };
+    }
+
+    pub fn deinit(self: *MlpN, allocator: std.mem.Allocator) void {
+        for (self.weights) |w| allocator.free(w);
+        for (self.biases) |b| allocator.free(b);
+        allocator.free(self.weights);
+        allocator.free(self.biases);
+        allocator.free(self.layer_dims);
+    }
+};
+
+/// Per-layer activation cache. `pre[i]` is the pre-activation of
+/// layer i; `post[i]` is the ReLU-applied output (= y for the output
+/// layer, where ReLU is skipped). `x` is the network input — caller-
+/// owned, never written.
+pub const ActivationsN = struct {
+    x: []const f32,
+    pre: [][]f32,
+    post: [][]f32,
+
+    pub fn init(allocator: std.mem.Allocator, mlp: *const MlpN) !ActivationsN {
+        const n = mlp.nLayers();
+        const pre = try allocator.alloc([]f32, n);
+        errdefer allocator.free(pre);
+        const post = try allocator.alloc([]f32, n);
+        errdefer allocator.free(post);
+
+        var allocated: usize = 0;
+        errdefer {
+            for (pre[0..allocated]) |buf| allocator.free(buf);
+            for (post[0..allocated]) |buf| allocator.free(buf);
+        }
+        for (0..n) |i| {
+            pre[i] = try allocator.alloc(f32, mlp.layer_dims[i + 1]);
+            post[i] = try allocator.alloc(f32, mlp.layer_dims[i + 1]);
+            allocated += 1;
+        }
+        return .{ .x = &[_]f32{}, .pre = pre, .post = post };
+    }
+
+    pub fn deinit(self: *ActivationsN, allocator: std.mem.Allocator) void {
+        for (self.pre) |buf| allocator.free(buf);
+        for (self.post) |buf| allocator.free(buf);
+        allocator.free(self.pre);
+        allocator.free(self.post);
+    }
+
+    pub fn y(self: *const ActivationsN) []f32 {
+        return self.post[self.post.len - 1];
+    }
+};
+
+/// Per-layer gradients, same shape as the parameters they shadow.
+pub const GradsN = struct {
+    dw: [][]f32,
+    db: [][]f32,
+
+    pub fn init(allocator: std.mem.Allocator, mlp: *const MlpN) !GradsN {
+        const n = mlp.nLayers();
+        const dw = try allocator.alloc([]f32, n);
+        errdefer allocator.free(dw);
+        const db = try allocator.alloc([]f32, n);
+        errdefer allocator.free(db);
+
+        var allocated: usize = 0;
+        errdefer {
+            for (dw[0..allocated]) |buf| allocator.free(buf);
+            for (db[0..allocated]) |buf| allocator.free(buf);
+        }
+        for (0..n) |i| {
+            dw[i] = try allocator.alloc(f32, mlp.weights[i].len);
+            db[i] = try allocator.alloc(f32, mlp.biases[i].len);
+            allocated += 1;
+        }
+        return .{ .dw = dw, .db = db };
+    }
+
+    pub fn deinit(self: *GradsN, allocator: std.mem.Allocator) void {
+        for (self.dw) |buf| allocator.free(buf);
+        for (self.db) |buf| allocator.free(buf);
+        allocator.free(self.dw);
+        allocator.free(self.db);
+    }
+
+    pub fn zero(self: *GradsN) void {
+        for (self.dw) |buf| @memset(buf, 0);
+        for (self.db) |buf| @memset(buf, 0);
+    }
+};
+
+/// Forward pass. ReLU on every layer except the last. `act.x` must be
+/// set by the caller; everything else is overwritten.
+pub fn forwardN(mlp: *const MlpN, act: *ActivationsN) void {
+    const n = mlp.nLayers();
+    std.debug.assert(act.x.len == mlp.dimIn());
+    std.debug.assert(act.pre.len == n);
+    std.debug.assert(act.post.len == n);
+
+    var input: []const f32 = act.x;
+    for (0..n) |layer| {
+        const dim_out = mlp.layer_dims[layer + 1];
+        const dim_in = mlp.layer_dims[layer];
+        const w = mlp.weights[layer];
+        const b = mlp.biases[layer];
+        const pre = act.pre[layer];
+        const post = act.post[layer];
+        std.debug.assert(pre.len == dim_out);
+        std.debug.assert(post.len == dim_out);
+
+        for (0..dim_out) |i| {
+            var acc: f32 = b[i];
+            const row_off = i * dim_in;
+            for (0..dim_in) |j| acc += w[row_off + j] * input[j];
+            pre[i] = acc;
+            // ReLU on hidden layers; raw output on the last layer.
+            post[i] = if (layer + 1 == n) acc else if (acc > 0) acc else 0;
+        }
+        input = post;
+    }
+}
+
+/// Backward pass. Given activations + dL/dy, fills every gradient.
+/// Hand-derived chain rule, generalised over depth:
+///   dL/dW[L][i,j] = dL/d_pre[L][i] · post[L-1][j]   (post[-1] = x)
+///   dL/db[L][i]   = dL/d_pre[L][i]
+///   dL/d_post[L-1][j] = Σᵢ dL/d_pre[L][i] · W[L][i,j]
+///   dL/d_pre[L-1][j]  = dL/d_post[L-1][j] · 1[pre[L-1][j] > 0]   (ReLU)
+/// `dL_dy` initially seeds dL/d_pre on the LAST layer (output layer
+/// has no ReLU, so d_pre = d_post = d_y there).
+pub fn backwardN(
+    allocator: std.mem.Allocator,
+    mlp: *const MlpN,
+    act: *const ActivationsN,
+    dL_dy: []const f32,
+    grads: *GradsN,
+) !void {
+    const n = mlp.nLayers();
+    std.debug.assert(dL_dy.len == mlp.dimOut());
+
+    // Working buffers for d_pre at the current layer; d_post at the
+    // previous layer. Sized to the largest layer dim to avoid per-
+    // layer reallocs.
+    var max_dim: usize = 0;
+    for (mlp.layer_dims) |d| max_dim = @max(max_dim, d);
+    const d_pre = try allocator.alloc(f32, max_dim);
+    defer allocator.free(d_pre);
+    const d_post = try allocator.alloc(f32, max_dim);
+    defer allocator.free(d_post);
+
+    // Seed: d_pre on the output layer = dL_dy (no ReLU at output).
+    @memcpy(d_pre[0..mlp.dimOut()], dL_dy);
+
+    var layer: usize = n;
+    while (layer > 0) : (layer -= 1) {
+        const idx = layer - 1;
+        const dim_out = mlp.layer_dims[layer];
+        const dim_in = mlp.layer_dims[idx];
+        const w = mlp.weights[idx];
+        const dw = grads.dw[idx];
+        const db = grads.db[idx];
+
+        // Input to this layer is post[idx-1], or x if idx == 0.
+        const input: []const f32 = if (idx == 0) act.x else act.post[idx - 1];
+
+        // dW[i,j] = d_pre[i] · input[j];  db[i] = d_pre[i].
+        for (0..dim_out) |i| {
+            db[i] = d_pre[i];
+            const row_off = i * dim_in;
+            for (0..dim_in) |j| {
+                dw[row_off + j] = d_pre[i] * input[j];
+            }
+        }
+
+        // If we still have layers below, propagate to d_pre on
+        // the layer below. d_post[idx-1][j] = Σᵢ d_pre[i]·W[i,j];
+        // then ReLU mask using pre[idx-1].
+        if (idx > 0) {
+            const dim_below = dim_in; // = mlp.layer_dims[idx]
+            @memset(d_post[0..dim_below], 0);
+            for (0..dim_out) |i| {
+                const row_off = i * dim_below;
+                const dpi = d_pre[i];
+                for (0..dim_below) |j| d_post[j] += dpi * w[row_off + j];
+            }
+            const pre_below = act.pre[idx - 1];
+            for (0..dim_below) |j| {
+                const mask: f32 = if (pre_below[j] > 0) 1.0 else 0.0;
+                d_pre[j] = d_post[j] * mask;
+            }
+        }
+    }
+}
+
+/// In-place SGD on every parameter. Same convention as `sgdStep`.
+pub fn sgdStepN(mlp: *MlpN, grads: *const GradsN, lr: f32) void {
+    const n = mlp.nLayers();
+    for (0..n) |i| {
+        for (mlp.weights[i], grads.dw[i]) |*p, g| p.* -= lr * g;
+        for (mlp.biases[i], grads.db[i]) |*p, g| p.* -= lr * g;
+    }
+}
+
+/// Forward + loss + backward + step. Returns pre-step loss.
+pub fn trainStepN(
+    allocator: std.mem.Allocator,
+    mlp: *MlpN,
+    act: *ActivationsN,
+    grads: *GradsN,
+    target: []const f32,
+    lr: f32,
+) !f32 {
+    forwardN(mlp, act);
+    const y_out = act.y();
+    const loss = mseLoss(y_out, target);
+
+    var dL_dy_buf: [256]f32 = undefined;
+    std.debug.assert(target.len <= dL_dy_buf.len);
+    const dL_dy = dL_dy_buf[0..target.len];
+    mseLossGrad(dL_dy, y_out, target);
+
+    try backwardN(allocator, mlp, act, dL_dy, grads);
+    sgdStepN(mlp, grads, lr);
+    return loss;
+}
