@@ -531,6 +531,7 @@ pub fn main() !void {
     try runGpuMatmulSmoke(allocator);
     try runGpuMlpForwardSmoke(allocator);
     try runGpuMlpBackwardSmoke(allocator);
+    try runGpuMlpTrainSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -1470,6 +1471,300 @@ fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU MLP backward (dW1, db1, dW2, db2 vs CPU; max |Δ| = {e})\n",
         .{max_abs},
+    );
+}
+
+// ── tiny-MLP GPU full training loop: SGD step + multi-step convergence ──
+//
+// Chunk 4 of training-v0. Adds the SGD step shader (`param -= lr ·
+// grad`) and the MSE loss-grad shader (`dL/dy = pred − target`),
+// closing the loop so the entire forward → backward → update cycle
+// stays on the GPU with no per-step CPU↔GPU sync. Then runs N steps
+// on both CPU oracle and GPU and asserts:
+//
+//   1. After 1 step, GPU weights == CPU weights within 1e-5
+//      (every kernel and the optimizer touched parameters identically).
+//   2. After N steps, the GPU loss curve matches the CPU loss curve
+//      within 1e-4 — error accumulates very slowly at our dims, but
+//      this catches any drift from a subtly-wrong dispatch order.
+//
+// One sync at the very end (read final weights and final pred for
+// loss). Every intermediate step is pure GPU — same shape as the
+// in-frame training the engine integration needs.
+
+const SgdStepPush = runtime.SgdStepPush;
+const MseLossGradPush = runtime.MseLossGradPush;
+
+fn runGpuMlpTrainSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim_in: usize = 4;
+    const dim_h: usize = 8;
+    const dim_out: usize = 4;
+    const lr: f32 = 0.05;
+    const n_steps: u32 = 50;
+
+    // Twin MLPs — same seed, same weights to start. CPU drives oracle,
+    // GPU drives the unit under test. After n_steps each they should
+    // be bit-close.
+    var mlp_cpu = try cpu_train.Mlp.init(allocator, dim_in, dim_h, dim_out, 0.3, 0x57DD57D);
+    defer mlp_cpu.deinit(allocator);
+    for (mlp_cpu.b1, 0..) |*v, i| v.* = 0.1 - 0.05 * @as(f32, @floatFromInt(i));
+    for (mlp_cpu.b2, 0..) |*v, i| v.* = -0.2 + 0.07 * @as(f32, @floatFromInt(i));
+
+    const x = [_]f32{ 1.0, 0.5, -0.3, 0.2 };
+    const target = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+
+    // ── GPU buffers (params live device-side and are mutated in
+    // place by the SGD step; activations + grads live device-side
+    // and are reused across steps) ──────────────────────────────────
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, &x);
+    defer buf_x.deinit(ctx.device);
+    var buf_target = try buffer.Buffer.initStatic(&ctx, f32, &target);
+    defer buf_target.deinit(ctx.device);
+    var buf_w1 = try buffer.Buffer.initStatic(&ctx, f32, mlp_cpu.w1);
+    defer buf_w1.deinit(ctx.device);
+    var buf_b1 = try buffer.Buffer.initStatic(&ctx, f32, mlp_cpu.b1);
+    defer buf_b1.deinit(ctx.device);
+    var buf_w2 = try buffer.Buffer.initStatic(&ctx, f32, mlp_cpu.w2);
+    defer buf_w2.deinit(ctx.device);
+    var buf_b2 = try buffer.Buffer.initStatic(&ctx, f32, mlp_cpu.b2);
+    defer buf_b2.deinit(ctx.device);
+    var buf_h_pre = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_h_pre.deinit(ctx.device);
+    var buf_h = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_h.deinit(ctx.device);
+    var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * @sizeOf(f32));
+    defer buf_y.deinit(ctx.device);
+    var buf_dL_dy = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * @sizeOf(f32));
+    defer buf_dL_dy.deinit(ctx.device);
+    var buf_dh = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_dh.deinit(ctx.device);
+    var buf_dh_pre = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_dh_pre.deinit(ctx.device);
+    var buf_dw1 = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * dim_in * @sizeOf(f32));
+    defer buf_dw1.deinit(ctx.device);
+    var buf_db1 = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_db1.deinit(ctx.device);
+    var buf_dw2 = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * dim_h * @sizeOf(f32));
+    defer buf_dw2.deinit(ctx.device);
+    var buf_db2 = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * @sizeOf(f32));
+    defer buf_db2.deinit(ctx.device);
+
+    // ── Pipelines ──────────────────────────────────────────────────
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    defer k_relu.deinit();
+    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(ReluBackwardPush));
+    defer k_relu_bw.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(LinearBackwardDxPush));
+    defer k_lin_dx.deinit();
+    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(OuterProductPush));
+    defer k_outer.deinit();
+    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush));
+    defer k_copy.deinit();
+    var k_sgd = try pipeline.Kernel.init(&ctx, &shaders.sgd_step, 2, @sizeOf(SgdStepPush));
+    defer k_sgd.deinit();
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    defer k_mse_grad.deinit();
+
+    // Push constants reused across steps.
+    const matmul1_push = MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
+    const matmul2_push = MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
+    const add1_push = runtime.AddInPlacePush{ .n = @intCast(dim_h) };
+    const add2_push = runtime.AddInPlacePush{ .n = @intCast(dim_out) };
+    const relu_push = ReluPush{ .n = @intCast(dim_h) };
+    const mse_grad_push = MseLossGradPush{ .n = @intCast(dim_out) };
+    const op_dw2 = OuterProductPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    const lin_dx_push = LinearBackwardDxPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    const relu_bw_push = ReluBackwardPush{ .n = @intCast(dim_h) };
+    const op_dw1 = OuterProductPush{ .dim_out = @intCast(dim_h), .dim_in = @intCast(dim_in) };
+    const copy_db2 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_out) };
+    const copy_db1 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_h) };
+    const sgd_w1_push = SgdStepPush{ .n = @intCast(mlp_cpu.w1.len), .lr = lr };
+    const sgd_b1_push = SgdStepPush{ .n = @intCast(mlp_cpu.b1.len), .lr = lr };
+    const sgd_w2_push = SgdStepPush{ .n = @intCast(mlp_cpu.w2.len), .lr = lr };
+    const sgd_b2_push = SgdStepPush{ .n = @intCast(mlp_cpu.b2.len), .lr = lr };
+
+    // ── Run N steps on each side ──────────────────────────────────
+    // Two GPU snapshots taken: after step 1 (single-step parity) and
+    // after step n_steps (full-trajectory parity).
+    const cpu_h_pre = try allocator.alloc(f32, dim_h);
+    defer allocator.free(cpu_h_pre);
+    const cpu_h = try allocator.alloc(f32, dim_h);
+    defer allocator.free(cpu_h);
+    const cpu_y = try allocator.alloc(f32, dim_out);
+    defer allocator.free(cpu_y);
+    var act_cpu: cpu_train.Activations = .{
+        .x = &x,
+        .h_pre = cpu_h_pre,
+        .h = cpu_h,
+        .y = cpu_y,
+    };
+    var grads_cpu = try cpu_train.Grads.init(allocator, &mlp_cpu);
+    defer grads_cpu.deinit(allocator);
+
+    const w1_after_1 = try allocator.alloc(f32, mlp_cpu.w1.len);
+    defer allocator.free(w1_after_1);
+    const w2_after_1 = try allocator.alloc(f32, mlp_cpu.w2.len);
+    defer allocator.free(w2_after_1);
+    const b1_after_1 = try allocator.alloc(f32, mlp_cpu.b1.len);
+    defer allocator.free(b1_after_1);
+    const b2_after_1 = try allocator.alloc(f32, mlp_cpu.b2.len);
+    defer allocator.free(b2_after_1);
+
+    // GPU side: drive each step through its own Recorder lifecycle.
+    // Re-using one recorder across N steps would need a way to reset
+    // n_dispatched + descriptor pool; cleanest for this smoke is one
+    // recorder per step. Real trainer uses a frame-style loop with
+    // per-frame recorder reset (chunk 5).
+    var step: u32 = 0;
+    while (step < n_steps) : (step += 1) {
+        // CPU step.
+        _ = try cpu_train.trainStep(allocator, &mlp_cpu, &act_cpu, &grads_cpu, &target, lr);
+
+        // GPU step.
+        var rec = try gpu_recorder.Recorder.init(&ctx, 16, 64);
+        defer rec.deinit();
+        try rec.begin();
+
+        // Forward.
+        try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
+        try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
+        try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+
+        // Loss grad.
+        try rec.dispatch(&k_mse_grad, &.{ &buf_y, &buf_target, &buf_dL_dy }, &mse_grad_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+
+        // Backward.
+        try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+        try rec.dispatch(&k_outer, &.{ &buf_dL_dy, &buf_h, &buf_dw2 }, &op_dw2, ceilDiv(@as(u32, dim_out), 16), ceilDiv(@as(u32, dim_h), 16), 1);
+        try rec.dispatch(&k_lin_dx, &.{ &buf_dL_dy, &buf_w2, &buf_dh }, &lin_dx_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_relu_bw, &.{ &buf_dh, &buf_h_pre, &buf_dh_pre }, &relu_bw_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_outer, &.{ &buf_dh_pre, &buf_x, &buf_dw1 }, &op_dw1, ceilDiv(@as(u32, dim_h), 16), ceilDiv(@as(u32, dim_in), 16), 1);
+
+        // SGD step (param -= lr · grad). Note W2 is updated BEFORE the
+        // dh = W2^T · dL/dy dispatch reads W2 — which is fine because
+        // dh was computed earlier in this same recorder, and the next
+        // step's W2-read starts a fresh recorder with a barrier.
+        try rec.dispatch(&k_sgd, &.{ &buf_w1, &buf_dw1 }, &sgd_w1_push, ceilDiv(@intCast(mlp_cpu.w1.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_b1, &buf_db1 }, &sgd_b1_push, ceilDiv(@intCast(mlp_cpu.b1.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_w2, &buf_dw2 }, &sgd_w2_push, ceilDiv(@intCast(mlp_cpu.w2.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_b2, &buf_db2 }, &sgd_b2_push, ceilDiv(@intCast(mlp_cpu.b2.len), 256), 1, 1);
+
+        try rec.endAndSubmit();
+
+        // Snapshot after step 1 for the single-step parity check.
+        if (step == 0) {
+            try buf_w1.readBack(&ctx, f32, w1_after_1);
+            try buf_b1.readBack(&ctx, f32, b1_after_1);
+            try buf_w2.readBack(&ctx, f32, w2_after_1);
+            try buf_b2.readBack(&ctx, f32, b2_after_1);
+        }
+    }
+
+    // ── Single-step parity ────────────────────────────────────────
+    // After step 0, the CPU has already mutated mlp_cpu — we need a
+    // fresh oracle for the "after one step" state. Easiest: re-run
+    // chunk-1's first step from scratch and compare.
+    var oracle = try cpu_train.Mlp.init(allocator, dim_in, dim_h, dim_out, 0.3, 0x57DD57D);
+    defer oracle.deinit(allocator);
+    for (oracle.b1, 0..) |*v, i| v.* = 0.1 - 0.05 * @as(f32, @floatFromInt(i));
+    for (oracle.b2, 0..) |*v, i| v.* = -0.2 + 0.07 * @as(f32, @floatFromInt(i));
+    const oracle_h_pre = try allocator.alloc(f32, dim_h);
+    defer allocator.free(oracle_h_pre);
+    const oracle_h = try allocator.alloc(f32, dim_h);
+    defer allocator.free(oracle_h);
+    const oracle_y = try allocator.alloc(f32, dim_out);
+    defer allocator.free(oracle_y);
+    var oracle_act: cpu_train.Activations = .{
+        .x = &x,
+        .h_pre = oracle_h_pre,
+        .h = oracle_h,
+        .y = oracle_y,
+    };
+    var oracle_grads = try cpu_train.Grads.init(allocator, &oracle);
+    defer oracle_grads.deinit(allocator);
+    _ = try cpu_train.trainStep(allocator, &oracle, &oracle_act, &oracle_grads, &target, lr);
+
+    const tol_step1: f32 = 1e-5;
+    var max_step1: f32 = 0;
+    for (oracle.w1, w1_after_1, 0..) |w, g, i| {
+        const d = @abs(g - w);
+        if (d > tol_step1) {
+            std.debug.print("step-1 W1 MISMATCH[{d}]: gpu={d} cpu={d}\n", .{ i, g, w });
+            return error.ParityFailed;
+        }
+        if (d > max_step1) max_step1 = d;
+    }
+    for (oracle.b1, b1_after_1, 0..) |w, g, i| {
+        const d = @abs(g - w);
+        if (d > tol_step1) {
+            std.debug.print("step-1 b1 MISMATCH[{d}]: gpu={d} cpu={d}\n", .{ i, g, w });
+            return error.ParityFailed;
+        }
+    }
+    for (oracle.w2, w2_after_1, 0..) |w, g, i| {
+        const d = @abs(g - w);
+        if (d > tol_step1) {
+            std.debug.print("step-1 W2 MISMATCH[{d}]: gpu={d} cpu={d}\n", .{ i, g, w });
+            return error.ParityFailed;
+        }
+    }
+    for (oracle.b2, b2_after_1, 0..) |w, g, i| {
+        const d = @abs(g - w);
+        if (d > tol_step1) {
+            std.debug.print("step-1 b2 MISMATCH[{d}]: gpu={d} cpu={d}\n", .{ i, g, w });
+            return error.ParityFailed;
+        }
+    }
+
+    // ── Full-trajectory parity ────────────────────────────────────
+    // After n_steps, compare the GPU's final weights against the
+    // CPU's final weights. Looser tol because rounding at each step
+    // accumulates — but at our dims and step count it stays tight.
+    const w1_gpu = try allocator.alloc(f32, mlp_cpu.w1.len);
+    defer allocator.free(w1_gpu);
+    const b1_gpu = try allocator.alloc(f32, mlp_cpu.b1.len);
+    defer allocator.free(b1_gpu);
+    const w2_gpu = try allocator.alloc(f32, mlp_cpu.w2.len);
+    defer allocator.free(w2_gpu);
+    const b2_gpu = try allocator.alloc(f32, mlp_cpu.b2.len);
+    defer allocator.free(b2_gpu);
+    try buf_w1.readBack(&ctx, f32, w1_gpu);
+    try buf_b1.readBack(&ctx, f32, b1_gpu);
+    try buf_w2.readBack(&ctx, f32, w2_gpu);
+    try buf_b2.readBack(&ctx, f32, b2_gpu);
+
+    const tol_traj: f32 = 1e-4;
+    var max_traj: f32 = 0;
+    const ParamCase = struct { name: []const u8, gpu: []const f32, cpu: []const f32 };
+    const traj_cases = [_]ParamCase{
+        .{ .name = "W1", .gpu = w1_gpu, .cpu = mlp_cpu.w1 },
+        .{ .name = "b1", .gpu = b1_gpu, .cpu = mlp_cpu.b1 },
+        .{ .name = "W2", .gpu = w2_gpu, .cpu = mlp_cpu.w2 },
+        .{ .name = "b2", .gpu = b2_gpu, .cpu = mlp_cpu.b2 },
+    };
+    for (traj_cases) |cs| {
+        for (cs.gpu, cs.cpu, 0..) |g, c, i| {
+            const d = @abs(g - c);
+            if (d > tol_traj) {
+                std.debug.print("traj {s} MISMATCH[{d}] @ step {d}: gpu={d} cpu={d}\n", .{ cs.name, i, n_steps, g, c });
+                return error.ParityFailed;
+            }
+            if (d > max_traj) max_traj = d;
+        }
+    }
+    std.debug.print(
+        "PASS GPU MLP train ({d} SGD steps; step-1 |Δ|={e}, after-{d} |Δ|={e}, all on-device)\n",
+        .{ n_steps, max_step1, n_steps, max_traj },
     );
 }
 

@@ -114,6 +114,10 @@ pub const LinearBackwardDxPush = extern struct { dim_out: u32, dim_in: u32 };
 
 pub const OuterProductPush = extern struct { dim_out: u32, dim_in: u32 };
 
+pub const SgdStepPush = extern struct { n: u32, lr: f32 };
+
+pub const MseLossGradPush = extern struct { n: u32 };
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {

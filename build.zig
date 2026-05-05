@@ -53,6 +53,8 @@ pub fn build(b: *std.Build) void {
     const relu_backward_spv = compileShader(b, "relu_backward");
     const linear_backward_dx_spv = compileShader(b, "linear_backward_dx");
     const outer_product_spv = compileShader(b, "outer_product");
+    const sgd_step_spv = compileShader(b, "sgd_step");
+    const mse_loss_grad_spv = compileShader(b, "mse_loss_grad");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -103,6 +105,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(relu_backward_spv, "relu_backward.spv");
     _ = wf.addCopyFile(linear_backward_dx_spv, "linear_backward_dx.spv");
     _ = wf.addCopyFile(outer_product_spv, "outer_product.spv");
+    _ = wf.addCopyFile(sgd_step_spv, "sgd_step.spv");
+    _ = wf.addCopyFile(mse_loss_grad_spv, "mse_loss_grad.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -148,6 +152,8 @@ pub fn build(b: *std.Build) void {
         \\pub const relu_backward align(4) = @embedFile("relu_backward.spv").*;
         \\pub const linear_backward_dx align(4) = @embedFile("linear_backward_dx.spv").*;
         \\pub const outer_product align(4) = @embedFile("outer_product.spv").*;
+        \\pub const sgd_step align(4) = @embedFile("sgd_step.spv").*;
+        \\pub const mse_loss_grad align(4) = @embedFile("mse_loss_grad.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──

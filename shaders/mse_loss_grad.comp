@@ -1,0 +1,25 @@
+#version 460
+// MSE loss gradient: dL/dy[i] = pred[i] - target[i]
+//
+// Pairs with the half-MSE loss `L = ½ Σ (y - t)²` used by the CPU
+// oracle: the ½ cancels the chain-rule factor of 2 so the gradient
+// is just the raw difference. Three buffers, one thread per element.
+//
+// Kept as a dedicated shader (not a "vec_sub" repurpose) for
+// readability — backward kernels read better when they spell out
+// what role they play in the chain rule. Future loss heads (cross-
+// entropy, contrastive) get their own shaders alongside.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer P { float pred[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer T { float target[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer G { float grad[];   };
+
+layout(push_constant) uniform Pc { uint n; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    grad[i] = pred[i] - target[i];
+}
