@@ -56,6 +56,11 @@ pub fn build(b: *std.Build) void {
     const sgd_step_spv = compileShader(b, "sgd_step");
     const mse_loss_grad_spv = compileShader(b, "mse_loss_grad");
     const mlp2_forward_batched_spv = compileShader(b, "mlp2_forward_batched");
+    const mlp2_forward_train_batched_spv = compileShader(b, "mlp2_forward_train_batched");
+    const mlp2_dy_batched_spv = compileShader(b, "mlp2_dy_batched");
+    const mlp2_dh_pre_batched_spv = compileShader(b, "mlp2_dh_pre_batched");
+    const mlp2_dw_accum_spv = compileShader(b, "mlp2_dw_accum");
+    const mlp2_db_accum_spv = compileShader(b, "mlp2_db_accum");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -109,6 +114,11 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(sgd_step_spv, "sgd_step.spv");
     _ = wf.addCopyFile(mse_loss_grad_spv, "mse_loss_grad.spv");
     _ = wf.addCopyFile(mlp2_forward_batched_spv, "mlp2_forward_batched.spv");
+    _ = wf.addCopyFile(mlp2_forward_train_batched_spv, "mlp2_forward_train_batched.spv");
+    _ = wf.addCopyFile(mlp2_dy_batched_spv, "mlp2_dy_batched.spv");
+    _ = wf.addCopyFile(mlp2_dh_pre_batched_spv, "mlp2_dh_pre_batched.spv");
+    _ = wf.addCopyFile(mlp2_dw_accum_spv, "mlp2_dw_accum.spv");
+    _ = wf.addCopyFile(mlp2_db_accum_spv, "mlp2_db_accum.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -157,6 +167,11 @@ pub fn build(b: *std.Build) void {
         \\pub const sgd_step align(4) = @embedFile("sgd_step.spv").*;
         \\pub const mse_loss_grad align(4) = @embedFile("mse_loss_grad.spv").*;
         \\pub const mlp2_forward_batched align(4) = @embedFile("mlp2_forward_batched.spv").*;
+        \\pub const mlp2_forward_train_batched align(4) = @embedFile("mlp2_forward_train_batched.spv").*;
+        \\pub const mlp2_dy_batched align(4) = @embedFile("mlp2_dy_batched.spv").*;
+        \\pub const mlp2_dh_pre_batched align(4) = @embedFile("mlp2_dh_pre_batched.spv").*;
+        \\pub const mlp2_dw_accum align(4) = @embedFile("mlp2_dw_accum.spv").*;
+        \\pub const mlp2_db_accum align(4) = @embedFile("mlp2_db_accum.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──

@@ -568,6 +568,7 @@ pub fn main() !void {
     try runTrainingRunnerSmoke(allocator);
     try runTrainingRunnerAttachedSmoke(allocator);
     try runTrainingRunnerBatchedSmoke(allocator);
+    try runTrainingRunnerBatchedTrainSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2082,6 +2083,166 @@ fn runTrainingRunnerBatchedSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner batched predict ({d} samples, dim 5→16→3; max |Δ| vs sequential = {e})\n",
         .{ n_samples, max_abs },
+    );
+}
+
+// ── TrainingRunner batched-train parity smoke ───────────────────────
+//
+// Validates `tickStepBatch` against a CPU oracle that simulates the
+// same averaged-batch SGD step. The oracle does:
+//   for each sample n: forward + per-sample grads
+//   sum grads across samples; divide by N
+//   SGD step
+// then runs the same cycle GPU-side and asserts final weights match
+// within fp32 tolerance over K consecutive steps. K = 8 catches any
+// drift that would compound across steps; tol is loose vs single-step
+// because outer-product accumulation order across N samples matters.
+
+fn runTrainingRunnerBatchedTrainSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_samples: u32 = 16;
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 8,
+        .dim_out = 3,
+        .lr = 0.05,
+        .init_seed = 0xBA7C7AA,
+        .max_batch_size = n_samples,
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // CPU mirror — same seed + scale = same starting MLP.
+    var cpu_mlp = try cpu_train.Mlp.init(allocator, cfg.dim_in, cfg.dim_hidden, cfg.dim_out, cfg.init_scale, cfg.init_seed);
+    defer cpu_mlp.deinit(allocator);
+
+    // Build a fixed batch of synthetic (x, target) pairs.
+    var rng = std.Random.DefaultPrng.init(0x5EED5);
+    const r = rng.random();
+    const x_batch = try allocator.alloc(f32, n_samples * cfg.dim_in);
+    defer allocator.free(x_batch);
+    const target_batch = try allocator.alloc(f32, n_samples * cfg.dim_out);
+    defer allocator.free(target_batch);
+    for (x_batch) |*v| v.* = r.float(f32) * 2 - 1;
+    for (target_batch) |*v| v.* = r.float(f32);
+
+    // CPU oracle: K averaged-batch SGD steps.
+    const K: u32 = 8;
+    const cpu_grads = try cpu_train.Grads.init(allocator, &cpu_mlp);
+    defer @constCast(&cpu_grads).deinit(allocator);
+    const acc_dw1 = try allocator.alloc(f32, cpu_mlp.w1.len);
+    defer allocator.free(acc_dw1);
+    const acc_db1 = try allocator.alloc(f32, cpu_mlp.b1.len);
+    defer allocator.free(acc_db1);
+    const acc_dw2 = try allocator.alloc(f32, cpu_mlp.w2.len);
+    defer allocator.free(acc_dw2);
+    const acc_db2 = try allocator.alloc(f32, cpu_mlp.b2.len);
+    defer allocator.free(acc_db2);
+    const cpu_h_pre = try allocator.alloc(f32, cfg.dim_hidden);
+    defer allocator.free(cpu_h_pre);
+    const cpu_h = try allocator.alloc(f32, cfg.dim_hidden);
+    defer allocator.free(cpu_h);
+    const cpu_y = try allocator.alloc(f32, cfg.dim_out);
+    defer allocator.free(cpu_y);
+    const cpu_dy = try allocator.alloc(f32, cfg.dim_out);
+    defer allocator.free(cpu_dy);
+
+    var step: u32 = 0;
+    while (step < K) : (step += 1) {
+        @memset(acc_dw1, 0);
+        @memset(acc_db1, 0);
+        @memset(acc_dw2, 0);
+        @memset(acc_db2, 0);
+        for (0..n_samples) |n| {
+            const x_row = x_batch[n * cfg.dim_in ..][0..cfg.dim_in];
+            const t_row = target_batch[n * cfg.dim_out ..][0..cfg.dim_out];
+            var act: cpu_train.Activations = .{
+                .x = x_row,
+                .h_pre = cpu_h_pre,
+                .h = cpu_h,
+                .y = cpu_y,
+            };
+            cpu_train.forward(&cpu_mlp, &act);
+            cpu_train.mseLossGrad(cpu_dy, cpu_y, t_row);
+            var sample_grads: cpu_train.Grads = .{
+                .dw1 = cpu_grads.dw1,
+                .db1 = cpu_grads.db1,
+                .dw2 = cpu_grads.dw2,
+                .db2 = cpu_grads.db2,
+            };
+            try cpu_train.backward(allocator, &cpu_mlp, &act, cpu_dy, &sample_grads);
+            for (acc_dw1, sample_grads.dw1) |*a, g| a.* += g;
+            for (acc_db1, sample_grads.db1) |*a, g| a.* += g;
+            for (acc_dw2, sample_grads.dw2) |*a, g| a.* += g;
+            for (acc_db2, sample_grads.db2) |*a, g| a.* += g;
+        }
+        const inv_n: f32 = 1.0 / @as(f32, @floatFromInt(n_samples));
+        for (acc_dw1) |*v| v.* *= inv_n;
+        for (acc_db1) |*v| v.* *= inv_n;
+        for (acc_dw2) |*v| v.* *= inv_n;
+        for (acc_db2) |*v| v.* *= inv_n;
+        const final_grads: cpu_train.Grads = .{
+            .dw1 = acc_dw1,
+            .db1 = acc_db1,
+            .dw2 = acc_dw2,
+            .db2 = acc_db2,
+        };
+        cpu_train.sgdStep(&cpu_mlp, &final_grads, cfg.lr);
+
+        // Mirror on GPU.
+        try runner.tickStepBatch(x_batch, target_batch);
+    }
+
+    // Compare final weights.
+    const gpu_w1 = try allocator.alloc(f32, cpu_mlp.w1.len);
+    defer allocator.free(gpu_w1);
+    const gpu_b1 = try allocator.alloc(f32, cpu_mlp.b1.len);
+    defer allocator.free(gpu_b1);
+    const gpu_w2 = try allocator.alloc(f32, cpu_mlp.w2.len);
+    defer allocator.free(gpu_w2);
+    const gpu_b2 = try allocator.alloc(f32, cpu_mlp.b2.len);
+    defer allocator.free(gpu_b2);
+    // Construct an Mlp view whose slices alias our scratch buffers —
+    // bypass Mlp.init so no allocator-owned weights leak when we
+    // immediately overwrite them via readWeights.
+    var gpu_mlp: cpu_train.Mlp = .{
+        .dim_in = cfg.dim_in,
+        .dim_hidden = cfg.dim_hidden,
+        .dim_out = cfg.dim_out,
+        .w1 = gpu_w1,
+        .b1 = gpu_b1,
+        .w2 = gpu_w2,
+        .b2 = gpu_b2,
+    };
+    try runner.readWeights(&gpu_mlp);
+
+    const tol: f32 = 1e-4;
+    var max_abs: f32 = 0;
+    const ParamCase = struct { name: []const u8, gpu: []const f32, cpu: []const f32 };
+    const cases = [_]ParamCase{
+        .{ .name = "W1", .gpu = gpu_w1, .cpu = cpu_mlp.w1 },
+        .{ .name = "b1", .gpu = gpu_b1, .cpu = cpu_mlp.b1 },
+        .{ .name = "W2", .gpu = gpu_w2, .cpu = cpu_mlp.w2 },
+        .{ .name = "b2", .gpu = gpu_b2, .cpu = cpu_mlp.b2 },
+    };
+    for (cases) |cs| {
+        for (cs.gpu, cs.cpu, 0..) |g, c, i| {
+            const d = @abs(g - c);
+            if (d > tol) {
+                std.debug.print(
+                    "tickStepBatch MISMATCH on {s}[{d}] @ step {d}: gpu={d:.7} cpu={d:.7}\n",
+                    .{ cs.name, i, K, g, c },
+                );
+                return error.ParityFailed;
+            }
+            if (d > max_abs) max_abs = d;
+        }
+    }
+    std.debug.print(
+        "PASS TrainingRunner batched train ({d} samples × {d} steps, dim 4→8→3; max |Δ| vs CPU oracle = {e})\n",
+        .{ n_samples, K, max_abs },
     );
 }
 

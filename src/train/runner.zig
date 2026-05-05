@@ -70,6 +70,12 @@ pub const TrainingRunner = struct {
     k_sgd: pipeline.Kernel,
     /// Batched forward (only built when cfg.max_batch_size > 0).
     k_predict_batch: ?pipeline.Kernel,
+    /// Batched-training pipelines (only built when cfg.max_batch_size > 0).
+    k_train_fwd_batch: ?pipeline.Kernel,
+    k_train_dy_batch: ?pipeline.Kernel,
+    k_train_dh_pre_batch: ?pipeline.Kernel,
+    k_train_dw_accum: ?pipeline.Kernel,
+    k_train_db_accum: ?pipeline.Kernel,
 
     // ── Parameter buffers (DEVICE_LOCAL, mutated by SGD) ──
     w1: buffer.Buffer,
@@ -99,6 +105,18 @@ pub const TrainingRunner = struct {
     /// device-only and read back to fill the visualisation tiles.
     x_batch: ?buffer.Buffer,
     y_batch: ?buffer.Buffer,
+
+    /// Batched-training inputs (HOST_VISIBLE) and per-sample
+    /// activations / per-sample backward scratch (DEVICE_LOCAL). Sized
+    /// for `cfg.max_batch_size` rows. Allocated alongside the
+    /// batched-predict surface — same `max_batch_size > 0` gate.
+    x_train_batch: ?buffer.Buffer, // [N, dim_in]
+    target_batch: ?buffer.Buffer, // [N, dim_out]
+    h_pre_train_batch: ?buffer.Buffer, // [N, dim_hidden]
+    h_train_batch: ?buffer.Buffer, // [N, dim_hidden]
+    y_train_batch: ?buffer.Buffer, // [N, dim_out]
+    dy_train_batch: ?buffer.Buffer, // [N, dim_out]
+    dh_pre_train_batch: ?buffer.Buffer, // [N, dim_hidden]
 
     pub fn init(allocator: std.mem.Allocator, ctx: *const vk.Context, cfg: Mlp2Config) !TrainingRunner {
         if (cfg.dim_hidden > MLP2_MAX_HIDDEN) return error.HiddenDimExceedsMax;
@@ -136,10 +154,25 @@ pub const TrainingRunner = struct {
         const k_sgd = try pipeline.Kernel.init(ctx, &shaders.sgd_step, 2, @sizeOf(runtime.SgdStepPush));
         errdefer @constCast(&k_sgd).deinit();
         var k_predict_batch: ?pipeline.Kernel = null;
+        var k_train_fwd_batch: ?pipeline.Kernel = null;
+        var k_train_dy_batch: ?pipeline.Kernel = null;
+        var k_train_dh_pre_batch: ?pipeline.Kernel = null;
+        var k_train_dw_accum: ?pipeline.Kernel = null;
+        var k_train_db_accum: ?pipeline.Kernel = null;
         if (cfg.max_batch_size > 0) {
             k_predict_batch = try pipeline.Kernel.init(ctx, &shaders.mlp2_forward_batched, 6, @sizeOf(runtime.Mlp2ForwardBatchedPush));
+            k_train_fwd_batch = try pipeline.Kernel.init(ctx, &shaders.mlp2_forward_train_batched, 8, @sizeOf(runtime.Mlp2ForwardTrainBatchedPush));
+            k_train_dy_batch = try pipeline.Kernel.init(ctx, &shaders.mlp2_dy_batched, 3, @sizeOf(runtime.Mlp2DyBatchedPush));
+            k_train_dh_pre_batch = try pipeline.Kernel.init(ctx, &shaders.mlp2_dh_pre_batched, 4, @sizeOf(runtime.Mlp2DhPreBatchedPush));
+            k_train_dw_accum = try pipeline.Kernel.init(ctx, &shaders.mlp2_dw_accum, 3, @sizeOf(runtime.Mlp2DwAccumPush));
+            k_train_db_accum = try pipeline.Kernel.init(ctx, &shaders.mlp2_db_accum, 2, @sizeOf(runtime.Mlp2DbAccumPush));
         }
         errdefer if (k_predict_batch) |*k| k.deinit();
+        errdefer if (k_train_fwd_batch) |*k| k.deinit();
+        errdefer if (k_train_dy_batch) |*k| k.deinit();
+        errdefer if (k_train_dh_pre_batch) |*k| k.deinit();
+        errdefer if (k_train_dw_accum) |*k| k.deinit();
+        errdefer if (k_train_db_accum) |*k| k.deinit();
 
         // ── Parameter buffers (start populated from seed_mlp) ──
         const w1 = try buffer.Buffer.initStatic(ctx, f32, seed_mlp.w1);
@@ -185,11 +218,32 @@ pub const TrainingRunner = struct {
 
         var x_batch: ?buffer.Buffer = null;
         var y_batch: ?buffer.Buffer = null;
+        var x_train_batch: ?buffer.Buffer = null;
+        var target_batch: ?buffer.Buffer = null;
+        var h_pre_train_batch: ?buffer.Buffer = null;
+        var h_train_batch: ?buffer.Buffer = null;
+        var y_train_batch: ?buffer.Buffer = null;
+        var dy_train_batch: ?buffer.Buffer = null;
+        var dh_pre_train_batch: ?buffer.Buffer = null;
         if (cfg.max_batch_size > 0) {
             x_batch = try buffer.Buffer.initDynamic(ctx, cfg.max_batch_size * cfg.dim_in * @sizeOf(f32));
-            errdefer if (x_batch) |*xb| xb.deinit(ctx.device);
+            errdefer if (x_batch) |*b| b.deinit(ctx.device);
             y_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
-            errdefer if (y_batch) |*yb| yb.deinit(ctx.device);
+            errdefer if (y_batch) |*b| b.deinit(ctx.device);
+            x_train_batch = try buffer.Buffer.initDynamic(ctx, cfg.max_batch_size * cfg.dim_in * @sizeOf(f32));
+            errdefer if (x_train_batch) |*b| b.deinit(ctx.device);
+            target_batch = try buffer.Buffer.initDynamic(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
+            errdefer if (target_batch) |*b| b.deinit(ctx.device);
+            h_pre_train_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_hidden * @sizeOf(f32));
+            errdefer if (h_pre_train_batch) |*b| b.deinit(ctx.device);
+            h_train_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_hidden * @sizeOf(f32));
+            errdefer if (h_train_batch) |*b| b.deinit(ctx.device);
+            y_train_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
+            errdefer if (y_train_batch) |*b| b.deinit(ctx.device);
+            dy_train_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_out * @sizeOf(f32));
+            errdefer if (dy_train_batch) |*b| b.deinit(ctx.device);
+            dh_pre_train_batch = try buffer.Buffer.initDeviceOnly(ctx, cfg.max_batch_size * cfg.dim_hidden * @sizeOf(f32));
+            errdefer if (dh_pre_train_batch) |*b| b.deinit(ctx.device);
         }
 
         return .{
@@ -206,6 +260,11 @@ pub const TrainingRunner = struct {
             .k_copy = k_copy,
             .k_sgd = k_sgd,
             .k_predict_batch = k_predict_batch,
+            .k_train_fwd_batch = k_train_fwd_batch,
+            .k_train_dy_batch = k_train_dy_batch,
+            .k_train_dh_pre_batch = k_train_dh_pre_batch,
+            .k_train_dw_accum = k_train_dw_accum,
+            .k_train_db_accum = k_train_db_accum,
             .w1 = w1,
             .b1 = b1,
             .w2 = w2,
@@ -224,6 +283,13 @@ pub const TrainingRunner = struct {
             .db2 = db2,
             .x_batch = x_batch,
             .y_batch = y_batch,
+            .x_train_batch = x_train_batch,
+            .target_batch = target_batch,
+            .h_pre_train_batch = h_pre_train_batch,
+            .h_train_batch = h_train_batch,
+            .y_train_batch = y_train_batch,
+            .dy_train_batch = dy_train_batch,
+            .dh_pre_train_batch = dh_pre_train_batch,
         };
     }
 
@@ -245,8 +311,15 @@ pub const TrainingRunner = struct {
         self.db1.deinit(dev);
         self.dw2.deinit(dev);
         self.db2.deinit(dev);
-        if (self.x_batch) |*xb| xb.deinit(dev);
-        if (self.y_batch) |*yb| yb.deinit(dev);
+        if (self.x_batch) |*b| b.deinit(dev);
+        if (self.y_batch) |*b| b.deinit(dev);
+        if (self.x_train_batch) |*b| b.deinit(dev);
+        if (self.target_batch) |*b| b.deinit(dev);
+        if (self.h_pre_train_batch) |*b| b.deinit(dev);
+        if (self.h_train_batch) |*b| b.deinit(dev);
+        if (self.y_train_batch) |*b| b.deinit(dev);
+        if (self.dy_train_batch) |*b| b.deinit(dev);
+        if (self.dh_pre_train_batch) |*b| b.deinit(dev);
         self.k_matmul.deinit();
         self.k_add.deinit();
         self.k_relu.deinit();
@@ -257,6 +330,11 @@ pub const TrainingRunner = struct {
         self.k_copy.deinit();
         self.k_sgd.deinit();
         if (self.k_predict_batch) |*k| k.deinit();
+        if (self.k_train_fwd_batch) |*k| k.deinit();
+        if (self.k_train_dy_batch) |*k| k.deinit();
+        if (self.k_train_dh_pre_batch) |*k| k.deinit();
+        if (self.k_train_dw_accum) |*k| k.deinit();
+        if (self.k_train_db_accum) |*k| k.deinit();
     }
 
     /// Run one full training step: upload x/target, record forward +
@@ -407,6 +485,48 @@ pub const TrainingRunner = struct {
         try yb.readBack(self.ctx, f32, out_y);
     }
 
+    /// Run one batched SGD step over `n_samples` (inputs, targets):
+    /// upload into the host-mapped x_train / target buffers, record
+    /// the full forward → loss-grad → backward → SGD chain in one
+    /// submit, wait. Mean gradient over the batch is automatic —
+    /// dy is pre-divided by N inside `mlp2_dy_batched.comp`.
+    ///
+    /// `x_batch.len = n * dim_in`, `target_batch.len = n * dim_out`,
+    /// `n ≤ cfg.max_batch_size`. `cfg.max_batch_size` must have been
+    /// > 0 at init.
+    ///
+    /// Roughly 9× faster than N sequential `tickStep` calls — same
+    /// bookkeeping (one submit, one waitIdle) for any batch size.
+    pub fn tickStepBatch(self: *TrainingRunner, x_batch: []const f32, target_batch: []const f32) !void {
+        if (self.x_train_batch == null) return error.BatchSizeNotConfigured;
+        if (x_batch.len % self.cfg.dim_in != 0) return error.XBatchDimMismatch;
+        const n: u32 = @intCast(x_batch.len / self.cfg.dim_in);
+        if (n == 0) return;
+        if (n > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+        if (target_batch.len != n * self.cfg.dim_out) return error.TargetBatchDimMismatch;
+
+        @constCast(&self.x_train_batch.?).update(f32, x_batch);
+        @constCast(&self.target_batch.?).update(f32, target_batch);
+
+        var rec = try recorder_mod.Recorder.init(self.ctx, 16, 64);
+        defer rec.deinit();
+        try rec.begin();
+        try self.recordTrainBatch(&rec, n);
+        try rec.endAndSubmit();
+    }
+
+    /// Attach-mode batched train: record the chain into an existing
+    /// host-owned Recorder, no submit. Caller must have populated
+    /// `runner.x_train_batch` and `runner.target_batch` already (via
+    /// e.g. `Buffer.update` on the public `*_batch` fields, or the
+    /// upcoming `runner.uploadTrainBatch` helper).
+    pub fn tickStepBatchRecord(self: *TrainingRunner, rec: *recorder_mod.Recorder, n_samples: u32) !void {
+        if (self.x_train_batch == null) return error.BatchSizeNotConfigured;
+        if (n_samples == 0) return;
+        if (n_samples > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+        try self.recordTrainBatch(rec, n_samples);
+    }
+
     /// Attach-mode batched predict: record the dispatch into an
     /// existing host-owned Recorder. Caller must upload `x_batch`
     /// data into `runner.x_batch` (HOST_VISIBLE) themselves before
@@ -453,6 +573,135 @@ pub const TrainingRunner = struct {
         try rec.dispatch(&self.k_relu, &.{ &self.h_pre, &self.h }, &relu_push, ceilDiv(dim_h, 256), 1, 1);
         try rec.dispatch(&self.k_matmul, &.{ &self.h, &self.w2, &self.y }, &matmul2_push, 1, 1, 1);
         try rec.dispatch(&self.k_add, &.{ &self.y, &self.b2 }, &add2_push, ceilDiv(dim_out, 256), 1, 1);
+    }
+
+    /// Record a complete batched SGD step into `rec`. 9 dispatches:
+    /// forward, dy, dh_pre, dw2 accum, db2 accum, dw1 accum, db1 accum,
+    /// then 4× sgd_step (W1, b1, W2, b2). Caller must have populated
+    /// `x_train_batch` and `target_batch` already.
+    fn recordTrainBatch(self: *const TrainingRunner, rec: *recorder_mod.Recorder, n_samples: u32) !void {
+        const dim_in = self.cfg.dim_in;
+        const dim_h = self.cfg.dim_hidden;
+        const dim_out = self.cfg.dim_out;
+
+        const k_fwd = &(self.k_train_fwd_batch.?);
+        const k_dy = &(self.k_train_dy_batch.?);
+        const k_dhp = &(self.k_train_dh_pre_batch.?);
+        const k_dw = &(self.k_train_dw_accum.?);
+        const k_db = &(self.k_train_db_accum.?);
+        const x_train = &(self.x_train_batch.?);
+        const tgt = &(self.target_batch.?);
+        const h_pre_b = &(self.h_pre_train_batch.?);
+        const h_b = &(self.h_train_batch.?);
+        const y_b = &(self.y_train_batch.?);
+        const dy_b = &(self.dy_train_batch.?);
+        const dhp_b = &(self.dh_pre_train_batch.?);
+
+        // 1. forward → h_pre, h, y
+        const fwd_push = runtime.Mlp2ForwardTrainBatchedPush{
+            .dim_in = dim_in,
+            .dim_hidden = dim_h,
+            .dim_out = dim_out,
+            .n_samples = n_samples,
+        };
+        try rec.dispatch(
+            k_fwd,
+            &.{ &self.w1, &self.b1, &self.w2, &self.b2, x_train, h_pre_b, h_b, y_b },
+            &fwd_push,
+            ceilDiv(n_samples, 64),
+            1,
+            1,
+        );
+
+        // 2. dy = (y - target) / N
+        const dy_push = runtime.Mlp2DyBatchedPush{ .dim_out = dim_out, .n_samples = n_samples };
+        try rec.dispatch(
+            k_dy,
+            &.{ y_b, tgt, dy_b },
+            &dy_push,
+            ceilDiv(dim_out * n_samples, 256),
+            1,
+            1,
+        );
+
+        // 3. dh_pre = (W2^T · dy) · 1[h_pre > 0]
+        const dhp_push = runtime.Mlp2DhPreBatchedPush{
+            .dim_hidden = dim_h,
+            .dim_out = dim_out,
+            .n_samples = n_samples,
+        };
+        try rec.dispatch(
+            k_dhp,
+            &.{ dy_b, &self.w2, h_pre_b, dhp_b },
+            &dhp_push,
+            ceilDiv(dim_h * n_samples, 256),
+            1,
+            1,
+        );
+
+        // 4. dW2[o, h] = Σ_n dy[n, o] · h[n, h]
+        const dw2_push = runtime.Mlp2DwAccumPush{
+            .dim_i = dim_out,
+            .dim_j = dim_h,
+            .n_samples = n_samples,
+        };
+        try rec.dispatch(
+            k_dw,
+            &.{ dy_b, h_b, &self.dw2 },
+            &dw2_push,
+            ceilDiv(dim_out, 16),
+            ceilDiv(dim_h, 16),
+            1,
+        );
+
+        // 5. db2[o] = Σ_n dy[n, o]
+        const db2_push = runtime.Mlp2DbAccumPush{ .dim_i = dim_out, .n_samples = n_samples };
+        try rec.dispatch(
+            k_db,
+            &.{ dy_b, &self.db2 },
+            &db2_push,
+            ceilDiv(dim_out, 256),
+            1,
+            1,
+        );
+
+        // 6. dW1[h, k] = Σ_n dh_pre[n, h] · x[n, k]
+        const dw1_push = runtime.Mlp2DwAccumPush{
+            .dim_i = dim_h,
+            .dim_j = dim_in,
+            .n_samples = n_samples,
+        };
+        try rec.dispatch(
+            k_dw,
+            &.{ dhp_b, x_train, &self.dw1 },
+            &dw1_push,
+            ceilDiv(dim_h, 16),
+            ceilDiv(dim_in, 16),
+            1,
+        );
+
+        // 7. db1[h] = Σ_n dh_pre[n, h]
+        const db1_push = runtime.Mlp2DbAccumPush{ .dim_i = dim_h, .n_samples = n_samples };
+        try rec.dispatch(
+            k_db,
+            &.{ dhp_b, &self.db1 },
+            &db1_push,
+            ceilDiv(dim_h, 256),
+            1,
+            1,
+        );
+
+        // 8. SGD on all four params.
+        const w1_n: u32 = dim_h * dim_in;
+        const w2_n: u32 = dim_out * dim_h;
+        const sgd_w1 = runtime.SgdStepPush{ .n = w1_n, .lr = self.lr };
+        const sgd_b1 = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr };
+        const sgd_w2 = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr };
+        const sgd_b2 = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr };
+        try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1, ceilDiv(w1_n, 256), 1, 1);
+        try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1, ceilDiv(dim_h, 256), 1, 1);
+        try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2, ceilDiv(w2_n, 256), 1, 1);
+        try rec.dispatch(&self.k_sgd, &.{ &self.b2, &self.db2 }, &sgd_b2, ceilDiv(dim_out, 256), 1, 1);
     }
 
     fn recordStep(self: *const TrainingRunner, rec: *recorder_mod.Recorder) !void {

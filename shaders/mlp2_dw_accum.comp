@@ -1,0 +1,37 @@
+#version 460
+// Generic batched outer-product accumulator:
+//
+//     dW[i, j] = Σ_n A[n, i] · B[n, j]
+//
+// Used twice in the batched training pass:
+//
+//   • dW2[o, h] = Σ_n dy[n, o] · h_post[n, h]
+//   • dW1[j, k] = Σ_n dh_pre[n, j] · x[n, k]
+//
+// One thread per (i, j) output cell, each loops over the batch
+// dimension N. No atomics — each cell is owned exclusively by one
+// thread. Pre-averaging happens upstream via `mlp2_dy_batched.comp`'s
+// /N scale, so the sum here IS the mean gradient.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A  { float a[];  }; // [N, dim_i]
+layout(set = 0, binding = 1, std430) readonly  buffer B  { float b[];  }; // [N, dim_j]
+layout(set = 0, binding = 2, std430) writeonly buffer DW { float dw[]; }; // [dim_i, dim_j]
+
+layout(push_constant) uniform Pc {
+    uint dim_i;
+    uint dim_j;
+    uint n_samples;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint j = gl_GlobalInvocationID.y;
+    if (i >= pc.dim_i || j >= pc.dim_j) return;
+    float acc = 0.0;
+    for (uint n = 0; n < pc.n_samples; n++) {
+        acc += a[n * pc.dim_i + i] * b[n * pc.dim_j + j];
+    }
+    dw[i * pc.dim_j + j] = acc;
+}

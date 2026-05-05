@@ -1,0 +1,40 @@
+#version 460
+// Per-sample backward through the second linear layer + ReLU mask:
+//
+//     dh[n, j]      = Σ_o dy[n, o] · W2[o, j]    (transposed matvec)
+//     dh_pre[n, j]  = dh[n, j] · 1[h_pre[n, j] > 0]
+//
+// Fused into one kernel: each (n, j) thread reads dy[n, *] and W2[*, j]
+// to produce dh, then masks against h_pre[n, j] in the same step. No
+// intermediate dh buffer needed.
+//
+// One thread per (sample n, hidden j). Flat 1D dispatch over N·H.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dy   { float dy_all[];     }; // [N, dim_out]
+layout(set = 0, binding = 1, std430) readonly  buffer W2   { float w2[];          }; // [dim_out, dim_hidden]
+layout(set = 0, binding = 2, std430) readonly  buffer Hpre { float h_pre_all[]; }; // [N, dim_hidden]
+layout(set = 0, binding = 3, std430) writeonly buffer Dhp  { float dh_pre_all[]; }; // [N, dim_hidden]
+
+layout(push_constant) uniform Pc {
+    uint dim_hidden;
+    uint dim_out;
+    uint n_samples;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.dim_hidden * pc.n_samples;
+    if (idx >= total) return;
+    uint n = idx / pc.dim_hidden;
+    uint j = idx % pc.dim_hidden;
+
+    float acc = 0.0;
+    uint dy_off = n * pc.dim_out;
+    for (uint o = 0; o < pc.dim_out; o++) {
+        acc += dy_all[dy_off + o] * w2[o * pc.dim_hidden + j];
+    }
+    float mask = h_pre_all[n * pc.dim_hidden + j] > 0.0 ? 1.0 : 0.0;
+    dh_pre_all[n * pc.dim_hidden + j] = acc * mask;
+}

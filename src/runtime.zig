@@ -125,6 +125,35 @@ pub const Mlp2ForwardBatchedPush = extern struct {
     n_samples: u32,
 };
 
+pub const Mlp2ForwardTrainBatchedPush = extern struct {
+    dim_in: u32,
+    dim_hidden: u32,
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DyBatchedPush = extern struct {
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DhPreBatchedPush = extern struct {
+    dim_hidden: u32,
+    dim_out: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DwAccumPush = extern struct {
+    dim_i: u32,
+    dim_j: u32,
+    n_samples: u32,
+};
+
+pub const Mlp2DbAccumPush = extern struct {
+    dim_i: u32,
+    n_samples: u32,
+};
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {
