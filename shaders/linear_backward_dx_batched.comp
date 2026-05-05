@@ -1,0 +1,41 @@
+#version 460
+// Linear-layer input gradient, batched over an outer "position" axis.
+//
+// Forward convention (matches src/cpu/train_decoder.zig and matmul_nt):
+//     out = x @ Wᵀ        x[M, K], W[N, K], out[M, N]
+//
+// Backward dx:
+//     dx[m, k] = Σ_n dout[m, n] · W[n, k]
+//
+// One thread per (m, k) cell; loop over n. 16×16 workgroup matches the
+// outer_product / matmul_nt grid convention so descriptor allocation
+// patterns line up across forward and backward.
+//
+// The single-row sibling shader `linear_backward_dx.comp` is kept for
+// the existing MlpN runner (M = 1). This batched form is the one
+// transformer training uses: one decoder layer touches it once per
+// linear (Q/K/V/O/FF1/FF2 = six dispatches).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dout { float dout[]; }; // [M, N]
+layout(set = 0, binding = 1, std430) readonly  buffer W    { float w[];    }; // [N, K]
+layout(set = 0, binding = 2, std430) writeonly buffer Dx   { float dx[];   }; // [M, K]
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    uint k = gl_GlobalInvocationID.y;
+    if (m >= pc.M || k >= pc.K) return;
+
+    float acc = 0.0;
+    for (uint n = 0; n < pc.N; n++) {
+        acc += dout[m * pc.N + n] * w[n * pc.K + k];
+    }
+    dx[m * pc.K + k] = acc;
+}

@@ -1,0 +1,38 @@
+#version 460
+// Linear-layer weight gradient, batched / summed over the position axis.
+//
+// Forward: out = x @ Wᵀ      x[M, K], W[N, K], out[M, N]
+// Weight grad (CPU oracle in train_decoder.linearBackward):
+//     dW[n, k] = Σ_m dout[m, n] · x[m, k]
+//
+// Overwrites dW. Caller resets / accumulates host-side between optimizer
+// steps — chunk-8a's CPU oracle does `grads.zero()` before each backward,
+// so a single full backward writes once and `=` matches that semantics.
+//
+// 16×16 workgroup grid over (n, k); each thread loops over m. Shape
+// `outer_product.comp` extended to a sum-over-batch — keeping the grid
+// shape lets allocators reuse descriptor pools.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dout { float dout[]; }; // [M, N]
+layout(set = 0, binding = 1, std430) readonly  buffer X    { float x[];    }; // [M, K]
+layout(set = 0, binding = 2, std430) writeonly buffer DW   { float dw[];   }; // [N, K]
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    uint k = gl_GlobalInvocationID.y;
+    if (n >= pc.N || k >= pc.K) return;
+
+    float acc = 0.0;
+    for (uint m = 0; m < pc.M; m++) {
+        acc += dout[m * pc.N + n] * x[m * pc.K + k];
+    }
+    dw[n * pc.K + k] = acc;
+}

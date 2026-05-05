@@ -171,6 +171,10 @@ pub const ReluBackwardPush = extern struct { n: u32 };
 
 pub const LinearBackwardDxPush = extern struct { dim_out: u32, dim_in: u32 };
 
+/// Batched linear-layer backward (dx and dW variants share this layout).
+/// Forward: out = x @ Wᵀ where x[M, K], W[N, K], out[M, N].
+pub const LinearBatchedPush = extern struct { M: u32, N: u32, K: u32 };
+
 pub const OuterProductPush = extern struct { dim_out: u32, dim_in: u32 };
 
 pub const SgdStepPush = extern struct { n: u32, lr: f32, weight_decay: f32 = 0 };

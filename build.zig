@@ -62,6 +62,8 @@ pub fn build(b: *std.Build) void {
     const relu_spv = compileShader(b, "relu");
     const relu_backward_spv = compileShader(b, "relu_backward");
     const linear_backward_dx_spv = compileShader(b, "linear_backward_dx");
+    const linear_backward_dx_batched_spv = compileShader(b, "linear_backward_dx_batched");
+    const linear_backward_dw_batched_spv = compileShader(b, "linear_backward_dw_batched");
     const outer_product_spv = compileShader(b, "outer_product");
     const sgd_step_spv = compileShader(b, "sgd_step");
     const adam_step_spv = compileShader(b, "adam_step");
@@ -134,6 +136,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(relu_spv, "relu.spv");
     _ = wf.addCopyFile(relu_backward_spv, "relu_backward.spv");
     _ = wf.addCopyFile(linear_backward_dx_spv, "linear_backward_dx.spv");
+    _ = wf.addCopyFile(linear_backward_dx_batched_spv, "linear_backward_dx_batched.spv");
+    _ = wf.addCopyFile(linear_backward_dw_batched_spv, "linear_backward_dw_batched.spv");
     _ = wf.addCopyFile(outer_product_spv, "outer_product.spv");
     _ = wf.addCopyFile(sgd_step_spv, "sgd_step.spv");
     _ = wf.addCopyFile(adam_step_spv, "adam_step.spv");
@@ -201,6 +205,8 @@ pub fn build(b: *std.Build) void {
         \\pub const relu align(4) = @embedFile("relu.spv").*;
         \\pub const relu_backward align(4) = @embedFile("relu_backward.spv").*;
         \\pub const linear_backward_dx align(4) = @embedFile("linear_backward_dx.spv").*;
+        \\pub const linear_backward_dx_batched align(4) = @embedFile("linear_backward_dx_batched.spv").*;
+        \\pub const linear_backward_dw_batched align(4) = @embedFile("linear_backward_dw_batched.spv").*;
         \\pub const outer_product align(4) = @embedFile("outer_product.spv").*;
         \\pub const sgd_step align(4) = @embedFile("sgd_step.spv").*;
         \\pub const adam_step align(4) = @embedFile("adam_step.spv").*;
