@@ -566,6 +566,7 @@ pub fn main() !void {
     try runGpuMlpForwardSmoke(allocator);
     try runGpuMlpBackwardSmoke(allocator);
     try runGpuMlpTrainSmoke(allocator);
+    try runGpuMlpNTrainSmoke(allocator);
     try runTrainingRunnerSmoke(allocator);
     try runTrainingRunnerAttachedSmoke(allocator);
     try runTrainingRunnerBatchedSmoke(allocator);
@@ -1963,6 +1964,285 @@ fn runGpuMlpTrainSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU MLP train ({d} SGD steps; step-1 |Δ|={e}, after-{d} |Δ|={e}, all on-device)\n",
         .{ n_steps, max_step1, n_steps, max_traj },
+    );
+}
+
+// ── Multi-layer GPU MLP train smoke ───────────────────────────────
+//
+// Tier-1 chunk 2 of the post-v0 training arc. Same primitives as the
+// 2-layer GPU train smoke, but orchestrated across n=3 layers in
+// generic loops. Bit-exact step-1 parity vs the new MlpN CPU oracle
+// proves the dispatch ordering works at depth before we lift it into
+// the runner.
+//
+// Composition: forward is matmul → bias add → ReLU per hidden layer,
+// then matmul → bias add (no ReLU) on the output. Backward seeds
+// dL/dy via mse_loss_grad on the output, then for each layer L from
+// n-1 down to 0 emits db = d_pre, dW = d_pre ⊗ input[L], and (if
+// L > 0) propagates d_post[L-1] = W[L]ᵀ · d_pre[L] then
+// d_pre[L-1] = d_post[L-1] · 1[pre[L-1] > 0]. SGD updates run after
+// all gradients are computed so each W[L] is read at its pre-update
+// value during backward.
+
+fn runGpuMlpNTrainSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const layer_dims = [_]usize{ 4, 8, 6, 4 };
+    const n = layer_dims.len - 1;
+    const lr: f32 = 0.05;
+    const n_steps: u32 = 50;
+
+    var mlp_cpu = try cpu_train.MlpN.init(allocator, &layer_dims, 0.3, 0xC0FFEE3D);
+    defer mlp_cpu.deinit(allocator);
+    // Stamp non-zero biases so gradient flow through b is exercised.
+    for (mlp_cpu.biases, 0..) |b, layer_idx| {
+        for (b, 0..) |*v, i| {
+            const li: f32 = @floatFromInt(layer_idx + 1);
+            const ii: f32 = @floatFromInt(@as(i32, @intCast(i % 3)));
+            v.* = 0.05 * (li - ii);
+        }
+    }
+
+    const x = [_]f32{ 1.0, 0.5, -0.3, 0.2 };
+    const target = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+
+    // ── GPU buffers ───────────────────────────────────────────────
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, &x);
+    defer buf_x.deinit(ctx.device);
+    var buf_target = try buffer.Buffer.initStatic(&ctx, f32, &target);
+    defer buf_target.deinit(ctx.device);
+
+    var bufs_w: [n]buffer.Buffer = undefined;
+    var bufs_b: [n]buffer.Buffer = undefined;
+    var bufs_dw: [n]buffer.Buffer = undefined;
+    var bufs_db: [n]buffer.Buffer = undefined;
+    var bufs_pre: [n]buffer.Buffer = undefined;
+    var bufs_post: [n]buffer.Buffer = undefined;
+    var bufs_dpre: [n]buffer.Buffer = undefined;
+    // d_post[L-1] for L=1..n-1 — needed only when there's a layer
+    // below to back-prop through. Index by L (i.e. dpost_for_below[L]
+    // is the d_post going INTO layer L-1's d_pre); slot 0 unused.
+    var bufs_dpost: [n]buffer.Buffer = undefined;
+
+    for (0..n) |L| {
+        bufs_w[L] = try buffer.Buffer.initStatic(&ctx, f32, mlp_cpu.weights[L]);
+        bufs_b[L] = try buffer.Buffer.initStatic(&ctx, f32, mlp_cpu.biases[L]);
+        const dim_o = layer_dims[L + 1];
+        const dim_i = layer_dims[L];
+        bufs_dw[L] = try buffer.Buffer.initDeviceOnly(&ctx, dim_o * dim_i * @sizeOf(f32));
+        bufs_db[L] = try buffer.Buffer.initDeviceOnly(&ctx, dim_o * @sizeOf(f32));
+        bufs_pre[L] = try buffer.Buffer.initDeviceOnly(&ctx, dim_o * @sizeOf(f32));
+        bufs_post[L] = try buffer.Buffer.initDeviceOnly(&ctx, dim_o * @sizeOf(f32));
+        bufs_dpre[L] = try buffer.Buffer.initDeviceOnly(&ctx, dim_o * @sizeOf(f32));
+    }
+    for (1..n) |L| {
+        bufs_dpost[L] = try buffer.Buffer.initDeviceOnly(&ctx, layer_dims[L] * @sizeOf(f32));
+    }
+    defer {
+        for (0..n) |L| {
+            bufs_w[L].deinit(ctx.device);
+            bufs_b[L].deinit(ctx.device);
+            bufs_dw[L].deinit(ctx.device);
+            bufs_db[L].deinit(ctx.device);
+            bufs_pre[L].deinit(ctx.device);
+            bufs_post[L].deinit(ctx.device);
+            bufs_dpre[L].deinit(ctx.device);
+        }
+        for (1..n) |L| bufs_dpost[L].deinit(ctx.device);
+    }
+
+    // ── Pipelines ──────────────────────────────────────────────────
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    defer k_relu.deinit();
+    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(ReluBackwardPush));
+    defer k_relu_bw.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(LinearBackwardDxPush));
+    defer k_lin_dx.deinit();
+    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(OuterProductPush));
+    defer k_outer.deinit();
+    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush));
+    defer k_copy.deinit();
+    var k_sgd = try pipeline.Kernel.init(&ctx, &shaders.sgd_step, 2, @sizeOf(SgdStepPush));
+    defer k_sgd.deinit();
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    defer k_mse_grad.deinit();
+
+    // ── CPU oracle to compare each step against ────────────────────
+    var act_cpu = try cpu_train.ActivationsN.init(allocator, &mlp_cpu);
+    defer act_cpu.deinit(allocator);
+    act_cpu.x = &x;
+    var grads_cpu = try cpu_train.GradsN.init(allocator, &mlp_cpu);
+    defer grads_cpu.deinit(allocator);
+
+    // Snapshot buffers for the after-step-1 parity check (per layer).
+    var w_after_1: [n][]f32 = undefined;
+    var b_after_1: [n][]f32 = undefined;
+    for (0..n) |L| {
+        w_after_1[L] = try allocator.alloc(f32, mlp_cpu.weights[L].len);
+        b_after_1[L] = try allocator.alloc(f32, mlp_cpu.biases[L].len);
+    }
+    defer for (0..n) |L| {
+        allocator.free(w_after_1[L]);
+        allocator.free(b_after_1[L]);
+    };
+
+    var step: u32 = 0;
+    while (step < n_steps) : (step += 1) {
+        // CPU step.
+        _ = try cpu_train.trainStepN(allocator, &mlp_cpu, &act_cpu, &grads_cpu, &target, lr);
+
+        // GPU step.
+        var rec = try gpu_recorder.Recorder.init(&ctx, 32, 256);
+        defer rec.deinit();
+        try rec.begin();
+
+        // Forward pass: layer L reads input[L] = (L==0 ? x : post[L-1]),
+        // writes pre[L] = W[L]·input + b[L], then post[L] = ReLU(pre[L])
+        // for hidden layers; for the output layer post[L] = pre[L] (we
+        // don't dispatch a relu, and downstream readers use pre as y).
+        for (0..n) |L| {
+            const dim_o: u32 = @intCast(layer_dims[L + 1]);
+            const dim_i: u32 = @intCast(layer_dims[L]);
+            const input_buf = if (L == 0) &buf_x else &bufs_post[L - 1];
+            const matmul_push = MatmulPush{ .m = 1, .n = dim_o, .k = dim_i };
+            try rec.dispatch(&k_matmul, &.{ input_buf, &bufs_w[L], &bufs_pre[L] }, &matmul_push, 1, 1, 1);
+            const add_push = runtime.AddInPlacePush{ .n = dim_o };
+            try rec.dispatch(&k_add, &.{ &bufs_pre[L], &bufs_b[L] }, &add_push, ceilDiv(dim_o, 256), 1, 1);
+            if (L + 1 < n) {
+                const relu_push = ReluPush{ .n = dim_o };
+                try rec.dispatch(&k_relu, &.{ &bufs_pre[L], &bufs_post[L] }, &relu_push, ceilDiv(dim_o, 256), 1, 1);
+            } else {
+                // Output layer has no ReLU — copy pre→post so backward
+                // and the host can both read the prediction from
+                // bufs_post[n-1] uniformly.
+                const copy_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
+                try rec.dispatch(&k_copy, &.{ &bufs_pre[L], &bufs_post[L] }, &copy_push, ceilDiv(dim_o, 256), 1, 1);
+            }
+        }
+
+        // Loss-grad seeds d_pre on the output layer (no ReLU there).
+        const dim_out_u: u32 = @intCast(layer_dims[n]);
+        const mse_grad_push = MseLossGradPush{ .n = dim_out_u };
+        try rec.dispatch(&k_mse_grad, &.{ &bufs_post[n - 1], &buf_target, &bufs_dpre[n - 1] }, &mse_grad_push, ceilDiv(dim_out_u, 256), 1, 1);
+
+        // Backward pass per layer, top-down. db = d_pre; dW = d_pre ⊗ input;
+        // if not the bottom layer, propagate d_post and apply the ReLU mask.
+        var Lp1: usize = n;
+        while (Lp1 > 0) : (Lp1 -= 1) {
+            const L = Lp1 - 1;
+            const dim_o: u32 = @intCast(layer_dims[L + 1]);
+            const dim_i: u32 = @intCast(layer_dims[L]);
+            const input_buf = if (L == 0) &buf_x else &bufs_post[L - 1];
+
+            // db[L] = d_pre[L]
+            const copy_db = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
+            try rec.dispatch(&k_copy, &.{ &bufs_dpre[L], &bufs_db[L] }, &copy_db, ceilDiv(dim_o, 256), 1, 1);
+            // dW[L] = d_pre[L] ⊗ input
+            const op_push = OuterProductPush{ .dim_out = dim_o, .dim_in = dim_i };
+            try rec.dispatch(&k_outer, &.{ &bufs_dpre[L], input_buf, &bufs_dw[L] }, &op_push, ceilDiv(dim_o, 16), ceilDiv(dim_i, 16), 1);
+            // Propagate to layer L-1's d_pre, with ReLU mask on its pre.
+            if (L > 0) {
+                const lin_dx_push = LinearBackwardDxPush{ .dim_out = dim_o, .dim_in = dim_i };
+                try rec.dispatch(&k_lin_dx, &.{ &bufs_dpre[L], &bufs_w[L], &bufs_dpost[L] }, &lin_dx_push, ceilDiv(dim_i, 256), 1, 1);
+                const relu_bw_push = ReluBackwardPush{ .n = dim_i };
+                try rec.dispatch(&k_relu_bw, &.{ &bufs_dpost[L], &bufs_pre[L - 1], &bufs_dpre[L - 1] }, &relu_bw_push, ceilDiv(dim_i, 256), 1, 1);
+            }
+        }
+
+        // SGD updates run after all gradients have been computed using
+        // pre-update weights. Order across layers doesn't matter.
+        for (0..n) |L| {
+            const sgd_w_push = SgdStepPush{ .n = @intCast(mlp_cpu.weights[L].len), .lr = lr };
+            try rec.dispatch(&k_sgd, &.{ &bufs_w[L], &bufs_dw[L] }, &sgd_w_push, ceilDiv(@intCast(mlp_cpu.weights[L].len), 256), 1, 1);
+            const sgd_b_push = SgdStepPush{ .n = @intCast(mlp_cpu.biases[L].len), .lr = lr };
+            try rec.dispatch(&k_sgd, &.{ &bufs_b[L], &bufs_db[L] }, &sgd_b_push, ceilDiv(@intCast(mlp_cpu.biases[L].len), 256), 1, 1);
+        }
+
+        try rec.endAndSubmit();
+
+        if (step == 0) {
+            for (0..n) |L| {
+                try bufs_w[L].readBack(&ctx, f32, w_after_1[L]);
+                try bufs_b[L].readBack(&ctx, f32, b_after_1[L]);
+            }
+        }
+    }
+
+    // ── Single-step parity ────────────────────────────────────────
+    // Re-run step 1 from a fresh oracle (mlp_cpu has already moved on).
+    var oracle = try cpu_train.MlpN.init(allocator, &layer_dims, 0.3, 0xC0FFEE3D);
+    defer oracle.deinit(allocator);
+    for (oracle.biases, 0..) |b, layer_idx| {
+        for (b, 0..) |*v, i| {
+            const li: f32 = @floatFromInt(layer_idx + 1);
+            const ii: f32 = @floatFromInt(@as(i32, @intCast(i % 3)));
+            v.* = 0.05 * (li - ii);
+        }
+    }
+    var oracle_act = try cpu_train.ActivationsN.init(allocator, &oracle);
+    defer oracle_act.deinit(allocator);
+    oracle_act.x = &x;
+    var oracle_grads = try cpu_train.GradsN.init(allocator, &oracle);
+    defer oracle_grads.deinit(allocator);
+    _ = try cpu_train.trainStepN(allocator, &oracle, &oracle_act, &oracle_grads, &target, lr);
+
+    const tol_step1: f32 = 1e-5;
+    var max_step1: f32 = 0;
+    for (0..n) |L| {
+        for (oracle.weights[L], w_after_1[L], 0..) |c, g, i| {
+            const d = @abs(g - c);
+            if (d > tol_step1) {
+                std.debug.print("step-1 W[{d}] MISMATCH[{d}]: gpu={d} cpu={d}\n", .{ L, i, g, c });
+                return error.ParityFailed;
+            }
+            if (d > max_step1) max_step1 = d;
+        }
+        for (oracle.biases[L], b_after_1[L], 0..) |c, g, i| {
+            const d = @abs(g - c);
+            if (d > tol_step1) {
+                std.debug.print("step-1 b[{d}] MISMATCH[{d}]: gpu={d} cpu={d}\n", .{ L, i, g, c });
+                return error.ParityFailed;
+            }
+            if (d > max_step1) max_step1 = d;
+        }
+    }
+
+    // ── Full-trajectory parity ────────────────────────────────────
+    const tol_traj: f32 = 1e-4;
+    var max_traj: f32 = 0;
+    for (0..n) |L| {
+        const w_gpu = try allocator.alloc(f32, mlp_cpu.weights[L].len);
+        defer allocator.free(w_gpu);
+        const b_gpu = try allocator.alloc(f32, mlp_cpu.biases[L].len);
+        defer allocator.free(b_gpu);
+        try bufs_w[L].readBack(&ctx, f32, w_gpu);
+        try bufs_b[L].readBack(&ctx, f32, b_gpu);
+        for (mlp_cpu.weights[L], w_gpu, 0..) |c, g, i| {
+            const d = @abs(g - c);
+            if (d > tol_traj) {
+                std.debug.print("traj W[{d}] MISMATCH[{d}] @ step {d}: gpu={d} cpu={d}\n", .{ L, i, n_steps, g, c });
+                return error.ParityFailed;
+            }
+            if (d > max_traj) max_traj = d;
+        }
+        for (mlp_cpu.biases[L], b_gpu, 0..) |c, g, i| {
+            const d = @abs(g - c);
+            if (d > tol_traj) {
+                std.debug.print("traj b[{d}] MISMATCH[{d}] @ step {d}: gpu={d} cpu={d}\n", .{ L, i, n_steps, g, c });
+                return error.ParityFailed;
+            }
+            if (d > max_traj) max_traj = d;
+        }
+    }
+
+    std.debug.print(
+        "PASS GPU MLP train (n={d} layers, dims [4,8,6,4], {d} SGD steps; step-1 |Δ|={e}, after-{d} |Δ|={e})\n",
+        .{ n, n_steps, max_step1, n_steps, max_traj },
     );
 }
 
