@@ -214,6 +214,38 @@ pub fn main() !void {
         try runGpuGenTq4V(allocator, args[2], token_id);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--train-demo")) {
+        // Headless training demo. Streams a time-dependent (input,
+        // target) signal through the TrainingRunner and prints a loss
+        // curve. No model file required; weights start random and
+        // converge in a few hundred steps. Format:
+        //   --train-demo [--steps N] [--hidden H] [--lr L] [--print-every K]
+        var steps: u32 = 600;
+        var hidden: u32 = 16;
+        var lr: f32 = 0.05;
+        var print_every: u32 = 50;
+        var i: usize = 2;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--steps") and i + 1 < args.len) {
+                steps = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--hidden") and i + 1 < args.len) {
+                hidden = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lr") and i + 1 < args.len) {
+                lr = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--print-every") and i + 1 < args.len) {
+                print_every = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        try runTrainDemo(allocator, steps, hidden, lr, print_every);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--bench")) {
         var n: usize = 64;
         var i: usize = 3;
@@ -1859,6 +1891,84 @@ fn runTrainingRunnerSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner ({d} alternating steps; loss {d:.6} → {d:.6}, readWeights OK)\n",
         .{ n_steps, initial_loss, final_loss },
+    );
+}
+
+// ── --train-demo: headless on-device training demo ──────────────────
+//
+// Chunk 6 of training-v0. End-user-facing CLI showing the
+// TrainingRunner converge on a non-trivial streaming signal, with no
+// model file required. Inputs and targets are derived from a virtual
+// "frame number" t — the same shape the engine integration will run,
+// just printed to stdout instead of driving a sphere's BRDF. Lets a
+// fresh checkout verify the whole training pipeline works end-to-end
+// without any external assets, and gives a feel for "what a few
+// hundred frames of training does to the loss" before the visual
+// demo lands.
+
+fn runTrainDemo(allocator: std.mem.Allocator, steps: u32, hidden: u32, lr: f32, print_every: u32) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = hidden,
+        .dim_out = 4,
+        .lr = lr,
+        .init_seed = 0xDEDEDED0,
+    };
+
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    std.debug.print(
+        "valkyr --train-demo on {s}\n  cfg: dim 4→{d}→4, lr={d}, steps={d}\n",
+        .{ ctx.deviceName(), hidden, lr, steps },
+    );
+    std.debug.print("  task: regress (sin t, cos t, sin 2t, cos 2t) → (½+½ sin t, ½+½ cos t, ½ + ⅓ sin 3t, 0)\n", .{});
+
+    // Input/target factories. Time advances by `dt` per step; the
+    // signal is intentionally smooth (so SGD on a single-sample stream
+    // sees a moving but locally-flat target) but non-trivial (the
+    // network must combine all 4 inputs to predict the 3rd component).
+    const dt: f32 = 0.05;
+    var pred: [4]f32 = undefined;
+    var target: [4]f32 = undefined;
+    var input: [4]f32 = undefined;
+
+    var step: u32 = 0;
+    var ema_loss: f32 = 0;
+    const ema_alpha: f32 = 0.05;
+    const t_start = std.time.nanoTimestamp();
+
+    while (step < steps) : (step += 1) {
+        const t = @as(f32, @floatFromInt(step)) * dt;
+        input[0] = @sin(t);
+        input[1] = @cos(t);
+        input[2] = @sin(2 * t);
+        input[3] = @cos(2 * t);
+        target[0] = 0.5 + 0.5 * @sin(t);
+        target[1] = 0.5 + 0.5 * @cos(t);
+        target[2] = 0.5 + 0.333 * @sin(3 * t);
+        target[3] = 0.0;
+
+        try runner.tickStep(&input, &target, &pred);
+        const loss = cpu_train.mseLoss(&pred, &target);
+        ema_loss = if (step == 0) loss else ema_alpha * loss + (1 - ema_alpha) * ema_loss;
+
+        if ((step + 1) % print_every == 0 or step == 0) {
+            std.debug.print(
+                "  step {d:>5}  loss={d:.6}  ema={d:.6}  pred=({d:.3},{d:.3},{d:.3},{d:.3})\n",
+                .{ step + 1, loss, ema_loss, pred[0], pred[1], pred[2], pred[3] },
+            );
+        }
+    }
+    const t_end = std.time.nanoTimestamp();
+    const elapsed_us = @divTrunc(t_end - t_start, 1000);
+    const us_per_step = @divTrunc(elapsed_us, @as(i128, steps));
+    std.debug.print(
+        "done: {d} steps in {d} µs ({d} µs/step, {d:.0} steps/s)\n",
+        .{ steps, elapsed_us, us_per_step, 1.0e6 / @as(f64, @floatFromInt(us_per_step)) },
     );
 }
 
