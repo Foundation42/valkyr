@@ -39,18 +39,25 @@ The two big arcs:
    - **TQ4-on-weights** — TurboQuant applied to the matmul weight
      side, orthogonal to Q4_0/Q4_K. Combined with `--tq4v` gets
      Gemma 2B into a few hundred MiB total.
-   - **Training stack** — v0 **shipped**. The 2-layer-MLP surface
-     (cooperative attach, batched mean-gradient SGD/Adam, MSE/CE loss
-     heads, loss-target decay, host-mapped predict staging) lives at
-     `src/train/runner.zig` with parity smokes against the CPU oracle
-     in `src/cpu/train.zig`. Headless `valkyr --train-demo` and two
-     visual companion demos in matryoshka (`train_mlp_demo`,
-     `train_classifier_demo`) show it running at refresh rate inside
-     a render loop. **Next tiers:** multi-layer MLP generalisation
-     (drop the hardcoded 2-layer assumption), then layernorm/RMSNorm
-     backward, attention backward, embedding gradient, and finally
-     the full transformer-fine-tune arc — same parity discipline:
-     CPU oracle first, GPU shader matches it. See
+   - **Training stack** — v0 **shipped**, Tier-1 **shipped**. The
+     2-layer-MLP surface (cooperative attach, batched mean-gradient
+     SGD/Adam, MSE/CE loss heads, loss-target decay, host-mapped
+     predict staging) lives at `src/train/runner.zig` with parity
+     smokes against the CPU oracle in `src/cpu/train.zig`. Headless
+     `valkyr --train-demo` and two visual companion demos in matryoshka
+     (`train_mlp_demo`, `train_classifier_demo`) show it running at
+     refresh rate inside a render loop. **Tier-1** generalised the
+     surface to depth N: `cpu_train.MlpN` + `train_runner_n.MlpNRunner`
+     (single-sample SGD only for now — Approach B in the planning
+     thread; chunk 3b will lift batched + Adam into the multi-layer
+     path). End-user reach via `valkyr --train-demo-n --layers a,b,c,d`.
+     Decoupled L2 weight decay (AdamW form) and a `cosineLr` host
+     helper round out the optimizer surface. **Next tiers:**
+     layernorm/RMSNorm backward, attention backward (the hardest one —
+     softmax + Q/K/V projections + RoPE), embedding gradient (sparse —
+     only indexed rows get grad), and finally the full
+     transformer-fine-tune arc — same parity discipline: CPU oracle
+     first, GPU shader matches it. See
      [embedding.md § Embedding training](embedding.md#embedding-training).
    - **Architectural blueprints (ONNX / JSON-spec).** Once the
      primitive set has stabilised through the transformer-training
