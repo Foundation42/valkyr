@@ -625,6 +625,7 @@ pub fn main() !void {
     try runGpuLayerNormBackwardSmoke(allocator);
     try runEmbeddingBackwardSmoke(allocator);
     try runSoftmaxBackwardSmoke(allocator);
+    try runAttentionBackwardCpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -5313,6 +5314,165 @@ fn runSoftmaxBackwardSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS softmax backward ({d}×{d}; CPU numeric-grad parity ≤ 1%; GPU max |Δ| = {e})\n",
         .{ n_rows, dim, max_abs },
+    );
+}
+
+// ── attention backward CPU oracle smoke ─────────────────────────────
+//
+// Numeric-grad parity for the full SDPA backward chain:
+//   forward(Q, K, V) → out;  L = Σ d_out · out  (with d_out fixed)
+//   ∂L/∂Q  numerically vs analytical
+//   ∂L/∂K  numerically vs analytical
+//   ∂L/∂V  numerically vs analytical
+// Tested with GQA (n_heads != n_kv_heads) and causal masking on a
+// small shape that exposes head-axis and position-axis bugs but is
+// small enough for central-difference to be stable.
+
+fn runAttentionBackwardCpuSmoke(allocator: std.mem.Allocator) !void {
+    const n_q: usize = 3;
+    const n_kv: usize = 4;
+    const n_heads: usize = 4;
+    const n_kv_heads: usize = 2; // heads_per_kv = 2 → GQA
+    const head_dim: usize = 8;
+    const causal = true;
+
+    const q_total = n_q * n_heads * head_dim;
+    const kv_total = n_kv * n_kv_heads * head_dim;
+    const out_total = n_q * n_heads * head_dim;
+    const scores_total = n_q * n_heads * n_kv;
+
+    const Q = try allocator.alloc(f32, q_total);
+    defer allocator.free(Q);
+    const K = try allocator.alloc(f32, kv_total);
+    defer allocator.free(K);
+    const V = try allocator.alloc(f32, kv_total);
+    defer allocator.free(V);
+    const d_out = try allocator.alloc(f32, out_total);
+    defer allocator.free(d_out);
+
+    var prng = std.Random.DefaultPrng.init(0xA77B_AC_01);
+    const rng = prng.random();
+    for (Q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (K) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (V) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (d_out) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    const scores = try allocator.alloc(f32, scores_total);
+    defer allocator.free(scores);
+    const attn = try allocator.alloc(f32, scores_total);
+    defer allocator.free(attn);
+    const out = try allocator.alloc(f32, out_total);
+    defer allocator.free(out);
+    const d_scores = try allocator.alloc(f32, scores_total);
+    defer allocator.free(d_scores);
+    const dQ = try allocator.alloc(f32, q_total);
+    defer allocator.free(dQ);
+    const dK = try allocator.alloc(f32, kv_total);
+    defer allocator.free(dK);
+    const dV = try allocator.alloc(f32, kv_total);
+    defer allocator.free(dV);
+
+    cpu_train_transformer.attentionForward(Q, K, V, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, scores, attn, out);
+    cpu_train_transformer.attentionBackward(d_out, Q, K, V, attn, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, d_scores, dQ, dK, dV);
+
+    // Probe loss helper: forward and dot with d_out.
+    const probe_scores = try allocator.alloc(f32, scores_total);
+    defer allocator.free(probe_scores);
+    const probe_attn = try allocator.alloc(f32, scores_total);
+    defer allocator.free(probe_attn);
+    const probe_out = try allocator.alloc(f32, out_total);
+    defer allocator.free(probe_out);
+
+    const lossFn = struct {
+        fn run(
+            Qp: []const f32,
+            Kp: []const f32,
+            Vp: []const f32,
+            d_outp: []const f32,
+            n_q_l: usize,
+            n_kv_l: usize,
+            n_heads_l: usize,
+            n_kv_heads_l: usize,
+            head_dim_l: usize,
+            causal_l: bool,
+            scratch_scores: []f32,
+            scratch_attn: []f32,
+            scratch_out: []f32,
+        ) f64 {
+            cpu_train_transformer.attentionForward(
+                Qp,
+                Kp,
+                Vp,
+                n_q_l,
+                n_kv_l,
+                n_heads_l,
+                n_kv_heads_l,
+                head_dim_l,
+                causal_l,
+                scratch_scores,
+                scratch_attn,
+                scratch_out,
+            );
+            var L: f64 = 0;
+            for (scratch_out, d_outp) |o, dop| L += @as(f64, o) * @as(f64, dop);
+            return L;
+        }
+    }.run;
+
+    const eps_h: f32 = 5e-3;
+    // Central-diff truncation ~O(eps_h²)·f‴; fp32 forward adds ~1e-5
+    // noise per loss eval, so for gradients of magnitude ~10⁻³ we
+    // expect rel_err around 1%. Skip very-near-zero analytic entries.
+    const target_rel_err: f32 = 2e-2;
+    const abs_floor: f32 = 5e-5;
+
+    const NamedBuf = struct {
+        name: []const u8,
+        buf: []f32,
+        analytic: []const f32,
+        probes: []const usize,
+    };
+
+    const probes_q = &[_]usize{ 0, 5, 13, 23, 47 }; // across (q, h, d) flat
+    const probes_k = &[_]usize{ 0, 7, 14, 27, 40 };
+    const probes_v = &[_]usize{ 1, 9, 18, 29, 41 };
+
+    var named = [_]NamedBuf{
+        .{ .name = "Q", .buf = Q, .analytic = dQ, .probes = probes_q },
+        .{ .name = "K", .buf = K, .analytic = dK, .probes = probes_k },
+        .{ .name = "V", .buf = V, .analytic = dV, .probes = probes_v },
+    };
+
+    var max_rel_err: f32 = 0;
+    for (&named) |nb| {
+        for (nb.probes) |i| {
+            const orig = nb.buf[i];
+            nb.buf[i] = orig + eps_h;
+            const Lp = lossFn(Q, K, V, d_out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, probe_scores, probe_attn, probe_out);
+            nb.buf[i] = orig - eps_h;
+            const Lm = lossFn(Q, K, V, d_out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, probe_scores, probe_attn, probe_out);
+            nb.buf[i] = orig;
+
+            const numeric: f32 = @floatCast((Lp - Lm) / (2.0 * @as(f64, eps_h)));
+            const analytic: f32 = nb.analytic[i];
+            const denom = @max(@abs(numeric), @abs(analytic));
+            // Both small? Numeric central-diff noise dominates; skip.
+            if (denom < abs_floor) continue;
+            const rel_err = @abs(numeric - analytic) / denom;
+            if (rel_err > target_rel_err) {
+                std.debug.print(
+                    "attn d{s}[{d}] analytic={d:.6} numeric={d:.6} rel_err={d:.4}\n",
+                    .{ nb.name, i, analytic, numeric, rel_err },
+                );
+                return error.ParityFailed;
+            }
+            if (rel_err > max_rel_err) max_rel_err = rel_err;
+        }
+    }
+
+    std.debug.print(
+        "PASS attention backward CPU (n_q={d} n_kv={d} heads={d}/{d} d={d} causal numeric-grad ≤ {e})\n",
+        .{ n_q, n_kv, n_heads, n_kv_heads, head_dim, max_rel_err },
     );
 }
 

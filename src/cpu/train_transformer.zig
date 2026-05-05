@@ -416,3 +416,236 @@ pub fn softmaxBackward(
         );
     }
 }
+
+// ── Scaled-dot-product attention forward + backward ────────────────
+//
+// Generic shape covers both training-style multi-query and decode-style
+// single-query attention:
+//
+//     Q       [n_q, n_heads, head_dim]            row-major
+//     K       [n_kv, n_kv_heads, head_dim]
+//     V       [n_kv, n_kv_heads, head_dim]
+//     scores  [n_q, n_heads, n_kv]                pre-softmax
+//     attn    [n_q, n_heads, n_kv]                post-softmax (saved for bwd)
+//     out     [n_q, n_heads, head_dim]
+//
+// GQA fold: head h reads K/V from `kv_h(h) = h / heads_per_kv` where
+// `heads_per_kv = n_heads / n_kv_heads`.
+//
+// Causal mask (when `causal = true`): for query at position q (0-indexed
+// from the start of the local window), keys at positions k > q are
+// masked out — forward sets `attn[q, h, k > q] = 0`. n_q ≤ n_kv is
+// assumed for causal attention with q's window aligned to the *end* of
+// the K/V window (the typical "decode against full history" layout):
+// query position q corresponds to key position `q + (n_kv − n_q)`,
+// keys at indices > `q + (n_kv − n_q)` are masked.
+//
+// For decode-step (n_q = 1, n_kv = pos+1) with causal = true, this
+// reduces to "no mask at all" (every key index is ≤ the single query's
+// position). For training-step (n_q = n_kv, both = sequence length) it
+// reduces to the standard lower-triangular causal mask.
+//
+// Forward:
+//     scores[q, h, k] = (Q[q, h] · K[k, kv_h(h)]) * inv_sqrt_d
+//                       (or -inf if causally masked)
+//     attn[q, h, :]   = softmax(scores[q, h, :])
+//     out[q, h, d]    = Σ_k attn[q, h, k] · V[k, kv_h(h), d]
+//
+// Backward (saved activations: attn, Q, K, V):
+//     dV[k, kv_h, d] = Σ_{h: kv_h(h)=kv_h} Σ_q attn[q, h, k] · dout[q, h, d]
+//     d_attn[q, h, k] = Σ_d dout[q, h, d] · V[k, kv_h(h), d]
+//     d_scores[q, h, :] = softmax_backward(d_attn[q, h, :], attn[q, h, :])
+//     dQ[q, h, d]   = inv_sqrt_d · Σ_k d_scores[q, h, k] · K[k, kv_h(h), d]
+//     dK[k, kv_h, d] = inv_sqrt_d · Σ_{h: kv_h(h)=kv_h} Σ_q
+//                                d_scores[q, h, k] · Q[q, h, d]
+//
+// Causal mask handling in backward: masked entries have attn = 0 → no
+// dV contribution; softmax_backward yields d_scores = 0 at masked
+// entries (since y_i = 0 means dx_i = 0); so dQ/dK pick up zeros from
+// those positions naturally — no extra masking logic needed in the
+// backward kernels themselves, as long as forward produced a clean
+// zero on the attn row for masked keys.
+
+inline fn causalKeyLimit(q: usize, n_q: usize, n_kv: usize) usize {
+    // Query q's "absolute" position is q + (n_kv − n_q); inclusive limit.
+    return q + (n_kv - n_q);
+}
+
+/// Full attention forward. Writes `scores`, `attn`, and `out`. The
+/// caller is expected to keep `attn` for backward (or re-run forward).
+pub fn attentionForward(
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    scores: []f32,
+    attn: []f32,
+    out: []f32,
+) void {
+    std.debug.assert(n_heads % n_kv_heads == 0);
+    const heads_per_kv = n_heads / n_kv_heads;
+    std.debug.assert(Q.len == n_q * n_heads * head_dim);
+    std.debug.assert(K.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(V.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(scores.len == n_q * n_heads * n_kv);
+    std.debug.assert(attn.len == n_q * n_heads * n_kv);
+    std.debug.assert(out.len == n_q * n_heads * head_dim);
+    if (causal) std.debug.assert(n_q <= n_kv);
+
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    for (0..n_q) |q| {
+        const k_limit: usize = if (causal) causalKeyLimit(q, n_q, n_kv) else (n_kv - 1);
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const q_off = q * n_heads * head_dim + h * head_dim;
+            const s_row_off = q * n_heads * n_kv + h * n_kv;
+
+            // ── 1. scores[q, h, k] = Q · K * inv_sqrt_d  (or -inf if masked)
+            for (0..n_kv) |k| {
+                if (causal and k > k_limit) {
+                    scores[s_row_off + k] = -std.math.inf(f32);
+                    continue;
+                }
+                const k_off = k * n_kv_heads * head_dim + kv_h * head_dim;
+                var s: f64 = 0;
+                for (0..head_dim) |d| {
+                    s += @as(f64, Q[q_off + d]) * @as(f64, K[k_off + d]);
+                }
+                scores[s_row_off + k] = @as(f32, @floatCast(s)) * inv_sqrt_d;
+            }
+
+            // ── 2. attn[q, h, :] = softmax(scores[q, h, :])  (stable)
+            var max_s: f32 = -std.math.inf(f32);
+            for (0..n_kv) |k| {
+                const v = scores[s_row_off + k];
+                if (v > max_s) max_s = v;
+            }
+            var sum: f64 = 0;
+            for (0..n_kv) |k| {
+                const v = scores[s_row_off + k];
+                const e: f32 = if (std.math.isInf(v) and v < 0) 0.0 else @exp(v - max_s);
+                attn[s_row_off + k] = e;
+                sum += e;
+            }
+            const inv_sum: f32 = if (sum > 0) 1.0 / @as(f32, @floatCast(sum)) else 0.0;
+            for (0..n_kv) |k| attn[s_row_off + k] *= inv_sum;
+
+            // ── 3. out[q, h, d] = Σ_k attn · V
+            const o_off = q * n_heads * head_dim + h * head_dim;
+            for (0..head_dim) |d| out[o_off + d] = 0.0;
+            for (0..n_kv) |k| {
+                const v_off = k * n_kv_heads * head_dim + kv_h * head_dim;
+                const w = attn[s_row_off + k];
+                if (w == 0.0) continue;
+                for (0..head_dim) |d| out[o_off + d] += w * V[v_off + d];
+            }
+        }
+    }
+}
+
+/// Full attention backward. `attn` is the saved softmax output from
+/// forward. `dQ`, `dK`, `dV` are *overwritten* (not accumulated) — the
+/// caller is responsible for any cross-step accumulation. `d_scores`
+/// is a scratch buffer the same shape as `scores` — reused as the
+/// staging area for `softmax_backward`.
+pub fn attentionBackward(
+    d_out: []const f32,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    attn: []const f32,
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    d_scores: []f32,
+    dQ: []f32,
+    dK: []f32,
+    dV: []f32,
+) void {
+    std.debug.assert(n_heads % n_kv_heads == 0);
+    _ = causal; // mask is implicit in `attn` (zeros at masked entries)
+    const heads_per_kv = n_heads / n_kv_heads;
+    std.debug.assert(d_out.len == n_q * n_heads * head_dim);
+    std.debug.assert(Q.len == n_q * n_heads * head_dim);
+    std.debug.assert(K.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(V.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(attn.len == n_q * n_heads * n_kv);
+    std.debug.assert(d_scores.len == n_q * n_heads * n_kv);
+    std.debug.assert(dQ.len == n_q * n_heads * head_dim);
+    std.debug.assert(dK.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(dV.len == n_kv * n_kv_heads * head_dim);
+
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    @memset(dQ, 0.0);
+    @memset(dK, 0.0);
+    @memset(dV, 0.0);
+
+    // ── 1. dV[k, kv_h, d] = Σ_h Σ_q attn[q, h, k] · dout[q, h, d]
+    //
+    //     and d_attn[q, h, k] = Σ_d dout[q, h, d] · V[k, kv_h(h), d]
+    //
+    // Fused into one pass over (q, h, k, d) for cache behaviour, fp64
+    // accumulation on the d-axis sum to match the row-wide reduction
+    // convention used elsewhere.
+    for (0..n_q) |q| {
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const dout_off = q * n_heads * head_dim + h * head_dim;
+            const a_row_off = q * n_heads * n_kv + h * n_kv;
+            const ds_row_off = a_row_off;
+
+            for (0..n_kv) |k| {
+                const v_off = k * n_kv_heads * head_dim + kv_h * head_dim;
+                const a = attn[a_row_off + k];
+
+                // dV accumulation — only contributes when attn != 0.
+                if (a != 0.0) {
+                    for (0..head_dim) |d| {
+                        dV[v_off + d] += a * d_out[dout_off + d];
+                    }
+                }
+
+                // d_attn[q, h, k] (staged into d_scores buffer).
+                var dot: f64 = 0;
+                for (0..head_dim) |d| {
+                    dot += @as(f64, d_out[dout_off + d]) * @as(f64, V[v_off + d]);
+                }
+                d_scores[ds_row_off + k] = @floatCast(dot);
+            }
+        }
+    }
+
+    // ── 2. d_scores[q, h, :] = softmax_backward(d_attn, attn)
+    softmaxBackward(d_scores, attn, n_q * n_heads, n_kv, d_scores);
+
+    // ── 3. dQ[q, h, d] = inv_sqrt_d · Σ_k d_scores · K
+    //      dK[k, kv_h, d] += inv_sqrt_d · Σ_h Σ_q d_scores · Q
+    for (0..n_q) |q| {
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const q_off = q * n_heads * head_dim + h * head_dim;
+            const ds_row_off = q * n_heads * n_kv + h * n_kv;
+
+            for (0..n_kv) |k| {
+                const k_off = k * n_kv_heads * head_dim + kv_h * head_dim;
+                const ds = d_scores[ds_row_off + k];
+                if (ds == 0.0) continue;
+                const ds_scaled = ds * inv_sqrt_d;
+                for (0..head_dim) |d| {
+                    dQ[q_off + d] += ds_scaled * K[k_off + d];
+                    dK[k_off + d] += ds_scaled * Q[q_off + d];
+                }
+            }
+        }
+    }
+}
