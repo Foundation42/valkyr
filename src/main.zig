@@ -569,6 +569,7 @@ pub fn main() !void {
     try runTrainingRunnerAttachedSmoke(allocator);
     try runTrainingRunnerBatchedSmoke(allocator);
     try runTrainingRunnerBatchedTrainSmoke(allocator);
+    try runTrainingRunnerCoopSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -2243,6 +2244,186 @@ fn runTrainingRunnerBatchedTrainSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS TrainingRunner batched train ({d} samples × {d} steps, dim 4→8→3; max |Δ| vs CPU oracle = {e})\n",
         .{ n_samples, K, max_abs },
+    );
+}
+
+// ── TrainingRunner cooperative-tickFrame smoke ──────────────────────
+//
+// Exercises the host-driven frame lifecycle: host owns the
+// VkCommandBuffer, runner records training + predict into it, host
+// submits once per frame. Verifies the budget API matches Session's
+// shape (.steps / .microseconds / .either) by checking:
+//
+//   1. .steps = N caps the recorded step count exactly at N
+//   2. .microseconds = 0 records 0 steps (early-out path)
+//   3. .either = { steps = 1, microseconds = huge } caps at 1 step
+//
+// Plus end-to-end convergence: train for ~30 host frames, predictions
+// at the supervised UVs end up close to their targets — same kind of
+// proof we used for chunks 5/7 but routed entirely through the
+// cooperative attach API.
+
+fn runTrainingRunnerCoopSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_train: u32 = 8;
+    const n_predict: u32 = 8;
+    const cfg = train_runner.Mlp2Config{
+        .dim_in = 4,
+        .dim_hidden = 16,
+        .dim_out = 3,
+        .lr = 0.1,
+        .init_seed = 0x7177EF00,
+        .max_batch_size = @max(n_train, n_predict),
+    };
+    var runner = try train_runner.TrainingRunner.init(allocator, &ctx, cfg);
+    defer runner.deinit();
+
+    // Synthetic training set + predict UVs. Inputs are random, targets
+    // are a simple linear function of the input — easy regression for
+    // a 16-wide hidden layer.
+    var rng = std.Random.DefaultPrng.init(0xCD0CD0);
+    const r = rng.random();
+    const x_train = try allocator.alloc(f32, n_train * cfg.dim_in);
+    defer allocator.free(x_train);
+    const t_train = try allocator.alloc(f32, n_train * cfg.dim_out);
+    defer allocator.free(t_train);
+    for (x_train) |*v| v.* = r.float(f32) * 2 - 1;
+    for (0..n_train) |i| {
+        const xr = x_train[i * cfg.dim_in ..][0..cfg.dim_in];
+        const tr = t_train[i * cfg.dim_out ..][0..cfg.dim_out];
+        // Trivial mapping: target[o] = sum_k x[k] * 0.5
+        for (0..cfg.dim_out) |o| {
+            var acc: f32 = 0;
+            for (xr) |xk| acc += xk * 0.5;
+            tr[o] = acc * (0.7 + 0.1 * @as(f32, @floatFromInt(o)));
+        }
+    }
+    const x_predict = try allocator.alloc(f32, n_predict * cfg.dim_in);
+    defer allocator.free(x_predict);
+    @memcpy(x_predict, x_train); // predict on the same UVs the trainer sees
+
+    try runner.uploadTrainBatch(x_train, t_train);
+    try runner.uploadPredictInputs(x_predict);
+
+    // ── Host-owned cmd buffer + fence ──
+    var cb_ai = std.mem.zeroes(vk.c.VkCommandBufferAllocateInfo);
+    cb_ai.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = ctx.cmd_pool;
+    cb_ai.level = vk.c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    var host_cmd: vk.c.VkCommandBuffer = null;
+    try vk.check(vk.c.vkAllocateCommandBuffers(ctx.device, &cb_ai, &host_cmd));
+    defer vk.c.vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &host_cmd);
+
+    var fci = std.mem.zeroes(vk.c.VkFenceCreateInfo);
+    fci.sType = vk.c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    var host_fence: vk.c.VkFence = null;
+    try vk.check(vk.c.vkCreateFence(ctx.device, &fci, null, &host_fence));
+    defer vk.c.vkDestroyFence(ctx.device, host_fence, null);
+
+    // Helper: run one host frame with a given budget. Returns the
+    // tick result so callers can assert step counts.
+    const runFrame = struct {
+        fn f(
+            rn: *train_runner.TrainingRunner,
+            ct: *const vk.Context,
+            cmd: vk.c.VkCommandBuffer,
+            fnc: vk.c.VkFence,
+            budget: train_runner.TrainBudget,
+            n_tr: u32,
+            n_pr: u32,
+        ) !train_runner.TrainTickResult {
+            try vk.check(vk.c.vkResetCommandBuffer(cmd, 0));
+            try vk.check(vk.c.vkResetFences(ct.device, 1, &fnc));
+            var bi = std.mem.zeroes(vk.c.VkCommandBufferBeginInfo);
+            bi.sType = vk.c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = vk.c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            try vk.check(vk.c.vkBeginCommandBuffer(cmd, &bi));
+
+            var rec = try gpu_recorder.Recorder.attachCmd(ct, cmd, 64, 256);
+            defer rec.deinit();
+            try rec.begin();
+
+            const result = try rn.tickFrameTrain(&rec, budget, n_tr);
+            try rn.tickPredictBatchRecord(&rec, n_pr);
+
+            try vk.check(vk.c.vkEndCommandBuffer(cmd));
+            var submit = std.mem.zeroes(vk.c.VkSubmitInfo);
+            submit.sType = vk.c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &cmd;
+            try vk.check(vk.c.vkQueueSubmit(ct.queue, 1, &submit, fnc));
+            const timeout_ns: u64 = 10 * 1_000_000_000;
+            try vk.check(vk.c.vkWaitForFences(ct.device, 1, &fnc, vk.c.VK_TRUE, timeout_ns));
+            return result;
+        }
+    }.f;
+
+    // ── Test 1: .steps = 3 caps at exactly 3 ──
+    const r3 = try runFrame(&runner, &ctx, host_cmd, host_fence, .{ .steps = 3 }, n_train, n_predict);
+    if (r3.steps_completed != 3) {
+        std.debug.print(".steps=3 wanted 3 steps, got {d}\n", .{r3.steps_completed});
+        return error.ParityFailed;
+    }
+
+    // ── Test 2: .microseconds = 0 records 0 steps ──
+    const r0 = try runFrame(&runner, &ctx, host_cmd, host_fence, .{ .microseconds = 0 }, n_train, n_predict);
+    if (r0.steps_completed != 0) {
+        std.debug.print(".microseconds=0 wanted 0 steps, got {d}\n", .{r0.steps_completed});
+        return error.ParityFailed;
+    }
+
+    // ── Test 3: .either with huge µs cap behaves like .steps ──
+    const r1 = try runFrame(
+        &runner,
+        &ctx,
+        host_cmd,
+        host_fence,
+        .{ .either = .{ .steps = 1, .microseconds = 1_000_000 } },
+        n_train,
+        n_predict,
+    );
+    if (r1.steps_completed != 1) {
+        std.debug.print(".either wanted 1 step, got {d}\n", .{r1.steps_completed});
+        return error.ParityFailed;
+    }
+
+    // ── Test 4: convergence over many frames ──
+    // Predict initial loss, train for 30 frames at .steps=2 each, then
+    // predict again. Loss should drop materially.
+    var pred_initial: [n_predict * 3]f32 = undefined;
+    try runner.tickPredictBatch(x_predict, &pred_initial);
+    var loss_initial: f32 = 0;
+    for (0..n_predict) |i| {
+        const py = pred_initial[i * cfg.dim_out ..][0..cfg.dim_out];
+        const ty = t_train[i * cfg.dim_out ..][0..cfg.dim_out];
+        loss_initial += cpu_train.mseLoss(py, ty);
+    }
+    var n_frames: u32 = 0;
+    while (n_frames < 30) : (n_frames += 1) {
+        _ = try runFrame(&runner, &ctx, host_cmd, host_fence, .{ .steps = 2 }, n_train, n_predict);
+    }
+    var pred_final: [n_predict * 3]f32 = undefined;
+    try runner.tickPredictBatch(x_predict, &pred_final);
+    var loss_final: f32 = 0;
+    for (0..n_predict) |i| {
+        const py = pred_final[i * cfg.dim_out ..][0..cfg.dim_out];
+        const ty = t_train[i * cfg.dim_out ..][0..cfg.dim_out];
+        loss_final += cpu_train.mseLoss(py, ty);
+    }
+    // 4× drop is plenty to demonstrate the cooperative API trains
+    // the network end-to-end. Tighter convergence is the parity test
+    // in chunk 8's smoke — this one just checks the wiring.
+    if (!(loss_final < loss_initial * 0.25)) {
+        std.debug.print("coop train didn't converge: initial={d:.6} final={d:.6}\n", .{ loss_initial, loss_final });
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS TrainingRunner cooperative tickFrame (budget shapes ok; loss {d:.6} → {d:.6} over 30 host frames)\n",
+        .{ loss_initial, loss_final },
     );
 }
 

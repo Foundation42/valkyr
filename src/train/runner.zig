@@ -53,6 +53,47 @@ pub const Mlp2Config = struct {
 /// this size). Mirrors the GLSL `MAX_HIDDEN` constant.
 pub const MLP2_MAX_HIDDEN: u32 = 64;
 
+/// Per-tickFrameTrain work cap. Mirrors `session.Budget` shape one-
+/// for-one with `steps` substituted for `layers` — same union variants
+/// (steps / microseconds / either), same defaults pattern, same
+/// "sample wall-clock between units" semantics.
+///
+/// Wall-clock here is CPU recording time (the cost of vkCmd* calls
+/// inside `recordTrainBatch`), not GPU execution time. That matches
+/// `session.Budget` exactly: the inference runner also measures
+/// recording-side wall-clock and lets the GPU run async after the
+/// host submits. Hosts that want to cap GPU work specifically should
+/// pre-calibrate "µs per step" and use `.steps`.
+pub const TrainBudget = union(enum) {
+    /// Run up to N batched SGD steps. Smallest legal value is 1 — a
+    /// 0-step tickFrame is a no-op.
+    steps: u32,
+    /// Run steps until elapsed wall-clock ≥ µs cap. Sampled once per
+    /// step (cheap), so one expensive step can overshoot by one unit.
+    /// `microseconds = 0` is valid — tickFrameTrain returns immediately
+    /// without recording.
+    microseconds: u64,
+    /// Both caps active; whichever fires first wins. Most embed
+    /// callers want this — coarse step cap as backstop, fine µs cap
+    /// as the real budget.
+    either: struct { steps: u32, microseconds: u64 },
+
+    pub fn defaults() TrainBudget {
+        return .{ .steps = 1 };
+    }
+};
+
+/// Result of a `tickFrameTrain` call. Lets hosts track schedule
+/// stability frame-to-frame without sampling wall-clock themselves.
+pub const TrainTickResult = struct {
+    /// Number of batched SGD steps actually recorded this tick.
+    steps_completed: u32,
+    /// Wall-clock spent in `tickFrameTrain` recording, microseconds.
+    /// Includes barrier emission and dispatch recording for every
+    /// step that ran.
+    elapsed_us: u64,
+};
+
 pub const TrainingRunner = struct {
     ctx: *const vk.Context,
     cfg: Mlp2Config,
@@ -518,13 +559,90 @@ pub const TrainingRunner = struct {
     /// Attach-mode batched train: record the chain into an existing
     /// host-owned Recorder, no submit. Caller must have populated
     /// `runner.x_train_batch` and `runner.target_batch` already (via
-    /// e.g. `Buffer.update` on the public `*_batch` fields, or the
-    /// upcoming `runner.uploadTrainBatch` helper).
+    /// `runner.uploadTrainBatch`).
     pub fn tickStepBatchRecord(self: *TrainingRunner, rec: *recorder_mod.Recorder, n_samples: u32) !void {
         if (self.x_train_batch == null) return error.BatchSizeNotConfigured;
         if (n_samples == 0) return;
         if (n_samples > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
         try self.recordTrainBatch(rec, n_samples);
+    }
+
+    /// Stage a (x_batch, target_batch) pair into the host-mapped
+    /// training buffers. Cheap memcpy — backs onto Buffer.update on
+    /// the dynamic buffers; the next training dispatch reads from them
+    /// directly.
+    pub fn uploadTrainBatch(self: *TrainingRunner, x_batch: []const f32, target_batch: []const f32) !void {
+        if (self.x_train_batch == null) return error.BatchSizeNotConfigured;
+        if (x_batch.len % self.cfg.dim_in != 0) return error.XBatchDimMismatch;
+        const n: u32 = @intCast(x_batch.len / self.cfg.dim_in);
+        if (n > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+        if (target_batch.len != n * self.cfg.dim_out) return error.TargetBatchDimMismatch;
+        @constCast(&self.x_train_batch.?).update(f32, x_batch);
+        @constCast(&self.target_batch.?).update(f32, target_batch);
+    }
+
+    /// Stage a batch of predict inputs into `runner.x_batch`. Mirrors
+    /// `uploadTrainBatch` for the predict path. Use before
+    /// `tickPredictBatchRecord` in attach mode.
+    pub fn uploadPredictInputs(self: *TrainingRunner, x_batch: []const f32) !void {
+        if (self.x_batch == null) return error.BatchSizeNotConfigured;
+        if (x_batch.len % self.cfg.dim_in != 0) return error.XBatchDimMismatch;
+        const n: u32 = @intCast(x_batch.len / self.cfg.dim_in);
+        if (n > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+        @constCast(&self.x_batch.?).update(f32, x_batch);
+    }
+
+    /// Cooperative training tick. Records up to `budget` batched SGD
+    /// steps over the staged (x_train_batch, target_batch) into the
+    /// host's Recorder, no submit. The host owns the submit cadence.
+    ///
+    /// Multi-step mode runs the same staged batch through multiple
+    /// SGD steps within one frame — useful when the host has CPU-side
+    /// supervision data that updates slowly and wants to spend more
+    /// GPU budget when there's frame-time headroom.
+    ///
+    /// Mirrors `Session.tickFrame` shape: caller passes the budget,
+    /// runner decides how many units to actually do based on wall-
+    /// clock sampling between units. Returns step-count + elapsed for
+    /// telemetry / schedule stability.
+    pub fn tickFrameTrain(
+        self: *TrainingRunner,
+        rec: *recorder_mod.Recorder,
+        budget: TrainBudget,
+        n_samples: u32,
+    ) !TrainTickResult {
+        if (self.x_train_batch == null) return error.BatchSizeNotConfigured;
+        if (n_samples == 0) return .{ .steps_completed = 0, .elapsed_us = 0 };
+        if (n_samples > self.cfg.max_batch_size) return error.BatchSizeExceedsMax;
+
+        const max_steps: u32 = switch (budget) {
+            .steps => |s| s,
+            .either => |e| e.steps,
+            .microseconds => std.math.maxInt(u32),
+        };
+        const us_cap: u64 = switch (budget) {
+            .microseconds => |us| us,
+            .either => |e| e.microseconds,
+            .steps => std.math.maxInt(u64),
+        };
+        if (max_steps == 0 or us_cap == 0) {
+            return .{ .steps_completed = 0, .elapsed_us = 0 };
+        }
+
+        const t0 = std.time.nanoTimestamp();
+        var steps_done: u32 = 0;
+        while (steps_done < max_steps) {
+            try self.recordTrainBatch(rec, n_samples);
+            steps_done += 1;
+            const elapsed_ns = std.time.nanoTimestamp() - t0;
+            const elapsed_us: u64 = @intCast(@divTrunc(elapsed_ns, 1000));
+            if (elapsed_us >= us_cap) break;
+        }
+        const final_ns = std.time.nanoTimestamp() - t0;
+        return .{
+            .steps_completed = steps_done,
+            .elapsed_us = @intCast(@divTrunc(final_ns, 1000)),
+        };
     }
 
     /// Attach-mode batched predict: record the dispatch into an
