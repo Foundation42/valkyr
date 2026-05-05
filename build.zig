@@ -50,6 +50,9 @@ pub fn build(b: *std.Build) void {
     const tq4_pack_to_cache128_spv = compileShader(b, "tq4_pack_to_cache128");
     const attn_synth_spv = compileShader(b, "attn_synth");
     const relu_spv = compileShader(b, "relu");
+    const relu_backward_spv = compileShader(b, "relu_backward");
+    const linear_backward_dx_spv = compileShader(b, "linear_backward_dx");
+    const outer_product_spv = compileShader(b, "outer_product");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -97,6 +100,9 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(tq4_pack_to_cache128_spv, "tq4_pack_to_cache128.spv");
     _ = wf.addCopyFile(attn_synth_spv, "attn_synth.spv");
     _ = wf.addCopyFile(relu_spv, "relu.spv");
+    _ = wf.addCopyFile(relu_backward_spv, "relu_backward.spv");
+    _ = wf.addCopyFile(linear_backward_dx_spv, "linear_backward_dx.spv");
+    _ = wf.addCopyFile(outer_product_spv, "outer_product.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -139,6 +145,9 @@ pub fn build(b: *std.Build) void {
         \\pub const tq4_pack_to_cache128 align(4) = @embedFile("tq4_pack_to_cache128.spv").*;
         \\pub const attn_synth align(4) = @embedFile("attn_synth.spv").*;
         \\pub const relu align(4) = @embedFile("relu.spv").*;
+        \\pub const relu_backward align(4) = @embedFile("relu_backward.spv").*;
+        \\pub const linear_backward_dx align(4) = @embedFile("linear_backward_dx.spv").*;
+        \\pub const outer_product align(4) = @embedFile("outer_product.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──

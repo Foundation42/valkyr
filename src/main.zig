@@ -530,6 +530,7 @@ pub fn main() !void {
     try runTrainCpuSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMlpForwardSmoke(allocator);
+    try runGpuMlpBackwardSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
@@ -1257,6 +1258,219 @@ fn runGpuMlpForwardSmoke(allocator: std.mem.Allocator) !void {
 
 fn ceilDiv(num: u32, den: u32) u32 {
     return (num + den - 1) / den;
+}
+
+// ── tiny-MLP GPU backward smoke: gradients vs CPU oracle ────────────
+//
+// Chunk 3 of training-v0. Runs the full forward + backward pipeline on
+// the GPU and parity-checks every gradient buffer against the CPU
+// oracle in `cpu_train.backward`. Three new shaders carry it:
+//
+//   linear_backward_dx — dL/dh from dL/dy and W2 (transposed matvec)
+//   relu_backward      — gates dL/dh by the saved h_pre > 0 mask
+//   outer_product      — dL/dW = upstream ⊗ input  (dW2 and dW1 both)
+//
+// db gradients reuse `slice_copy` (dL/db = dL/dy by definition; pure
+// memcpy at the buffer level). Per-step loss-grad (dL/dy = y - target)
+// is computed in a single host-side op against `add_in_place`-style
+// staging — kept on host because it's one fp32 subtract per step at
+// dim_out scale, not worth a shader.
+
+const ReluBackwardPush = runtime.ReluBackwardPush;
+const LinearBackwardDxPush = runtime.LinearBackwardDxPush;
+const OuterProductPush = runtime.OuterProductPush;
+
+fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim_in: usize = 4;
+    const dim_h: usize = 8;
+    const dim_out: usize = 4;
+
+    var mlp = try cpu_train.Mlp.init(allocator, dim_in, dim_h, dim_out, 0.3, 0xBACC0FF);
+    defer mlp.deinit(allocator);
+    for (mlp.b1, 0..) |*v, i| v.* = 0.1 - 0.05 * @as(f32, @floatFromInt(i));
+    for (mlp.b2, 0..) |*v, i| v.* = -0.2 + 0.07 * @as(f32, @floatFromInt(i));
+
+    const x = [_]f32{ 1.0, 0.5, -0.3, 0.2 };
+    const target = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+
+    // ── CPU oracle: forward + grads ────────────────────────────────
+    var h_pre_cpu: [dim_h]f32 = undefined;
+    var h_cpu: [dim_h]f32 = undefined;
+    var y_cpu: [dim_out]f32 = undefined;
+    var act: cpu_train.Activations = .{
+        .x = &x,
+        .h_pre = &h_pre_cpu,
+        .h = &h_cpu,
+        .y = &y_cpu,
+    };
+    cpu_train.forward(&mlp, &act);
+    var dL_dy_cpu: [dim_out]f32 = undefined;
+    cpu_train.mseLossGrad(&dL_dy_cpu, &y_cpu, &target);
+    var grads_cpu = try cpu_train.Grads.init(allocator, &mlp);
+    defer grads_cpu.deinit(allocator);
+    try cpu_train.backward(allocator, &mlp, &act, &dL_dy_cpu, &grads_cpu);
+
+    // ── GPU buffers ────────────────────────────────────────────────
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, &x);
+    defer buf_x.deinit(ctx.device);
+    var buf_w1 = try buffer.Buffer.initStatic(&ctx, f32, mlp.w1);
+    defer buf_w1.deinit(ctx.device);
+    var buf_b1 = try buffer.Buffer.initStatic(&ctx, f32, mlp.b1);
+    defer buf_b1.deinit(ctx.device);
+    var buf_w2 = try buffer.Buffer.initStatic(&ctx, f32, mlp.w2);
+    defer buf_w2.deinit(ctx.device);
+    var buf_b2 = try buffer.Buffer.initStatic(&ctx, f32, mlp.b2);
+    defer buf_b2.deinit(ctx.device);
+    var buf_h_pre = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_h_pre.deinit(ctx.device);
+    var buf_h = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_h.deinit(ctx.device);
+    var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * @sizeOf(f32));
+    defer buf_y.deinit(ctx.device);
+
+    // dL/dy is staged from host (cheap, dim_out scalars). Same for
+    // grads buffers — they get *written* by the GPU.
+    var buf_dL_dy = try buffer.Buffer.initStatic(&ctx, f32, &dL_dy_cpu);
+    defer buf_dL_dy.deinit(ctx.device);
+    var buf_dh = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_dh.deinit(ctx.device);
+    var buf_dh_pre = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_dh_pre.deinit(ctx.device);
+    var buf_dw1 = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * dim_in * @sizeOf(f32));
+    defer buf_dw1.deinit(ctx.device);
+    var buf_db1 = try buffer.Buffer.initDeviceOnly(&ctx, dim_h * @sizeOf(f32));
+    defer buf_db1.deinit(ctx.device);
+    var buf_dw2 = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * dim_h * @sizeOf(f32));
+    defer buf_dw2.deinit(ctx.device);
+    var buf_db2 = try buffer.Buffer.initDeviceOnly(&ctx, dim_out * @sizeOf(f32));
+    defer buf_db2.deinit(ctx.device);
+
+    // ── Pipelines ──────────────────────────────────────────────────
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    defer k_relu.deinit();
+    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(ReluBackwardPush));
+    defer k_relu_bw.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(LinearBackwardDxPush));
+    defer k_lin_dx.deinit();
+    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(OuterProductPush));
+    defer k_outer.deinit();
+    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush));
+    defer k_copy.deinit();
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 32, 128);
+    defer rec.deinit();
+    try rec.begin();
+
+    // ── Forward (same as chunk 2) ──────────────────────────────────
+    const matmul1_push = MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
+    const matmul2_push = MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
+    const add1_push = runtime.AddInPlacePush{ .n = @intCast(dim_h) };
+    const add2_push = runtime.AddInPlacePush{ .n = @intCast(dim_out) };
+    const relu_push = ReluPush{ .n = @intCast(dim_h) };
+    try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+
+    // ── Backward ───────────────────────────────────────────────────
+    // dL/db2 = dL/dy   (slice_copy 0..dim_out → 0..dim_out).
+    const copy_db2 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_out) };
+    try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+
+    // dL/dW2[i, j] = dL/dy[i] · h[j]   (outer product, [dim_out, dim_h]).
+    const op_dw2 = OuterProductPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    try rec.dispatch(
+        &k_outer,
+        &.{ &buf_dL_dy, &buf_h, &buf_dw2 },
+        &op_dw2,
+        ceilDiv(@as(u32, dim_out), 16),
+        ceilDiv(@as(u32, dim_h), 16),
+        1,
+    );
+
+    // dL/dh = W2^T · dL/dy  (transposed matvec).
+    const lin_dx_push = LinearBackwardDxPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    try rec.dispatch(
+        &k_lin_dx,
+        &.{ &buf_dL_dy, &buf_w2, &buf_dh },
+        &lin_dx_push,
+        ceilDiv(@as(u32, dim_h), 256),
+        1,
+        1,
+    );
+
+    // dL/dh_pre = dL/dh · 1[h_pre > 0].
+    const relu_bw_push = ReluBackwardPush{ .n = @intCast(dim_h) };
+    try rec.dispatch(
+        &k_relu_bw,
+        &.{ &buf_dh, &buf_h_pre, &buf_dh_pre },
+        &relu_bw_push,
+        ceilDiv(@as(u32, dim_h), 256),
+        1,
+        1,
+    );
+
+    // dL/db1 = dL/dh_pre.
+    const copy_db1 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_h) };
+    try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+
+    // dL/dW1[j, k] = dL/dh_pre[j] · x[k].
+    const op_dw1 = OuterProductPush{ .dim_out = @intCast(dim_h), .dim_in = @intCast(dim_in) };
+    try rec.dispatch(
+        &k_outer,
+        &.{ &buf_dh_pre, &buf_x, &buf_dw1 },
+        &op_dw1,
+        ceilDiv(@as(u32, dim_h), 16),
+        ceilDiv(@as(u32, dim_in), 16),
+        1,
+    );
+
+    try rec.endAndSubmit();
+
+    // ── Read back + parity ─────────────────────────────────────────
+    var dw1_gpu: [dim_h * dim_in]f32 = undefined;
+    var db1_gpu: [dim_h]f32 = undefined;
+    var dw2_gpu: [dim_out * dim_h]f32 = undefined;
+    var db2_gpu: [dim_out]f32 = undefined;
+    try buf_dw1.readBack(&ctx, f32, &dw1_gpu);
+    try buf_db1.readBack(&ctx, f32, &db1_gpu);
+    try buf_dw2.readBack(&ctx, f32, &dw2_gpu);
+    try buf_db2.readBack(&ctx, f32, &db2_gpu);
+
+    const tol: f32 = 1e-5;
+    const ParityCase = struct { name: []const u8, got: []const f32, want: []const f32 };
+    const cases = [_]ParityCase{
+        .{ .name = "dW1", .got = &dw1_gpu, .want = grads_cpu.dw1 },
+        .{ .name = "db1", .got = &db1_gpu, .want = grads_cpu.db1 },
+        .{ .name = "dW2", .got = &dw2_gpu, .want = grads_cpu.dw2 },
+        .{ .name = "db2", .got = &db2_gpu, .want = grads_cpu.db2 },
+    };
+    var max_abs: f32 = 0;
+    for (cases) |cs| {
+        for (cs.got, cs.want, 0..) |g, w, i| {
+            const d = @abs(g - w);
+            if (d > tol) {
+                std.debug.print(
+                    "GPU MLP backward MISMATCH on {s}[{d}]: got {d:.7}, expected {d:.7}\n",
+                    .{ cs.name, i, g, w },
+                );
+                return error.ParityFailed;
+            }
+            if (d > max_abs) max_abs = d;
+        }
+    }
+    std.debug.print(
+        "PASS GPU MLP backward (dW1, db1, dW2, db2 vs CPU; max |Δ| = {e})\n",
+        .{max_abs},
+    );
 }
 
 // ── gpu matmul_nt smoke: synthetic A·Bᵀ on the GPU vs CPU expected ──

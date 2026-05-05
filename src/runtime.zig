@@ -108,6 +108,12 @@ pub const AddInPlacePush = extern struct { n: u32 };
 
 pub const ReluPush = extern struct { n: u32 };
 
+pub const ReluBackwardPush = extern struct { n: u32 };
+
+pub const LinearBackwardDxPush = extern struct { dim_out: u32, dim_in: u32 };
+
+pub const OuterProductPush = extern struct { dim_out: u32, dim_in: u32 };
+
 pub const GegluPush = extern struct { n: u32 };
 
 pub const EmbedLookupPush = extern struct {

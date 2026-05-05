@@ -1,0 +1,24 @@
+#version 460
+// ReLU backward: dh_pre[j] = dh[j] · 1[h_pre[j] > 0]
+//
+// Reads the saved pre-activation from forward and zeros the gradient
+// wherever the unit was clamped. The h_pre = 0 boundary is
+// conventionally treated as inactive (mask = 0); this matches the
+// CPU oracle in `cpu_train.backward`. fp32-exact zero on h_pre is
+// vanishingly rare in practice; the convention is what matters when
+// it happens.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dh    { float dh[];     }; // [n]
+layout(set = 0, binding = 1, std430) readonly  buffer Hpre  { float h_pre[];  }; // [n]
+layout(set = 0, binding = 2, std430) writeonly buffer Dhpre { float dh_pre[]; }; // [n]
+
+layout(push_constant) uniform Pc { uint n; } pc;
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    float mask = h_pre[j] > 0.0 ? 1.0 : 0.0;
+    dh_pre[j] = dh[j] * mask;
+}
