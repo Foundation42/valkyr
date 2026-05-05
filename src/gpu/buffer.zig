@@ -108,6 +108,12 @@ pub const Buffer = struct {
         );
         var mapped: ?*anyopaque = null;
         try vk.check(c.vkMapMemory(ctx.device, raw.memory, 0, total, 0, &mapped));
+        // Vulkan doesn't guarantee zeroed memory at allocation; without
+        // this CPU readers see garbage on the first frame before the
+        // first GPU copy lands.
+        if (mapped) |m| {
+            @memset(@as([*]u8, @ptrCast(m))[0..total], 0);
+        }
         return .{
             .handle = raw.handle,
             .memory = raw.memory,
