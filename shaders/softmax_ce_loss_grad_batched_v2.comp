@@ -1,0 +1,91 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Fused softmax + cross-entropy loss gradient, batched, cooperative
+// reduction. Same outputs as `softmax_ce_loss_grad_batched.comp`:
+//
+//     p[n, o]      = softmax(y[n, *])[o]
+//     dL/dy[n, o]  = (p[n, o] − target[n, o]) / N
+//
+// Differences from v1:
+//   - One workgroup per sample (instead of one thread). 256 threads
+//     cooperate over the `dim_out` (vocab) dimension.
+//   - No MAX_OUT cap. Works at vocab-size logits (151 K and beyond).
+//   - Two cooperative reductions (max, then sum_e), then a parallel
+//     write loop. Reduction follows the same two-stage pattern as
+//     `matmul_nt_v2.comp` and `rmsnorm.comp`: per-thread partial →
+//     subgroupAdd / subgroupMax → shared memory → subgroup-0 reduces
+//     across subgroups → broadcast.
+//
+// Numerics match v1 within fp32 reduction-order noise (the strided
+// reduction order over `dim_out` differs from v1's left-to-right
+// scalar loop).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Y { float y_all[];      }; // [N, dim_out]
+layout(set = 0, binding = 1, std430) readonly  buffer T { float target_all[]; }; // [N, dim_out]
+layout(set = 0, binding = 2, std430) writeonly buffer D { float dy_all[];     }; // [N, dim_out]
+
+layout(push_constant) uniform Pc {
+    uint dim_out;
+    uint n_samples;
+} pc;
+
+shared float sg_max_partials[32];
+shared float sg_sum_partials[32];
+shared float row_max;
+shared float row_inv_sum;
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= pc.n_samples) return;
+
+    uint off = n * pc.dim_out;
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+
+    // ── Pass 1: row-max via cooperative reduction.
+    float my_max = -1e30;
+    for (uint i = tid; i < pc.dim_out; i += wg_size) {
+        my_max = max(my_max, y_all[off + i]);
+    }
+    float sg_max = subgroupMax(my_max);
+    if (subgroupElect()) sg_max_partials[gl_SubgroupID] = sg_max;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_max_partials[gl_SubgroupInvocationID]
+                    : -1e30;
+        float total_max = subgroupMax(v);
+        if (subgroupElect()) row_max = total_max;
+    }
+    barrier();
+    float m = row_max;
+
+    // ── Pass 2: sum of exp(y - m) via cooperative reduction.
+    float my_sum = 0.0;
+    for (uint i = tid; i < pc.dim_out; i += wg_size) {
+        my_sum += exp(y_all[off + i] - m);
+    }
+    float sg_sum = subgroupAdd(my_sum);
+    if (subgroupElect()) sg_sum_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_sum_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total_sum = subgroupAdd(v);
+        if (subgroupElect()) row_inv_sum = 1.0 / total_sum;
+    }
+    barrier();
+    float inv_sum = row_inv_sum;
+    float inv_n = 1.0 / float(pc.n_samples);
+
+    // ── Pass 3: emit (softmax − target) / N in parallel.
+    for (uint i = tid; i < pc.dim_out; i += wg_size) {
+        float p = exp(y_all[off + i] - m) * inv_sum;
+        dy_all[off + i] = (p - target_all[off + i]) * inv_n;
+    }
+}

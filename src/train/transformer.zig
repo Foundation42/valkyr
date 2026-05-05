@@ -310,7 +310,9 @@ pub const Runner = struct {
         errdefer k_lin_dx.deinit();
         var k_lin_dw = try pipeline.Kernel.init(ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
         errdefer k_lin_dw.deinit();
-        var k_ce_loss_grad = try pipeline.Kernel.init(ctx, &shaders.softmax_ce_loss_grad_batched, 3, @sizeOf(runtime.SoftmaxCeLossGradPush));
+        // v2: cooperative reduction over dim_out — works at vocab-scale
+        // (151 K+) where v1 silently early-returns (MAX_OUT cap of 1024).
+        var k_ce_loss_grad = try pipeline.Kernel.init(ctx, &shaders.softmax_ce_loss_grad_batched_v2, 3, @sizeOf(runtime.SoftmaxCeLossGradPush));
         errdefer k_ce_loss_grad.deinit();
         var k_embed_bw = try pipeline.Kernel.init(ctx, &shaders.embedding_backward, 3, @sizeOf(runtime.EmbeddingBackwardPush));
         errdefer k_embed_bw.deinit();
@@ -913,12 +915,13 @@ pub const Runner = struct {
             1,
             1,
         );
-        const ce_local: u32 = 64;
+        // v2: one workgroup per sample (n_pos workgroups), 256 threads
+        // cooperatively reduce over vocab.
         try self.rec.dispatch(
             &self.k_ce_loss_grad,
             &.{ &self.buf_logits, &self.buf_target_oh, &self.buf_d_logits },
             &self.push_ce,
-            ceilDiv(cfg.n_pos, ce_local),
+            cfg.n_pos,
             1,
             1,
         );

@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
     const mlp2_dw_accum_spv = compileShader(b, "mlp2_dw_accum");
     const mlp2_db_accum_spv = compileShader(b, "mlp2_db_accum");
     const softmax_ce_loss_grad_batched_spv = compileShader(b, "softmax_ce_loss_grad_batched");
+    const softmax_ce_loss_grad_batched_v2_spv = compileShader(b, "softmax_ce_loss_grad_batched_v2");
     const mlp2_mse_loss_batched_spv = compileShader(b, "mlp2_mse_loss_batched");
     const mlp2_ce_loss_batched_spv = compileShader(b, "mlp2_ce_loss_batched");
 
@@ -157,6 +158,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(mlp2_dw_accum_spv, "mlp2_dw_accum.spv");
     _ = wf.addCopyFile(mlp2_db_accum_spv, "mlp2_db_accum.spv");
     _ = wf.addCopyFile(softmax_ce_loss_grad_batched_spv, "softmax_ce_loss_grad_batched.spv");
+    _ = wf.addCopyFile(softmax_ce_loss_grad_batched_v2_spv, "softmax_ce_loss_grad_batched_v2.spv");
     _ = wf.addCopyFile(mlp2_mse_loss_batched_spv, "mlp2_mse_loss_batched.spv");
     _ = wf.addCopyFile(mlp2_ce_loss_batched_spv, "mlp2_ce_loss_batched.spv");
     const shader_mod = wf.add("shaders.zig",
@@ -230,6 +232,7 @@ pub fn build(b: *std.Build) void {
         \\pub const mlp2_dw_accum align(4) = @embedFile("mlp2_dw_accum.spv").*;
         \\pub const mlp2_db_accum align(4) = @embedFile("mlp2_db_accum.spv").*;
         \\pub const softmax_ce_loss_grad_batched align(4) = @embedFile("softmax_ce_loss_grad_batched.spv").*;
+        \\pub const softmax_ce_loss_grad_batched_v2 align(4) = @embedFile("softmax_ce_loss_grad_batched_v2.spv").*;
         \\pub const mlp2_mse_loss_batched align(4) = @embedFile("mlp2_mse_loss_batched.spv").*;
         \\pub const mlp2_ce_loss_batched align(4) = @embedFile("mlp2_ce_loss_batched.spv").*;
     );

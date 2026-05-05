@@ -634,6 +634,7 @@ pub fn main() !void {
     try runDecoderStackFineTuneCpuSmoke(allocator);
     try runDecoderStackBackwardGpuParitySmoke(allocator);
     try runDecoderStackTrainGpuSmoke(allocator);
+    try runDecoderStackTrainGpuRealShapeSmoke(allocator);
     try runDecoderBackwardGpuParitySmoke(allocator);
     try runDecoderTrainGpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
@@ -7224,6 +7225,190 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU decoder stack fine-tune via Runner (n_layers={d} dim={d} vocab={d} n_pos={d}; CE loss {d:.6} → {d:.6} ({e:.2}× drop) over {d} Adam steps, {d} dispatches/step)\n",
         .{ cfg.n_layers, dim, vocab, n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps, 11 + 46 * cfg.n_layers },
+    );
+}
+
+// ── chunk 8c-β-2: Real-shape buffer sizing (synthetic weights) ──────
+//
+// Instantiates `train_transformer.Runner` at Qwen3-0.6B-class dims with
+// random fp32 weights and verifies the runtime envelope holds: init
+// succeeds, one Adam step doesn't OOM, loss decreases over ~50 steps,
+// and reports ms/step so β-3 can compare once real weights enter.
+//
+// Architecture is the toy-decoder shape the trainer ships today (no
+// SwiGLU, no RoPE, no q/k-norm). Architectural fidelity to real Qwen3
+// belongs to a separate β-3a chunk that adds the missing primitives
+// (each gets the chunk-1..7 treatment: CPU oracle → GPU shader → smoke
+// → fold into Runner). What β-2 establishes is that the *buffer
+// sizing* + *dispatch sequencing* the Runner generates scales to
+// realistic memory pressure (~9 GB) and depth (28 layers).
+//
+// Pass criteria:
+//   - Runner.init returns without OOM / descriptor exhaustion.
+//   - All 50 steps run.
+//   - Final CE < initial CE (any ratio < 1; this is a "does it still
+//     train" envelope check, not a convergence assertion).
+//   - All loss values finite.
+//
+// All weights heap-allocated via the smoke's allocator; per-layer
+// weights live in an arena so the slice lifetime ends cleanly when
+// the smoke returns.
+
+fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
+    const dim: u32 = 1024;
+    const n_layers: u32 = 28;
+    const n_heads: u32 = 16;
+    const n_kv_heads: u32 = 8;
+    const head_dim: u32 = 64;
+    const ff_dim: u32 = 3072;
+    const vocab: u32 = 151_936;
+    const n_pos: u32 = 64;
+    const q_dim: u32 = n_heads * head_dim;
+    const kv_dim: u32 = n_kv_heads * head_dim;
+
+    var prng = std.Random.DefaultPrng.init(0xBE_BA_2A_01);
+    const rng = prng.random();
+    // Conservative init scale — wide layers + Adam can blow up at 0.1
+    // even on a single-batch overfit. 0.02 keeps initial activations
+    // and logits bounded.
+    const init_scale: f32 = 0.02;
+
+    const fillRandom = struct {
+        fn run(r: std.Random, buf: []f32, scale: f32) void {
+            for (buf) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * scale;
+        }
+    }.run;
+
+    // Stack-level synthetic weights.
+    const w_embed = try allocator.alloc(f32, @as(usize, vocab) * dim);
+    defer allocator.free(w_embed);
+    fillRandom(rng, w_embed, init_scale);
+    const w_final_norm = try allocator.alloc(f32, dim);
+    defer allocator.free(w_final_norm);
+    @memset(w_final_norm, 1.0);
+    const w_lm_head = try allocator.alloc(f32, @as(usize, vocab) * dim);
+    defer allocator.free(w_lm_head);
+    fillRandom(rng, w_lm_head, init_scale);
+
+    // Per-layer weights live in an arena; freed wholesale at smoke end.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+    const layer_weights = try allocator.alloc(train_transformer.LayerWeights, n_layers);
+    defer allocator.free(layer_weights);
+    for (layer_weights) |*lw| {
+        const w_n1 = try aalloc.alloc(f32, dim);
+        const w_q = try aalloc.alloc(f32, @as(usize, q_dim) * dim);
+        const w_k = try aalloc.alloc(f32, @as(usize, kv_dim) * dim);
+        const w_v = try aalloc.alloc(f32, @as(usize, kv_dim) * dim);
+        const w_o = try aalloc.alloc(f32, @as(usize, dim) * q_dim);
+        const w_n2 = try aalloc.alloc(f32, dim);
+        const w_ff1 = try aalloc.alloc(f32, @as(usize, ff_dim) * dim);
+        const w_ff2 = try aalloc.alloc(f32, @as(usize, dim) * ff_dim);
+        @memset(w_n1, 1.0);
+        @memset(w_n2, 1.0);
+        fillRandom(rng, w_q, init_scale);
+        fillRandom(rng, w_k, init_scale);
+        fillRandom(rng, w_v, init_scale);
+        fillRandom(rng, w_o, init_scale);
+        fillRandom(rng, w_ff1, init_scale);
+        fillRandom(rng, w_ff2, init_scale);
+        lw.* = .{
+            .w_n1 = w_n1,
+            .w_q = w_q,
+            .w_k = w_k,
+            .w_v = w_v,
+            .w_o = w_o,
+            .w_n2 = w_n2,
+            .w_ff1 = w_ff1,
+            .w_ff2 = w_ff2,
+        };
+    }
+
+    // Random batch — overfit a single fixed (token_ids, target_ids) pair
+    // so loss should drop monotonically.
+    const token_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(token_ids);
+    for (token_ids) |*t| t.* = rng.intRangeLessThan(u32, 0, vocab);
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    for (target_ids) |*t| t.* = rng.intRangeLessThan(u32, 0, vocab);
+
+    const target_one_hot = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(target_one_hot);
+    @memset(target_one_hot, 0);
+    for (target_ids, 0..) |tid, p| target_one_hot[p * vocab + @as(usize, tid)] = 1.0;
+
+    // ── GPU bring-up.
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var runner = try train_transformer.Runner.init(
+        allocator,
+        &ctx,
+        .{
+            .dim = dim,
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .ff_dim = ff_dim,
+            .n_pos = n_pos,
+            .n_layers = n_layers,
+            .vocab_size = vocab,
+            // Same lr as the toy 8c-α-3 smoke (1e-2). Single-batch
+            // overfit is the regime we're in, not pre-training.
+            .lr = 1e-2,
+        },
+        .{
+            .embed = w_embed,
+            .final_norm = w_final_norm,
+            .lm_head = w_lm_head,
+            .layers = layer_weights,
+        },
+    );
+    defer runner.deinit();
+
+    const logits_buf = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(logits_buf);
+
+    try runner.forwardLogits(token_ids, logits_buf);
+    const initial_loss = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(initial_loss)) {
+        std.debug.print("Real-shape envelope: initial_loss not finite ({d})\n", .{initial_loss});
+        return error.LossNotFinite;
+    }
+
+    const n_steps: u32 = 50;
+    const t_start = std.time.nanoTimestamp();
+    var step_t: u32 = 0;
+    while (step_t < n_steps) : (step_t += 1) {
+        try runner.step(token_ids, target_one_hot);
+        if (step_t % 10 == 0 or step_t == n_steps - 1) {
+            // Cheap heartbeat: forward + CE so we can watch the curve.
+            try runner.forwardLogits(token_ids, logits_buf);
+            const heartbeat = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+            std.debug.print("  envelope step {d}: CE={d:.6}\n", .{ step_t + 1, heartbeat });
+            if (!std.math.isFinite(heartbeat)) return error.LossNotFinite;
+        }
+    }
+    const t_end = std.time.nanoTimestamp();
+    const elapsed_ms: f64 = @as(f64, @floatFromInt(t_end - t_start)) / 1.0e6;
+    const ms_per_step: f64 = elapsed_ms / @as(f64, @floatFromInt(n_steps));
+
+    try runner.forwardLogits(token_ids, logits_buf);
+    const final_loss = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(final_loss)) {
+        std.debug.print("Real-shape envelope: final_loss not finite ({d}) after initial={d:.6}\n", .{ final_loss, initial_loss });
+        return error.LossNotFinite;
+    }
+    if (final_loss >= initial_loss) {
+        std.debug.print("Real-shape envelope: initial_loss={d:.6} final_loss={d:.6} (no decrease)\n", .{ initial_loss, final_loss });
+        return error.LossDidNotDecrease;
+    }
+
+    std.debug.print(
+        "PASS GPU decoder stack real-shape envelope (Qwen3-0.6B-class toy-arch: n_layers={d} dim={d} GQA {d}/{d} ff_dim={d} vocab={d} n_pos={d}; CE {d:.6} → {d:.6} over {d} Adam steps, {d:.1} ms/step)\n",
+        .{ n_layers, dim, n_heads, n_kv_heads, ff_dim, vocab, n_pos, initial_loss, final_loss, n_steps, ms_per_step },
     );
 }
 
