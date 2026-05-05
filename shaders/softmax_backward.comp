@@ -1,0 +1,63 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Softmax backward, one workgroup per row:
+//
+//     S          = Σⱼ dyⱼ · yⱼ                    (scalar across row)
+//     dxᵢ        = yᵢ · (dyᵢ − S)
+//
+// Saved-activation is `y` (the softmax output), not `x` — y is enough
+// for the chain rule and saves recomputing max/sum/exp. Same `stride`
+// flexibility as the forward kernel: pass `stride = dim` for a packed
+// `[rows, dim]` layout, or a wider stride when the softmax sits over
+// a sub-row of a larger allocation (typical attention case where
+// scores are [n_pos, max_pos]).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dy { float dy[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Y  { float y[];  };
+layout(set = 0, binding = 2, std430) writeonly buffer Dx { float dx[]; };
+
+layout(push_constant) uniform Pc {
+    uint dim;
+    uint stride;
+} pc;
+
+shared float subgroup_sums[32];
+shared float reduced_shared;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint row_off = row * pc.stride;
+    uint tid = gl_LocalInvocationID.x;
+
+    // ── Phase 1: S = Σ dy · y ────────────────────────────────────
+    float local_S = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        local_S += dy[row_off + i] * y[row_off + i];
+    }
+    float sg_sum = subgroupAdd(local_S);
+    if (subgroupElect()) {
+        subgroup_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sums[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            reduced_shared = total;
+        }
+    }
+    barrier();
+    float S = reduced_shared;
+
+    // ── Phase 2: dxᵢ = yᵢ · (dyᵢ − S) ───────────────────────────
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        dx[row_off + i] = y[row_off + i] * (dy[row_off + i] - S);
+    }
+}

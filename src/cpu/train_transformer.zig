@@ -364,3 +364,55 @@ pub fn embeddingBackward(
         for (dst, src) |*d, s| d.* += s;
     }
 }
+
+// ── Softmax backward ───────────────────────────────────────────────
+//
+// Given the softmax forward yᵢ = exp(xᵢ − max) / Σ exp(xⱼ − max), the
+// Jacobian is ∂yⱼ/∂xᵢ = yⱼ (δᵢⱼ − yᵢ), and the backward step
+//
+//     dxᵢ = Σⱼ dyⱼ · ∂yⱼ/∂xᵢ
+//         = dyᵢ · yᵢ − yᵢ · Σⱼ dyⱼ · yⱼ
+//         = yᵢ · (dyᵢ − ⟨dy, y⟩)
+//
+// reduces to a single scalar reduction `S = ⟨dy, y⟩` per row, then a
+// per-element write `dxᵢ = yᵢ · (dyᵢ − S)`. Foundation for attention
+// backward, where the softmax sits at the centre of the chain.
+//
+// Saved-activation is `y` (not `x`): forward already computed y, and
+// y is sufficient — no need to re-do max/sum/exp.
+
+/// Single-row softmax backward.
+pub fn softmaxBackwardRow(
+    dy: []const f32,
+    y: []const f32,
+    dx: []f32,
+) void {
+    std.debug.assert(dy.len == y.len);
+    std.debug.assert(dx.len == y.len);
+    var S: f64 = 0;
+    for (dy, y) |d, yi| S += @as(f64, d) * @as(f64, yi);
+    const S_f: f32 = @floatCast(S);
+    for (dy, y, dx) |d, yi, *dxi| dxi.* = yi * (d - S_f);
+}
+
+/// Multi-row softmax backward. Per-row independent — no cross-row
+/// state to manage.
+pub fn softmaxBackward(
+    dy: []const f32,
+    y: []const f32,
+    n_rows: usize,
+    dim: usize,
+    dx: []f32,
+) void {
+    std.debug.assert(dy.len == n_rows * dim);
+    std.debug.assert(y.len == n_rows * dim);
+    std.debug.assert(dx.len == n_rows * dim);
+    for (0..n_rows) |r| {
+        const off = r * dim;
+        softmaxBackwardRow(
+            dy[off .. off + dim],
+            y[off .. off + dim],
+            dx[off .. off + dim],
+        );
+    }
+}

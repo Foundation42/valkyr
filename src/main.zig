@@ -624,6 +624,7 @@ pub fn main() !void {
     try runGpuLayerNormSmoke(allocator);
     try runGpuLayerNormBackwardSmoke(allocator);
     try runEmbeddingBackwardSmoke(allocator);
+    try runSoftmaxBackwardSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -5145,6 +5146,173 @@ fn runEmbeddingBackwardSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS embedding gradient (vocab={d}, dim={d}, n_pos={d} with reused tokens; CPU oracle bit-exact vs reference; GPU max |Δ| = {e})\n",
         .{ vocab_size, dim, n_pos, max_abs },
+    );
+}
+
+// ── Softmax backward smoke (CPU oracle + GPU parity) ───────────────
+//
+// Tier-2 chunk 5 — bridge to attention backward. Two halves:
+//
+//   1. CPU oracle numeric-grad parity. Loss = Σⱼ dyⱼ · yⱼ(x); we
+//      verify ∂L/∂xᵢ matches central-difference at eps=1e-3 to ≤ 1%.
+//
+//   2. GPU shader parity. Multi-row, with stride = dim (packed
+//      layout). dx must match CPU oracle ≤ 1e-5.
+//
+// Saved-activation is `y` (the softmax output) — no need to re-do
+// max/sum/exp on the backward pass.
+
+fn runSoftmaxBackwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // ── (1) CPU oracle numeric-grad ───────────────────────────────
+    {
+        const dim: usize = 24;
+        var x: [dim]f32 = undefined;
+        var y: [dim]f32 = undefined;
+        var dy: [dim]f32 = undefined;
+        var dx: [dim]f32 = undefined;
+        var probe_y: [dim]f32 = undefined;
+
+        var prng = std.Random.DefaultPrng.init(0x50F7BAC1);
+        const rng = prng.random();
+        for (&x) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 2.0;
+        for (&dy) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+        // Forward: stable softmax.
+        var max_x: f32 = -std.math.inf(f32);
+        for (x) |v| if (v > max_x) {
+            max_x = v;
+        };
+        var sum: f64 = 0;
+        for (x, &y) |xi, *yi| {
+            const e = @exp(xi - max_x);
+            yi.* = e;
+            sum += e;
+        }
+        const inv_sum: f32 = 1.0 / @as(f32, @floatCast(sum));
+        for (&y) |*yi| yi.* *= inv_sum;
+
+        cpu_train_transformer.softmaxBackwardRow(&dy, &y, &dx);
+
+        const eps_h: f32 = 1e-3;
+        const probes = [_]usize{ 0, 4, 9, 15, 21 };
+        var max_rel_err: f32 = 0;
+        for (probes) |i| {
+            // f(x) = Σⱼ dyⱼ · y(x)ⱼ. Re-run forward with x[i] perturbed.
+            const orig = x[i];
+            x[i] = orig + eps_h;
+            var local_max: f32 = -std.math.inf(f32);
+            for (x) |v| if (v > local_max) {
+                local_max = v;
+            };
+            var local_sum: f64 = 0;
+            for (x, &probe_y) |xi, *yi| {
+                const e = @exp(xi - local_max);
+                yi.* = e;
+                local_sum += e;
+            }
+            for (&probe_y) |*yi| yi.* /= @as(f32, @floatCast(local_sum));
+            var l_plus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_plus += d * yi;
+
+            x[i] = orig - eps_h;
+            local_max = -std.math.inf(f32);
+            for (x) |v| if (v > local_max) {
+                local_max = v;
+            };
+            local_sum = 0;
+            for (x, &probe_y) |xi, *yi| {
+                const e = @exp(xi - local_max);
+                yi.* = e;
+                local_sum += e;
+            }
+            for (&probe_y) |*yi| yi.* /= @as(f32, @floatCast(local_sum));
+            var l_minus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_minus += d * yi;
+            x[i] = orig;
+
+            const numeric = (l_plus - l_minus) / (2.0 * eps_h);
+            const analytic = dx[i];
+            const denom = @max(@abs(numeric), @abs(analytic));
+            const rel_err = if (denom > 0) @abs(numeric - analytic) / denom else @abs(numeric - analytic);
+            if (rel_err > 1e-2) {
+                std.debug.print("softmax dx[{d}] analytic={d:.6} numeric={d:.6} rel_err={d:.4}\n", .{ i, analytic, numeric, rel_err });
+                return error.ParityFailed;
+            }
+            if (rel_err > max_rel_err) max_rel_err = rel_err;
+        }
+        std.debug.print("    softmax CPU numeric-grad parity ≤ {e} (5 probes)\n", .{max_rel_err});
+    }
+
+    // ── (2) GPU shader parity ─────────────────────────────────────
+    const dim: usize = 256;
+    const n_rows: usize = 4;
+    const y_buf = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(y_buf);
+    const dy = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dy);
+    const dx_cpu = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dx_cpu);
+
+    var prng = std.Random.DefaultPrng.init(0x50F7BAC2);
+    const rng = prng.random();
+    for (dy) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    // Synthetic stable softmax outputs per row (no need to go through
+    // forward — y just needs to be a valid probability distribution).
+    for (0..n_rows) |r| {
+        var row_sum: f64 = 0;
+        for (0..dim) |i| {
+            const v = @exp(rng.float(f32) * 4.0 - 2.0);
+            y_buf[r * dim + i] = v;
+            row_sum += v;
+        }
+        const inv: f32 = 1.0 / @as(f32, @floatCast(row_sum));
+        for (0..dim) |i| y_buf[r * dim + i] *= inv;
+    }
+
+    cpu_train_transformer.softmaxBackward(dy, y_buf, n_rows, dim, dx_cpu);
+
+    var buf_dy = try buffer.Buffer.initStatic(&ctx, f32, dy);
+    defer buf_dy.deinit(ctx.device);
+    var buf_y = try buffer.Buffer.initStatic(&ctx, f32, y_buf);
+    defer buf_y.deinit(ctx.device);
+    var buf_dx = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
+    defer buf_dx.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.softmax_backward, 3, @sizeOf(runtime.SoftmaxPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_dy, &buf_y, &buf_dx });
+
+    const push = runtime.SoftmaxPush{ .dim = @intCast(dim), .stride = @intCast(dim) };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.SoftmaxPush,
+        n_rows: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.n_rows, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .n_rows = @intCast(n_rows) });
+
+    const dx_gpu = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dx_gpu);
+    try buf_dx.readBack(&ctx, f32, dx_gpu);
+
+    var max_abs: f32 = 0;
+    for (dx_gpu, dx_cpu) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_abs) max_abs = d;
+    }
+    if (max_abs > 1e-5) {
+        std.debug.print("softmax_backward GPU: max |Δ| = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS softmax backward ({d}×{d}; CPU numeric-grad parity ≤ 1%; GPU max |Δ| = {e})\n",
+        .{ n_rows, dim, max_abs },
     );
 }
 

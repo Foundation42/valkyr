@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const layernorm_spv = compileShader(b, "layernorm");
     const layernorm_backward_spv = compileShader(b, "layernorm_backward");
     const embedding_backward_spv = compileShader(b, "embedding_backward");
+    const softmax_backward_spv = compileShader(b, "softmax_backward");
     const geglu_spv = compileShader(b, "geglu");
     const swiglu_spv = compileShader(b, "swiglu");
     const rope_spv = compileShader(b, "rope");
@@ -86,6 +87,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(layernorm_spv, "layernorm.spv");
     _ = wf.addCopyFile(layernorm_backward_spv, "layernorm_backward.spv");
     _ = wf.addCopyFile(embedding_backward_spv, "embedding_backward.spv");
+    _ = wf.addCopyFile(softmax_backward_spv, "softmax_backward.spv");
     _ = wf.addCopyFile(geglu_spv, "geglu.spv");
     _ = wf.addCopyFile(swiglu_spv, "swiglu.spv");
     _ = wf.addCopyFile(rope_spv, "rope.spv");
@@ -147,6 +149,7 @@ pub fn build(b: *std.Build) void {
         \\pub const layernorm align(4) = @embedFile("layernorm.spv").*;
         \\pub const layernorm_backward align(4) = @embedFile("layernorm_backward.spv").*;
         \\pub const embedding_backward align(4) = @embedFile("embedding_backward.spv").*;
+        \\pub const softmax_backward align(4) = @embedFile("softmax_backward.spv").*;
         \\pub const geglu align(4) = @embedFile("geglu.spv").*;
         \\pub const swiglu align(4) = @embedFile("swiglu.spv").*;
         \\pub const rope align(4) = @embedFile("rope.spv").*;
