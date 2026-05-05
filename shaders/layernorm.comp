@@ -1,0 +1,81 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// LayerNorm forward, single row per workgroup:
+//
+//     μ        = (1/D) Σ xⱼ
+//     v        = (1/D) Σ (xⱼ − μ)²        (variance)
+//     s        = 1 / sqrt(v + eps)        (norm_inv)
+//     yᵢ       = γᵢ · s · (xᵢ − μ) + βᵢ
+//
+// Two row-wide reductions (Σ x for μ, then Σ (x − μ)² for v) — same
+// shape as the RMSNorm backward kernel's two reductions.
+//
+// Bindings deliberately mirror rmsnorm.comp's layout on the first
+// three slots (a, w, c), then add bias as the fourth. Push struct is
+// just (dim, eps); no gemma_quirk — that's an RMSNorm convention.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A    { float a[];    };
+layout(set = 0, binding = 1, std430) readonly  buffer W    { float w[];    };
+layout(set = 0, binding = 2, std430) readonly  buffer B    { float bias[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer C    { float c[];    };
+
+layout(push_constant) uniform Pc {
+    uint  dim;
+    float eps;
+} pc;
+
+shared float subgroup_sums[32];
+shared float reduced_shared;
+
+float rowReduce(float local_value) {
+    float sg_sum = subgroupAdd(local_value);
+    if (subgroupElect()) {
+        subgroup_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sums[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            reduced_shared = total;
+        }
+    }
+    barrier();
+    return reduced_shared;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint row_off = row * pc.dim;
+    uint tid = gl_LocalInvocationID.x;
+
+    // ── Phase 1: μ = (1/D) Σ x ───────────────────────────────────
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        local_sum += a[row_off + i];
+    }
+    float total = rowReduce(local_sum);
+    float mu = total / float(pc.dim);
+
+    // ── Phase 2: v = (1/D) Σ (x − μ)² ────────────────────────────
+    barrier();
+    float local_var = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float z = a[row_off + i] - mu;
+        local_var += z * z;
+    }
+    float total_var = rowReduce(local_var);
+    float s = inversesqrt(total_var / float(pc.dim) + pc.eps);
+
+    // ── Phase 3: per-thread output write ─────────────────────────
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float z = a[row_off + i] - mu;
+        c[row_off + i] = w[i] * s * z + bias[i];
+    }
+}

@@ -596,6 +596,7 @@ pub fn main() !void {
     try runTrainCpuSmoke(allocator);
     try runTrainCpuMultiLayerSmoke(allocator);
     try runRmsNormBackwardCpuSmoke(allocator);
+    try runLayerNormBackwardCpuSmoke(allocator);
     try runGpuMatmulSmoke(allocator);
     try runGpuMlpForwardSmoke(allocator);
     try runGpuMlpBackwardSmoke(allocator);
@@ -620,6 +621,8 @@ pub fn main() !void {
     try runGpuMatmulQ4_KSmoke(allocator);
     try runGpuRmsnormSmoke(allocator);
     try runGpuRmsnormBackwardSmoke(allocator);
+    try runGpuLayerNormSmoke(allocator);
+    try runGpuLayerNormBackwardSmoke(allocator);
     try runGpuGegluSmoke(allocator);
     try runGpuRopeSmoke(allocator);
     try runGpuRopePartialSmoke(allocator);
@@ -4769,6 +4772,275 @@ fn runGpuRmsnormBackwardSmoke(allocator: std.mem.Allocator) !void {
 
     std.debug.print(
         "PASS GPU rmsnorm_backward (Llama + Gemma variants, {d}×{d}; dx + dw match CPU oracle ≤ 1e-4)\n",
+        .{ n_rows, dim },
+    );
+}
+
+// ── LayerNorm CPU oracle smoke ────────────────────────────────────
+//
+// Tier-2 chunk 3 first half: sanity-check the CPU oracle in
+// `cpu/train_transformer.zig` for both forward and backward against
+// numeric gradients. Forward already covered by the GPU parity smoke
+// below — this is the "is the math right at all" oracle test.
+
+fn runLayerNormBackwardCpuSmoke(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    const dim: usize = 32;
+    const eps: f32 = 1e-5;
+
+    var x: [dim]f32 = undefined;
+    var w: [dim]f32 = undefined;
+    var bias: [dim]f32 = undefined;
+    var dy: [dim]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x14E72097);
+    const rng = prng.random();
+    for (&x) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 1.5;
+    for (&w) |*v| v.* = 0.5 + rng.float(f32) * 0.5;
+    for (&bias) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 0.2;
+    for (&dy) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+
+    var dx: [dim]f32 = undefined;
+    var dw: [dim]f32 = undefined;
+    var dbias: [dim]f32 = undefined;
+    var probe_y: [dim]f32 = undefined;
+
+    @memset(&dw, 0);
+    @memset(&dbias, 0);
+    cpu_train_transformer.layerNormBackwardRow(&dy, &x, &w, eps, &dx, &dw, &dbias);
+
+    const eps_h: f32 = 1e-3;
+    const probes = [_]usize{ 0, 5, 11, 17, 23, 29 };
+    var max_rel_err: f32 = 0;
+
+    const Buf = enum { x, w, bias };
+    const bufs = [_]Buf{ .x, .w, .bias };
+    for (bufs) |b| {
+        const target_buf: []f32 = switch (b) {
+            .x => &x,
+            .w => &w,
+            .bias => &bias,
+        };
+        const grad_buf: []const f32 = switch (b) {
+            .x => &dx,
+            .w => &dw,
+            .bias => &dbias,
+        };
+        for (probes) |i| {
+            const orig = target_buf[i];
+            target_buf[i] = orig + eps_h;
+            _ = cpu_train_transformer.layerNormForwardRow(&x, &w, &bias, eps, &probe_y);
+            var l_plus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_plus += d * yi;
+            target_buf[i] = orig - eps_h;
+            _ = cpu_train_transformer.layerNormForwardRow(&x, &w, &bias, eps, &probe_y);
+            var l_minus: f32 = 0;
+            for (dy, probe_y) |d, yi| l_minus += d * yi;
+            target_buf[i] = orig;
+
+            const numeric = (l_plus - l_minus) / (2.0 * eps_h);
+            const analytic = grad_buf[i];
+            const denom = @max(@abs(numeric), @abs(analytic));
+            const rel_err = if (denom > 0) @abs(numeric - analytic) / denom else @abs(numeric - analytic);
+            if (rel_err > 1e-2) {
+                std.debug.print(
+                    "layernorm grad mismatch on {s}[{d}]: analytic={d:.6} numeric={d:.6} rel_err={d:.4}\n",
+                    .{ @tagName(b), i, analytic, numeric, rel_err },
+                );
+                return error.ParityFailed;
+            }
+            if (rel_err > max_rel_err) max_rel_err = rel_err;
+        }
+    }
+
+    std.debug.print(
+        "PASS layernorm backward CPU oracle (numeric-grad parity ≤ {e} on dx + dw + dbias)\n",
+        .{max_rel_err},
+    );
+}
+
+// ── GPU layernorm forward parity smoke ──────────────────────────────
+
+fn runGpuLayerNormSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim: usize = 1024;
+    const n_rows: usize = 4;
+    const eps: f32 = 1e-5;
+
+    const x = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(x);
+    const w = try allocator.alloc(f32, dim);
+    defer allocator.free(w);
+    const bias = try allocator.alloc(f32, dim);
+    defer allocator.free(bias);
+    var prng = std.Random.DefaultPrng.init(0x14E70F02);
+    const rng = prng.random();
+    for (x) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (w) |*v| v.* = 0.5 + rng.float(f32) * 0.5;
+    for (bias) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 0.2;
+
+    const want = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(want);
+    cpu_train_transformer.layerNormForward(x, w, bias, eps, n_rows, want);
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, x);
+    defer buf_a.deinit(ctx.device);
+    var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+    defer buf_w.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, f32, bias);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.layernorm, 4, @sizeOf(runtime.LayernormPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_a, &buf_w, &buf_b, &buf_c });
+
+    const push = runtime.LayernormPush{ .dim = @intCast(dim), .eps = eps };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.LayernormPush,
+        n_rows: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.n_rows, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .n_rows = @intCast(n_rows) });
+
+    const got = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(got);
+    try buf_c.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    for (got, want) |g, e| {
+        const d = @abs(g - e);
+        if (d > max_abs) max_abs = d;
+    }
+    if (max_abs > 1e-4) {
+        std.debug.print("GPU layernorm: max |Δ| = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+    std.debug.print(
+        "PASS GPU layernorm ({d}×{d}; max |Δ| vs CPU oracle = {e})\n",
+        .{ n_rows, dim, max_abs },
+    );
+}
+
+// ── GPU layernorm_backward parity smoke ─────────────────────────────
+
+fn runGpuLayerNormBackwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const dim: usize = 256;
+    const n_rows: usize = 4;
+    const eps: f32 = 1e-5;
+
+    var prng = std.Random.DefaultPrng.init(0xBA66120E);
+    const rng = prng.random();
+    const x = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(x);
+    const dy = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dy);
+    const w = try allocator.alloc(f32, dim);
+    defer allocator.free(w);
+    for (x) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (dy) |*v| v.* = (rng.float(f32) * 2.0 - 1.0);
+    for (w) |*v| v.* = 0.5 + rng.float(f32) * 0.5;
+
+    const dx_cpu = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dx_cpu);
+    const dw_cpu = try allocator.alloc(f32, dim);
+    defer allocator.free(dw_cpu);
+    const dbias_cpu = try allocator.alloc(f32, dim);
+    defer allocator.free(dbias_cpu);
+    @memset(dw_cpu, 0);
+    @memset(dbias_cpu, 0);
+    cpu_train_transformer.layerNormBackward(dy, x, w, eps, n_rows, dx_cpu, dw_cpu, dbias_cpu);
+
+    var buf_dy = try buffer.Buffer.initStatic(&ctx, f32, dy);
+    defer buf_dy.deinit(ctx.device);
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, x);
+    defer buf_x.deinit(ctx.device);
+    var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+    defer buf_w.deinit(ctx.device);
+    var buf_dx = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
+    defer buf_dx.deinit(ctx.device);
+    var buf_dw_partial = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
+    defer buf_dw_partial.deinit(ctx.device);
+    var buf_dbias_partial = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
+    defer buf_dbias_partial.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.layernorm_backward, 6, @sizeOf(runtime.LayernormPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_dy, &buf_x, &buf_w, &buf_dx, &buf_dw_partial, &buf_dbias_partial });
+
+    const push = runtime.LayernormPush{ .dim = @intCast(dim), .eps = eps };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.LayernormPush,
+        n_rows: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.n_rows, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .n_rows = @intCast(n_rows) });
+
+    const dx_gpu = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dx_gpu);
+    const dw_partial_gpu = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dw_partial_gpu);
+    const dbias_partial_gpu = try allocator.alloc(f32, n_rows * dim);
+    defer allocator.free(dbias_partial_gpu);
+    try buf_dx.readBack(&ctx, f32, dx_gpu);
+    try buf_dw_partial.readBack(&ctx, f32, dw_partial_gpu);
+    try buf_dbias_partial.readBack(&ctx, f32, dbias_partial_gpu);
+
+    const dw_gpu = try allocator.alloc(f32, dim);
+    defer allocator.free(dw_gpu);
+    const dbias_gpu = try allocator.alloc(f32, dim);
+    defer allocator.free(dbias_gpu);
+    @memset(dw_gpu, 0);
+    @memset(dbias_gpu, 0);
+    for (0..n_rows) |r| {
+        const off = r * dim;
+        for (0..dim) |i| {
+            dw_gpu[i] += dw_partial_gpu[off + i];
+            dbias_gpu[i] += dbias_partial_gpu[off + i];
+        }
+    }
+
+    var max_dx: f32 = 0;
+    for (dx_gpu, dx_cpu) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_dx) max_dx = d;
+    }
+    if (max_dx > 1e-4) {
+        std.debug.print("layernorm_backward dx: max |Δ| = {e}\n", .{max_dx});
+        return error.ParityFailed;
+    }
+
+    var max_dw: f32 = 0;
+    for (dw_gpu, dw_cpu) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_dw) max_dw = d;
+    }
+    if (max_dw > 1e-4) {
+        std.debug.print("layernorm_backward dw: max |Δ| = {e}\n", .{max_dw});
+        return error.ParityFailed;
+    }
+
+    var max_db: f32 = 0;
+    for (dbias_gpu, dbias_cpu) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_db) max_db = d;
+    }
+    if (max_db > 1e-4) {
+        std.debug.print("layernorm_backward dbias: max |Δ| = {e}\n", .{max_db});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS GPU layernorm_backward ({d}×{d}; dx + dw + dbias match CPU oracle ≤ 1e-4)\n",
         .{ n_rows, dim },
     );
 }

@@ -50,6 +50,14 @@ pub const RmsnormPush = extern struct {
     gemma_quirk: u32,
 };
 
+/// LayerNorm has neither the gemma_quirk gain offset nor a third
+/// configurable knob — `(dim, eps)` is enough for both forward and
+/// backward variants.
+pub const LayernormPush = extern struct {
+    dim: u32,
+    eps: f32,
+};
+
 pub const RopePush = extern struct {
     n_heads: u32,
     head_dim: u32,

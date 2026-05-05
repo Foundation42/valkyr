@@ -17,6 +17,8 @@ pub fn build(b: *std.Build) void {
     const matmul_nt_v2_q4_k_spv = compileShader(b, "matmul_nt_v2_q4_k");
     const rmsnorm_spv = compileShader(b, "rmsnorm");
     const rmsnorm_backward_spv = compileShader(b, "rmsnorm_backward");
+    const layernorm_spv = compileShader(b, "layernorm");
+    const layernorm_backward_spv = compileShader(b, "layernorm_backward");
     const geglu_spv = compileShader(b, "geglu");
     const swiglu_spv = compileShader(b, "swiglu");
     const rope_spv = compileShader(b, "rope");
@@ -80,6 +82,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matmul_nt_v2_q4_k_spv, "matmul_nt_v2_q4_k.spv");
     _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
     _ = wf.addCopyFile(rmsnorm_backward_spv, "rmsnorm_backward.spv");
+    _ = wf.addCopyFile(layernorm_spv, "layernorm.spv");
+    _ = wf.addCopyFile(layernorm_backward_spv, "layernorm_backward.spv");
     _ = wf.addCopyFile(geglu_spv, "geglu.spv");
     _ = wf.addCopyFile(swiglu_spv, "swiglu.spv");
     _ = wf.addCopyFile(rope_spv, "rope.spv");
@@ -138,6 +142,8 @@ pub fn build(b: *std.Build) void {
         \\pub const matmul_nt_v2_q4_k align(4) = @embedFile("matmul_nt_v2_q4_k.spv").*;
         \\pub const rmsnorm align(4) = @embedFile("rmsnorm.spv").*;
         \\pub const rmsnorm_backward align(4) = @embedFile("rmsnorm_backward.spv").*;
+        \\pub const layernorm align(4) = @embedFile("layernorm.spv").*;
+        \\pub const layernorm_backward align(4) = @embedFile("layernorm_backward.spv").*;
         \\pub const geglu align(4) = @embedFile("geglu.spv").*;
         \\pub const swiglu align(4) = @embedFile("swiglu.spv").*;
         \\pub const rope align(4) = @embedFile("rope.spv").*;

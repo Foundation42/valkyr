@@ -1,0 +1,108 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// LayerNorm backward, one workgroup per row:
+//
+//     A1            = Σ dyⱼ · γⱼ
+//     A2            = Σ dyⱼ · γⱼ · zⱼ        (zⱼ = xⱼ − μ)
+//     dxᵢ           = s · (γᵢ · dyᵢ − A1/D − (s² · zᵢ / D) · A2)
+//     dw_partialᵢ   = dyᵢ · s · zᵢ
+//     dbias_partialᵢ = dyᵢ
+//
+// Four row-wide reductions: Σ x → μ; Σ z² → v → s; Σ dy·γ → A1; Σ dy·γ·z → A2.
+// All four share the same subgroup_sums shared array, run sequentially
+// with a barrier between phases. dw_partial and dbias_partial follow
+// the rmsnorm_backward convention — caller sums across rows host-side
+// or via a follow-up reduce kernel.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Dy { float dy[];           };
+layout(set = 0, binding = 1, std430) readonly  buffer X  { float x[];            };
+layout(set = 0, binding = 2, std430) readonly  buffer W  { float w[];            };
+layout(set = 0, binding = 3, std430) writeonly buffer Dx { float dx[];           };
+layout(set = 0, binding = 4, std430) writeonly buffer DW { float dw_partial[];   };
+layout(set = 0, binding = 5, std430) writeonly buffer DB { float dbias_partial[]; };
+
+layout(push_constant) uniform Pc {
+    uint  dim;
+    float eps;
+} pc;
+
+shared float subgroup_sums[32];
+shared float reduced_shared;
+
+float rowReduce(float local_value) {
+    float sg_sum = subgroupAdd(local_value);
+    if (subgroupElect()) {
+        subgroup_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? subgroup_sums[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            reduced_shared = total;
+        }
+    }
+    barrier();
+    return reduced_shared;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint row_off = row * pc.dim;
+    uint tid = gl_LocalInvocationID.x;
+    float D_f = float(pc.dim);
+
+    // ── Phase 1: μ = (1/D) Σ x ───────────────────────────────────
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        local_sum += x[row_off + i];
+    }
+    float total_x = rowReduce(local_sum);
+    float mu = total_x / D_f;
+
+    // ── Phase 2: v from Σ z² ────────────────────────────────────
+    barrier();
+    float local_var = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float z = x[row_off + i] - mu;
+        local_var += z * z;
+    }
+    float total_var = rowReduce(local_var);
+    float s = inversesqrt(total_var / D_f + pc.eps);
+
+    // ── Phase 3: A1 = Σ dy · γ ──────────────────────────────────
+    barrier();
+    float local_A1 = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        local_A1 += dy[row_off + i] * w[i];
+    }
+    float A1 = rowReduce(local_A1);
+
+    // ── Phase 4: A2 = Σ dy · γ · z ──────────────────────────────
+    barrier();
+    float local_A2 = 0.0;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float z = x[row_off + i] - mu;
+        local_A2 += dy[row_off + i] * w[i] * z;
+    }
+    float A2 = rowReduce(local_A2);
+
+    // ── Phase 5: per-thread output write ────────────────────────
+    float inv_D = 1.0 / D_f;
+    float s2_over_D = s * s * inv_D;
+    for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float xi = x[row_off + i];
+        float dyi = dy[row_off + i];
+        float wi = w[i];
+        float z = xi - mu;
+        dx[row_off + i] = s * (wi * dyi - A1 * inv_D - s2_over_D * z * A2);
+        dw_partial[row_off + i] = dyi * s * z;
+        dbias_partial[row_off + i] = dyi;
+    }
+}
