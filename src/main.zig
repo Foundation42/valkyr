@@ -25,6 +25,7 @@ const train_runner = @import("train/runner.zig");
 const train_runner_n = @import("train/runner_n.zig");
 const train_transformer = @import("train/transformer.zig");
 const train_load_real = @import("train/load_real.zig");
+const train_dataset = @import("train/dataset.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
@@ -638,6 +639,7 @@ pub fn main() !void {
     try runDecoderStackTrainGpuRealShapeSmoke(allocator);
     try runRealModelLoadSmoke(allocator);
     try runRealModelForwardSmoke(allocator);
+    try runRealModelDatasetSmoke(allocator);
     try runDecoderBackwardGpuParitySmoke(allocator);
     try runDecoderTrainGpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
@@ -7802,6 +7804,117 @@ fn runRealModelForwardSmoke(allocator: std.mem.Allocator) !void {
             .{ n_pos, real_len, ce_mean, argmax_after_prompt },
         );
     }
+}
+
+// ── chunk 8c-β-4: tokenizer + dataset stub ───────────────────────────
+//
+// β-3a/3b proved the static loader path. β-4 adds the streaming side:
+// a `train_dataset.Dataset` packs tokenized examples into one stream
+// with EOS separators, and produces sliding (n_pos+1)-windows as
+// (input_ids, target_ids) batches for next-token-prediction training.
+// β-5 will iterate over these and call `runner.step` once per batch.
+//
+// The new module supports both in-memory examples and a JSONL file
+// (one `{"text": "..."}` object per line). This smoke uses the JSONL
+// path to exercise both code paths end-to-end and ships a tiny
+// fact-style dataset at `data/train/tiny_facts.jsonl` so future
+// chunks have a hermetic corpus to overfit on.
+//
+// Pass criterion: dataset builds with packed_ids longer than n_pos+1,
+// at least one batch is producible, forward CE on the first batch is
+// finite + below `pretrained_ce_threshold`. The threshold is loose
+// (8 nats) because we're running a *trained* Qwen3-0.6B on factual
+// English — actual CE will land in the 1.5-4 nat regime.
+
+fn runRealModelDatasetSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3-0.6B";
+    const jsonl_path = "data/train/tiny_facts.jsonl";
+    const n_pos: u32 = 16;
+    const eos_id: u32 = 151_645; // Qwen3 <|im_end|>; matches config.eos_token_id.
+    const ce_threshold: f32 = 8.0;
+
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.HfModelNotInCache => {
+            std.debug.print("SKIP runRealModelDatasetSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    var weights = try train_load_real.loadTrainWeights(allocator, &cpu, n_pos);
+    defer weights.deinit();
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    var ds = try train_dataset.buildFromJsonl(allocator, &tok, jsonl_path, n_pos, eos_id);
+    defer ds.deinit();
+
+    if (ds.numBatches() == 0) {
+        std.debug.print("Dataset smoke: numBatches=0 ({d} packed ids ≤ n_pos={d})\n", .{ ds.packed_ids.len, n_pos });
+        return error.DatasetTooShort;
+    }
+
+    // ── Read batch 0 and verify the next-token shift is intact.
+    const input_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(input_ids);
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    try ds.batch(0, input_ids, target_ids);
+
+    for (0..n_pos) |p| {
+        // packed_ids[p+1] should equal both target_ids[p] and (for p<n_pos-1)
+        // input_ids[p+1]. The first guarantees the shift is correct;
+        // the second confirms the windowing is consistent.
+        if (target_ids[p] != ds.packed_ids[p + 1]) return error.TargetShiftMismatch;
+        if (p + 1 < n_pos and input_ids[p + 1] != ds.packed_ids[p + 1]) return error.InputWindowMismatch;
+    }
+
+    // ── Forward + CE on the first batch.
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+    var runner = try train_transformer.Runner.init(allocator, &ctx, weights.cfg, weights.view());
+    defer runner.deinit();
+
+    const vocab: usize = weights.cfg.vocab_size;
+    const logits = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(logits);
+    try runner.forwardLogits(input_ids, logits);
+
+    var ce_sum: f64 = 0;
+    for (0..n_pos) |p| {
+        const off = p * vocab;
+        var m: f32 = -std.math.inf(f32);
+        for (0..vocab) |o| m = @max(m, logits[off + o]);
+        var sum_e: f64 = 0;
+        for (0..vocab) |o| sum_e += @exp(@as(f64, logits[off + o]) - @as(f64, m));
+        const log_z: f64 = @as(f64, m) + @log(sum_e);
+        ce_sum += log_z - @as(f64, logits[off + target_ids[p]]);
+    }
+    const ce_mean: f32 = @floatCast(ce_sum / @as(f64, @floatFromInt(n_pos)));
+
+    if (!std.math.isFinite(ce_mean)) {
+        std.debug.print("Dataset smoke: mean CE not finite ({d})\n", .{ce_mean});
+        return error.CeNotFinite;
+    }
+    if (ce_mean >= ce_threshold) {
+        std.debug.print(
+            "Dataset smoke: batch-0 mean CE {d:.3} ≥ threshold {d:.3}\n",
+            .{ ce_mean, ce_threshold },
+        );
+        return error.CeAboveThreshold;
+    }
+
+    std.debug.print(
+        "PASS real Qwen3-0.6B dataset (jsonl→{d} packed ids; {d} batches at n_pos={d}; batch-0 mean_CE={d:.3} nats)\n",
+        .{ ds.packed_ids.len, ds.numBatches(), n_pos, ce_mean },
+    );
 }
 
 // ── chunk 8b stage A: gpu backward chain parity vs cpu oracle ────────
