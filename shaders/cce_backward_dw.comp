@@ -1,0 +1,104 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Cut Cross-Entropy backward (dW component).
+//
+// Vocab-major dispatch — one workgroup per vocab id v. Mirrors
+// embedding_backward.comp's "1 WG per vocab entry, no atomic float"
+// pattern: each WG owns dW[v, :] exclusively, so concurrent WGs never
+// touch the same gradient slot and we avoid VK_EXT_shader_atomic_float.
+//
+// Math: the dW gradient summed over all rows is
+//
+//     dW[v, k] += Σ_n dz[n, v] · h[n, k]                          (1)
+//
+// where dz follows the same form as in cce_backward_dh.comp:
+//
+//     dz[n, v] = (exp(z[n, v] − lse[n]) − [v == target[n]]) / N    (2)
+//
+// Each WG iterates over N rows. Per row:
+//   - 256 threads cooperate on the dot product z_nv = h[n] · W[v]ᵀ
+//   - the reduced z_nv lands in shared mem, thread 0 computes dz and
+//     broadcasts it to the whole WG
+//   - each thread accumulates its strided k slice of (1) — single-thread
+//     ownership of each dW[v, k] makes the read-modify-write race-free
+//
+// dW is *accumulated* into (caller zeroes — same convention as
+// linearBackward and embedding_backward).
+//
+// Shape note: this kernel does N row matmuls per WG and dispatches V
+// WGs total, so the total work is V·N·D MACs — the same as the
+// materialized linear_backward(dW) it replaces. The win over the
+// materialized path is that we never instantiate the [N, V] d_logits
+// tensor: dz lives in registers per row.
+//
+// CPU oracle: src/cpu/cce.zig#cceBackward (the dW portion). Parity
+// asserted by runGpuCceBackwardDwSmoke.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer H  { float h[]; };       // [N, D]
+layout(set = 0, binding = 1, std430) readonly buffer W  { float w_lm[]; };    // [V, D]
+layout(set = 0, binding = 2, std430) readonly buffer Tg { uint  tgt[]; };     // [N]
+layout(set = 0, binding = 3, std430) readonly buffer Ls { float lse[]; };     // [N]
+layout(set = 0, binding = 4, std430)          buffer Dw { float dW[]; };       // [V, D] accumulated
+
+layout(push_constant) uniform Pc {
+    uint N;
+    uint V;
+    uint D;
+} pc;
+
+shared float sg_partials[32];   // up to 32 subgroups
+shared float row_dz;            // dz_{n, v} broadcast across the WG
+
+void main() {
+    uint v = gl_WorkGroupID.x;
+    if (v >= pc.V) return;
+
+    uint tid       = gl_LocalInvocationID.x;
+    uint warp_id   = gl_SubgroupID;
+    uint num_warps = gl_NumSubgroups;
+    uint lane      = gl_SubgroupInvocationID;
+    uint sg_size   = gl_SubgroupSize;
+    uint w_off     = v * pc.D;
+    float inv_n    = 1.0 / float(pc.N);
+
+    for (uint n = 0; n < pc.N; n++) {
+        uint h_off = n * pc.D;
+
+        // ── Step 1: cooperative dot product z_nv = h[n] · W[v]ᵀ.
+        // Each thread accumulates a strided slice of D, then a two-stage
+        // reduction (subgroupAdd → shared sg_partials → cross-subgroup
+        // subgroupAdd) gathers the total. Same pattern as matmul_nt_v2.
+        float partial = 0.0;
+        for (uint k = tid; k < pc.D; k += 256) {
+            partial += h[h_off + k] * w_lm[w_off + k];
+        }
+        float sg_sum = subgroupAdd(partial);
+        if (subgroupElect()) sg_partials[warp_id] = sg_sum;
+        barrier();
+
+        // ── Step 2: cross-subgroup reduce + dz, broadcast via shared.
+        if (warp_id == 0) {
+            float vv = (lane < num_warps) ? sg_partials[lane] : 0.0;
+            float total = subgroupAdd(vv);
+            if (subgroupElect()) {
+                float p     = exp(total - lse[n]);
+                float t_ind = (v == tgt[n]) ? 1.0 : 0.0;
+                row_dz = (p - t_ind) * inv_n;
+            }
+        }
+        barrier();
+
+        // ── Step 3: dW[v, k] += dz · h[n, k]   strided by tid.
+        // Each k is owned by exactly one thread for the whole WG, so
+        // the read-modify-write of dW[w_off + k] is single-threaded.
+        float dz = row_dz;
+        for (uint k = tid; k < pc.D; k += 256) {
+            dW[w_off + k] += dz * h[h_off + k];
+        }
+        barrier();  // ensure dW writes are sequenced before next row's reads
+    }
+}

@@ -104,6 +104,16 @@ pub fn main() !void {
         try runGpuCceForwardSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--cce-backward-dh-smoke")) {
+        // Fast-path for the d_h half of CCE backward.
+        try runGpuCceBackwardDhSmoke(allocator);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--cce-backward-dw-smoke")) {
+        // Fast-path for the dW half of CCE backward.
+        try runGpuCceBackwardDwSmoke(allocator);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
@@ -629,6 +639,8 @@ pub fn main() !void {
     try runWeightDecayCosineLrSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
     try runGpuCceForwardSmoke(allocator);
+    try runGpuCceBackwardDhSmoke(allocator);
+    try runGpuCceBackwardDwSmoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
     try runGpuMatmulQ4_0Smoke(allocator);
@@ -4312,6 +4324,219 @@ fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
         std.debug.print(
             "PASS GPU CCE forward — {s}  N={d} V={d} D={d}  mean_loss={d:.4}  rel(lse/loss/mean)=({e},{e},{e})\n",
             .{ cs.name, cs.n, cs.v, cs.d, mean_loss_cpu, lse_rel, loss_rel, mean_rel },
+        );
+    }
+}
+
+// ── GPU CCE backward d_h smoke: vs CPU oracle ─────────────────────────
+//
+// Drives `cce_backward_dh.comp` against the d_h output of
+// `cpu_cce.cceBackward`. The oracle path uses the same chunked
+// recompute-and-accumulate algorithm but in scalar f64; the GPU version
+// uses cooperative subgroup reductions. Tolerance is 1e-5 global rel-err
+// (`max|diff| / max|ref|`), same as cce.zig's in-file parity tests.
+
+fn runGpuCceBackwardDhSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const SmokeCase = struct {
+        name: []const u8,
+        n: u32,
+        v: u32,
+        d: u32,
+    };
+    const cases = [_]SmokeCase{
+        .{ .name = "multi-chunk (V=2048, 8 chunks)", .n = 4, .v = 2048, .d = 896 },
+        .{ .name = "partial-chunk (V=300, 1+ chunks)", .n = 3, .v = 300, .d = 64 },
+        .{ .name = "single-chunk (V=256, exactly CHUNK)", .n = 2, .v = 256, .d = 128 },
+    };
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.cce_backward_dh, 5, @sizeOf(runtime.CceBackwardPush));
+    defer kern.deinit();
+
+    for (cases) |cs| {
+        var prng = std.Random.DefaultPrng.init(0xCCEB_DAA0 + cs.v);
+        const rng = prng.random();
+
+        const h = try allocator.alloc(f32, cs.n * cs.d);
+        defer allocator.free(h);
+        const w_lm = try allocator.alloc(f32, cs.v * cs.d);
+        defer allocator.free(w_lm);
+        const targets = try allocator.alloc(u32, cs.n);
+        defer allocator.free(targets);
+
+        for (h) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+        for (w_lm) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+        for (targets) |*t| t.* = rng.intRangeLessThan(u32, 0, cs.v);
+
+        // CPU oracle: forward to populate lse, then full backward.
+        // d_h is what we compare; dW is computed but discarded for this
+        // smoke (it's the cce_backward_dw kernel's parity target).
+        const lse_cpu = try allocator.alloc(f32, cs.n);
+        defer allocator.free(lse_cpu);
+        _ = cpu_cce.cceForward(h, w_lm, targets, cs.n, cs.v, cs.d, 256, lse_cpu);
+
+        const d_h_cpu = try allocator.alloc(f32, cs.n * cs.d);
+        defer allocator.free(d_h_cpu);
+        const dW_unused = try allocator.alloc(f32, cs.v * cs.d);
+        defer allocator.free(dW_unused);
+        @memset(dW_unused, 0);
+        cpu_cce.cceBackward(h, w_lm, targets, lse_cpu, cs.n, cs.v, cs.d, 256, d_h_cpu, dW_unused);
+
+        // GPU dispatch. lse comes from CPU (the upstream cce_forward
+        // kernel computed the same lse, but we use the CPU values here
+        // to isolate the d_h kernel's correctness from any forward
+        // round-off — chunk 2's GPU↔CPU lse parity already validated to
+        // 1e-7).
+        var buf_h = try buffer.Buffer.initStatic(&ctx, f32, h);
+        defer buf_h.deinit(ctx.device);
+        var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w_lm);
+        defer buf_w.deinit(ctx.device);
+        var buf_t = try buffer.Buffer.initStatic(&ctx, u32, targets);
+        defer buf_t.deinit(ctx.device);
+        var buf_lse = try buffer.Buffer.initStatic(&ctx, f32, lse_cpu);
+        defer buf_lse.deinit(ctx.device);
+        var buf_dh = try buffer.Buffer.initDeviceOnly(&ctx, cs.n * cs.d * @sizeOf(f32));
+        defer buf_dh.deinit(ctx.device);
+
+        try kern.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_dh });
+
+        const push = runtime.CceBackwardPush{ .n_samples = cs.n, .vocab = cs.v, .dim = cs.d };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.CceBackwardPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &kern, .push = &push, .gx = cs.n });
+
+        const d_h_gpu = try allocator.alloc(f32, cs.n * cs.d);
+        defer allocator.free(d_h_gpu);
+        try buf_dh.readBack(&ctx, f32, d_h_gpu);
+
+        const rel = globalRelDiff(d_h_cpu, d_h_gpu);
+        const tol: f32 = 1e-5;
+        if (rel >= tol) {
+            std.debug.print("CCE bw d_h smoke ({s}) FAIL: rel={e}  tol={e}\n", .{ cs.name, rel, tol });
+            for (d_h_cpu, d_h_gpu, 0..) |a, b, i| {
+                if (@abs(a - b) > tol * @max(@abs(a), 1e-6)) {
+                    std.debug.print("  first mismatch idx={d}: cpu={e}  gpu={e}\n", .{ i, a, b });
+                    break;
+                }
+            }
+            return error.ParityFailed;
+        }
+
+        std.debug.print(
+            "PASS GPU CCE backward d_h — {s}  N={d} V={d} D={d}  rel={e}\n",
+            .{ cs.name, cs.n, cs.v, cs.d, rel },
+        );
+    }
+}
+
+// ── GPU CCE backward dW smoke: vs CPU oracle ──────────────────────────
+//
+// Vocab-major dispatch — one workgroup per vocab id. Drives
+// `cce_backward_dw.comp` against the dW output of `cpu_cce.cceBackward`.
+// `initDeviceOnly` zero-fills, so the kernel's `+=` accumulates from
+// zero on first call (matching the caller-zeroes convention shared with
+// embedding_backward and linearBackward).
+
+fn runGpuCceBackwardDwSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const SmokeCase = struct {
+        name: []const u8,
+        n: u32,
+        v: u32,
+        d: u32,
+    };
+    const cases = [_]SmokeCase{
+        .{ .name = "multi-chunk (V=2048)", .n = 4, .v = 2048, .d = 896 },
+        .{ .name = "small-vocab (V=300)", .n = 3, .v = 300, .d = 64 },
+        .{ .name = "boundary (V=256)", .n = 2, .v = 256, .d = 128 },
+    };
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.cce_backward_dw, 5, @sizeOf(runtime.CceBackwardPush));
+    defer kern.deinit();
+
+    for (cases) |cs| {
+        var prng = std.Random.DefaultPrng.init(0xCCED_DAA0 + cs.v);
+        const rng = prng.random();
+
+        const h = try allocator.alloc(f32, cs.n * cs.d);
+        defer allocator.free(h);
+        const w_lm = try allocator.alloc(f32, cs.v * cs.d);
+        defer allocator.free(w_lm);
+        const targets = try allocator.alloc(u32, cs.n);
+        defer allocator.free(targets);
+
+        for (h) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+        for (w_lm) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+        for (targets) |*t| t.* = rng.intRangeLessThan(u32, 0, cs.v);
+
+        // CPU oracle: forward to populate lse, then full backward.
+        const lse_cpu = try allocator.alloc(f32, cs.n);
+        defer allocator.free(lse_cpu);
+        _ = cpu_cce.cceForward(h, w_lm, targets, cs.n, cs.v, cs.d, 256, lse_cpu);
+
+        const d_h_unused = try allocator.alloc(f32, cs.n * cs.d);
+        defer allocator.free(d_h_unused);
+        const dW_cpu = try allocator.alloc(f32, cs.v * cs.d);
+        defer allocator.free(dW_cpu);
+        @memset(dW_cpu, 0);
+        cpu_cce.cceBackward(h, w_lm, targets, lse_cpu, cs.n, cs.v, cs.d, 256, d_h_unused, dW_cpu);
+
+        // GPU dispatch.
+        var buf_h = try buffer.Buffer.initStatic(&ctx, f32, h);
+        defer buf_h.deinit(ctx.device);
+        var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w_lm);
+        defer buf_w.deinit(ctx.device);
+        var buf_t = try buffer.Buffer.initStatic(&ctx, u32, targets);
+        defer buf_t.deinit(ctx.device);
+        var buf_lse = try buffer.Buffer.initStatic(&ctx, f32, lse_cpu);
+        defer buf_lse.deinit(ctx.device);
+        // initDeviceOnly zero-fills, which the `+=` kernel needs.
+        var buf_dw = try buffer.Buffer.initDeviceOnly(&ctx, cs.v * cs.d * @sizeOf(f32));
+        defer buf_dw.deinit(ctx.device);
+
+        try kern.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_dw });
+
+        const push = runtime.CceBackwardPush{ .n_samples = cs.n, .vocab = cs.v, .dim = cs.d };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.CceBackwardPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &kern, .push = &push, .gx = cs.v });
+
+        const dW_gpu = try allocator.alloc(f32, cs.v * cs.d);
+        defer allocator.free(dW_gpu);
+        try buf_dw.readBack(&ctx, f32, dW_gpu);
+
+        const rel = globalRelDiff(dW_cpu, dW_gpu);
+        const tol: f32 = 1e-5;
+        if (rel >= tol) {
+            std.debug.print("CCE bw dW smoke ({s}) FAIL: rel={e}  tol={e}\n", .{ cs.name, rel, tol });
+            for (dW_cpu, dW_gpu, 0..) |a, b, i| {
+                if (@abs(a - b) > tol * @max(@abs(a), 1e-6)) {
+                    std.debug.print("  first mismatch idx={d} (v={d}, k={d}): cpu={e}  gpu={e}\n", .{
+                        i, i / cs.d, i % cs.d, a, b,
+                    });
+                    break;
+                }
+            }
+            return error.ParityFailed;
+        }
+
+        std.debug.print(
+            "PASS GPU CCE backward dW — {s}  N={d} V={d} D={d}  rel={e}\n",
+            .{ cs.name, cs.n, cs.v, cs.d, rel },
         );
     }
 }

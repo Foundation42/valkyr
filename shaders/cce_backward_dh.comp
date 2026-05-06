@@ -1,0 +1,135 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Cut Cross-Entropy backward (d_h component).
+//
+// One workgroup per row n. Walks vocab in chunks of CHUNK = 256 — same
+// shape as cce_forward.comp — but instead of accumulating online-softmax
+// stats, builds the gradient w.r.t. the hidden state:
+//
+//     d_h[n, k] = Σ_v dz[n, v] · W[v, k]                         (1)
+//
+// where the per-element gradient is derived from the cached log-sum-exp:
+//
+//     dz[n, v] = (exp(z[n, v] − lse[n]) − [v == target[n]]) / N  (2)
+//
+// Because we never stored z, each chunk is recomputed:
+//
+//     z_chunk[CHUNK] = h[n] · W[c : c + CHUNK]ᵀ
+//
+// Then per chunk we compute dz_chunk[CHUNK] from (2), and accumulate
+//
+//     d_h[n, k] += Σ_o dz_chunk[o] · W[c + o, k]                  (3)
+//
+// striding k across threads. Each k is owned by exactly one thread for
+// the lifetime of this WG, so the read-modify-write of d_h[h_off + k]
+// is single-threaded — no atomics, no shared accumulator, no MAX_DIM
+// constraint.
+//
+// The WG-local zero-init of d_h before the chunk loop is the standard
+// "overwrite, not accumulate" convention shared with linearBackward in
+// train_decoder.zig — caller's pre-existing d_h contents are discarded.
+//
+// CPU oracle: src/cpu/cce.zig#cceBackward (the d_h portion). Parity
+// asserted against that oracle's output via runGpuCceBackwardDhSmoke.
+
+layout(local_size_x = 256) in;
+
+#define CHUNK 256
+#define NEG_INF (uintBitsToFloat(0xff800000u))
+
+layout(set = 0, binding = 0, std430) readonly  buffer H  { float h[]; };       // [N, D]
+layout(set = 0, binding = 1, std430) readonly  buffer W  { float w_lm[]; };    // [V, D]
+layout(set = 0, binding = 2, std430) readonly  buffer Tg { uint  tgt[]; };     // [N]
+layout(set = 0, binding = 3, std430) readonly  buffer Ls { float lse[]; };     // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer Dh { float d_h[]; };     // [N, D]
+
+layout(push_constant) uniform Pc {
+    uint N;
+    uint V;
+    uint D;
+} pc;
+
+shared float z_chunk[CHUNK];
+shared float dz_chunk[CHUNK];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.N) return;
+
+    uint tid       = gl_LocalInvocationID.x;
+    uint warp_id   = gl_SubgroupID;
+    uint num_warps = gl_NumSubgroups;
+    uint lane      = gl_SubgroupInvocationID;
+    uint sg_size   = gl_SubgroupSize;
+    uint h_off     = row * pc.D;
+    uint tgt_id    = tgt[row];
+    float lse_row  = lse[row];
+    float inv_n    = 1.0 / float(pc.N);
+
+    // ── Zero d_h[row, :] so the chunk-loop's `+=` accumulates from zero.
+    // Each thread owns its strided k slice, so this is race-free.
+    for (uint k = tid; k < pc.D; k += 256) {
+        d_h[h_off + k] = 0.0;
+    }
+    // No barrier here: each thread's subsequent reads/writes to its
+    // own k slice are sequenced within the thread.
+
+    for (uint c = 0; c < pc.V; c += CHUNK) {
+        uint chunk_end  = min(c + CHUNK, pc.V);
+        uint chunk_size = chunk_end - c;
+
+        // ── Step 1: recompute z_chunk[CHUNK] cooperatively. Same shape
+        // as cce_forward.comp — each subgroup processes a strided slice
+        // of CHUNK outputs; for each output, lanes cooperate over D
+        // (coalesced W-row reads).
+        for (uint o = warp_id; o < CHUNK; o += num_warps) {
+            uint o_global = c + o;
+            float partial = 0.0;
+            if (o_global < pc.V) {
+                uint w_off = o_global * pc.D;
+                for (uint k = lane; k < pc.D; k += sg_size) {
+                    partial += h[h_off + k] * w_lm[w_off + k];
+                }
+            }
+            float total = subgroupAdd(partial);
+            if (subgroupElect()) {
+                z_chunk[o] = (o_global < pc.V) ? total : NEG_INF;
+            }
+        }
+        barrier();
+
+        // ── Step 2: derive dz_chunk[tid] = (softmax(z) − target) / N.
+        // The cached lse turns softmax into one cheap subtraction:
+        //     softmax(z[v]) = exp(z[v] − lse).
+        // Out-of-bounds slots get dz = 0 so step 3's accumulation is
+        // unaffected (multiplying by 0).
+        {
+            uint o_global = c + tid;
+            if (tid < CHUNK && o_global < pc.V) {
+                float p     = exp(z_chunk[tid] - lse_row);
+                float t_ind = (o_global == tgt_id) ? 1.0 : 0.0;
+                dz_chunk[tid] = (p - t_ind) * inv_n;
+            } else if (tid < CHUNK) {
+                dz_chunk[tid] = 0.0;
+            }
+        }
+        barrier();
+
+        // ── Step 3: d_h[h_off + k] += Σ_o dz_chunk[o] · W[c+o, k].
+        // Each thread owns a strided k slice for the entire WG lifetime,
+        // so the load-add-store is single-threaded — race-free without
+        // atomics. The o-loop runs over only the valid slice; reading
+        // w_lm with o_global ≥ V is undefined under non-robust SSBO
+        // bounds, so we cap to chunk_size.
+        for (uint k = tid; k < pc.D; k += 256) {
+            float acc = 0.0;
+            for (uint o = 0; o < chunk_size; o++) {
+                acc += dz_chunk[o] * w_lm[(c + o) * pc.D + k];
+            }
+            d_h[h_off + k] += acc;
+        }
+        barrier();  // guard dz_chunk against next chunk's step 2 overwrite
+    }
+}

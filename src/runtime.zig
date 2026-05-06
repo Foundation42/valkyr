@@ -287,6 +287,16 @@ pub const CceForwardPush = extern struct {
     dim: u32,
 };
 
+/// CCE backward — d_h component (one WG per row) and dW component (one
+/// WG per vocab entry, mirrors embedding_backward.comp's vocab-major
+/// layout to avoid VK_EXT_shader_atomic_float). Both kernels share the
+/// same problem shape so they reuse the same push-constant struct.
+pub const CceBackwardPush = extern struct {
+    n_samples: u32,
+    vocab: u32,
+    dim: u32,
+};
+
 pub const Mlp2LossBatchedPush = extern struct {
     dim_out: u32,
     n_samples: u32,

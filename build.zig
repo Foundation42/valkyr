@@ -87,6 +87,8 @@ pub fn build(b: *std.Build) void {
     const mlp2_mse_loss_batched_spv = compileShader(b, "mlp2_mse_loss_batched");
     const mlp2_ce_loss_batched_spv = compileShader(b, "mlp2_ce_loss_batched");
     const cce_forward_spv = compileShader(b, "cce_forward");
+    const cce_backward_dh_spv = compileShader(b, "cce_backward_dh");
+    const cce_backward_dw_spv = compileShader(b, "cce_backward_dw");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -171,6 +173,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(mlp2_mse_loss_batched_spv, "mlp2_mse_loss_batched.spv");
     _ = wf.addCopyFile(mlp2_ce_loss_batched_spv, "mlp2_ce_loss_batched.spv");
     _ = wf.addCopyFile(cce_forward_spv, "cce_forward.spv");
+    _ = wf.addCopyFile(cce_backward_dh_spv, "cce_backward_dh.spv");
+    _ = wf.addCopyFile(cce_backward_dw_spv, "cce_backward_dw.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -250,6 +254,8 @@ pub fn build(b: *std.Build) void {
         \\pub const mlp2_mse_loss_batched align(4) = @embedFile("mlp2_mse_loss_batched.spv").*;
         \\pub const mlp2_ce_loss_batched align(4) = @embedFile("mlp2_ce_loss_batched.spv").*;
         \\pub const cce_forward align(4) = @embedFile("cce_forward.spv").*;
+        \\pub const cce_backward_dh align(4) = @embedFile("cce_backward_dh.spv").*;
+        \\pub const cce_backward_dw align(4) = @embedFile("cce_backward_dw.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──
