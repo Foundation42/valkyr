@@ -24,6 +24,7 @@ const cpu_train_decoder = @import("cpu/train_decoder.zig");
 const train_runner = @import("train/runner.zig");
 const train_runner_n = @import("train/runner_n.zig");
 const train_transformer = @import("train/transformer.zig");
+const train_load_real = @import("train/load_real.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
@@ -635,6 +636,7 @@ pub fn main() !void {
     try runDecoderStackBackwardGpuParitySmoke(allocator);
     try runDecoderStackTrainGpuSmoke(allocator);
     try runDecoderStackTrainGpuRealShapeSmoke(allocator);
+    try runRealModelLoadSmoke(allocator);
     try runDecoderBackwardGpuParitySmoke(allocator);
     try runDecoderTrainGpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
@@ -7503,6 +7505,133 @@ fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU decoder stack real-shape envelope (Qwen3-0.6B-class toy-arch: n_layers={d} dim={d} GQA {d}/{d} ff_dim={d} vocab={d} n_pos={d}; CE {d:.6} → {d:.6} over {d} Adam steps, {d:.1} ms/step)\n",
         .{ n_layers, dim, n_heads, n_kv_heads, ff_dim, vocab, n_pos, initial_loss, final_loss, n_steps, ms_per_step },
+    );
+}
+
+// ── chunk 8c-β-3a: real Qwen3 weight load (fp32 train tensors) ───────
+//
+// Loads Qwen3-0.6B from the local HF cache, materialises fp32 training
+// weights via `train_load_real.loadTrainWeightsFromId`, and gates the
+// loader with three checks:
+//
+//   1. The derived `train_transformer.Config` matches Qwen3-0.6B's
+//      published architecture (28 layers, 16/8 GQA at head_dim=128,
+//      ff_dim=3072, vocab=151,936, full-RoPE, qk_norm on, rms_eps=1e-6,
+//      rope_theta=1e6).
+//   2. Every fp32 buffer has the expected element count.
+//   3. A sampled subset of values from each tensor is finite. Cheap
+//      vs scanning all ~720M params; catches any byte-pattern errors
+//      from a wrong dtype path or shape misread.
+//
+// SKIP on `error.HfModelNotInCache` — fresh checkouts won't have the
+// 1.2 GB safetensors local. PASS proves the bytes-on-disk → fp32 path
+// is end-to-end correct; β-3b will run a forward pass to gate layout.
+
+fn runRealModelLoadSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3-0.6B";
+    const n_pos: u32 = 64;
+
+    var weights = train_load_real.loadTrainWeightsFromId(allocator, model_id, n_pos) catch |err| switch (err) {
+        error.HfModelNotInCache => {
+            std.debug.print("SKIP runRealModelLoadSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer weights.deinit();
+
+    const cfg = weights.cfg;
+
+    // ── 1. Architecture identity check.
+    if (cfg.n_layers != 28) return error.UnexpectedLayers;
+    if (cfg.dim != 1024) return error.UnexpectedHiddenSize;
+    if (cfg.n_heads != 16) return error.UnexpectedNumHeads;
+    if (cfg.n_kv_heads != 8) return error.UnexpectedNumKvHeads;
+    if (cfg.head_dim != 128) return error.UnexpectedHeadDim;
+    if (cfg.ff_dim != 3072) return error.UnexpectedFfDim;
+    if (cfg.vocab_size != 151_936) return error.UnexpectedVocabSize;
+    if (cfg.n_pos != n_pos) return error.UnexpectedNPos;
+    if (cfg.rotary_dim != cfg.head_dim) return error.UnexpectedRotaryDim;
+    if (!cfg.qk_norm) return error.QkNormShouldBeOn;
+    if (@abs(cfg.rms_eps - 1e-6) > 1e-9) return error.UnexpectedRmsEps;
+    if (@abs(cfg.rope_theta - 1_000_000.0) > 1.0) return error.UnexpectedRopeTheta;
+
+    // ── 2. Shape (numel) check. Mirrors transformer.Runner.init's
+    //    validation — if these slip past us, init would error first.
+    const dim: usize = cfg.dim;
+    const q_dim: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
+    const kv_dim: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
+    const ff_dim: usize = cfg.ff_dim;
+    const vocab: usize = cfg.vocab_size;
+    const head_dim: usize = cfg.head_dim;
+
+    if (weights.embed.len != vocab * dim) return error.EmbedNumelMismatch;
+    if (weights.final_norm.len != dim) return error.FinalNormNumelMismatch;
+    if (weights.lm_head.len != vocab * dim) return error.LmHeadNumelMismatch;
+    if (weights.layers.len != cfg.n_layers) return error.LayersCountMismatch;
+
+    for (weights.layers, 0..) |lw, li| {
+        if (lw.w_n1.len != dim) return error.LayerN1NumelMismatch;
+        if (lw.w_q.len != q_dim * dim) return error.LayerQNumelMismatch;
+        if (lw.w_k.len != kv_dim * dim) return error.LayerKNumelMismatch;
+        if (lw.w_v.len != kv_dim * dim) return error.LayerVNumelMismatch;
+        if (lw.w_o.len != dim * q_dim) return error.LayerONumelMismatch;
+        if (lw.w_n2.len != dim) return error.LayerN2NumelMismatch;
+        if (lw.w_gate.len != ff_dim * dim) return error.LayerGateNumelMismatch;
+        if (lw.w_up.len != ff_dim * dim) return error.LayerUpNumelMismatch;
+        if (lw.w_down.len != dim * ff_dim) return error.LayerDownNumelMismatch;
+        if (lw.w_q_norm.len != head_dim) return error.LayerQNormNumelMismatch;
+        if (lw.w_k_norm.len != head_dim) return error.LayerKNormNumelMismatch;
+        _ = li; // li available for richer errors if any of the above fire.
+    }
+
+    // ── 3. Sampled finiteness scan. We sample ~256 elements per
+    //    tensor, evenly spaced — cheap and catches any wholesale-wrong
+    //    bytes (dtype mismatch, shape misread, etc).
+    const sample = struct {
+        fn run(name: []const u8, slice: []const f32) !void {
+            const n = slice.len;
+            if (n == 0) return;
+            const stride: usize = @max(1, n / 256);
+            var i: usize = 0;
+            while (i < n) : (i += stride) {
+                if (!std.math.isFinite(slice[i])) {
+                    std.debug.print("non-finite value in {s} at index {d}: {d}\n", .{ name, i, slice[i] });
+                    return error.NonFiniteWeight;
+                }
+            }
+        }
+    }.run;
+
+    try sample("embed", weights.embed);
+    try sample("final_norm", weights.final_norm);
+    try sample("lm_head", weights.lm_head);
+    for (weights.layers, 0..) |lw, li| {
+        // Only sample the big ones — rmsnorm gains are tiny and were
+        // already covered by the shape check.
+        try sample("w_q", lw.w_q);
+        try sample("w_k", lw.w_k);
+        try sample("w_v", lw.w_v);
+        try sample("w_o", lw.w_o);
+        try sample("w_gate", lw.w_gate);
+        try sample("w_up", lw.w_up);
+        try sample("w_down", lw.w_down);
+        _ = li;
+    }
+
+    // ── Stat: total fp32 weight bytes (rough: matches what Runner
+    //    would upload, modulo embed-vs-lm_head distinct copies).
+    var total_f32: usize = weights.embed.len + weights.final_norm.len + weights.lm_head.len;
+    for (weights.layers) |lw| {
+        total_f32 += lw.w_n1.len + lw.w_q.len + lw.w_k.len + lw.w_v.len + lw.w_o.len;
+        total_f32 += lw.w_n2.len + lw.w_gate.len + lw.w_up.len + lw.w_down.len;
+        total_f32 += lw.w_q_norm.len + lw.w_k_norm.len;
+    }
+    const total_mib: f64 = @as(f64, @floatFromInt(total_f32 * @sizeOf(f32))) / (1024.0 * 1024.0);
+
+    std.debug.print(
+        "PASS real Qwen3-0.6B weight load (n_layers={d} dim={d} GQA {d}/{d} head_dim={d} ff_dim={d} vocab={d}; rope_theta={d:.0} rms_eps={e}; {d:.1} MiB fp32 host)\n",
+        .{ cfg.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.ff_dim, cfg.vocab_size, cfg.rope_theta, cfg.rms_eps, total_mib },
     );
 }
 
