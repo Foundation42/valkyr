@@ -22,6 +22,7 @@ const cpu_train = @import("cpu/train.zig");
 const cpu_train_transformer = @import("cpu/train_transformer.zig");
 const cpu_train_decoder = @import("cpu/train_decoder.zig");
 const cpu_cce = @import("cpu/cce.zig");
+const cpu_lora = @import("cpu/lora.zig");
 const train_runner = @import("train/runner.zig");
 const train_runner_n = @import("train/runner_n.zig");
 const train_transformer = @import("train/transformer.zig");
@@ -135,6 +136,14 @@ pub fn main() !void {
         // and report per-kernel ms. Shows where the LM-head bucket's
         // time actually goes.
         try runCceBench(allocator);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-smoke")) {
+        // GPU LoRA composition smoke. Drives existing matmul_nt_v2 +
+        // linear_backward_d{x,w}_batched + scale + add_in_place
+        // kernels in the LoRA pattern (no new SPIR-V) and parity-checks
+        // the outputs against the cpu/lora.zig oracle.
+        try runGpuLoraSmoke(allocator);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
@@ -664,6 +673,7 @@ pub fn main() !void {
     try runGpuCceForwardSmoke(allocator);
     try runGpuCceBackwardDhSmoke(allocator);
     try runGpuCceBackwardDwSmoke(allocator);
+    try runGpuLoraSmoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
     try runGpuMatmulQ4_0Smoke(allocator);
@@ -4347,6 +4357,288 @@ fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
         std.debug.print(
             "PASS GPU CCE forward — {s}  N={d} V={d} D={d}  mean_loss={d:.4}  rel(lse/loss/mean)=({e},{e},{e})\n",
             .{ cs.name, cs.n, cs.v, cs.d, mean_loss_cpu, lse_rel, loss_rel, mean_rel },
+        );
+    }
+}
+
+// ── GPU LoRA smoke: composes existing kernels, parity vs CPU oracle ───
+//
+// LoRA-augmented linear forward + backward built entirely from existing
+// SPIR-V (matmul_nt_v2, linear_backward_dx_batched, linear_backward_dw_batched,
+// scale, add_in_place — no new shaders). The dispatch chain mirrors
+// cpu_lora.{loraForward, loraBackward} step-for-step:
+//
+//   forward:
+//     matmul_nt_v2(x, W)                     → y_base
+//     matmul_nt_v2(x, A)                     → intermediate
+//     matmul_nt_v2(intermediate, B)          → y_lora
+//     scale(y_lora, α/r)                     → y_lora_scaled
+//     add_in_place(y_base, y_lora_scaled)    → y  (overwrites y_base)
+//
+//   backward:
+//     linear_backward_dx(dy, W)              → dx_base
+//     linear_backward_dx(dy, B) {treat as M×N=N K=r} → dy_B
+//     linear_backward_dx(dy_B, A) {M=M N=r K=K}      → dx_lora_unscaled
+//     scale(dx_lora_unscaled, α/r)                   → dx_lora_scaled
+//     add_in_place(dx_base, dx_lora_scaled)          → dx
+//     linear_backward_dw(dy_B, x) {M=M N=r K=K}      → dA_unscaled
+//     scale(dA_unscaled, α/r)                        → dA
+//     linear_backward_dw(dy, intermediate)           → dB_unscaled
+//     scale(dB_unscaled, α/r)                        → dB
+//
+// Three shape cases (small / medium-rank-16 / high-rank-32) cover the
+// parameter range we'd actually adapt: rank-16 is the LoRA paper's
+// canonical setting, rank-32 is at the upper end of "feature learning"
+// territory. All assert global rel-err < 1e-5 against the CPU oracle.
+
+fn runGpuLoraSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const SmokeCase = struct {
+        name: []const u8,
+        m: u32,
+        n: u32,
+        k: u32,
+        r: u32,
+        aor: f32, // alpha / r
+    };
+    const cases = [_]SmokeCase{
+        .{ .name = "rank-4 (M=4 N=8 K=16)", .m = 4, .n = 8, .k = 16, .r = 4, .aor = 2.0 },
+        .{ .name = "rank-16 (M=8 N=64 K=128)", .m = 8, .n = 64, .k = 128, .r = 16, .aor = 2.0 },
+        .{ .name = "rank-32 (M=4 N=32 K=64)", .m = 4, .n = 32, .k = 64, .r = 32, .aor = 1.0 },
+    };
+
+    // Build pipelines once — reused across cases.
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dx.deinit();
+    var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dw.deinit();
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(ScalePush));
+    defer k_scale.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+
+    const group_lwg: u32 = 16; // matches linear_backward_d{x,w}_batched layout
+    const group_lin: u32 = 256; // matches scale + add_in_place
+
+    for (cases) |cs| {
+        const M: usize = cs.m;
+        const Nn: usize = cs.n; // can't shadow top-level `const N` for the vec_add smoke
+        const K: usize = cs.k;
+        const r: usize = cs.r;
+
+        // ── Host-side init: random x, W, A, B, dy.
+        var prng = std.Random.DefaultPrng.init(0xABBA_FACE +% @as(u64, cs.m) *% 1000 +% cs.n);
+        const rng = prng.random();
+
+        const x = try allocator.alloc(f32, M * K);
+        defer allocator.free(x);
+        const w = try allocator.alloc(f32, Nn * K);
+        defer allocator.free(w);
+        const a = try allocator.alloc(f32, r * K);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f32, Nn * r);
+        defer allocator.free(b);
+        const dy = try allocator.alloc(f32, M * Nn);
+        defer allocator.free(dy);
+
+        for (x) |*v| v.* = (rng.float(f32) - 0.5) * 0.3;
+        for (w) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+        for (a) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+        for (b) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+        for (dy) |*v| v.* = (rng.float(f32) - 0.5) * 0.4;
+
+        // ── CPU oracle reference outputs.
+        const y_cpu = try allocator.alloc(f32, M * Nn);
+        defer allocator.free(y_cpu);
+        const intermediate_cpu = try allocator.alloc(f32, M * r);
+        defer allocator.free(intermediate_cpu);
+        cpu_lora.loraForward(x, w, a, b, M, Nn, K, r, cs.aor, y_cpu, intermediate_cpu);
+
+        const dx_cpu = try allocator.alloc(f32, M * K);
+        defer allocator.free(dx_cpu);
+        const dA_cpu = try allocator.alloc(f32, r * K);
+        defer allocator.free(dA_cpu);
+        const dB_cpu = try allocator.alloc(f32, Nn * r);
+        defer allocator.free(dB_cpu);
+        @memset(dA_cpu, 0);
+        @memset(dB_cpu, 0);
+        try cpu_lora.loraBackward(dy, x, w, a, b, intermediate_cpu, M, Nn, K, r, cs.aor, dx_cpu, dA_cpu, dB_cpu, allocator);
+
+        // ── GPU buffer allocation.
+        var buf_x = try buffer.Buffer.initStatic(&ctx, f32, x);
+        defer buf_x.deinit(ctx.device);
+        var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+        defer buf_w.deinit(ctx.device);
+        var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a);
+        defer buf_a.deinit(ctx.device);
+        var buf_b = try buffer.Buffer.initStatic(&ctx, f32, b);
+        defer buf_b.deinit(ctx.device);
+        var buf_dy = try buffer.Buffer.initStatic(&ctx, f32, dy);
+        defer buf_dy.deinit(ctx.device);
+
+        // Outputs.
+        var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+        defer buf_y.deinit(ctx.device);
+        var buf_intermediate = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+        defer buf_intermediate.deinit(ctx.device);
+        var buf_dx = try buffer.Buffer.initDeviceOnly(&ctx, M * K * @sizeOf(f32));
+        defer buf_dx.deinit(ctx.device);
+        var buf_dA = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+        defer buf_dA.deinit(ctx.device);
+        var buf_dB = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+        defer buf_dB.deinit(ctx.device);
+
+        // Scratches.
+        var buf_y_lora = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+        defer buf_y_lora.deinit(ctx.device);
+        var buf_y_lora_scaled = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+        defer buf_y_lora_scaled.deinit(ctx.device);
+        var buf_dy_B = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+        defer buf_dy_B.deinit(ctx.device);
+        var buf_dx_lora = try buffer.Buffer.initDeviceOnly(&ctx, M * K * @sizeOf(f32));
+        defer buf_dx_lora.deinit(ctx.device);
+        var buf_dx_lora_scaled = try buffer.Buffer.initDeviceOnly(&ctx, M * K * @sizeOf(f32));
+        defer buf_dx_lora_scaled.deinit(ctx.device);
+        var buf_dA_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+        defer buf_dA_unscaled.deinit(ctx.device);
+        var buf_dB_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+        defer buf_dB_unscaled.deinit(ctx.device);
+
+        // Push-constant constants.
+        const M_u32: u32 = cs.m;
+        const N_u32: u32 = cs.n;
+        const K_u32: u32 = cs.k;
+        const R_u32: u32 = cs.r;
+
+        // Helper: dispatch one matmul_nt_v2 (1D, gx output cells).
+        const recordMatmul = struct {
+            fn rec(rec_kern: *pipeline.Kernel, push: *const MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+                try rec_kern.bind(bufs);
+                const Rec = struct {
+                    k: *const pipeline.Kernel,
+                    p: *const MatmulPush,
+                    gx_: u32,
+                    pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                        s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                    }
+                };
+                try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = push, .gx_ = gx });
+            }
+        }.rec;
+
+        // Helper: dispatch one linear_backward_d{x,w}_batched (16x16 grid).
+        const recordLinBackward = struct {
+            fn rec(rec_kern: *pipeline.Kernel, push: *const runtime.LinearBatchedPush, gx: u32, gy: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+                try rec_kern.bind(bufs);
+                const Rec = struct {
+                    k: *const pipeline.Kernel,
+                    p: *const runtime.LinearBatchedPush,
+                    gx_: u32,
+                    gy_: u32,
+                    pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                        s.k.dispatch(cmd, s.p, s.gx_, s.gy_, 1);
+                    }
+                };
+                try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = push, .gx_ = gx, .gy_ = gy });
+            }
+        }.rec;
+
+        // Helper: dispatch a 1D scalar kernel (scale, add_in_place).
+        const recordScalar1D = struct {
+            fn rec(rec_kern: *pipeline.Kernel, push: anytype, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+                try rec_kern.bind(bufs);
+                const PushT = @TypeOf(push);
+                const Rec = struct {
+                    k: *const pipeline.Kernel,
+                    p: *const PushT,
+                    gx_: u32,
+                    pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                        s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                    }
+                };
+                try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = &push, .gx_ = gx });
+            }
+        }.rec;
+
+        // ── FORWARD chain.
+        // 1. y_base = x · Wᵀ
+        const push_y_base = MatmulPush{ .m = M_u32, .n = N_u32, .k = K_u32 };
+        try recordMatmul(&k_matmul, &push_y_base, M_u32 * N_u32, &ctx, &.{ &buf_x, &buf_w, &buf_y });
+        // 2. intermediate = x · Aᵀ
+        const push_inter = MatmulPush{ .m = M_u32, .n = R_u32, .k = K_u32 };
+        try recordMatmul(&k_matmul, &push_inter, M_u32 * R_u32, &ctx, &.{ &buf_x, &buf_a, &buf_intermediate });
+        // 3. y_lora = intermediate · Bᵀ
+        const push_ylora = MatmulPush{ .m = M_u32, .n = N_u32, .k = R_u32 };
+        try recordMatmul(&k_matmul, &push_ylora, M_u32 * N_u32, &ctx, &.{ &buf_intermediate, &buf_b, &buf_y_lora });
+        // 4. y_lora_scaled = y_lora * (α/r)
+        const push_scale_ylora = ScalePush{ .n = M_u32 * N_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_ylora, ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y_lora, &buf_y_lora_scaled });
+        // 5. y += y_lora_scaled  (in place into buf_y)
+        const push_add_y = runtime.AddInPlacePush{ .n = M_u32 * N_u32 };
+        try recordScalar1D(&k_add, push_add_y, ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y, &buf_y_lora_scaled });
+
+        // ── BACKWARD chain.
+        // 1. dx_base = dy · W                  (shape M×K = M×Nn · Nn×K)
+        const push_dx_base = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = K_u32 };
+        try recordLinBackward(&k_lin_dx, &push_dx_base, ceilDiv(M_u32, group_lwg), ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_w, &buf_dx });
+        // 2. dy_B = dy · B                     (shape M×r = M×Nn · Nn×r). LinearBatchedPush.K = r.
+        const push_dy_B = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = R_u32 };
+        try recordLinBackward(&k_lin_dx, &push_dy_B, ceilDiv(M_u32, group_lwg), ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
+        // 3. dx_lora = dy_B · A                (shape M×K = M×r · r×K). Nn=r in the linear-backward sense.
+        const push_dx_lora = runtime.LinearBatchedPush{ .M = M_u32, .N = R_u32, .K = K_u32 };
+        try recordLinBackward(&k_lin_dx, &push_dx_lora, ceilDiv(M_u32, group_lwg), ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_a, &buf_dx_lora });
+        // 4. dx_lora_scaled = dx_lora * (α/r)
+        const push_scale_dxlora = ScalePush{ .n = M_u32 * K_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_dxlora, ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx_lora, &buf_dx_lora_scaled });
+        // 5. dx += dx_lora_scaled
+        const push_add_dx = runtime.AddInPlacePush{ .n = M_u32 * K_u32 };
+        try recordScalar1D(&k_add, push_add_dx, ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx, &buf_dx_lora_scaled });
+        // 6. ∇A_unscaled = dy_Bᵀ · x          (shape r×K). dW[Nn=r, K]
+        const push_dA = runtime.LinearBatchedPush{ .M = M_u32, .N = R_u32, .K = K_u32 };
+        try recordLinBackward(&k_lin_dw, &push_dA, ceilDiv(R_u32, group_lwg), ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
+        // 7. ∇A = ∇A_unscaled * (α/r)
+        const push_scale_dA = ScalePush{ .n = R_u32 * K_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_dA, ceilDiv(R_u32 * K_u32, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
+        // 8. ∇B_unscaled = dyᵀ · intermediate (shape Nn×r). dW[Nn, K=r]
+        const push_dB = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = R_u32 };
+        try recordLinBackward(&k_lin_dw, &push_dB, ceilDiv(N_u32, group_lwg), ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
+        // 9. ∇B = ∇B_unscaled * (α/r)
+        const push_scale_dB = ScalePush{ .n = N_u32 * R_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_dB, ceilDiv(N_u32 * R_u32, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
+
+        // ── Read back + diff.
+        const y_gpu = try allocator.alloc(f32, M * Nn);
+        defer allocator.free(y_gpu);
+        const dx_gpu = try allocator.alloc(f32, M * K);
+        defer allocator.free(dx_gpu);
+        const dA_gpu = try allocator.alloc(f32, r * K);
+        defer allocator.free(dA_gpu);
+        const dB_gpu = try allocator.alloc(f32, Nn * r);
+        defer allocator.free(dB_gpu);
+        try buf_y.readBack(&ctx, f32, y_gpu);
+        try buf_dx.readBack(&ctx, f32, dx_gpu);
+        try buf_dA.readBack(&ctx, f32, dA_gpu);
+        try buf_dB.readBack(&ctx, f32, dB_gpu);
+
+        const tol: f32 = 1e-5;
+        const y_rel = globalRelDiff(y_cpu, y_gpu);
+        const dx_rel = globalRelDiff(dx_cpu, dx_gpu);
+        const dA_rel = globalRelDiff(dA_cpu, dA_gpu);
+        const dB_rel = globalRelDiff(dB_cpu, dB_gpu);
+        if (y_rel >= tol or dx_rel >= tol or dA_rel >= tol or dB_rel >= tol) {
+            std.debug.print(
+                "LoRA smoke ({s}) FAIL: y_rel={e}  dx_rel={e}  dA_rel={e}  dB_rel={e}  (tol {e})\n",
+                .{ cs.name, y_rel, dx_rel, dA_rel, dB_rel, tol },
+            );
+            return error.ParityFailed;
+        }
+        std.debug.print(
+            "PASS GPU LoRA — {s}  α/r={d:.2}  rel(y/dx/dA/dB)=({e},{e},{e},{e})\n",
+            .{ cs.name, cs.aor, y_rel, dx_rel, dA_rel, dB_rel },
         );
     }
 }
