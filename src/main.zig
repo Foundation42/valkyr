@@ -640,6 +640,7 @@ pub fn main() !void {
     try runRealModelLoadSmoke(allocator);
     try runRealModelForwardSmoke(allocator);
     try runRealModelDatasetSmoke(allocator);
+    try runRealModelTrainStepSmoke(allocator);
     try runDecoderBackwardGpuParitySmoke(allocator);
     try runDecoderTrainGpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
@@ -7915,6 +7916,150 @@ fn runRealModelDatasetSmoke(allocator: std.mem.Allocator) !void {
         "PASS real Qwen3-0.6B dataset (jsonl→{d} packed ids; {d} batches at n_pos={d}; batch-0 mean_CE={d:.3} nats)\n",
         .{ ds.packed_ids.len, ds.numBatches(), n_pos, ce_mean },
     );
+}
+
+// ── chunk 8c-β-5: end-to-end one-step real-model train ──────────────
+//
+// The "does it actually train" gate. β-3a/3b proved the static loader
+// is correct, β-4 proved the streaming side is correct. β-5 closes the
+// loop: load Qwen3-0.6B, sample one real batch from the dataset, take
+// one Adam step, forward again on the same batch, assert the loss
+// decreased.
+//
+// Why a small lr matters: the β-2 envelope uses lr=1e-2 because it's
+// overfitting random-init weights from 0.02 scale, where one update
+// of size lr*sign(g) ≈ 1e-2 is a 50% relative perturbation. Pretrained
+// weights are at scales of 0.01-0.5 with carefully-tuned magnitudes;
+// a 1e-2 update would catastrophically diverge them. Standard real-
+// world fine-tune lr is 1e-5 to 5e-5 — we use 1e-5, which gives a
+// first-step relative perturbation of 0.01-0.1% per weight (small but
+// measurable in the loss).
+//
+// Pass criterion:
+//   - CE_before finite
+//   - CE_after finite
+//   - CE_after < CE_before (the actual gate — if false, either the
+//     gradient is zero, the lr is wrong, or training is broken)
+//
+// The decrease is expected to be small (a few % of CE_before) because
+// (1) lr is conservative and (2) we're stepping on a single small
+// batch — overfitting one window with one Adam step will visibly
+// shift its CE but won't dent broader Qwen3-0.6B knowledge. β-6 will
+// loop this for many steps + checkpoints.
+
+fn runRealModelTrainStepSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3-0.6B";
+    const jsonl_path = "data/train/tiny_facts.jsonl";
+    const n_pos: u32 = 16;
+    const eos_id: u32 = 151_645;
+    const lr: f32 = 1e-5;
+
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.HfModelNotInCache => {
+            std.debug.print("SKIP runRealModelTrainStepSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    var weights = try train_load_real.loadTrainWeights(allocator, &cpu, n_pos);
+    defer weights.deinit();
+    // Override the trainer's default lr with a fine-tune-appropriate
+    // value before instantiation. Config is value-passed into init,
+    // and Runner stores it; setting via .lr field on a copy is fine.
+    var cfg = weights.cfg;
+    cfg.lr = lr;
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    var ds = try train_dataset.buildFromJsonl(allocator, &tok, jsonl_path, n_pos, eos_id);
+    defer ds.deinit();
+    if (ds.numBatches() == 0) return error.DatasetTooShort;
+
+    const input_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(input_ids);
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    try ds.batch(0, input_ids, target_ids);
+
+    // ── target_one_hot: trainer's CE-loss-grad shader expects this
+    //    shape (n_pos × vocab, sparse with a single 1 per row).
+    const vocab: usize = cfg.vocab_size;
+    const target_one_hot = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(target_one_hot);
+    @memset(target_one_hot, 0);
+    for (target_ids, 0..) |tid, p| target_one_hot[p * vocab + @as(usize, tid)] = 1.0;
+
+    // ── GPU bring-up + Runner.
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var runner = try train_transformer.Runner.init(allocator, &ctx, cfg, weights.view());
+    defer runner.deinit();
+
+    const logits = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(logits);
+
+    // ── CE before.
+    try runner.forwardLogits(input_ids, logits);
+    const ce_before = computeMeanCe(logits, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_before)) {
+        std.debug.print("Train-step smoke: CE_before not finite ({d})\n", .{ce_before});
+        return error.CeBeforeNotFinite;
+    }
+
+    // ── One Adam step on this single batch.
+    const t_step_start = std.time.nanoTimestamp();
+    try runner.step(input_ids, target_one_hot);
+    const t_step_end = std.time.nanoTimestamp();
+    const step_ms: f64 = @as(f64, @floatFromInt(t_step_end - t_step_start)) / 1.0e6;
+
+    // ── CE after.
+    try runner.forwardLogits(input_ids, logits);
+    const ce_after = computeMeanCe(logits, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_after)) {
+        std.debug.print("Train-step smoke: CE_after not finite ({d}) after CE_before={d:.6}\n", .{ ce_after, ce_before });
+        return error.CeAfterNotFinite;
+    }
+
+    if (ce_after >= ce_before) {
+        std.debug.print(
+            "Train-step smoke: CE did not decrease (before={d:.6} after={d:.6} delta={d:.6}) at lr={e}\n",
+            .{ ce_before, ce_after, ce_after - ce_before, lr },
+        );
+        return error.CeDidNotDecrease;
+    }
+
+    const delta = ce_before - ce_after;
+    const rel_pct: f64 = 100.0 * @as(f64, delta) / @as(f64, ce_before);
+    std.debug.print(
+        "PASS real Qwen3-0.6B one-step train (n_pos={d} lr={e}; CE {d:.6} → {d:.6}, Δ={d:.6} ({d:.3}%); step={d:.1} ms)\n",
+        .{ n_pos, lr, ce_before, ce_after, delta, rel_pct, step_ms },
+    );
+}
+
+/// Mean per-position cross-entropy: −log p(target_ids[p] | logits[p,·])
+/// averaged over `n_pos`. Uses fp64 accumulation for the per-position
+/// log-Z so n_pos × vocab × magnitude doesn't lose precision.
+fn computeMeanCe(logits: []const f32, target_ids: []const u32, n_pos: u32, vocab: usize) f32 {
+    var ce_sum: f64 = 0;
+    for (0..n_pos) |p| {
+        const off = p * vocab;
+        var m: f32 = -std.math.inf(f32);
+        for (0..vocab) |o| m = @max(m, logits[off + o]);
+        var sum_e: f64 = 0;
+        for (0..vocab) |o| sum_e += @exp(@as(f64, logits[off + o]) - @as(f64, m));
+        const log_z: f64 = @as(f64, m) + @log(sum_e);
+        ce_sum += log_z - @as(f64, logits[off + target_ids[p]]);
+    }
+    return @floatCast(ce_sum / @as(f64, @floatFromInt(n_pos)));
 }
 
 // ── chunk 8b stage A: gpu backward chain parity vs cpu oracle ────────
