@@ -1,17 +1,25 @@
 //! End-to-end toy decoder layer for Tier-2 chunk 8a.
 //!
 //! Wires the transformer-primitive backward passes shipped in chunks
-//! 1-7 into a single decoder block:
+//! 1-7 (plus the SwiGLU primitive from β-3a-1) into a single decoder
+//! block:
 //!
-//!     x_in  [n_pos, dim]
-//!     n1   = RMSNorm(x_in, w_n1)
-//!     Q,K,V = linear projections of n1                      [n_pos, dim]
-//!     attn = SDPA(Q, K, V, causal)                          [n_pos, dim]
-//!     o    = linear(attn, W_O)
-//!     mid  = x_in + o                                        ← residual
-//!     n2   = RMSNorm(mid, w_n2)
-//!     ff_h = ReLU(linear(n2, W_FF1))                        [n_pos, ff_dim]
-//!     y    = mid + linear(ff_h, W_FF2)                       ← residual
+//!     x_in     [n_pos, dim]
+//!     n1       = RMSNorm(x_in, w_n1)
+//!     Q,K,V    = linear projections of n1                   [n_pos, dim]
+//!     attn     = SDPA(Q, K, V, causal)                      [n_pos, dim]
+//!     o        = linear(attn, W_O)
+//!     mid      = x_in + o                                    ← residual
+//!     n2       = RMSNorm(mid, w_n2)
+//!     pre_gate = linear(n2, W_gate)                          [n_pos, ff_dim]
+//!     up       = linear(n2, W_up)                            [n_pos, ff_dim]
+//!     gated    = silu(pre_gate) · up                         [n_pos, ff_dim]
+//!     y        = mid + linear(gated, W_down)                 ← residual
+//!
+//! SwiGLU FFN replaces the ReLU FFN of chunk-8a. Three weight tensors
+//! per layer instead of two; the gate's nonlinearity is silu (z·σ(z)).
+//! Saved activations grow by one buffer (`up`); `gated` is recomputed
+//! during backward rather than stored.
 //!
 //! No RoPE — the chunk-7 backward smoke already covers it; bringing it
 //! in here just adds bookkeeping without exercising new gradient flow.
@@ -64,16 +72,17 @@ pub const Config = struct {
 pub const Layer = struct {
     cfg: Config,
     w_n1: []f32, // [dim]
-    w_q: []f32, // [dim, dim]            (n_heads * head_dim, dim)
+    w_q: []f32, // [n_heads * head_dim, dim]
     w_k: []f32, // [n_kv_heads * head_dim, dim]
     w_v: []f32, // [n_kv_heads * head_dim, dim]
     w_o: []f32, // [dim, n_heads * head_dim]
     w_n2: []f32, // [dim]
-    w_ff1: []f32, // [ff_dim, dim]
-    w_ff2: []f32, // [dim, ff_dim]
+    w_gate: []f32, // [ff_dim, dim]
+    w_up: []f32, // [ff_dim, dim]
+    w_down: []f32, // [dim, ff_dim]
 
-    pub fn paramSlices(self: *Layer) [8][]f32 {
-        return .{ self.w_n1, self.w_q, self.w_k, self.w_v, self.w_o, self.w_n2, self.w_ff1, self.w_ff2 };
+    pub fn paramSlices(self: *Layer) [9][]f32 {
+        return .{ self.w_n1, self.w_q, self.w_k, self.w_v, self.w_o, self.w_n2, self.w_gate, self.w_up, self.w_down };
     }
 };
 
@@ -84,11 +93,12 @@ pub const Grads = struct {
     dw_v: []f32,
     dw_o: []f32,
     dw_n2: []f32,
-    dw_ff1: []f32,
-    dw_ff2: []f32,
+    dw_gate: []f32,
+    dw_up: []f32,
+    dw_down: []f32,
 
-    pub fn slices(self: *Grads) [8][]f32 {
-        return .{ self.dw_n1, self.dw_q, self.dw_k, self.dw_v, self.dw_o, self.dw_n2, self.dw_ff1, self.dw_ff2 };
+    pub fn slices(self: *Grads) [9][]f32 {
+        return .{ self.dw_n1, self.dw_q, self.dw_k, self.dw_v, self.dw_o, self.dw_n2, self.dw_gate, self.dw_up, self.dw_down };
     }
 
     pub fn zero(self: *Grads) void {
@@ -109,9 +119,10 @@ pub const Acts = struct {
     o: []f32, // [n_pos, dim]
     mid: []f32, // [n_pos, dim] = x_in + o
     n2: []f32, // [n_pos, dim]
-    ff_pre: []f32, // [n_pos, ff_dim]
-    ff_h: []f32, // [n_pos, ff_dim] = ReLU(ff_pre)
-    ff_out: []f32, // [n_pos, dim]
+    pre_gate: []f32, // [n_pos, ff_dim]
+    up: []f32, // [n_pos, ff_dim]
+    gated: []f32, // [n_pos, ff_dim] = silu(pre_gate) · up
+    ff_out: []f32, // [n_pos, dim] = gated @ W_down
     y: []f32, // [n_pos, dim] = mid + ff_out
 };
 
@@ -133,8 +144,9 @@ pub fn allocActs(gpa: std.mem.Allocator, cfg: Config) !Acts {
         .o = try gpa.alloc(f32, n_pos * dim),
         .mid = try gpa.alloc(f32, n_pos * dim),
         .n2 = try gpa.alloc(f32, n_pos * dim),
-        .ff_pre = try gpa.alloc(f32, n_pos * cfg.ff_dim),
-        .ff_h = try gpa.alloc(f32, n_pos * cfg.ff_dim),
+        .pre_gate = try gpa.alloc(f32, n_pos * cfg.ff_dim),
+        .up = try gpa.alloc(f32, n_pos * cfg.ff_dim),
+        .gated = try gpa.alloc(f32, n_pos * cfg.ff_dim),
         .ff_out = try gpa.alloc(f32, n_pos * dim),
         .y = try gpa.alloc(f32, n_pos * dim),
     };
@@ -152,8 +164,9 @@ pub fn freeActs(gpa: std.mem.Allocator, a: *Acts) void {
     gpa.free(a.o);
     gpa.free(a.mid);
     gpa.free(a.n2);
-    gpa.free(a.ff_pre);
-    gpa.free(a.ff_h);
+    gpa.free(a.pre_gate);
+    gpa.free(a.up);
+    gpa.free(a.gated);
     gpa.free(a.ff_out);
     gpa.free(a.y);
 }
@@ -200,14 +213,17 @@ pub fn forward(layer: *const Layer, acts: *Acts) void {
     // n2 = RMSNorm(mid, w_n2)
     tt.rmsNormForward(acts.mid, layer.w_n2, cfg.rms_eps, false, n_pos, acts.n2);
 
-    // ff_pre = n2 @ W_FF1ᵀ
-    matmulNt(acts.ff_pre, acts.n2, layer.w_ff1, n_pos, cfg.ff_dim, dim);
+    // pre_gate = n2 @ W_gateᵀ
+    matmulNt(acts.pre_gate, acts.n2, layer.w_gate, n_pos, cfg.ff_dim, dim);
 
-    // ff_h = ReLU(ff_pre)
-    for (acts.ff_h, acts.ff_pre) |*h, p| h.* = if (p > 0) p else 0;
+    // up = n2 @ W_upᵀ
+    matmulNt(acts.up, acts.n2, layer.w_up, n_pos, cfg.ff_dim, dim);
 
-    // ff_out = ff_h @ W_FF2ᵀ
-    matmulNt(acts.ff_out, acts.ff_h, layer.w_ff2, n_pos, dim, cfg.ff_dim);
+    // gated = silu(pre_gate) · up
+    tt.swigluForward(acts.pre_gate, acts.up, acts.gated);
+
+    // ff_out = gated @ W_downᵀ
+    matmulNt(acts.ff_out, acts.gated, layer.w_down, n_pos, dim, cfg.ff_dim);
 
     // y = mid + ff_out (residual)
     for (acts.y, acts.mid, acts.ff_out) |*yv, m, f| yv.* = m + f;
@@ -302,20 +318,28 @@ pub fn backwardFromDy(
     defer gpa.free(d_mid);
     @memcpy(d_mid, d_y);
 
-    // ── 2. ff_out = ff_h @ W_FF2ᵀ
-    const d_ff_h = try gpa.alloc(f32, n_pos * cfg.ff_dim);
-    defer gpa.free(d_ff_h);
-    linearBackward(d_y, acts.ff_h, layer.w_ff2, n_pos, dim, cfg.ff_dim, d_ff_h, grads.dw_ff2);
+    // ── 2. ff_out = gated @ W_downᵀ
+    //    d_gated = d_y @ W_down                       (lin_dx)
+    //    dw_down += d_yᵀ @ gated                       (lin_dw)
+    const d_gated = try gpa.alloc(f32, n_pos * cfg.ff_dim);
+    defer gpa.free(d_gated);
+    linearBackward(d_y, acts.gated, layer.w_down, n_pos, dim, cfg.ff_dim, d_gated, grads.dw_down);
 
-    // ── 3. ff_h = ReLU(ff_pre)  →  d_ff_pre = d_ff_h * (ff_pre > 0)
-    const d_ff_pre = try gpa.alloc(f32, n_pos * cfg.ff_dim);
-    defer gpa.free(d_ff_pre);
-    for (d_ff_pre, d_ff_h, acts.ff_pre) |*dp, dh, pre| dp.* = if (pre > 0) dh else 0;
+    // ── 3. SwiGLU backward.  d_gated → d_pre_gate, d_up.
+    const d_pre_gate = try gpa.alloc(f32, n_pos * cfg.ff_dim);
+    defer gpa.free(d_pre_gate);
+    const d_up = try gpa.alloc(f32, n_pos * cfg.ff_dim);
+    defer gpa.free(d_up);
+    tt.swigluBackward(d_gated, acts.pre_gate, acts.up, d_pre_gate, d_up);
 
-    // ── 4. ff_pre = n2 @ W_FF1ᵀ
+    // ── 4. pre_gate = n2 @ W_gateᵀ ; up = n2 @ W_upᵀ. Sum into d_n2.
     const d_n2 = try gpa.alloc(f32, n_pos * dim);
     defer gpa.free(d_n2);
-    linearBackward(d_ff_pre, acts.n2, layer.w_ff1, n_pos, cfg.ff_dim, dim, d_n2, grads.dw_ff1);
+    const d_n2_up = try gpa.alloc(f32, n_pos * dim);
+    defer gpa.free(d_n2_up);
+    linearBackward(d_pre_gate, acts.n2, layer.w_gate, n_pos, cfg.ff_dim, dim, d_n2, grads.dw_gate);
+    linearBackward(d_up, acts.n2, layer.w_up, n_pos, cfg.ff_dim, dim, d_n2_up, grads.dw_up);
+    for (d_n2, d_n2_up) |*a, b| a.* += b;
 
     // ── 5. n2 = RMSNorm(mid, w_n2)  →  d_mid += rmsnorm.dx;  dw_n2 += rmsnorm.dw
     const d_mid_norm = try gpa.alloc(f32, n_pos * dim);
@@ -412,8 +436,8 @@ pub fn backward(
 // ── Adam optimizer ─────────────────────────────────────────────────
 
 pub const AdamState = struct {
-    m: [8][]f32,
-    v: [8][]f32,
+    m: [9][]f32,
+    v: [9][]f32,
     t: u32 = 0,
     lr: f32,
     beta1: f32 = 0.9,
@@ -421,8 +445,8 @@ pub const AdamState = struct {
     eps: f32 = 1e-8,
 
     pub fn init(gpa: std.mem.Allocator, layer: *Layer, lr: f32) !AdamState {
-        var m: [8][]f32 = undefined;
-        var v: [8][]f32 = undefined;
+        var m: [9][]f32 = undefined;
+        var v: [9][]f32 = undefined;
         const params = layer.paramSlices();
         for (params, 0..) |p, i| {
             m[i] = try gpa.alloc(f32, p.len);
@@ -448,7 +472,7 @@ pub fn adamStep(state: *AdamState, layer: *Layer, grads: *Grads) void {
 
     const params = layer.paramSlices();
     const grad_slices = grads.slices();
-    inline for (0..8) |i| {
+    inline for (0..9) |i| {
         const p = params[i];
         const g = grad_slices[i];
         const m = state.m[i];
@@ -555,8 +579,9 @@ pub fn allocStackGrads(gpa: std.mem.Allocator, stack: *const Stack) !StackGrads 
             .dw_v = try gpa.alloc(f32, layer.w_v.len),
             .dw_o = try gpa.alloc(f32, layer.w_o.len),
             .dw_n2 = try gpa.alloc(f32, layer.w_n2.len),
-            .dw_ff1 = try gpa.alloc(f32, layer.w_ff1.len),
-            .dw_ff2 = try gpa.alloc(f32, layer.w_ff2.len),
+            .dw_gate = try gpa.alloc(f32, layer.w_gate.len),
+            .dw_up = try gpa.alloc(f32, layer.w_up.len),
+            .dw_down = try gpa.alloc(f32, layer.w_down.len),
         };
     }
     return StackGrads{
@@ -576,8 +601,9 @@ pub fn freeStackGrads(gpa: std.mem.Allocator, sg: *StackGrads) void {
         gpa.free(lg.dw_v);
         gpa.free(lg.dw_o);
         gpa.free(lg.dw_n2);
-        gpa.free(lg.dw_ff1);
-        gpa.free(lg.dw_ff2);
+        gpa.free(lg.dw_gate);
+        gpa.free(lg.dw_up);
+        gpa.free(lg.dw_down);
     }
     gpa.free(sg.layer_grads);
     gpa.free(sg.dw_final_norm);
@@ -741,13 +767,13 @@ pub const StackAdamState = struct {
     eps: f32 = 1e-8,
 };
 
-/// Iteration order: `embed`, then for each layer the 8 single-layer
+/// Iteration order: `embed`, then for each layer the 9 single-layer
 /// params in `Layer.paramSlices` order, then `final_norm`, then
-/// `lm_head`. Total = 8·n_layers + 3.
+/// `lm_head`. Total = 9·n_layers + 3.
 const stack_extra_params: usize = 3;
 
 fn stackParamCount(stack: *const Stack) usize {
-    return stack_extra_params + 8 * stack.cfg.n_layers;
+    return stack_extra_params + 9 * stack.cfg.n_layers;
 }
 
 fn fillStackParamSlices(stack: *Stack, params: [][]f32, grads: *StackGrads, gradsOut: [][]f32) void {

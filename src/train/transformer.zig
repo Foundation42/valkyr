@@ -52,8 +52,9 @@ pub const LayerWeights = struct {
     w_v: []const f32, // [n_kv_heads*head_dim, dim]
     w_o: []const f32, // [dim, n_heads*head_dim]
     w_n2: []const f32, // [dim]
-    w_ff1: []const f32, // [ff_dim, dim]
-    w_ff2: []const f32, // [dim, ff_dim]
+    w_gate: []const f32, // [ff_dim, dim]
+    w_up: []const f32, // [ff_dim, dim]
+    w_down: []const f32, // [dim, ff_dim]
 };
 
 pub const InitWeights = struct {
@@ -85,8 +86,8 @@ pub const Runner = struct {
     k_attn_dv: pipeline.Kernel,
     k_attn_dq: pipeline.Kernel,
     k_attn_dk: pipeline.Kernel,
-    k_relu: pipeline.Kernel,
-    k_relu_bw: pipeline.Kernel,
+    k_swiglu_fwd: pipeline.Kernel,
+    k_swiglu_bw: pipeline.Kernel,
     k_vec_add: pipeline.Kernel,
     k_add: pipeline.Kernel,
     k_lin_dx: pipeline.Kernel,
@@ -134,8 +135,9 @@ pub const Runner = struct {
     buf_w_v: []buffer.Buffer,
     buf_w_o: []buffer.Buffer,
     buf_w_n2: []buffer.Buffer,
-    buf_w_ff1: []buffer.Buffer,
-    buf_w_ff2: []buffer.Buffer,
+    buf_w_gate: []buffer.Buffer,
+    buf_w_up: []buffer.Buffer,
+    buf_w_down: []buffer.Buffer,
 
     buf_n1: []buffer.Buffer,
     buf_q: []buffer.Buffer,
@@ -145,8 +147,9 @@ pub const Runner = struct {
     buf_attn_out: []buffer.Buffer,
     buf_mid: []buffer.Buffer,
     buf_n2: []buffer.Buffer,
-    buf_ff_pre: []buffer.Buffer,
-    buf_ff_h: []buffer.Buffer,
+    buf_pre_gate: []buffer.Buffer,
+    buf_up: []buffer.Buffer,
+    buf_gated: []buffer.Buffer,
     buf_y: []buffer.Buffer,
 
     buf_dw_n1_partial: []buffer.Buffer,
@@ -155,8 +158,9 @@ pub const Runner = struct {
     buf_dw_v: []buffer.Buffer,
     buf_dw_o: []buffer.Buffer,
     buf_dw_n2_partial: []buffer.Buffer,
-    buf_dw_ff1: []buffer.Buffer,
-    buf_dw_ff2: []buffer.Buffer,
+    buf_dw_gate: []buffer.Buffer,
+    buf_dw_up: []buffer.Buffer,
+    buf_dw_down: []buffer.Buffer,
 
     // Dynamic; host-reduced from the corresponding _partial each step.
     buf_dw_n1: []buffer.Buffer,
@@ -174,10 +178,12 @@ pub const Runner = struct {
     buf_v_o: []buffer.Buffer,
     buf_m_n2: []buffer.Buffer,
     buf_v_n2: []buffer.Buffer,
-    buf_m_ff1: []buffer.Buffer,
-    buf_v_ff1: []buffer.Buffer,
-    buf_m_ff2: []buffer.Buffer,
-    buf_v_ff2: []buffer.Buffer,
+    buf_m_gate: []buffer.Buffer,
+    buf_v_gate: []buffer.Buffer,
+    buf_m_up: []buffer.Buffer,
+    buf_v_up: []buffer.Buffer,
+    buf_m_down: []buffer.Buffer,
+    buf_v_down: []buffer.Buffer,
 
     /// Per-layer d_x_in: written by layer L's backward, consumed as
     /// d_y_in by layer L-1's backward (or fed to embedding_backward
@@ -188,9 +194,11 @@ pub const Runner = struct {
     sc_scores: buffer.Buffer,
     sc_o: buffer.Buffer,
     sc_ff_out: buffer.Buffer,
-    sc_d_ff_h: buffer.Buffer,
-    sc_d_ff_pre: buffer.Buffer,
+    sc_d_gated: buffer.Buffer,
+    sc_d_pre_gate: buffer.Buffer,
+    sc_d_up_grad: buffer.Buffer,
     sc_d_n2: buffer.Buffer,
+    sc_d_n2_up: buffer.Buffer,
     sc_d_mid_norm: buffer.Buffer,
     sc_d_attn_out: buffer.Buffer,
     sc_d_attn: buffer.Buffer,
@@ -212,22 +220,23 @@ pub const Runner = struct {
     push_embed: runtime.EmbedLookupBatchedPush,
     push_rms: runtime.RmsnormPush,
     push_n_pos_dim: runtime.AddInPlacePush,
-    push_relu_n: runtime.ReluPush,
-    push_relu_bw_n: runtime.ReluBackwardPush,
+    push_swiglu: runtime.SwigluPush,
     push_softmax: runtime.SoftmaxPush,
     push_ce: runtime.SoftmaxCeLossGradPush,
     push_mm_q: runtime.MatmulPush,
     push_mm_k: runtime.MatmulPush,
     push_mm_v: runtime.MatmulPush,
     push_mm_o: runtime.MatmulPush,
-    push_mm_ff1: runtime.MatmulPush,
-    push_mm_ff2: runtime.MatmulPush,
+    push_mm_gate: runtime.MatmulPush,
+    push_mm_up: runtime.MatmulPush,
+    push_mm_down: runtime.MatmulPush,
     push_mm_lm_head: runtime.MatmulPush,
     push_attn_scores: runtime.AttnScoresTrainPush,
     push_attn_output: runtime.AttnOutputTrainPush,
     push_lin_lm_head: runtime.LinearBatchedPush,
-    push_lin_ff2: runtime.LinearBatchedPush,
-    push_lin_ff1: runtime.LinearBatchedPush,
+    push_lin_down: runtime.LinearBatchedPush,
+    push_lin_gate: runtime.LinearBatchedPush,
+    push_lin_up: runtime.LinearBatchedPush,
     push_lin_o: runtime.LinearBatchedPush,
     push_lin_q: runtime.LinearBatchedPush,
     push_lin_k: runtime.LinearBatchedPush,
@@ -264,8 +273,9 @@ pub const Runner = struct {
             if (lw.w_v.len != kv_dim * dim) return error.LayerVShape;
             if (lw.w_o.len != dim * q_dim) return error.LayerOShape;
             if (lw.w_n2.len != dim) return error.LayerN2Shape;
-            if (lw.w_ff1.len != ff_dim * dim) return error.LayerFf1Shape;
-            if (lw.w_ff2.len != dim * ff_dim) return error.LayerFf2Shape;
+            if (lw.w_gate.len != ff_dim * dim) return error.LayerGateShape;
+            if (lw.w_up.len != ff_dim * dim) return error.LayerUpShape;
+            if (lw.w_down.len != dim * ff_dim) return error.LayerDownShape;
         }
 
         const f32sz = @sizeOf(f32);
@@ -298,10 +308,10 @@ pub const Runner = struct {
         errdefer k_attn_dq.deinit();
         var k_attn_dk = try pipeline.Kernel.init(ctx, &shaders.attn_backward_dk, 3, @sizeOf(runtime.AttnBackwardDkPush));
         errdefer k_attn_dk.deinit();
-        var k_relu = try pipeline.Kernel.init(ctx, &shaders.relu, 2, @sizeOf(runtime.ReluPush));
-        errdefer k_relu.deinit();
-        var k_relu_bw = try pipeline.Kernel.init(ctx, &shaders.relu_backward, 3, @sizeOf(runtime.ReluBackwardPush));
-        errdefer k_relu_bw.deinit();
+        var k_swiglu_fwd = try pipeline.Kernel.init(ctx, &shaders.swiglu_forward, 3, @sizeOf(runtime.SwigluPush));
+        errdefer k_swiglu_fwd.deinit();
+        var k_swiglu_bw = try pipeline.Kernel.init(ctx, &shaders.swiglu_backward, 5, @sizeOf(runtime.SwigluPush));
+        errdefer k_swiglu_bw.deinit();
         var k_vec_add = try pipeline.Kernel.init(ctx, &shaders.vec_add, 3, @sizeOf(runtime.AddInPlacePush));
         errdefer k_vec_add.deinit();
         var k_add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
@@ -324,7 +334,11 @@ pub const Runner = struct {
         //    + 4 stack-level backward + 38 per-layer + 2 reused). Adam
         //    phase is 8N+3, embed_bw phase is 1. Size for phase-1 with
         //    headroom; descriptors ≤ 5 per dispatch.
-        const phase1_dispatches: u32 = 32 + 38 * cfg.n_layers;
+        // Phase-1 (forward+loss-grad+backward) per-layer dispatch is
+        //   forward 15 + backward 27 = 42 per layer.
+        // Plus 9 stack-level (embed + final_norm + lm_head + ce + lm_dx +
+        // lm_dw + final_norm_bw + 2 spare). Headroom: 32 + 42·N.
+        const phase1_dispatches: u32 = 32 + 42 * cfg.n_layers;
         var rec = try recorder_mod.Recorder.init(ctx, phase1_dispatches, 8 * phase1_dispatches);
         errdefer rec.deinit();
 
@@ -396,12 +410,16 @@ pub const Runner = struct {
         errdefer @constCast(&sc_o).deinit(ctx.device);
         const sc_ff_out = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&sc_ff_out).deinit(ctx.device);
-        const sc_d_ff_h = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
-        errdefer @constCast(&sc_d_ff_h).deinit(ctx.device);
-        const sc_d_ff_pre = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
-        errdefer @constCast(&sc_d_ff_pre).deinit(ctx.device);
+        const sc_d_gated = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
+        errdefer @constCast(&sc_d_gated).deinit(ctx.device);
+        const sc_d_pre_gate = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
+        errdefer @constCast(&sc_d_pre_gate).deinit(ctx.device);
+        const sc_d_up_grad = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
+        errdefer @constCast(&sc_d_up_grad).deinit(ctx.device);
         const sc_d_n2 = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&sc_d_n2).deinit(ctx.device);
+        const sc_d_n2_up = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
+        errdefer @constCast(&sc_d_n2_up).deinit(ctx.device);
         const sc_d_mid_norm = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&sc_d_mid_norm).deinit(ctx.device);
         const sc_d_attn_out = try buffer.Buffer.initDeviceOnly(ctx, n_pos * q_dim * f32sz);
@@ -433,16 +451,16 @@ pub const Runner = struct {
         const push_embed = runtime.EmbedLookupBatchedPush{ .dim = cfg.dim, .n_pos = cfg.n_pos, .scale = 1.0 };
         const push_rms = runtime.RmsnormPush{ .dim = cfg.dim, .eps = cfg.rms_eps, .gemma_quirk = 0 };
         const push_n_pos_dim = runtime.AddInPlacePush{ .n = cfg.n_pos * cfg.dim };
-        const push_relu_n = runtime.ReluPush{ .n = cfg.n_pos * cfg.ff_dim };
-        const push_relu_bw_n = runtime.ReluBackwardPush{ .n = cfg.n_pos * cfg.ff_dim };
+        const push_swiglu = runtime.SwigluPush{ .n = cfg.n_pos * cfg.ff_dim };
         const push_softmax = runtime.SoftmaxPush{ .dim = cfg.n_pos, .stride = cfg.n_pos };
         const push_ce = runtime.SoftmaxCeLossGradPush{ .dim_out = cfg.vocab_size, .n_samples = cfg.n_pos };
         const push_mm_q = runtime.MatmulPush{ .m = cfg.n_pos, .n = @intCast(q_dim), .k = cfg.dim };
         const push_mm_k = runtime.MatmulPush{ .m = cfg.n_pos, .n = @intCast(kv_dim), .k = cfg.dim };
         const push_mm_v = runtime.MatmulPush{ .m = cfg.n_pos, .n = @intCast(kv_dim), .k = cfg.dim };
         const push_mm_o = runtime.MatmulPush{ .m = cfg.n_pos, .n = cfg.dim, .k = @intCast(q_dim) };
-        const push_mm_ff1 = runtime.MatmulPush{ .m = cfg.n_pos, .n = cfg.ff_dim, .k = cfg.dim };
-        const push_mm_ff2 = runtime.MatmulPush{ .m = cfg.n_pos, .n = cfg.dim, .k = cfg.ff_dim };
+        const push_mm_gate = runtime.MatmulPush{ .m = cfg.n_pos, .n = cfg.ff_dim, .k = cfg.dim };
+        const push_mm_up = runtime.MatmulPush{ .m = cfg.n_pos, .n = cfg.ff_dim, .k = cfg.dim };
+        const push_mm_down = runtime.MatmulPush{ .m = cfg.n_pos, .n = cfg.dim, .k = cfg.ff_dim };
         const push_mm_lm_head = runtime.MatmulPush{ .m = cfg.n_pos, .n = cfg.vocab_size, .k = cfg.dim };
         const push_attn_scores = runtime.AttnScoresTrainPush{
             .n_q = cfg.n_pos,
@@ -465,8 +483,9 @@ pub const Runner = struct {
             .attn_stride = cfg.n_pos,
         };
         const push_lin_lm_head = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.vocab_size, .K = cfg.dim };
-        const push_lin_ff2 = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.dim, .K = cfg.ff_dim };
-        const push_lin_ff1 = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.ff_dim, .K = cfg.dim };
+        const push_lin_down = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.dim, .K = cfg.ff_dim };
+        const push_lin_gate = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.ff_dim, .K = cfg.dim };
+        const push_lin_up = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.ff_dim, .K = cfg.dim };
         const push_lin_o = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.dim, .K = @intCast(q_dim) };
         const push_lin_q = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = @intCast(q_dim), .K = cfg.dim };
         const push_lin_k = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = @intCast(kv_dim), .K = cfg.dim };
@@ -532,8 +551,8 @@ pub const Runner = struct {
             .k_attn_dv = k_attn_dv,
             .k_attn_dq = k_attn_dq,
             .k_attn_dk = k_attn_dk,
-            .k_relu = k_relu,
-            .k_relu_bw = k_relu_bw,
+            .k_swiglu_fwd = k_swiglu_fwd,
+            .k_swiglu_bw = k_swiglu_bw,
             .k_vec_add = k_vec_add,
             .k_add = k_add,
             .k_lin_dx = k_lin_dx,
@@ -569,8 +588,9 @@ pub const Runner = struct {
             .buf_w_v = per_layer.w_v,
             .buf_w_o = per_layer.w_o,
             .buf_w_n2 = per_layer.w_n2,
-            .buf_w_ff1 = per_layer.w_ff1,
-            .buf_w_ff2 = per_layer.w_ff2,
+            .buf_w_gate = per_layer.w_gate,
+            .buf_w_up = per_layer.w_up,
+            .buf_w_down = per_layer.w_down,
             .buf_n1 = per_layer.a_n1,
             .buf_q = per_layer.a_q,
             .buf_k = per_layer.a_k,
@@ -579,8 +599,9 @@ pub const Runner = struct {
             .buf_attn_out = per_layer.a_attn_out,
             .buf_mid = per_layer.a_mid,
             .buf_n2 = per_layer.a_n2,
-            .buf_ff_pre = per_layer.a_ff_pre,
-            .buf_ff_h = per_layer.a_ff_h,
+            .buf_pre_gate = per_layer.a_pre_gate,
+            .buf_up = per_layer.a_up,
+            .buf_gated = per_layer.a_gated,
             .buf_y = per_layer.a_y,
             .buf_dw_n1_partial = per_layer.dw_n1_partial,
             .buf_dw_q = per_layer.dw_q,
@@ -588,8 +609,9 @@ pub const Runner = struct {
             .buf_dw_v = per_layer.dw_v,
             .buf_dw_o = per_layer.dw_o,
             .buf_dw_n2_partial = per_layer.dw_n2_partial,
-            .buf_dw_ff1 = per_layer.dw_ff1,
-            .buf_dw_ff2 = per_layer.dw_ff2,
+            .buf_dw_gate = per_layer.dw_gate,
+            .buf_dw_up = per_layer.dw_up,
+            .buf_dw_down = per_layer.dw_down,
             .buf_dw_n1 = per_layer.dw_n1,
             .buf_dw_n2 = per_layer.dw_n2,
             .buf_m_n1 = per_layer.m_n1,
@@ -604,17 +626,21 @@ pub const Runner = struct {
             .buf_v_o = per_layer.v_o,
             .buf_m_n2 = per_layer.m_n2,
             .buf_v_n2 = per_layer.v_n2,
-            .buf_m_ff1 = per_layer.m_ff1,
-            .buf_v_ff1 = per_layer.v_ff1,
-            .buf_m_ff2 = per_layer.m_ff2,
-            .buf_v_ff2 = per_layer.v_ff2,
+            .buf_m_gate = per_layer.m_gate,
+            .buf_v_gate = per_layer.v_gate,
+            .buf_m_up = per_layer.m_up,
+            .buf_v_up = per_layer.v_up,
+            .buf_m_down = per_layer.m_down,
+            .buf_v_down = per_layer.v_down,
             .buf_d_x_in = per_layer.d_x_in,
             .sc_scores = sc_scores,
             .sc_o = sc_o,
             .sc_ff_out = sc_ff_out,
-            .sc_d_ff_h = sc_d_ff_h,
-            .sc_d_ff_pre = sc_d_ff_pre,
+            .sc_d_gated = sc_d_gated,
+            .sc_d_pre_gate = sc_d_pre_gate,
+            .sc_d_up_grad = sc_d_up_grad,
             .sc_d_n2 = sc_d_n2,
+            .sc_d_n2_up = sc_d_n2_up,
             .sc_d_mid_norm = sc_d_mid_norm,
             .sc_d_attn_out = sc_d_attn_out,
             .sc_d_attn = sc_d_attn,
@@ -630,22 +656,23 @@ pub const Runner = struct {
             .push_embed = push_embed,
             .push_rms = push_rms,
             .push_n_pos_dim = push_n_pos_dim,
-            .push_relu_n = push_relu_n,
-            .push_relu_bw_n = push_relu_bw_n,
+            .push_swiglu = push_swiglu,
             .push_softmax = push_softmax,
             .push_ce = push_ce,
             .push_mm_q = push_mm_q,
             .push_mm_k = push_mm_k,
             .push_mm_v = push_mm_v,
             .push_mm_o = push_mm_o,
-            .push_mm_ff1 = push_mm_ff1,
-            .push_mm_ff2 = push_mm_ff2,
+            .push_mm_gate = push_mm_gate,
+            .push_mm_up = push_mm_up,
+            .push_mm_down = push_mm_down,
             .push_mm_lm_head = push_mm_lm_head,
             .push_attn_scores = push_attn_scores,
             .push_attn_output = push_attn_output,
             .push_lin_lm_head = push_lin_lm_head,
-            .push_lin_ff2 = push_lin_ff2,
-            .push_lin_ff1 = push_lin_ff1,
+            .push_lin_down = push_lin_down,
+            .push_lin_gate = push_lin_gate,
+            .push_lin_up = push_lin_up,
             .push_lin_o = push_lin_o,
             .push_lin_q = push_lin_q,
             .push_lin_k = push_lin_k,
@@ -689,20 +716,21 @@ pub const Runner = struct {
         const arrs = [_][]buffer.Buffer{
             self.buf_w_n1,         self.buf_w_q,          self.buf_w_k,
             self.buf_w_v,          self.buf_w_o,          self.buf_w_n2,
-            self.buf_w_ff1,        self.buf_w_ff2,        self.buf_n1,
-            self.buf_q,            self.buf_k,            self.buf_v,
-            self.buf_attn,         self.buf_attn_out,     self.buf_mid,
-            self.buf_n2,           self.buf_ff_pre,       self.buf_ff_h,
-            self.buf_y,            self.buf_dw_n1_partial, self.buf_dw_q,
-            self.buf_dw_k,         self.buf_dw_v,         self.buf_dw_o,
-            self.buf_dw_n2_partial, self.buf_dw_ff1,      self.buf_dw_ff2,
+            self.buf_w_gate,       self.buf_w_up,         self.buf_w_down,
+            self.buf_n1,           self.buf_q,            self.buf_k,
+            self.buf_v,            self.buf_attn,         self.buf_attn_out,
+            self.buf_mid,          self.buf_n2,           self.buf_pre_gate,
+            self.buf_up,           self.buf_gated,        self.buf_y,
+            self.buf_dw_n1_partial, self.buf_dw_q,        self.buf_dw_k,
+            self.buf_dw_v,         self.buf_dw_o,         self.buf_dw_n2_partial,
+            self.buf_dw_gate,      self.buf_dw_up,        self.buf_dw_down,
             self.buf_dw_n1,        self.buf_dw_n2,        self.buf_m_n1,
             self.buf_v_n1,         self.buf_m_q,          self.buf_v_q,
             self.buf_m_k,          self.buf_v_k,          self.buf_m_v,
             self.buf_v_v,          self.buf_m_o,          self.buf_v_o,
-            self.buf_m_n2,         self.buf_v_n2,         self.buf_m_ff1,
-            self.buf_v_ff1,        self.buf_m_ff2,        self.buf_v_ff2,
-            self.buf_d_x_in,
+            self.buf_m_n2,         self.buf_v_n2,         self.buf_m_gate,
+            self.buf_v_gate,       self.buf_m_up,         self.buf_v_up,
+            self.buf_m_down,       self.buf_v_down,       self.buf_d_x_in,
         };
         for (arrs) |arr| {
             for (arr) |*b| b.deinit(dev);
@@ -713,9 +741,11 @@ pub const Runner = struct {
         self.sc_scores.deinit(dev);
         self.sc_o.deinit(dev);
         self.sc_ff_out.deinit(dev);
-        self.sc_d_ff_h.deinit(dev);
-        self.sc_d_ff_pre.deinit(dev);
+        self.sc_d_gated.deinit(dev);
+        self.sc_d_pre_gate.deinit(dev);
+        self.sc_d_up_grad.deinit(dev);
         self.sc_d_n2.deinit(dev);
+        self.sc_d_n2_up.deinit(dev);
         self.sc_d_mid_norm.deinit(dev);
         self.sc_d_attn_out.deinit(dev);
         self.sc_d_attn.deinit(dev);
@@ -743,8 +773,8 @@ pub const Runner = struct {
         self.k_attn_dv.deinit();
         self.k_attn_dq.deinit();
         self.k_attn_dk.deinit();
-        self.k_relu.deinit();
-        self.k_relu_bw.deinit();
+        self.k_swiglu_fwd.deinit();
+        self.k_swiglu_bw.deinit();
         self.k_vec_add.deinit();
         self.k_add.deinit();
         self.k_lin_dx.deinit();
@@ -885,14 +915,16 @@ pub const Runner = struct {
         try self.rec.dispatch(&self.k_vec_add, &.{ x_in_buf, &self.sc_o, &self.buf_mid[i] }, &self.push_n_pos_dim, add_groups, 1, 1);
         // 10. RMSNorm n2.
         try self.rec.dispatch(&self.k_rms, &.{ &self.buf_mid[i], &self.buf_w_n2[i], &self.buf_n2[i] }, &self.push_rms, cfg.n_pos, 1, 1);
-        // 11. FF1.
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n2[i], &self.buf_w_ff1[i], &self.buf_ff_pre[i] }, &self.push_mm_ff1, cfg.n_pos * self.push_mm_ff1.n, 1, 1);
-        // 12. ReLU.
-        const relu_groups: u32 = ceilDiv(self.push_relu_n.n, group_lin);
-        try self.rec.dispatch(&self.k_relu, &.{ &self.buf_ff_pre[i], &self.buf_ff_h[i] }, &self.push_relu_n, relu_groups, 1, 1);
-        // 13. FF2.
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_ff_h[i], &self.buf_w_ff2[i], &self.sc_ff_out }, &self.push_mm_ff2, cfg.n_pos * self.push_mm_ff2.n, 1, 1);
-        // 14. y = mid + ff_out.
+        // 11. W_gate matmul.
+        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n2[i], &self.buf_w_gate[i], &self.buf_pre_gate[i] }, &self.push_mm_gate, cfg.n_pos * self.push_mm_gate.n, 1, 1);
+        // 12. W_up matmul.
+        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n2[i], &self.buf_w_up[i], &self.buf_up[i] }, &self.push_mm_up, cfg.n_pos * self.push_mm_up.n, 1, 1);
+        // 13. SwiGLU fwd: gated = silu(pre_gate) · up.
+        const swiglu_groups: u32 = ceilDiv(self.push_swiglu.n, group_lin);
+        try self.rec.dispatch(&self.k_swiglu_fwd, &.{ &self.buf_pre_gate[i], &self.buf_up[i], &self.buf_gated[i] }, &self.push_swiglu, swiglu_groups, 1, 1);
+        // 14. W_down matmul → ff_out.
+        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_gated[i], &self.buf_w_down[i], &self.sc_ff_out }, &self.push_mm_down, cfg.n_pos * self.push_mm_down.n, 1, 1);
+        // 15. y = mid + ff_out.
         try self.rec.dispatch(&self.k_vec_add, &.{ &self.buf_mid[i], &self.sc_ff_out, &self.buf_y[i] }, &self.push_n_pos_dim, add_groups, 1, 1);
     }
 
@@ -966,16 +998,20 @@ pub const Runner = struct {
         const x_in_buf: *const buffer.Buffer = if (li == 0) &self.buf_x_emb else &self.buf_y[i - 1];
 
         const add_groups: u32 = ceilDiv(self.push_n_pos_dim.n, group_lin);
-        const relu_groups: u32 = ceilDiv(self.push_relu_bw_n.n, group_lin);
+        const swiglu_groups: u32 = ceilDiv(self.push_swiglu.n, group_lin);
 
-        // FF2 dx + dW.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_ff2[i], &self.sc_d_ff_h }, &self.push_lin_ff2, ceilDiv(self.push_lin_ff2.M, group_lwg), ceilDiv(self.push_lin_ff2.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_ff_h[i], &self.buf_dw_ff2[i] }, &self.push_lin_ff2, ceilDiv(self.push_lin_ff2.N, group_lwg), ceilDiv(self.push_lin_ff2.K, group_lwg), 1);
-        // ReLU bw.
-        try self.rec.dispatch(&self.k_relu_bw, &.{ &self.sc_d_ff_h, &self.buf_ff_pre[i], &self.sc_d_ff_pre }, &self.push_relu_bw_n, relu_groups, 1, 1);
-        // FF1 dx + dW.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_ff_pre, &self.buf_w_ff1[i], &self.sc_d_n2 }, &self.push_lin_ff1, ceilDiv(self.push_lin_ff1.M, group_lwg), ceilDiv(self.push_lin_ff1.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_ff_pre, &self.buf_n2[i], &self.buf_dw_ff1[i] }, &self.push_lin_ff1, ceilDiv(self.push_lin_ff1.N, group_lwg), ceilDiv(self.push_lin_ff1.K, group_lwg), 1);
+        // W_down dx + dW (treats d_y_in as d_ff_out).
+        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_down[i], &self.sc_d_gated }, &self.push_lin_down, ceilDiv(self.push_lin_down.M, group_lwg), ceilDiv(self.push_lin_down.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_gated[i], &self.buf_dw_down[i] }, &self.push_lin_down, ceilDiv(self.push_lin_down.N, group_lwg), ceilDiv(self.push_lin_down.K, group_lwg), 1);
+        // SwiGLU bw: (d_gated, pre_gate, up) → (d_pre_gate, d_up).
+        try self.rec.dispatch(&self.k_swiglu_bw, &.{ &self.sc_d_gated, &self.buf_pre_gate[i], &self.buf_up[i], &self.sc_d_pre_gate, &self.sc_d_up_grad }, &self.push_swiglu, swiglu_groups, 1, 1);
+        // W_gate dx + dW (writes d_n2).
+        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_pre_gate, &self.buf_w_gate[i], &self.sc_d_n2 }, &self.push_lin_gate, ceilDiv(self.push_lin_gate.M, group_lwg), ceilDiv(self.push_lin_gate.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_pre_gate, &self.buf_n2[i], &self.buf_dw_gate[i] }, &self.push_lin_gate, ceilDiv(self.push_lin_gate.N, group_lwg), ceilDiv(self.push_lin_gate.K, group_lwg), 1);
+        // W_up dx + dW + accumulate into d_n2.
+        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_up_grad, &self.buf_w_up[i], &self.sc_d_n2_up }, &self.push_lin_up, ceilDiv(self.push_lin_up.M, group_lwg), ceilDiv(self.push_lin_up.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_up_grad, &self.buf_n2[i], &self.buf_dw_up[i] }, &self.push_lin_up, ceilDiv(self.push_lin_up.N, group_lwg), ceilDiv(self.push_lin_up.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n2, &self.sc_d_n2_up }, &self.push_n_pos_dim, add_groups, 1, 1);
         // RMSNorm n2 bw → d_mid_norm + dw_n2_partial.
         try self.rec.dispatch(&self.k_rms_bw, &.{ &self.sc_d_n2, &self.buf_mid[i], &self.buf_w_n2[i], &self.sc_d_mid_norm, &self.buf_dw_n2_partial[i] }, &self.push_rms, cfg.n_pos, 1, 1);
         // d_y_in += d_mid_norm. From here, d_y_in holds d_mid_total.
@@ -1021,8 +1057,9 @@ pub const Runner = struct {
         const n_k_w: u32 = cfg.n_kv_heads * cfg.head_dim * cfg.dim;
         const n_v_w: u32 = cfg.n_kv_heads * cfg.head_dim * cfg.dim;
         const n_o_w: u32 = cfg.dim * cfg.n_heads * cfg.head_dim;
-        const n_ff1_w: u32 = cfg.ff_dim * cfg.dim;
-        const n_ff2_w: u32 = cfg.dim * cfg.ff_dim;
+        const n_gate_w: u32 = cfg.ff_dim * cfg.dim;
+        const n_up_w: u32 = cfg.ff_dim * cfg.dim;
+        const n_down_w: u32 = cfg.dim * cfg.ff_dim;
 
         const adam_embed = runtime.AdamStepPush{ .n = n_embed, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
         try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_embed, &self.buf_dE_embed, &self.buf_m_embed, &self.buf_v_embed }, &adam_embed, ceilDiv(n_embed, group_lin), 1, 1);
@@ -1034,8 +1071,9 @@ pub const Runner = struct {
             const adam_v = runtime.AdamStepPush{ .n = n_v_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
             const adam_o = runtime.AdamStepPush{ .n = n_o_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
             const adam_n2 = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-            const adam_ff1 = runtime.AdamStepPush{ .n = n_ff1_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-            const adam_ff2 = runtime.AdamStepPush{ .n = n_ff2_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
+            const adam_gate = runtime.AdamStepPush{ .n = n_gate_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
+            const adam_up = runtime.AdamStepPush{ .n = n_up_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
+            const adam_down = runtime.AdamStepPush{ .n = n_down_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
 
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n1[i], &self.buf_dw_n1[i], &self.buf_m_n1[i], &self.buf_v_n1[i] }, &adam_n1, ceilDiv(dim_n, group_lin), 1, 1);
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q[i], &self.buf_dw_q[i], &self.buf_m_q[i], &self.buf_v_q[i] }, &adam_q, ceilDiv(n_q_w, group_lin), 1, 1);
@@ -1043,8 +1081,9 @@ pub const Runner = struct {
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_v[i], &self.buf_dw_v[i], &self.buf_m_v[i], &self.buf_v_v[i] }, &adam_v, ceilDiv(n_v_w, group_lin), 1, 1);
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_o[i], &self.buf_dw_o[i], &self.buf_m_o[i], &self.buf_v_o[i] }, &adam_o, ceilDiv(n_o_w, group_lin), 1, 1);
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n2[i], &self.buf_dw_n2[i], &self.buf_m_n2[i], &self.buf_v_n2[i] }, &adam_n2, ceilDiv(dim_n, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_ff1[i], &self.buf_dw_ff1[i], &self.buf_m_ff1[i], &self.buf_v_ff1[i] }, &adam_ff1, ceilDiv(n_ff1_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_ff2[i], &self.buf_dw_ff2[i], &self.buf_m_ff2[i], &self.buf_v_ff2[i] }, &adam_ff2, ceilDiv(n_ff2_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_gate[i], &self.buf_dw_gate[i], &self.buf_m_gate[i], &self.buf_v_gate[i] }, &adam_gate, ceilDiv(n_gate_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_up[i], &self.buf_dw_up[i], &self.buf_m_up[i], &self.buf_v_up[i] }, &adam_up, ceilDiv(n_up_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_down[i], &self.buf_dw_down[i], &self.buf_m_down[i], &self.buf_v_down[i] }, &adam_down, ceilDiv(n_down_w, group_lin), 1, 1);
         }
 
         const adam_final_norm = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
@@ -1087,8 +1126,9 @@ const PerLayerArrays = struct {
     w_v: []buffer.Buffer,
     w_o: []buffer.Buffer,
     w_n2: []buffer.Buffer,
-    w_ff1: []buffer.Buffer,
-    w_ff2: []buffer.Buffer,
+    w_gate: []buffer.Buffer,
+    w_up: []buffer.Buffer,
+    w_down: []buffer.Buffer,
 
     a_n1: []buffer.Buffer,
     a_q: []buffer.Buffer,
@@ -1098,8 +1138,9 @@ const PerLayerArrays = struct {
     a_attn_out: []buffer.Buffer,
     a_mid: []buffer.Buffer,
     a_n2: []buffer.Buffer,
-    a_ff_pre: []buffer.Buffer,
-    a_ff_h: []buffer.Buffer,
+    a_pre_gate: []buffer.Buffer,
+    a_up: []buffer.Buffer,
+    a_gated: []buffer.Buffer,
     a_y: []buffer.Buffer,
 
     dw_n1_partial: []buffer.Buffer,
@@ -1108,8 +1149,9 @@ const PerLayerArrays = struct {
     dw_v: []buffer.Buffer,
     dw_o: []buffer.Buffer,
     dw_n2_partial: []buffer.Buffer,
-    dw_ff1: []buffer.Buffer,
-    dw_ff2: []buffer.Buffer,
+    dw_gate: []buffer.Buffer,
+    dw_up: []buffer.Buffer,
+    dw_down: []buffer.Buffer,
 
     dw_n1: []buffer.Buffer,
     dw_n2: []buffer.Buffer,
@@ -1126,10 +1168,12 @@ const PerLayerArrays = struct {
     v_o: []buffer.Buffer,
     m_n2: []buffer.Buffer,
     v_n2: []buffer.Buffer,
-    m_ff1: []buffer.Buffer,
-    v_ff1: []buffer.Buffer,
-    m_ff2: []buffer.Buffer,
-    v_ff2: []buffer.Buffer,
+    m_gate: []buffer.Buffer,
+    v_gate: []buffer.Buffer,
+    m_up: []buffer.Buffer,
+    v_up: []buffer.Buffer,
+    m_down: []buffer.Buffer,
+    v_down: []buffer.Buffer,
 
     d_x_in: []buffer.Buffer,
 
@@ -1143,8 +1187,9 @@ const PerLayerArrays = struct {
         pl.w_v = try allocator.alloc(buffer.Buffer, n_layers);
         pl.w_o = try allocator.alloc(buffer.Buffer, n_layers);
         pl.w_n2 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.w_ff1 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.w_ff2 = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.w_gate = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.w_up = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.w_down = try allocator.alloc(buffer.Buffer, n_layers);
         pl.a_n1 = try allocator.alloc(buffer.Buffer, n_layers);
         pl.a_q = try allocator.alloc(buffer.Buffer, n_layers);
         pl.a_k = try allocator.alloc(buffer.Buffer, n_layers);
@@ -1153,8 +1198,9 @@ const PerLayerArrays = struct {
         pl.a_attn_out = try allocator.alloc(buffer.Buffer, n_layers);
         pl.a_mid = try allocator.alloc(buffer.Buffer, n_layers);
         pl.a_n2 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.a_ff_pre = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.a_ff_h = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.a_pre_gate = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.a_up = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.a_gated = try allocator.alloc(buffer.Buffer, n_layers);
         pl.a_y = try allocator.alloc(buffer.Buffer, n_layers);
         pl.dw_n1_partial = try allocator.alloc(buffer.Buffer, n_layers);
         pl.dw_q = try allocator.alloc(buffer.Buffer, n_layers);
@@ -1162,8 +1208,9 @@ const PerLayerArrays = struct {
         pl.dw_v = try allocator.alloc(buffer.Buffer, n_layers);
         pl.dw_o = try allocator.alloc(buffer.Buffer, n_layers);
         pl.dw_n2_partial = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.dw_ff1 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.dw_ff2 = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.dw_gate = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.dw_up = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.dw_down = try allocator.alloc(buffer.Buffer, n_layers);
         pl.dw_n1 = try allocator.alloc(buffer.Buffer, n_layers);
         pl.dw_n2 = try allocator.alloc(buffer.Buffer, n_layers);
         pl.m_n1 = try allocator.alloc(buffer.Buffer, n_layers);
@@ -1178,10 +1225,12 @@ const PerLayerArrays = struct {
         pl.v_o = try allocator.alloc(buffer.Buffer, n_layers);
         pl.m_n2 = try allocator.alloc(buffer.Buffer, n_layers);
         pl.v_n2 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.m_ff1 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.v_ff1 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.m_ff2 = try allocator.alloc(buffer.Buffer, n_layers);
-        pl.v_ff2 = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.m_gate = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.v_gate = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.m_up = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.v_up = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.m_down = try allocator.alloc(buffer.Buffer, n_layers);
+        pl.v_down = try allocator.alloc(buffer.Buffer, n_layers);
         pl.d_x_in = try allocator.alloc(buffer.Buffer, n_layers);
         return pl;
     }
@@ -1201,8 +1250,9 @@ const PerLayerArrays = struct {
         self.w_v[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_v);
         self.w_o[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_o);
         self.w_n2[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_n2);
-        self.w_ff1[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_ff1);
-        self.w_ff2[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_ff2);
+        self.w_gate[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_gate);
+        self.w_up[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_up);
+        self.w_down[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_down);
 
         self.a_n1[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         self.a_q[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * q_dim * f32sz);
@@ -1212,8 +1262,9 @@ const PerLayerArrays = struct {
         self.a_attn_out[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * q_dim * f32sz);
         self.a_mid[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         self.a_n2[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
-        self.a_ff_pre[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
-        self.a_ff_h[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
+        self.a_pre_gate[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
+        self.a_up[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
+        self.a_gated[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
         self.a_y[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
 
         self.dw_n1_partial[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
@@ -1222,8 +1273,9 @@ const PerLayerArrays = struct {
         self.dw_v[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_v.len * f32sz);
         self.dw_o[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_o.len * f32sz);
         self.dw_n2_partial[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
-        self.dw_ff1[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_ff1.len * f32sz);
-        self.dw_ff2[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_ff2.len * f32sz);
+        self.dw_gate[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_gate.len * f32sz);
+        self.dw_up[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_up.len * f32sz);
+        self.dw_down[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_down.len * f32sz);
 
         self.dw_n1[li] = try buffer.Buffer.initDynamic(ctx, dim * f32sz);
         self.dw_n2[li] = try buffer.Buffer.initDynamic(ctx, dim * f32sz);
@@ -1240,10 +1292,12 @@ const PerLayerArrays = struct {
         self.v_o[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_o.len * f32sz);
         self.m_n2[li] = try buffer.Buffer.initDeviceOnly(ctx, dim * f32sz);
         self.v_n2[li] = try buffer.Buffer.initDeviceOnly(ctx, dim * f32sz);
-        self.m_ff1[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_ff1.len * f32sz);
-        self.v_ff1[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_ff1.len * f32sz);
-        self.m_ff2[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_ff2.len * f32sz);
-        self.v_ff2[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_ff2.len * f32sz);
+        self.m_gate[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_gate.len * f32sz);
+        self.v_gate[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_gate.len * f32sz);
+        self.m_up[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_up.len * f32sz);
+        self.v_up[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_up.len * f32sz);
+        self.m_down[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_down.len * f32sz);
+        self.v_down[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_down.len * f32sz);
 
         self.d_x_in[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
 
@@ -1254,22 +1308,23 @@ const PerLayerArrays = struct {
     /// per-layer buffer slot, then free all the slice allocations.
     fn deinitOnError(self: *PerLayerArrays, dev: anytype, allocator: std.mem.Allocator) void {
         const arrs = [_][]buffer.Buffer{
-            self.w_n1,         self.w_q,          self.w_k,
-            self.w_v,          self.w_o,          self.w_n2,
-            self.w_ff1,        self.w_ff2,        self.a_n1,
-            self.a_q,          self.a_k,          self.a_v,
-            self.a_attn,       self.a_attn_out,   self.a_mid,
-            self.a_n2,         self.a_ff_pre,     self.a_ff_h,
-            self.a_y,          self.dw_n1_partial, self.dw_q,
-            self.dw_k,         self.dw_v,         self.dw_o,
-            self.dw_n2_partial, self.dw_ff1,      self.dw_ff2,
-            self.dw_n1,        self.dw_n2,        self.m_n1,
-            self.v_n1,         self.m_q,          self.v_q,
-            self.m_k,          self.v_k,          self.m_v,
-            self.v_v,          self.m_o,          self.v_o,
-            self.m_n2,         self.v_n2,         self.m_ff1,
-            self.v_ff1,        self.m_ff2,        self.v_ff2,
-            self.d_x_in,
+            self.w_n1,        self.w_q,          self.w_k,
+            self.w_v,         self.w_o,          self.w_n2,
+            self.w_gate,      self.w_up,         self.w_down,
+            self.a_n1,        self.a_q,          self.a_k,
+            self.a_v,         self.a_attn,      self.a_attn_out,
+            self.a_mid,       self.a_n2,        self.a_pre_gate,
+            self.a_up,        self.a_gated,     self.a_y,
+            self.dw_n1_partial, self.dw_q,      self.dw_k,
+            self.dw_v,        self.dw_o,        self.dw_n2_partial,
+            self.dw_gate,     self.dw_up,       self.dw_down,
+            self.dw_n1,       self.dw_n2,       self.m_n1,
+            self.v_n1,        self.m_q,         self.v_q,
+            self.m_k,         self.v_k,         self.m_v,
+            self.v_v,         self.m_o,         self.v_o,
+            self.m_n2,        self.v_n2,        self.m_gate,
+            self.v_gate,      self.m_up,        self.v_up,
+            self.m_down,      self.v_down,      self.d_x_in,
         };
         for (arrs) |arr| {
             for (arr[0..self.populated]) |*b| b.deinit(dev);
