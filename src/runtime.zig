@@ -304,6 +304,12 @@ pub const CceForwardPush = extern struct {
     /// the per-row loss. Default 0 ⇒ plain CE; typical training value
     /// is 1e-4. Cost is one scalar add per row in the shader.
     z_loss_scale: f32 = 0.0,
+    /// Optional label smoothing ε (Chronicals §"Label Smoothing").
+    /// Softens the one-hot target to (1−ε)·δ_{v,t} + ε/V; the per-row
+    /// loss becomes lse − (1−ε)·z_target − ε·z_mean. Default 0 ⇒
+    /// hard CE; typical training value is 0.1. Adds one cooperative
+    /// reduction per chunk in the forward shader.
+    label_smoothing_eps: f32 = 0.0,
 };
 
 /// CCE backward — d_h component (one WG per row) and dW component (one
@@ -318,6 +324,10 @@ pub const CceBackwardPush = extern struct {
     /// the gradient picks up a (1 + 2·λ_z·lse) factor on the softmax
     /// part of dz when λ_z > 0. Default 0 ⇒ plain CE backward.
     z_loss_scale: f32 = 0.0,
+    /// Must match the value used in the matching cce_forward dispatch.
+    /// Replaces the target indicator (1.0) with (1−ε) and subtracts
+    /// ε/V from every dz_v. Default 0 ⇒ hard-CE backward.
+    label_smoothing_eps: f32 = 0.0,
 };
 
 pub const Mlp2LossBatchedPush = extern struct {

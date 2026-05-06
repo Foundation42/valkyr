@@ -69,7 +69,8 @@ layout(push_constant) uniform Pc {
     uint N;
     uint V;
     uint D;
-    float z_loss_scale; // λ_z; 0 ⇒ plain CE, typical training value 1e-4
+    float z_loss_scale;       // λ_z; 0 ⇒ no z-loss, typical training value 1e-4
+    float label_smoothing_eps; // ε;   0 ⇒ hard CE,  typical training value 0.1
 } pc;
 
 shared float z_chunk[CHUNK];
@@ -77,6 +78,9 @@ shared float sg_partials[32];   // up to 32 subgroups (3090: 8, AMD wave64: 4)
 shared float row_m;
 shared float row_d;
 shared float row_z_target;
+shared float row_z_sum; // Σ_v z_v across chunks — needed for label-smoothing's
+                        // L_uniform = lse − z_mean. Always accumulated; the
+                        // final loss formula folds it in only when ε > 0.
 
 void main() {
     uint row = gl_WorkGroupID.x;
@@ -94,6 +98,7 @@ void main() {
         row_m = NEG_INF;        // sentinel; first chunk's max replaces it
         row_d = 0.0;
         row_z_target = 0.0;
+        row_z_sum = 0.0;
     }
     barrier();
 
@@ -141,6 +146,25 @@ void main() {
         barrier();
         float chunk_max = sg_partials[0];
 
+        // ── Step 3b: chunk_sum_z via two-stage cooperative reduction.
+        // Needed only when label-smoothing's L_uniform = lse − z_mean
+        // is in play (ε > 0). Always computed — the cost is one
+        // subgroupAdd + cross-subgroup reduce per chunk, dwarfed by
+        // the per-output dot products in step 1. Out-of-bounds tids
+        // (tid ≥ chunk_size_in) hold NEG_INF in z_chunk (set in step 1)
+        // — must skip them so the sum isn't NaN-poisoned.
+        uint chunk_size_in = min(CHUNK, pc.V - c);
+        float my_z_sum = (tid < chunk_size_in) ? my_z : 0.0;
+        float sg_zs = subgroupAdd(my_z_sum);
+        if (subgroupElect()) sg_partials[warp_id] = sg_zs;
+        barrier();
+        if (warp_id == 0) {
+            float v = (lane < num_warps) ? sg_partials[lane] : 0.0;
+            float total = subgroupAdd(v);
+            if (subgroupElect()) row_z_sum += total;
+        }
+        barrier();
+
         // ── Step 4: online merge.
         // Trick: every thread reads `row_m` (shared, broadcast),
         // computes the same `m_new = max(row_m, chunk_max)` locally,
@@ -175,11 +199,14 @@ void main() {
     if (tid == 0) {
         float lse_val = log(row_d) + row_m;
         lse[row] = lse_val;
-        // Z-loss penalty: + λ_z · lse² added to the per-row loss
-        // (Chronicals §"Z-Loss" / PaLM eq. 15). With λ_z = 0 this
-        // collapses to the plain CE loss; otherwise it caps logit
-        // magnitudes by penalizing large logsumexp values.
-        float ce = lse_val - row_z_target;
+        // Smoothed CE: blend hard CE with uniform CE.
+        //   L_smoothed = (1−ε)·(lse − z_target) + ε·(lse − z_mean)
+        //              = lse − (1−ε)·z_target − ε·z_mean
+        // Plus z-loss penalty λ_z · lse² (Chronicals §"Z-Loss"). With
+        // ε = 0 and λ_z = 0 this collapses to plain CE.
+        float t_scale = 1.0 - pc.label_smoothing_eps;
+        float z_mean = row_z_sum / float(pc.V);
+        float ce = lse_val - t_scale * row_z_target - pc.label_smoothing_eps * z_mean;
         float z_pen = pc.z_loss_scale * lse_val * lse_val;
         loss_row[row] = ce + z_pen;
     }

@@ -62,7 +62,8 @@ layout(push_constant) uniform Pc {
     uint N;
     uint V;
     uint D;
-    float z_loss_scale; // λ_z; multiplies softmax part of dz by (1 + 2·λ_z·lse)
+    float z_loss_scale;       // λ_z; multiplies softmax part of dz by (1 + 2·λ_z·lse)
+    float label_smoothing_eps; // ε; replaces target indicator (1.0) with (1−ε), subtracts ε/V from each dz
 } pc;
 
 shared float z_chunk[CHUNK];
@@ -84,6 +85,10 @@ void main() {
     // Z-loss multiplies the softmax part of the gradient by
     // (1 + 2·λ_z·lse). λ_z = 0 ⇒ factor = 1 ⇒ plain CE backward.
     float softmax_factor = 1.0 + 2.0 * pc.z_loss_scale * lse_row;
+    // Label smoothing: target indicator becomes (1−ε), every dz_v
+    // gets an extra −ε/V offset. ε = 0 ⇒ both reduce to no-op.
+    float t_scale     = 1.0 - pc.label_smoothing_eps;
+    float eps_over_v  = pc.label_smoothing_eps / float(pc.V);
 
     // ── Zero d_h[row, :] so the chunk-loop's `+=` accumulates from zero.
     // Each thread owns its strided k slice, so this is race-free.
@@ -126,8 +131,8 @@ void main() {
             uint o_global = c + tid;
             if (tid < CHUNK && o_global < pc.V) {
                 float p     = exp(z_chunk[tid] - lse_row);
-                float t_ind = (o_global == tgt_id) ? 1.0 : 0.0;
-                dz_chunk[tid] = (softmax_factor * p - t_ind) * inv_n;
+                float t_ind = (o_global == tgt_id) ? t_scale : 0.0;
+                dz_chunk[tid] = (softmax_factor * p - t_ind - eps_over_v) * inv_n;
             } else if (tid < CHUNK) {
                 dz_chunk[tid] = 0.0;
             }

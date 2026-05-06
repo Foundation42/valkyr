@@ -48,7 +48,8 @@ layout(push_constant) uniform Pc {
     uint N;
     uint V;
     uint D;
-    float z_loss_scale; // λ_z; multiplies softmax part of dz by (1 + 2·λ_z·lse)
+    float z_loss_scale;       // λ_z; multiplies softmax part of dz by (1 + 2·λ_z·lse)
+    float label_smoothing_eps; // ε; replaces target indicator with (1−ε), subtracts ε/V from each dz
 } pc;
 
 shared float sg_partials[32];   // up to 32 subgroups
@@ -83,16 +84,20 @@ void main() {
 
         // ── Step 2: cross-subgroup reduce + dz, broadcast via shared.
         // Z-loss multiplies the softmax part of dz by (1 + 2·λ_z·lse).
-        // λ_z = 0 ⇒ factor = 1 ⇒ plain CE backward.
+        // Label smoothing replaces the target indicator (1.0) with
+        // (1−ε) and subtracts ε/V from every dz_v.
+        // ε = λ_z = 0 ⇒ plain CE backward.
         if (warp_id == 0) {
             float vv = (lane < num_warps) ? sg_partials[lane] : 0.0;
             float total = subgroupAdd(vv);
             if (subgroupElect()) {
                 float lse_n          = lse[n];
                 float p              = exp(total - lse_n);
-                float t_ind          = (v == tgt[n]) ? 1.0 : 0.0;
+                float t_scale        = 1.0 - pc.label_smoothing_eps;
+                float t_ind          = (v == tgt[n]) ? t_scale : 0.0;
+                float eps_over_v     = pc.label_smoothing_eps / float(pc.V);
                 float softmax_factor = 1.0 + 2.0 * pc.z_loss_scale * lse_n;
-                row_dz = (softmax_factor * p - t_ind) * inv_n;
+                row_dz = (softmax_factor * p - t_ind - eps_over_v) * inv_n;
             }
         }
         barrier();

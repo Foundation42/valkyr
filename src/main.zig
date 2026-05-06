@@ -4257,14 +4257,18 @@ fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
         v: u32,
         d: u32,
         z_loss_scale: f32,
+        label_smoothing: f32,
     };
     const cases = [_]SmokeCase{
-        .{ .name = "multi-chunk (V=2048, 8 chunks)", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 0.0 },
-        .{ .name = "partial-chunk (V=300, 1+ chunks)", .n = 3, .v = 300, .d = 64, .z_loss_scale = 0.0 },
-        .{ .name = "single-chunk (V=256, exactly CHUNK)", .n = 2, .v = 256, .d = 128, .z_loss_scale = 0.0 },
-        // Z-loss enabled — exercises the (lse² penalty in fwd, softmax-factor
-        // multiplier in bwd) code paths that default to no-op when λ_z = 0.
-        .{ .name = "multi-chunk + z-loss λ=1e-4", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4 },
+        .{ .name = "multi-chunk (V=2048, 8 chunks)", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "partial-chunk (V=300, 1+ chunks)", .n = 3, .v = 300, .d = 64, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "single-chunk (V=256, exactly CHUNK)", .n = 2, .v = 256, .d = 128, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "multi-chunk + z-loss λ=1e-4", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4, .label_smoothing = 0.0 },
+        .{ .name = "multi-chunk + label-smoothing ε=0.1", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 0.0, .label_smoothing = 0.1 },
+        // Combined regularizers — the realistic setting Chronicals
+        // recommends for fine-tuning. Exercises every conditional in
+        // the loss-and-gradient math at once.
+        .{ .name = "multi-chunk + z-loss + label-smoothing", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4, .label_smoothing = 0.1 },
     };
 
     var kern = try pipeline.Kernel.init(&ctx, &shaders.cce_forward, 5, @sizeOf(runtime.CceForwardPush));
@@ -4300,7 +4304,7 @@ fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
             cs.v,
             cs.d,
             256, // shader hardcodes CHUNK = 256
-            cs.z_loss_scale,
+            .{ .z_loss_scale = cs.z_loss_scale, .label_smoothing = cs.label_smoothing },
             lse_cpu,
         );
 
@@ -4318,7 +4322,13 @@ fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
 
         try kern.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_loss });
 
-        const push = runtime.CceForwardPush{ .n_samples = cs.n, .vocab = cs.v, .dim = cs.d, .z_loss_scale = cs.z_loss_scale };
+        const push = runtime.CceForwardPush{
+            .n_samples = cs.n,
+            .vocab = cs.v,
+            .dim = cs.d,
+            .z_loss_scale = cs.z_loss_scale,
+            .label_smoothing_eps = cs.label_smoothing,
+        };
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
             push: *const runtime.CceForwardPush,
@@ -4349,17 +4359,29 @@ fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
         defer allocator.free(loss_cpu_per_row);
         for (0..cs.n) |row| {
             const tgt: usize = @intCast(targets[row]);
-            var s: f64 = 0;
+            var s_target: f64 = 0;
             for (0..cs.d) |k| {
-                s += @as(f64, h[row * cs.d + k]) * @as(f64, w_lm[tgt * cs.d + k]);
+                s_target += @as(f64, h[row * cs.d + k]) * @as(f64, w_lm[tgt * cs.d + k]);
             }
-            const z_target: f32 = @floatCast(s);
+            const z_target: f32 = @floatCast(s_target);
+            // For label smoothing's L_uniform term we need z_mean = (1/V)·Σ_v z_v.
+            // Skip the inner V·D loop entirely when ε = 0 (most cases).
+            var z_mean: f32 = 0.0;
+            if (cs.label_smoothing > 0.0) {
+                var z_sum: f64 = 0;
+                for (0..cs.v) |o| {
+                    var s: f64 = 0;
+                    for (0..cs.d) |k| s += @as(f64, h[row * cs.d + k]) * @as(f64, w_lm[o * cs.d + k]);
+                    z_sum += s;
+                }
+                z_mean = @floatCast(z_sum / @as(f64, @floatFromInt(cs.v)));
+            }
             const lse_v = lse_cpu[row];
-            // Per-row loss = CE + λ_z · lse² (matches cce_forward.comp's
-            // loss_row[row] write — the kernel folds z-loss in directly,
-            // so the reconstruction has to as well or this diff blows up
-            // when z_loss_scale > 0).
-            const ce: f32 = lse_v - z_target;
+            // Per-row smoothed CE + z-loss matches cce_forward.comp's
+            // loss_row[row] write:
+            //   loss = lse − (1−ε)·z_target − ε·z_mean + λ_z · lse²
+            const t_scale: f32 = 1.0 - cs.label_smoothing;
+            const ce: f32 = lse_v - t_scale * z_target - cs.label_smoothing * z_mean;
             const z_pen: f32 = cs.z_loss_scale * lse_v * lse_v;
             loss_cpu_per_row[row] = ce + z_pen;
         }
@@ -5622,12 +5644,14 @@ fn runGpuCceBackwardDhSmoke(allocator: std.mem.Allocator) !void {
         v: u32,
         d: u32,
         z_loss_scale: f32,
+        label_smoothing: f32,
     };
     const cases = [_]SmokeCase{
-        .{ .name = "multi-chunk (V=2048, 8 chunks)", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 0.0 },
-        .{ .name = "partial-chunk (V=300, 1+ chunks)", .n = 3, .v = 300, .d = 64, .z_loss_scale = 0.0 },
-        .{ .name = "single-chunk (V=256, exactly CHUNK)", .n = 2, .v = 256, .d = 128, .z_loss_scale = 0.0 },
-        .{ .name = "multi-chunk + z-loss λ=1e-4", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4 },
+        .{ .name = "multi-chunk (V=2048, 8 chunks)", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "partial-chunk (V=300, 1+ chunks)", .n = 3, .v = 300, .d = 64, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "single-chunk (V=256, exactly CHUNK)", .n = 2, .v = 256, .d = 128, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "multi-chunk + z-loss λ=1e-4", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4, .label_smoothing = 0.0 },
+        .{ .name = "multi-chunk + z-loss + label-smoothing", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4, .label_smoothing = 0.1 },
     };
 
     var kern = try pipeline.Kernel.init(&ctx, &shaders.cce_backward_dh, 5, @sizeOf(runtime.CceBackwardPush));
@@ -5653,14 +5677,14 @@ fn runGpuCceBackwardDhSmoke(allocator: std.mem.Allocator) !void {
         // smoke (it's the cce_backward_dw kernel's parity target).
         const lse_cpu = try allocator.alloc(f32, cs.n);
         defer allocator.free(lse_cpu);
-        _ = cpu_cce.cceForward(h, w_lm, targets, cs.n, cs.v, cs.d, 256, cs.z_loss_scale, lse_cpu);
+        _ = cpu_cce.cceForward(h, w_lm, targets, cs.n, cs.v, cs.d, 256, .{ .z_loss_scale = cs.z_loss_scale, .label_smoothing = cs.label_smoothing }, lse_cpu);
 
         const d_h_cpu = try allocator.alloc(f32, cs.n * cs.d);
         defer allocator.free(d_h_cpu);
         const dW_unused = try allocator.alloc(f32, cs.v * cs.d);
         defer allocator.free(dW_unused);
         @memset(dW_unused, 0);
-        cpu_cce.cceBackward(h, w_lm, targets, lse_cpu, cs.n, cs.v, cs.d, 256, cs.z_loss_scale, d_h_cpu, dW_unused);
+        cpu_cce.cceBackward(h, w_lm, targets, lse_cpu, cs.n, cs.v, cs.d, 256, .{ .z_loss_scale = cs.z_loss_scale, .label_smoothing = cs.label_smoothing }, d_h_cpu, dW_unused);
 
         // GPU dispatch. lse comes from CPU (the upstream cce_forward
         // kernel computed the same lse, but we use the CPU values here
@@ -5680,7 +5704,13 @@ fn runGpuCceBackwardDhSmoke(allocator: std.mem.Allocator) !void {
 
         try kern.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_dh });
 
-        const push = runtime.CceBackwardPush{ .n_samples = cs.n, .vocab = cs.v, .dim = cs.d, .z_loss_scale = cs.z_loss_scale };
+        const push = runtime.CceBackwardPush{
+            .n_samples = cs.n,
+            .vocab = cs.v,
+            .dim = cs.d,
+            .z_loss_scale = cs.z_loss_scale,
+            .label_smoothing_eps = cs.label_smoothing,
+        };
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
             push: *const runtime.CceBackwardPush,
@@ -5732,12 +5762,14 @@ fn runGpuCceBackwardDwSmoke(allocator: std.mem.Allocator) !void {
         v: u32,
         d: u32,
         z_loss_scale: f32,
+        label_smoothing: f32,
     };
     const cases = [_]SmokeCase{
-        .{ .name = "multi-chunk (V=2048)", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 0.0 },
-        .{ .name = "small-vocab (V=300)", .n = 3, .v = 300, .d = 64, .z_loss_scale = 0.0 },
-        .{ .name = "boundary (V=256)", .n = 2, .v = 256, .d = 128, .z_loss_scale = 0.0 },
-        .{ .name = "multi-chunk + z-loss λ=1e-4", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4 },
+        .{ .name = "multi-chunk (V=2048)", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "small-vocab (V=300)", .n = 3, .v = 300, .d = 64, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "boundary (V=256)", .n = 2, .v = 256, .d = 128, .z_loss_scale = 0.0, .label_smoothing = 0.0 },
+        .{ .name = "multi-chunk + z-loss λ=1e-4", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4, .label_smoothing = 0.0 },
+        .{ .name = "multi-chunk + z-loss + label-smoothing", .n = 4, .v = 2048, .d = 896, .z_loss_scale = 1e-4, .label_smoothing = 0.1 },
     };
 
     var kern = try pipeline.Kernel.init(&ctx, &shaders.cce_backward_dw, 5, @sizeOf(runtime.CceBackwardPush));
@@ -5761,14 +5793,14 @@ fn runGpuCceBackwardDwSmoke(allocator: std.mem.Allocator) !void {
         // CPU oracle: forward to populate lse, then full backward.
         const lse_cpu = try allocator.alloc(f32, cs.n);
         defer allocator.free(lse_cpu);
-        _ = cpu_cce.cceForward(h, w_lm, targets, cs.n, cs.v, cs.d, 256, cs.z_loss_scale, lse_cpu);
+        _ = cpu_cce.cceForward(h, w_lm, targets, cs.n, cs.v, cs.d, 256, .{ .z_loss_scale = cs.z_loss_scale, .label_smoothing = cs.label_smoothing }, lse_cpu);
 
         const d_h_unused = try allocator.alloc(f32, cs.n * cs.d);
         defer allocator.free(d_h_unused);
         const dW_cpu = try allocator.alloc(f32, cs.v * cs.d);
         defer allocator.free(dW_cpu);
         @memset(dW_cpu, 0);
-        cpu_cce.cceBackward(h, w_lm, targets, lse_cpu, cs.n, cs.v, cs.d, 256, cs.z_loss_scale, d_h_unused, dW_cpu);
+        cpu_cce.cceBackward(h, w_lm, targets, lse_cpu, cs.n, cs.v, cs.d, 256, .{ .z_loss_scale = cs.z_loss_scale, .label_smoothing = cs.label_smoothing }, d_h_unused, dW_cpu);
 
         // GPU dispatch.
         var buf_h = try buffer.Buffer.initStatic(&ctx, f32, h);
@@ -5785,7 +5817,13 @@ fn runGpuCceBackwardDwSmoke(allocator: std.mem.Allocator) !void {
 
         try kern.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_dw });
 
-        const push = runtime.CceBackwardPush{ .n_samples = cs.n, .vocab = cs.v, .dim = cs.d, .z_loss_scale = cs.z_loss_scale };
+        const push = runtime.CceBackwardPush{
+            .n_samples = cs.n,
+            .vocab = cs.v,
+            .dim = cs.d,
+            .z_loss_scale = cs.z_loss_scale,
+            .label_smoothing_eps = cs.label_smoothing,
+        };
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
             push: *const runtime.CceBackwardPush,
