@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/valkyr-banner.png" alt="valkyr — cross-vendor LLM inference, Zig + Vulkan, unified compute" width="100%" />
+  <img src="docs/images/valkyr-banner.png" alt="valkyr — cross-vendor LLM inference and training, Zig + Vulkan, unified compute" width="100%" />
 </p>
 
 # valkyr
@@ -10,11 +10,13 @@ Vulkan. One SPIR-V binary runs on every GPU — no CUDA lock-in.**
 Greedy and sampled text generation across six model families,
 multi-turn chat, parity-verified against HuggingFace `transformers`,
 OpenAI-compatible HTTP server, embeddable inside any Vulkan host.
-Now with **interactive in-frame training** (MLPs, MSE/CE, SGD/Adam,
-loss-target decay) — train + infer cooperatively inside a render loop
-with the same submit, the same device, zero waitIdle. Supported
-families: Gemma, Llama, Mistral, Qwen3 (dense), Qwen3.5 / Qwen3.6
-(hybrid Gated DeltaNet), TinyLlama / Zephyr.
+Now with **interactive in-frame training** — from MLPs (MSE/CE,
+SGD/Adam, loss-target decay) through **real transformer fine-tuning**
+(Qwen3-0.6B Adam step in ~330 ms; CE 2.78 → 1.28 on the first batch)
+— train + infer cooperatively inside a render loop with the same
+submit, the same device, zero waitIdle. Supported families: Gemma,
+Llama, Mistral, Qwen3 (dense), Qwen3.5 / Qwen3.6 (hybrid Gated
+DeltaNet), TinyLlama / Zephyr.
 
 valkyr runs the same math on any GPU that supports Vulkan 1.3
 (AMD / Intel / NVIDIA / Apple via MoltenVK / Android Adreno / Mali) —
@@ -107,6 +109,18 @@ years), and intentionally *less* than llama.cpp. So why pick it up?
 regression (smooth interpolation); right: cross-entropy classifier
 (sharp partition). Same scene, same click mechanics, one config
 switch. Both at refresh rate. <a href="docs/embedding.md#visual-demos">More</a>.</em></p>
+
+**Real transformer fine-tuning** — as of 2026-05-06, the same
+training stack drives Qwen3-0.6B end-to-end. `train_load_real`
+materialises the model's bf16 weights as fp32 train tensors,
+`train_dataset.buildFromJsonl` packs an instruction-style corpus
+into EOS-separated (n_pos+1)-windows, and a single Adam step at
+lr=1e-5 drops batch CE from 2.78 → 1.28 nats in ~330 ms (n_pos=16,
+ReleaseFast). Every architecture primitive — RMSNorm / embedding /
+softmax / fused-attention / RoPE / per-head Q-K-norm / SwiGLU
+backward + GQA + Adam — composed first-try when real weights and
+real data finally flowed through. Multi-step + checkpoint
+persistence is the next layer.
 
 **Honest framing.** valkyr is younger and smaller than llama.cpp. On
 raw decode tok/s on a single CUDA card, llama.cpp's CUDA path is
