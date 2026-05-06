@@ -34,9 +34,22 @@
 // CPU oracle: src/cpu/cce.zig#cceBackward (the d_h portion). Parity
 // asserted against that oracle's output via runGpuCceBackwardDhSmoke.
 
-layout(local_size_x = 256) in;
+// local_size_x = 1024 to match cce_forward.comp's wide-WG layout. At
+// small batch sizes (β-5 ships N=16), only N WGs are in flight, so
+// each SM gets the maximum available warps to hide memory latency.
+// Step 3's d_h accumulation already strides over D regardless of
+// thread count, so widening the WG just shrinks per-thread work
+// proportionally.
+//
+// LSX is the literal stride used in the strided-k loops; declaring it
+// as #define rather than reading gl_WorkGroupSize.x gives glslc a
+// constant for unrolling and immediate-stride encoding (the latter
+// matters more — gl_WorkGroupSize.x compiles down to a uniform load
+// per iteration on some drivers).
+layout(local_size_x = 1024) in;
 
-#define CHUNK 256
+#define LSX 1024
+#define CHUNK 1024
 #define NEG_INF (uintBitsToFloat(0xff800000u))
 
 layout(set = 0, binding = 0, std430) readonly  buffer H  { float h[]; };       // [N, D]
@@ -70,7 +83,7 @@ void main() {
 
     // ── Zero d_h[row, :] so the chunk-loop's `+=` accumulates from zero.
     // Each thread owns its strided k slice, so this is race-free.
-    for (uint k = tid; k < pc.D; k += 256) {
+    for (uint k = tid; k < pc.D; k += LSX) {
         d_h[h_off + k] = 0.0;
     }
     // No barrier here: each thread's subsequent reads/writes to its
@@ -123,7 +136,7 @@ void main() {
         // atomics. The o-loop runs over only the valid slice; reading
         // w_lm with o_global ≥ V is undefined under non-robust SSBO
         // bounds, so we cap to chunk_size.
-        for (uint k = tid; k < pc.D; k += 256) {
+        for (uint k = tid; k < pc.D; k += LSX) {
             float acc = 0.0;
             for (uint o = 0; o < chunk_size; o++) {
                 acc += dz_chunk[o] * w_lm[(c + o) * pc.D + k];

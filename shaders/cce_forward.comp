@@ -40,9 +40,23 @@
 // CPU oracle: src/cpu/cce.zig#cceForward. Parity asserted by the
 // run-cce-forward-smoke driver in main.zig (1e-5 global rel-err).
 
-layout(local_size_x = 256) in;
+// local_size_x = 1024 (max on every Vulkan 1.3 GPU we target). Sized to
+// fit 32 NVIDIA wave32 subgroups or 16 AMD wave64 subgroups per WG; with
+// only N WGs in flight at small batch sizes (β-5 ships at N=16), this
+// gives each SM the maximum possible warp count for latency hiding —
+// 256 threads/WG was leaving each SM with only 8 warps to schedule
+// across, which on the RTX 3090 measured at 54 ms / 76 ms for
+// fwd / bw_dh respectively.
+//
+// CHUNK matches local_size_x so the post-matmul online-softmax merge
+// has one z_chunk slot per thread (each thread owns z_chunk[tid] and
+// contributes one exp(z - m_new) to the sum reduction).
+layout(local_size_x = 1024) in;
 
-#define CHUNK 256
+// LSX = local_size_x as a literal; same rationale as cce_backward_dh.comp
+// — keeps compile-time strides where we have them.
+#define LSX 1024
+#define CHUNK 1024
 #define NEG_INF (uintBitsToFloat(0xff800000u))
 
 layout(set = 0, binding = 0, std430) readonly  buffer H { float h[]; };
