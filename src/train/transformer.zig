@@ -42,6 +42,11 @@ pub const Config = struct {
     /// gradients before the linear-backward of W_q / W_k.
     rotary_dim: u32 = 0,
     rope_theta: f32 = 10_000.0,
+    /// Per-head Q/K RMSNorm (Qwen3 architectural detail). When true,
+    /// RMSNorm is applied to Q + K after projection but before RoPE.
+    /// Two new learnable [head_dim] gains per layer (`w_q_norm`,
+    /// `w_k_norm`).
+    qk_norm: bool = false,
     /// Adam learning rate. Sensible default for the toy 8c-α-3 demo:
     /// 1e-2. Mutable across steps; write `runner.lr` between ticks
     /// for schedules.
@@ -61,6 +66,10 @@ pub const LayerWeights = struct {
     w_gate: []const f32, // [ff_dim, dim]
     w_up: []const f32, // [ff_dim, dim]
     w_down: []const f32, // [dim, ff_dim]
+    /// [head_dim] when Config.qk_norm is true, else empty.
+    w_q_norm: []const f32 = &.{},
+    /// [head_dim] when Config.qk_norm is true, else empty.
+    w_k_norm: []const f32 = &.{},
 };
 
 pub const InitWeights = struct {
@@ -160,6 +169,22 @@ pub const Runner = struct {
     buf_gated: []buffer.Buffer,
     buf_y: []buffer.Buffer,
 
+    // Q/K-norm per-layer buffers. Empty slices (length 0) when
+    // `cfg.qk_norm = false` — the recordLayer{Forward,Backward} paths
+    // skip the rmsnorm dispatches entirely.
+    buf_w_q_norm: []buffer.Buffer,
+    buf_w_k_norm: []buffer.Buffer,
+    buf_q_pre_norm: []buffer.Buffer, // saved per-layer for rmsnorm_bw input
+    buf_k_pre_norm: []buffer.Buffer,
+    buf_dw_q_norm_partial: []buffer.Buffer, // [n_pos*n_heads*head_dim] per layer
+    buf_dw_k_norm_partial: []buffer.Buffer,
+    buf_dw_q_norm: []buffer.Buffer, // dynamic, [head_dim]
+    buf_dw_k_norm: []buffer.Buffer,
+    buf_m_q_norm: []buffer.Buffer,
+    buf_v_q_norm: []buffer.Buffer,
+    buf_m_k_norm: []buffer.Buffer,
+    buf_v_k_norm: []buffer.Buffer,
+
     buf_dw_n1_partial: []buffer.Buffer,
     buf_dw_q: []buffer.Buffer,
     buf_dw_k: []buffer.Buffer,
@@ -202,10 +227,12 @@ pub const Runner = struct {
     sc_scores: buffer.Buffer,
     sc_o: buffer.Buffer,
     sc_ff_out: buffer.Buffer,
-    sc_q_pre: buffer.Buffer, // pre-RoPE Q (matmul output, RoPE input)
+    sc_q_pre: buffer.Buffer, // pre-RoPE Q (matmul/rmsnorm output, RoPE input)
     sc_k_pre: buffer.Buffer, // pre-RoPE K
-    sc_dQ_pre: buffer.Buffer, // pre-RoPE dQ (RoPE-bw output, lin-bw input)
+    sc_dQ_pre: buffer.Buffer, // pre-RoPE dQ (RoPE-bw output, lin-bw or rms-bw input)
     sc_dK_pre: buffer.Buffer, // pre-RoPE dK
+    sc_dQ_pre_norm: buffer.Buffer, // pre-norm dQ (rms-bw output, lin-bw input). Allocated empty when qk_norm=false.
+    sc_dK_pre_norm: buffer.Buffer,
     sc_d_gated: buffer.Buffer,
     sc_d_pre_gate: buffer.Buffer,
     sc_d_up_grad: buffer.Buffer,
@@ -247,6 +274,7 @@ pub const Runner = struct {
     push_attn_output: runtime.AttnOutputTrainPush,
     push_rope_q: runtime.RopeBatchedPush,
     push_rope_k: runtime.RopeBatchedPush,
+    push_rms_qk: runtime.RmsnormPush, // dim = head_dim; same for q-norm + k-norm
     push_lin_lm_head: runtime.LinearBatchedPush,
     push_lin_down: runtime.LinearBatchedPush,
     push_lin_gate: runtime.LinearBatchedPush,
@@ -290,6 +318,10 @@ pub const Runner = struct {
             if (lw.w_gate.len != ff_dim * dim) return error.LayerGateShape;
             if (lw.w_up.len != ff_dim * dim) return error.LayerUpShape;
             if (lw.w_down.len != dim * ff_dim) return error.LayerDownShape;
+            if (cfg.qk_norm) {
+                if (lw.w_q_norm.len != cfg.head_dim) return error.LayerQNormShape;
+                if (lw.w_k_norm.len != cfg.head_dim) return error.LayerKNormShape;
+            }
         }
 
         const f32sz = @sizeOf(f32);
@@ -353,11 +385,11 @@ pub const Runner = struct {
         //    phase is 8N+3, embed_bw phase is 1. Size for phase-1 with
         //    headroom; descriptors ≤ 5 per dispatch.
         // Phase-1 (forward+loss-grad+backward) per-layer dispatch is
-        //   forward 15 (+2 RoPE if enabled) + backward 27 (+2 RoPE if
-        //   enabled) = 42 to 46 per layer.
+        //   forward 15 (+2 RoPE if rotary_dim>0, +2 if qk_norm)
+        //   + backward 27 (+2 RoPE, +2 qk_norm) = 42 to 50 per layer.
         // Plus 9 stack-level (embed + final_norm + lm_head + ce + lm_dx +
-        // lm_dw + final_norm_bw + 2 spare). Headroom: 32 + 46·N.
-        const phase1_dispatches: u32 = 32 + 46 * cfg.n_layers;
+        // lm_dw + final_norm_bw + 2 spare). Headroom: 32 + 50·N.
+        const phase1_dispatches: u32 = 32 + 50 * cfg.n_layers;
         var rec = try recorder_mod.Recorder.init(ctx, phase1_dispatches, 8 * phase1_dispatches);
         errdefer rec.deinit();
 
@@ -414,7 +446,7 @@ pub const Runner = struct {
         // ── Per-layer arrays. Track populated counts so partial-init
         //    failures roll back correctly. We use slice errdefers that
         //    only deinit the populated prefix.
-        var per_layer = try PerLayerArrays.alloc(allocator, n_layers);
+        var per_layer = try PerLayerArrays.alloc(allocator, n_layers, cfg);
         errdefer per_layer.deinitOnError(ctx.device, allocator);
 
         for (0..n_layers) |li| {
@@ -437,6 +469,15 @@ pub const Runner = struct {
         errdefer @constCast(&sc_dQ_pre).deinit(ctx.device);
         const sc_dK_pre = try buffer.Buffer.initDeviceOnly(ctx, n_pos * kv_dim * f32sz);
         errdefer @constCast(&sc_dK_pre).deinit(ctx.device);
+        // sc_dQ_pre_norm/sc_dK_pre_norm: pre-norm dQ/dK (rmsnorm-bw output).
+        // 1-byte placeholder when qk_norm=false; never bound by any
+        // dispatch in that case.
+        const qkn_q_bytes: usize = if (cfg.qk_norm) n_pos * q_dim * f32sz else 4;
+        const qkn_k_bytes: usize = if (cfg.qk_norm) n_pos * kv_dim * f32sz else 4;
+        const sc_dQ_pre_norm = try buffer.Buffer.initDeviceOnly(ctx, qkn_q_bytes);
+        errdefer @constCast(&sc_dQ_pre_norm).deinit(ctx.device);
+        const sc_dK_pre_norm = try buffer.Buffer.initDeviceOnly(ctx, qkn_k_bytes);
+        errdefer @constCast(&sc_dK_pre_norm).deinit(ctx.device);
         const sc_d_gated = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
         errdefer @constCast(&sc_d_gated).deinit(ctx.device);
         const sc_d_pre_gate = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
@@ -522,6 +563,11 @@ pub const Runner = struct {
             .head_dim = cfg.head_dim,
             .rotary_dim = cfg.rotary_dim,
             .theta_base = cfg.rope_theta,
+        };
+        const push_rms_qk = runtime.RmsnormPush{
+            .dim = cfg.head_dim,
+            .eps = cfg.rms_eps,
+            .gemma_quirk = 0,
         };
         const push_lin_lm_head = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.vocab_size, .K = cfg.dim };
         const push_lin_down = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.dim, .K = cfg.ff_dim };
@@ -675,6 +721,18 @@ pub const Runner = struct {
             .buf_v_up = per_layer.v_up,
             .buf_m_down = per_layer.m_down,
             .buf_v_down = per_layer.v_down,
+            .buf_w_q_norm = per_layer.w_q_norm,
+            .buf_w_k_norm = per_layer.w_k_norm,
+            .buf_q_pre_norm = per_layer.a_q_pre_norm,
+            .buf_k_pre_norm = per_layer.a_k_pre_norm,
+            .buf_dw_q_norm_partial = per_layer.dw_q_norm_partial,
+            .buf_dw_k_norm_partial = per_layer.dw_k_norm_partial,
+            .buf_dw_q_norm = per_layer.dw_q_norm,
+            .buf_dw_k_norm = per_layer.dw_k_norm,
+            .buf_m_q_norm = per_layer.m_q_norm,
+            .buf_v_q_norm = per_layer.v_q_norm,
+            .buf_m_k_norm = per_layer.m_k_norm,
+            .buf_v_k_norm = per_layer.v_k_norm,
             .buf_d_x_in = per_layer.d_x_in,
             .sc_scores = sc_scores,
             .sc_o = sc_o,
@@ -683,6 +741,8 @@ pub const Runner = struct {
             .sc_k_pre = sc_k_pre,
             .sc_dQ_pre = sc_dQ_pre,
             .sc_dK_pre = sc_dK_pre,
+            .sc_dQ_pre_norm = sc_dQ_pre_norm,
+            .sc_dK_pre_norm = sc_dK_pre_norm,
             .sc_d_gated = sc_d_gated,
             .sc_d_pre_gate = sc_d_pre_gate,
             .sc_d_up_grad = sc_d_up_grad,
@@ -718,6 +778,7 @@ pub const Runner = struct {
             .push_attn_output = push_attn_output,
             .push_rope_q = push_rope_q,
             .push_rope_k = push_rope_k,
+            .push_rms_qk = push_rms_qk,
             .push_lin_lm_head = push_lin_lm_head,
             .push_lin_down = push_lin_down,
             .push_lin_gate = push_lin_gate,
@@ -779,7 +840,12 @@ pub const Runner = struct {
             self.buf_v_v,          self.buf_m_o,          self.buf_v_o,
             self.buf_m_n2,         self.buf_v_n2,         self.buf_m_gate,
             self.buf_v_gate,       self.buf_m_up,         self.buf_v_up,
-            self.buf_m_down,       self.buf_v_down,       self.buf_d_x_in,
+            self.buf_m_down,       self.buf_v_down,       self.buf_w_q_norm,
+            self.buf_w_k_norm,     self.buf_q_pre_norm,   self.buf_k_pre_norm,
+            self.buf_dw_q_norm_partial, self.buf_dw_k_norm_partial,
+            self.buf_dw_q_norm,    self.buf_dw_k_norm,    self.buf_m_q_norm,
+            self.buf_v_q_norm,     self.buf_m_k_norm,     self.buf_v_k_norm,
+            self.buf_d_x_in,
         };
         for (arrs) |arr| {
             for (arr) |*b| b.deinit(dev);
@@ -794,6 +860,8 @@ pub const Runner = struct {
         self.sc_k_pre.deinit(dev);
         self.sc_dQ_pre.deinit(dev);
         self.sc_dK_pre.deinit(dev);
+        self.sc_dQ_pre_norm.deinit(dev);
+        self.sc_dK_pre_norm.deinit(dev);
         self.sc_d_gated.deinit(dev);
         self.sc_d_pre_gate.deinit(dev);
         self.sc_d_up_grad.deinit(dev);
@@ -885,6 +953,11 @@ pub const Runner = struct {
         for (0..cfg.n_layers) |i| {
             try self.reduceDwPartial(&self.buf_dw_n1_partial[i], &self.buf_dw_n1[i]);
             try self.reduceDwPartial(&self.buf_dw_n2_partial[i], &self.buf_dw_n2[i]);
+            if (cfg.qk_norm) {
+                const hd: usize = @intCast(cfg.head_dim);
+                try self.reduceDwPartialN(&self.buf_dw_q_norm_partial[i], &self.buf_dw_q_norm[i], cfg.n_pos * cfg.n_heads, hd);
+                try self.reduceDwPartialN(&self.buf_dw_k_norm_partial[i], &self.buf_dw_k_norm[i], cfg.n_pos * cfg.n_kv_heads, hd);
+            }
         }
 
         // ── Phase 4: Adam update on every parameter.
@@ -953,15 +1026,36 @@ pub const Runner = struct {
 
         // 1. RMSNorm n1.
         try self.rec.dispatch(&self.k_rms, &.{ x_in_buf, &self.buf_w_n1[i], &self.buf_n1[i] }, &self.push_rms, cfg.n_pos, 1, 1);
-        // 2-4. Q/K/V matmuls. When RoPE is enabled, Q + K go to scratch
-        // (sc_q_pre, sc_k_pre) then a RoPE dispatch lands the rotated
-        // result in the saved buf_q[i] / buf_k[i]. With rotary_dim == 0
-        // RoPE is skipped and we matmul straight into the saved buf.
-        const q_dst: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_q_pre else &self.buf_q[i];
-        const k_dst: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_k_pre else &self.buf_k[i];
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_q[i], q_dst }, &self.push_mm_q, cfg.n_pos * self.push_mm_q.n, 1, 1);
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_k[i], k_dst }, &self.push_mm_k, cfg.n_pos * self.push_mm_k.n, 1, 1);
+        // 2-4. Q/K/V matmuls. The Q/K matmul destination depends on
+        // which transforms come after:
+        //   qk_norm + rope: matmul → q_pre_norm, rmsnorm → sc_q_pre, rope → buf_q
+        //   qk_norm only:   matmul → q_pre_norm, rmsnorm → buf_q
+        //   rope only:      matmul → sc_q_pre,                       rope → buf_q
+        //   neither:        matmul → buf_q
+        const q_matmul_dst: *const buffer.Buffer = if (cfg.qk_norm)
+            &self.buf_q_pre_norm[i]
+        else if (cfg.rotary_dim > 0)
+            &self.sc_q_pre
+        else
+            &self.buf_q[i];
+        const k_matmul_dst: *const buffer.Buffer = if (cfg.qk_norm)
+            &self.buf_k_pre_norm[i]
+        else if (cfg.rotary_dim > 0)
+            &self.sc_k_pre
+        else
+            &self.buf_k[i];
+        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_q[i], q_matmul_dst }, &self.push_mm_q, cfg.n_pos * self.push_mm_q.n, 1, 1);
+        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_k[i], k_matmul_dst }, &self.push_mm_k, cfg.n_pos * self.push_mm_k.n, 1, 1);
         try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_v[i], &self.buf_v[i] }, &self.push_mm_v, cfg.n_pos * self.push_mm_v.n, 1, 1);
+        if (cfg.qk_norm) {
+            // rmsnorm dispatches: one workgroup per row, n_rows = n_pos * n_heads
+            // (Q) or n_pos * n_kv_heads (K), dim = head_dim. The rmsnorm
+            // shader takes n_rows as its X dispatch count.
+            const q_dst: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_q_pre else &self.buf_q[i];
+            const k_dst: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_k_pre else &self.buf_k[i];
+            try self.rec.dispatch(&self.k_rms, &.{ &self.buf_q_pre_norm[i], &self.buf_w_q_norm[i], q_dst }, &self.push_rms_qk, cfg.n_pos * cfg.n_heads, 1, 1);
+            try self.rec.dispatch(&self.k_rms, &.{ &self.buf_k_pre_norm[i], &self.buf_w_k_norm[i], k_dst }, &self.push_rms_qk, cfg.n_pos * cfg.n_kv_heads, 1, 1);
+        }
         if (cfg.rotary_dim > 0) {
             const q_total: u32 = cfg.n_pos * cfg.n_heads * cfg.head_dim;
             const k_total: u32 = cfg.n_pos * cfg.n_kv_heads * cfg.head_dim;
@@ -1094,16 +1188,44 @@ pub const Runner = struct {
 
         // RoPE backward: the dQ / dK from SDPA are gradients of the
         // post-RoPE Q / K. Inverting the rotation lands them as
-        // gradients of the pre-RoPE Q / K, which is what the linear
-        // backward of W_q / W_k expects.
-        const dQ_lin: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_dQ_pre else &self.sc_dQ;
-        const dK_lin: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_dK_pre else &self.sc_dK;
+        // gradients of the pre-RoPE Q / K (i.e. of the rmsnorm
+        // output when qk_norm is on, or of the matmul output when
+        // it's off).
         if (cfg.rotary_dim > 0) {
             const q_total: u32 = cfg.n_pos * cfg.n_heads * cfg.head_dim;
             const k_total: u32 = cfg.n_pos * cfg.n_kv_heads * cfg.head_dim;
             try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dQ, &self.sc_dQ_pre }, &self.push_rope_q, ceilDiv(q_total, group_lin), 1, 1);
             try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dK, &self.sc_dK_pre }, &self.push_rope_k, ceilDiv(k_total, group_lin), 1, 1);
         }
+
+        // Q/K-norm backward: rmsnorm_bw needs the pre-norm input
+        // (saved in buf_q_pre_norm[i]) plus the upstream gradient
+        // (post-RoPE-bw if RoPE is on, else post-attn dQ/dK).
+        // Writes a per-row dw_partial that the host reduces in step().
+        if (cfg.qk_norm) {
+            const dQ_norm_in: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_dQ_pre else &self.sc_dQ;
+            const dK_norm_in: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_dK_pre else &self.sc_dK;
+            try self.rec.dispatch(&self.k_rms_bw, &.{ dQ_norm_in, &self.buf_q_pre_norm[i], &self.buf_w_q_norm[i], &self.sc_dQ_pre_norm, &self.buf_dw_q_norm_partial[i] }, &self.push_rms_qk, cfg.n_pos * cfg.n_heads, 1, 1);
+            try self.rec.dispatch(&self.k_rms_bw, &.{ dK_norm_in, &self.buf_k_pre_norm[i], &self.buf_w_k_norm[i], &self.sc_dK_pre_norm, &self.buf_dw_k_norm_partial[i] }, &self.push_rms_qk, cfg.n_pos * cfg.n_kv_heads, 1, 1);
+        }
+
+        // Final input to lin_dx/lin_dw of W_q / W_k: the pre-everything
+        // dQ / dK. Decision tree:
+        //   qk_norm enabled (with or without RoPE): sc_dQ_pre_norm / sc_dK_pre_norm
+        //   RoPE only:                              sc_dQ_pre / sc_dK_pre
+        //   neither:                                sc_dQ / sc_dK
+        const dQ_lin: *const buffer.Buffer = if (cfg.qk_norm)
+            &self.sc_dQ_pre_norm
+        else if (cfg.rotary_dim > 0)
+            &self.sc_dQ_pre
+        else
+            &self.sc_dQ;
+        const dK_lin: *const buffer.Buffer = if (cfg.qk_norm)
+            &self.sc_dK_pre_norm
+        else if (cfg.rotary_dim > 0)
+            &self.sc_dK_pre
+        else
+            &self.sc_dK;
 
         // Q proj. Writes directly into sc_d_n1 (saves an add_in_place).
         try self.rec.dispatch(&self.k_lin_dx, &.{ dQ_lin, &self.buf_w_q[i], &self.sc_d_n1 }, &self.push_lin_q, ceilDiv(self.push_lin_q.M, group_lwg), ceilDiv(self.push_lin_q.K, group_lwg), 1);
@@ -1164,6 +1286,11 @@ pub const Runner = struct {
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_gate[i], &self.buf_dw_gate[i], &self.buf_m_gate[i], &self.buf_v_gate[i] }, &adam_gate, ceilDiv(n_gate_w, group_lin), 1, 1);
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_up[i], &self.buf_dw_up[i], &self.buf_m_up[i], &self.buf_v_up[i] }, &adam_up, ceilDiv(n_up_w, group_lin), 1, 1);
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_down[i], &self.buf_dw_down[i], &self.buf_m_down[i], &self.buf_v_down[i] }, &adam_down, ceilDiv(n_down_w, group_lin), 1, 1);
+            if (cfg.qk_norm) {
+                const adam_qn = runtime.AdamStepPush{ .n = cfg.head_dim, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
+                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q_norm[i], &self.buf_dw_q_norm[i], &self.buf_m_q_norm[i], &self.buf_v_q_norm[i] }, &adam_qn, ceilDiv(cfg.head_dim, group_lin), 1, 1);
+                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_k_norm[i], &self.buf_dw_k_norm[i], &self.buf_m_k_norm[i], &self.buf_v_k_norm[i] }, &adam_qn, ceilDiv(cfg.head_dim, group_lin), 1, 1);
+            }
         }
 
         const adam_final_norm = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
@@ -1182,6 +1309,31 @@ pub const Runner = struct {
             for (0..dim) |idx| self.dw_reduced[idx] += self.dw_partial_host[off + idx];
         }
         dst_dynamic.update(f32, self.dw_reduced);
+    }
+
+    /// Generic per-row reduce: partial is [n_rows × dim_per_row], dst
+    /// is [dim_per_row]. Used by Q/K-norm where rows are
+    /// (n_pos × n_heads) and dim_per_row is head_dim — different shape
+    /// than the main RMSNorm dw partial reducer above.
+    fn reduceDwPartialN(
+        self: *Runner,
+        partial: *const buffer.Buffer,
+        dst_dynamic: *buffer.Buffer,
+        n_rows: usize,
+        dim_per_row: usize,
+    ) !void {
+        const total = n_rows * dim_per_row;
+        // dw_partial_host is sized for the largest partial shape we hit
+        // — n_pos * dim. Verify q/k-norm fits there too.
+        std.debug.assert(total <= self.dw_partial_host.len);
+        std.debug.assert(dim_per_row <= self.dw_reduced.len);
+        try partial.readBack(self.ctx, f32, self.dw_partial_host[0..total]);
+        @memset(self.dw_reduced[0..dim_per_row], 0);
+        for (0..n_rows) |row| {
+            const off = row * dim_per_row;
+            for (0..dim_per_row) |idx| self.dw_reduced[idx] += self.dw_partial_host[off + idx];
+        }
+        dst_dynamic.update(f32, self.dw_reduced[0..dim_per_row]);
     }
 };
 
@@ -1255,9 +1407,25 @@ const PerLayerArrays = struct {
     m_down: []buffer.Buffer,
     v_down: []buffer.Buffer,
 
+    // Q/K-norm per-layer (always alloc'd as a slice of `n_layers`
+    // entries; the entries themselves stay zero-sized when
+    // cfg.qk_norm is false, so nothing else changes shape-wise).
+    w_q_norm: []buffer.Buffer,
+    w_k_norm: []buffer.Buffer,
+    a_q_pre_norm: []buffer.Buffer,
+    a_k_pre_norm: []buffer.Buffer,
+    dw_q_norm_partial: []buffer.Buffer,
+    dw_k_norm_partial: []buffer.Buffer,
+    dw_q_norm: []buffer.Buffer,
+    dw_k_norm: []buffer.Buffer,
+    m_q_norm: []buffer.Buffer,
+    v_q_norm: []buffer.Buffer,
+    m_k_norm: []buffer.Buffer,
+    v_k_norm: []buffer.Buffer,
+
     d_x_in: []buffer.Buffer,
 
-    fn alloc(allocator: std.mem.Allocator, n_layers: usize) !PerLayerArrays {
+    fn alloc(allocator: std.mem.Allocator, n_layers: usize, cfg: Config) !PerLayerArrays {
         var pl: PerLayerArrays = undefined;
         pl.n_layers = n_layers;
         pl.populated = 0;
@@ -1311,6 +1479,22 @@ const PerLayerArrays = struct {
         pl.v_up = try allocator.alloc(buffer.Buffer, n_layers);
         pl.m_down = try allocator.alloc(buffer.Buffer, n_layers);
         pl.v_down = try allocator.alloc(buffer.Buffer, n_layers);
+        // Q/K-norm slots: allocated only when enabled. Empty slices
+        // when disabled — the per-layer dispatch paths key off
+        // `cfg.qk_norm`, so empty slices are never indexed.
+        const qkn = cfg.qk_norm;
+        pl.w_q_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.w_k_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.a_q_pre_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.a_k_pre_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.dw_q_norm_partial = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.dw_k_norm_partial = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.dw_q_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.dw_k_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.m_q_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.v_q_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.m_k_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
+        pl.v_k_norm = if (qkn) try allocator.alloc(buffer.Buffer, n_layers) else &.{};
         pl.d_x_in = try allocator.alloc(buffer.Buffer, n_layers);
         return pl;
     }
@@ -1380,6 +1564,22 @@ const PerLayerArrays = struct {
         self.v_down[li] = try buffer.Buffer.initDeviceOnly(ctx, lw.w_down.len * f32sz);
 
         self.d_x_in[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
+
+        if (cfg.qk_norm) {
+            const hd: usize = @intCast(cfg.head_dim);
+            self.w_q_norm[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_q_norm);
+            self.w_k_norm[li] = try buffer.Buffer.initStatic(ctx, f32, lw.w_k_norm);
+            self.a_q_pre_norm[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * q_dim * f32sz);
+            self.a_k_pre_norm[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * kv_dim * f32sz);
+            self.dw_q_norm_partial[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * q_dim * f32sz);
+            self.dw_k_norm_partial[li] = try buffer.Buffer.initDeviceOnly(ctx, n_pos * kv_dim * f32sz);
+            self.dw_q_norm[li] = try buffer.Buffer.initDynamic(ctx, hd * f32sz);
+            self.dw_k_norm[li] = try buffer.Buffer.initDynamic(ctx, hd * f32sz);
+            self.m_q_norm[li] = try buffer.Buffer.initDeviceOnly(ctx, hd * f32sz);
+            self.v_q_norm[li] = try buffer.Buffer.initDeviceOnly(ctx, hd * f32sz);
+            self.m_k_norm[li] = try buffer.Buffer.initDeviceOnly(ctx, hd * f32sz);
+            self.v_k_norm[li] = try buffer.Buffer.initDeviceOnly(ctx, hd * f32sz);
+        }
 
         self.populated = li + 1;
     }

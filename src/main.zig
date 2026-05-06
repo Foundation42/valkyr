@@ -5928,6 +5928,8 @@ fn runDecoderFineTuneCpuSmoke(allocator: std.mem.Allocator) !void {
         .w_gate = w_gate,
         .w_up = w_up,
         .w_down = w_down,
+        .w_q_norm = &.{}, // qk_norm disabled in this smoke
+        .w_k_norm = &.{},
     };
 
     var acts = try cpu_train_decoder.allocActs(allocator, cfg);
@@ -5958,6 +5960,8 @@ fn runDecoderFineTuneCpuSmoke(allocator: std.mem.Allocator) !void {
         .dw_gate = try allocator.alloc(f32, w_gate.len),
         .dw_up = try allocator.alloc(f32, w_up.len),
         .dw_down = try allocator.alloc(f32, w_down.len),
+        .dw_q_norm = &.{},
+        .dw_k_norm = &.{},
     };
     defer {
         allocator.free(grads.dw_n1);
@@ -6085,6 +6089,8 @@ fn runDecoderStackFineTuneCpuSmoke(allocator: std.mem.Allocator) !void {
             .w_gate = w_gate,
             .w_up = w_up,
             .w_down = w_down,
+            .w_q_norm = &.{}, // qk_norm disabled in this smoke
+            .w_k_norm = &.{},
         };
     }
 
@@ -6413,6 +6419,8 @@ fn runDecoderStackBackwardGpuParitySmoke(allocator: std.mem.Allocator) !void {
             .w_gate = w_gate,
             .w_up = w_up,
             .w_down = w_down,
+            .w_q_norm = &.{}, // qk_norm disabled in this smoke
+            .w_k_norm = &.{},
         };
     }
 
@@ -7106,6 +7114,7 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
             .rms_eps = 1e-5,
             .causal = true,
             .rotary_dim = 8, // full RoPE (rotary_dim = head_dim)
+            .qk_norm = true, // per-head Q/K-norm (Qwen3 architectural detail)
         },
         .n_layers = 2,
         .vocab_size = 8,
@@ -7143,7 +7152,11 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
     defer allocator.free(layer_weight_buffers);
     defer for (layer_weight_buffers) |slots| for (slots) |s| allocator.free(s);
 
-    for (layers, layer_weight_buffers) |*layer, *slots| {
+    const layer_qk_buffers = try allocator.alloc([2][]f32, cfg.n_layers);
+    defer allocator.free(layer_qk_buffers);
+    defer for (layer_qk_buffers) |slots| for (slots) |s| allocator.free(s);
+
+    for (layers, layer_weight_buffers, layer_qk_buffers) |*layer, *slots, *qk_slots| {
         const w_n1 = try allocator.alloc(f32, dim);
         const w_q = try allocator.alloc(f32, q_dim * dim);
         const w_k = try allocator.alloc(f32, kv_dim * dim);
@@ -7153,8 +7166,12 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
         const w_gate = try allocator.alloc(f32, ff_dim * dim);
         const w_up = try allocator.alloc(f32, ff_dim * dim);
         const w_down = try allocator.alloc(f32, dim * ff_dim);
+        const w_q_norm = try allocator.alloc(f32, head_dim);
+        const w_k_norm = try allocator.alloc(f32, head_dim);
         for (w_n1) |*v| v.* = 1.0;
         for (w_n2) |*v| v.* = 1.0;
+        for (w_q_norm) |*v| v.* = 1.0;
+        for (w_k_norm) |*v| v.* = 1.0;
         for (w_q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
         for (w_k) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
         for (w_v) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
@@ -7163,6 +7180,7 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
         for (w_up) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
         for (w_down) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * initScale;
         slots.* = .{ w_n1, w_q, w_k, w_v, w_o, w_n2, w_gate, w_up, w_down };
+        qk_slots.* = .{ w_q_norm, w_k_norm };
         layer.* = .{
             .cfg = cfg.base,
             .w_n1 = w_n1,
@@ -7174,6 +7192,8 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
             .w_gate = w_gate,
             .w_up = w_up,
             .w_down = w_down,
+            .w_q_norm = w_q_norm,
+            .w_k_norm = w_k_norm,
         };
     }
 
@@ -7226,6 +7246,8 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
             .w_gate = layer.w_gate,
             .w_up = layer.w_up,
             .w_down = layer.w_down,
+            .w_q_norm = layer.w_q_norm,
+            .w_k_norm = layer.w_k_norm,
         };
     }
 
@@ -7245,6 +7267,7 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
             .causal = cfg.base.causal,
             .rotary_dim = @intCast(cfg.base.rotary_dim),
             .rope_theta = cfg.base.rope_theta,
+            .qk_norm = cfg.base.qk_norm,
             .lr = 1e-2,
         },
         .{
@@ -7277,8 +7300,11 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
     }
 
     // Per-layer dispatches: 51 baseline (β-3a-2 SwiGLU stack) + 4 when
-    // RoPE is enabled (2 fwd + 2 bw across Q + K).
-    const per_layer_dispatches: usize = if (cfg.base.rotary_dim > 0) 55 else 51;
+    // RoPE is enabled (2 fwd + 2 bw across Q + K) + 6 when qk_norm is
+    // enabled (2 fwd rmsnorm + 2 bw rmsnorm + 2 Adam updates).
+    var per_layer_dispatches: usize = 51;
+    if (cfg.base.rotary_dim > 0) per_layer_dispatches += 4;
+    if (cfg.base.qk_norm) per_layer_dispatches += 6;
     std.debug.print(
         "PASS GPU decoder stack fine-tune via Runner (n_layers={d} dim={d} vocab={d} n_pos={d}; CE loss {d:.6} → {d:.6} ({e:.2}× drop) over {d} Adam steps, {d} dispatches/step)\n",
         .{ cfg.n_layers, dim, vocab, n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps, 11 + per_layer_dispatches * cfg.n_layers },
@@ -7363,8 +7389,12 @@ fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
         const w_gate = try aalloc.alloc(f32, @as(usize, ff_dim) * dim);
         const w_up = try aalloc.alloc(f32, @as(usize, ff_dim) * dim);
         const w_down = try aalloc.alloc(f32, @as(usize, dim) * ff_dim);
+        const w_q_norm = try aalloc.alloc(f32, head_dim);
+        const w_k_norm = try aalloc.alloc(f32, head_dim);
         @memset(w_n1, 1.0);
         @memset(w_n2, 1.0);
+        @memset(w_q_norm, 1.0);
+        @memset(w_k_norm, 1.0);
         fillRandom(rng, w_q, init_scale);
         fillRandom(rng, w_k, init_scale);
         fillRandom(rng, w_v, init_scale);
@@ -7382,6 +7412,8 @@ fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
             .w_gate = w_gate,
             .w_up = w_up,
             .w_down = w_down,
+            .w_q_norm = w_q_norm,
+            .w_k_norm = w_k_norm,
         };
     }
 
@@ -7416,6 +7448,7 @@ fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
             .n_layers = n_layers,
             .vocab_size = vocab,
             .rotary_dim = head_dim, // full RoPE
+            .qk_norm = true, // per-head Q/K-norm (Qwen3 architectural detail)
             // Same lr as the toy 8c-α-3 smoke (1e-2). Single-batch
             // overfit is the regime we're in, not pre-training.
             .lr = 1e-2,

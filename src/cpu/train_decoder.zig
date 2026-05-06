@@ -71,9 +71,18 @@ pub const Config = struct {
     /// partial rotation.
     rotary_dim: usize = 0,
     rope_theta: f32 = 10_000.0,
+    /// Per-head Q/K RMSNorm (Qwen3 / Qwen3.5 architectural detail).
+    /// When true, RMSNorm is applied to Q and K vectors per head after
+    /// projection but before RoPE. Two new learnable [head_dim] gains
+    /// per layer (`w_q_norm`, `w_k_norm`).
+    qk_norm: bool = false,
 };
 
 /// All learnable parameters. `[N, K]` row-major; bias-free.
+///
+/// q_norm / k_norm slots are [head_dim] when `cfg.qk_norm` is true,
+/// or empty (`&.{}`) when false. paramSlices always returns 11 slots
+/// — Adam over an empty slice is a no-op.
 pub const Layer = struct {
     cfg: Config,
     w_n1: []f32, // [dim]
@@ -85,9 +94,11 @@ pub const Layer = struct {
     w_gate: []f32, // [ff_dim, dim]
     w_up: []f32, // [ff_dim, dim]
     w_down: []f32, // [dim, ff_dim]
+    w_q_norm: []f32, // [head_dim] when qk_norm; else &.{}
+    w_k_norm: []f32, // [head_dim] when qk_norm; else &.{}
 
-    pub fn paramSlices(self: *Layer) [9][]f32 {
-        return .{ self.w_n1, self.w_q, self.w_k, self.w_v, self.w_o, self.w_n2, self.w_gate, self.w_up, self.w_down };
+    pub fn paramSlices(self: *Layer) [11][]f32 {
+        return .{ self.w_n1, self.w_q, self.w_k, self.w_v, self.w_o, self.w_n2, self.w_gate, self.w_up, self.w_down, self.w_q_norm, self.w_k_norm };
     }
 };
 
@@ -101,9 +112,11 @@ pub const Grads = struct {
     dw_gate: []f32,
     dw_up: []f32,
     dw_down: []f32,
+    dw_q_norm: []f32, // [head_dim] when qk_norm; else &.{}
+    dw_k_norm: []f32, // [head_dim] when qk_norm; else &.{}
 
-    pub fn slices(self: *Grads) [9][]f32 {
-        return .{ self.dw_n1, self.dw_q, self.dw_k, self.dw_v, self.dw_o, self.dw_n2, self.dw_gate, self.dw_up, self.dw_down };
+    pub fn slices(self: *Grads) [11][]f32 {
+        return .{ self.dw_n1, self.dw_q, self.dw_k, self.dw_v, self.dw_o, self.dw_n2, self.dw_gate, self.dw_up, self.dw_down, self.dw_q_norm, self.dw_k_norm };
     }
 
     pub fn zero(self: *Grads) void {
@@ -124,6 +137,8 @@ pub const Acts = struct {
     o: []f32, // [n_pos, dim]
     mid: []f32, // [n_pos, dim] = x_in + o
     n2: []f32, // [n_pos, dim]
+    q_pre_norm: []f32, // [n_pos, n_heads*head_dim] when qk_norm; else empty
+    k_pre_norm: []f32, // [n_pos, n_kv_heads*head_dim] when qk_norm; else empty
     pre_gate: []f32, // [n_pos, ff_dim]
     up: []f32, // [n_pos, ff_dim]
     gated: []f32, // [n_pos, ff_dim] = silu(pre_gate) · up
@@ -149,6 +164,8 @@ pub fn allocActs(gpa: std.mem.Allocator, cfg: Config) !Acts {
         .o = try gpa.alloc(f32, n_pos * dim),
         .mid = try gpa.alloc(f32, n_pos * dim),
         .n2 = try gpa.alloc(f32, n_pos * dim),
+        .q_pre_norm = if (cfg.qk_norm) try gpa.alloc(f32, n_pos * q_dim) else &.{},
+        .k_pre_norm = if (cfg.qk_norm) try gpa.alloc(f32, n_pos * kv_dim) else &.{},
         .pre_gate = try gpa.alloc(f32, n_pos * cfg.ff_dim),
         .up = try gpa.alloc(f32, n_pos * cfg.ff_dim),
         .gated = try gpa.alloc(f32, n_pos * cfg.ff_dim),
@@ -169,6 +186,8 @@ pub fn freeActs(gpa: std.mem.Allocator, a: *Acts) void {
     gpa.free(a.o);
     gpa.free(a.mid);
     gpa.free(a.n2);
+    if (a.q_pre_norm.len > 0) gpa.free(a.q_pre_norm);
+    if (a.k_pre_norm.len > 0) gpa.free(a.k_pre_norm);
     gpa.free(a.pre_gate);
     gpa.free(a.up);
     gpa.free(a.gated);
@@ -188,9 +207,20 @@ pub fn forward(layer: *const Layer, acts: *Acts) void {
     // n1 = RMSNorm(x_in, w_n1) — per-row.
     tt.rmsNormForward(acts.x_in, layer.w_n1, cfg.rms_eps, false, n_pos, acts.n1);
 
-    // Q, K, V projections
-    matmulNt(acts.q, acts.n1, layer.w_q, n_pos, q_dim, dim);
-    matmulNt(acts.k, acts.n1, layer.w_k, n_pos, kv_dim, dim);
+    // Q, K, V projections. With qk_norm enabled, Q + K go to a saved
+    // pre-norm buffer so the RMSNorm backward can recover the input.
+    if (cfg.qk_norm) {
+        matmulNt(acts.q_pre_norm, acts.n1, layer.w_q, n_pos, q_dim, dim);
+        matmulNt(acts.k_pre_norm, acts.n1, layer.w_k, n_pos, kv_dim, dim);
+        // Per-head RMSNorm: rows are [n_pos*n_heads, head_dim] for Q,
+        // [n_pos*n_kv_heads, head_dim] for K. Same gain shared across
+        // heads.
+        tt.rmsNormForward(acts.q_pre_norm, layer.w_q_norm, cfg.rms_eps, false, n_pos * cfg.n_heads, acts.q);
+        tt.rmsNormForward(acts.k_pre_norm, layer.w_k_norm, cfg.rms_eps, false, n_pos * cfg.n_kv_heads, acts.k);
+    } else {
+        matmulNt(acts.q, acts.n1, layer.w_q, n_pos, q_dim, dim);
+        matmulNt(acts.k, acts.n1, layer.w_k, n_pos, kv_dim, dim);
+    }
     matmulNt(acts.v, acts.n1, layer.w_v, n_pos, kv_dim, dim);
 
     // RoPE on Q + K (in-place; pos = row index). Skipped when
@@ -414,6 +444,36 @@ pub fn backwardFromDy(
         @memcpy(dK, dK_pre);
     }
 
+    // Q/K-norm backward — undoes the per-head RMSNorm so the gradient
+    // matches the *pre-norm* Q/K (the matmul output). dw_q_norm and
+    // dw_k_norm are accumulated.
+    if (cfg.qk_norm) {
+        const dQ_pre_norm = try gpa.alloc(f32, n_pos * q_dim);
+        defer gpa.free(dQ_pre_norm);
+        const dK_pre_norm = try gpa.alloc(f32, n_pos * kv_dim);
+        defer gpa.free(dK_pre_norm);
+        // rmsNormBackward writes per-row dw partials into a flat buffer;
+        // size [n_rows * dim] = [n_pos*n_heads * head_dim] for Q.
+        const dw_q_partial = try gpa.alloc(f32, n_pos * q_dim);
+        defer gpa.free(dw_q_partial);
+        const dw_k_partial = try gpa.alloc(f32, n_pos * kv_dim);
+        defer gpa.free(dw_k_partial);
+        tt.rmsNormBackward(dQ, acts.q_pre_norm, layer.w_q_norm, cfg.rms_eps, false, n_pos * cfg.n_heads, dQ_pre_norm, dw_q_partial);
+        tt.rmsNormBackward(dK, acts.k_pre_norm, layer.w_k_norm, cfg.rms_eps, false, n_pos * cfg.n_kv_heads, dK_pre_norm, dw_k_partial);
+        // Reduce per-row partials into the layer's gain gradient.
+        const hd = cfg.head_dim;
+        for (0..n_pos * cfg.n_heads) |r| {
+            const off = r * hd;
+            for (0..hd) |i| grads.dw_q_norm[i] += dw_q_partial[off + i];
+        }
+        for (0..n_pos * cfg.n_kv_heads) |r| {
+            const off = r * hd;
+            for (0..hd) |i| grads.dw_k_norm[i] += dw_k_partial[off + i];
+        }
+        @memcpy(dQ, dQ_pre_norm);
+        @memcpy(dK, dK_pre_norm);
+    }
+
     // ── 9. Q = n1 @ W_Qᵀ etc. Sum into d_n1.
     const d_n1 = try gpa.alloc(f32, n_pos * dim);
     defer gpa.free(d_n1);
@@ -462,8 +522,8 @@ pub fn backward(
 // ── Adam optimizer ─────────────────────────────────────────────────
 
 pub const AdamState = struct {
-    m: [9][]f32,
-    v: [9][]f32,
+    m: [11][]f32,
+    v: [11][]f32,
     t: u32 = 0,
     lr: f32,
     beta1: f32 = 0.9,
@@ -471,8 +531,8 @@ pub const AdamState = struct {
     eps: f32 = 1e-8,
 
     pub fn init(gpa: std.mem.Allocator, layer: *Layer, lr: f32) !AdamState {
-        var m: [9][]f32 = undefined;
-        var v: [9][]f32 = undefined;
+        var m: [11][]f32 = undefined;
+        var v: [11][]f32 = undefined;
         const params = layer.paramSlices();
         for (params, 0..) |p, i| {
             m[i] = try gpa.alloc(f32, p.len);
@@ -498,7 +558,7 @@ pub fn adamStep(state: *AdamState, layer: *Layer, grads: *Grads) void {
 
     const params = layer.paramSlices();
     const grad_slices = grads.slices();
-    inline for (0..9) |i| {
+    inline for (0..11) |i| {
         const p = params[i];
         const g = grad_slices[i];
         const m = state.m[i];
@@ -608,6 +668,8 @@ pub fn allocStackGrads(gpa: std.mem.Allocator, stack: *const Stack) !StackGrads 
             .dw_gate = try gpa.alloc(f32, layer.w_gate.len),
             .dw_up = try gpa.alloc(f32, layer.w_up.len),
             .dw_down = try gpa.alloc(f32, layer.w_down.len),
+            .dw_q_norm = if (layer.w_q_norm.len > 0) try gpa.alloc(f32, layer.w_q_norm.len) else &.{},
+            .dw_k_norm = if (layer.w_k_norm.len > 0) try gpa.alloc(f32, layer.w_k_norm.len) else &.{},
         };
     }
     return StackGrads{
@@ -630,6 +692,8 @@ pub fn freeStackGrads(gpa: std.mem.Allocator, sg: *StackGrads) void {
         gpa.free(lg.dw_gate);
         gpa.free(lg.dw_up);
         gpa.free(lg.dw_down);
+        if (lg.dw_q_norm.len > 0) gpa.free(lg.dw_q_norm);
+        if (lg.dw_k_norm.len > 0) gpa.free(lg.dw_k_norm);
     }
     gpa.free(sg.layer_grads);
     gpa.free(sg.dw_final_norm);
@@ -793,13 +857,15 @@ pub const StackAdamState = struct {
     eps: f32 = 1e-8,
 };
 
-/// Iteration order: `embed`, then for each layer the 9 single-layer
+/// Iteration order: `embed`, then for each layer the 11 single-layer
 /// params in `Layer.paramSlices` order, then `final_norm`, then
-/// `lm_head`. Total = 9·n_layers + 3.
+/// `lm_head`. Total = 11·n_layers + 3. Empty slots (q_norm/k_norm
+/// when qk_norm=false) still count toward the param-list length —
+/// stackAdamStep iterates over them as no-ops.
 const stack_extra_params: usize = 3;
 
 fn stackParamCount(stack: *const Stack) usize {
-    return stack_extra_params + 9 * stack.cfg.n_layers;
+    return stack_extra_params + 11 * stack.cfg.n_layers;
 }
 
 fn fillStackParamSlices(stack: *Stack, params: [][]f32, grads: *StackGrads, gradsOut: [][]f32) void {
