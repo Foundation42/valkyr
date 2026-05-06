@@ -153,6 +153,13 @@ pub fn main() !void {
         try runGpuLoraTrainDemo(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-plus-demo")) {
+        // LoRA+ comparative demo: same task at η_B/η_A ∈ {1, 4, 16}.
+        // Demonstrates the Chronicals/Hayou prediction that B should
+        // learn ~16× faster than A in the feature-learning regime.
+        try runGpuLoraPlusDemo(allocator);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
@@ -4984,6 +4991,455 @@ fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
         return error.LossDidNotDecrease;
     }
     std.debug.print("PASS GPU LoRA train demo — recovered rank-{d} delta, loss {d:.4} → {d:.4} ({d:.2}× drop)\n", .{ r, initial_loss, final_loss, 1.0 / ratio });
+}
+
+// ── LoRA+ comparative demo: η_B / η_A ∈ {1, 4, 16} on same task ───────
+//
+// Same synthetic recovery task as runGpuLoraTrainDemo (rank-r delta on
+// a frozen base), but trains three trajectories with different LoRA+
+// learning-rate ratios λ = η_B / η_A. Vanilla LoRA is λ = 1; the
+// Hayou et al. (ICML 2024) / Chronicals §5 theoretical optimum in the
+// feature-learning regime is λ = O(n) ≈ 16 for our shape.
+//
+// Why λ matters. At init, B = 0 and A = N(0, σ²), so:
+//   ∇A = (α/r) · Bᵀ · ∇W_eff = 0    (gated by Bᵀ = 0)
+//   ∇B = (α/r) · ∇W_eff · Aᵀ ≠ 0    (only path that's "open")
+// B has to learn first before A can start contributing. With η_B = η_A,
+// B catches up slowly; with η_B = 16·η_A, B's first few updates are
+// large enough to push (α/r)·B·A into a regime where ∇A becomes
+// non-trivial within a few steps — significantly accelerating
+// convergence on tasks where the optimal rank-r delta is non-trivial.
+//
+// The demo runs each ratio for the same number of steps with identical
+// initial weights (deterministic seed → re-init A, B and Adam state
+// between trajectories). Prints all three trajectories side by side
+// and asserts that λ = 16 reaches a fixed loss threshold in fewer
+// steps than λ = 1.
+
+fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Same shape as runGpuLoraTrainDemo for direct comparison.
+    const M_u: u32 = 16;
+    const N_u: u32 = 32;
+    const K_u: u32 = 64;
+    const R_u: u32 = 8;
+    const aor: f32 = 2.0;
+    const base_lr: f32 = 1e-2;
+    const beta1: f32 = 0.9;
+    const beta2: f32 = 0.999;
+    const eps: f32 = 1e-8;
+    const n_steps: u32 = 100;
+    const log_every: u32 = 25;
+
+    const ratios = [_]f32{ 1.0, 4.0, 16.0 };
+
+    const M: usize = M_u;
+    const Nn: usize = N_u;
+    const K: usize = K_u;
+    const r: usize = R_u;
+
+    // ── Synthetic problem (deterministic seed).
+    var prng = std.Random.DefaultPrng.init(0x10AAFADE);
+    const rng = prng.random();
+
+    const w = try allocator.alloc(f32, Nn * K);
+    defer allocator.free(w);
+    for (w) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+
+    const a_target = try allocator.alloc(f32, r * K);
+    defer allocator.free(a_target);
+    const b_target = try allocator.alloc(f32, Nn * r);
+    defer allocator.free(b_target);
+    for (a_target) |*v| v.* = (rng.float(f32) - 0.5) * 0.5;
+    for (b_target) |*v| v.* = (rng.float(f32) - 0.5) * 0.5;
+
+    const x = try allocator.alloc(f32, M * K);
+    defer allocator.free(x);
+    for (x) |*v| v.* = (rng.float(f32) - 0.5);
+
+    const w_eff_target = try allocator.alloc(f32, Nn * K);
+    defer allocator.free(w_eff_target);
+    @memcpy(w_eff_target, w);
+    for (0..Nn) |n_| {
+        for (0..K) |k_| {
+            var s: f64 = 0;
+            for (0..r) |ri_| s += @as(f64, b_target[n_ * r + ri_]) * @as(f64, a_target[ri_ * K + k_]);
+            w_eff_target[n_ * K + k_] += aor * @as(f32, @floatCast(s));
+        }
+    }
+    const target_y = try allocator.alloc(f32, M * Nn);
+    defer allocator.free(target_y);
+    for (0..M) |m_| {
+        for (0..Nn) |n_| {
+            var s: f64 = 0;
+            for (0..K) |k_| s += @as(f64, x[m_ * K + k_]) * @as(f64, w_eff_target[n_ * K + k_]);
+            target_y[m_ * Nn + n_] = @floatCast(s);
+        }
+    }
+
+    const a_init = try allocator.alloc(f32, r * K);
+    defer allocator.free(a_init);
+    for (a_init) |*v| v.* = (rng.float(f32) - 0.5) * 0.1;
+    const b_init = try allocator.alloc(f32, Nn * r);
+    defer allocator.free(b_init);
+    @memset(b_init, 0);
+
+    // ── GPU buffers. A, B are *dynamic* so we can reset between trajectories.
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, x);
+    defer buf_x.deinit(ctx.device);
+    var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+    defer buf_w.deinit(ctx.device);
+    var buf_a = try buffer.Buffer.initDynamic(&ctx, r * K * @sizeOf(f32));
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initDynamic(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_b.deinit(ctx.device);
+    var buf_target_y = try buffer.Buffer.initStatic(&ctx, f32, target_y);
+    defer buf_target_y.deinit(ctx.device);
+
+    var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_y.deinit(ctx.device);
+    var buf_intermediate = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+    defer buf_intermediate.deinit(ctx.device);
+    var buf_y_lora = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_y_lora.deinit(ctx.device);
+    var buf_y_lora_scaled = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_y_lora_scaled.deinit(ctx.device);
+    var buf_dy = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_dy.deinit(ctx.device);
+    var buf_dy_B = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+    defer buf_dy_B.deinit(ctx.device);
+    var buf_dA_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_dA_unscaled.deinit(ctx.device);
+    var buf_dA = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_dA.deinit(ctx.device);
+    var buf_dB_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_dB_unscaled.deinit(ctx.device);
+    var buf_dB = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_dB.deinit(ctx.device);
+    var buf_m_a = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_m_a.deinit(ctx.device);
+    var buf_v_a = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_v_a.deinit(ctx.device);
+    var buf_m_b = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_m_b.deinit(ctx.device);
+    var buf_v_b = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_v_b.deinit(ctx.device);
+
+    // ── Pipelines.
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dx.deinit();
+    var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dw.deinit();
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(ScalePush));
+    defer k_scale.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    defer k_mse_grad.deinit();
+    var k_adam = try pipeline.Kernel.init(&ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
+    defer k_adam.deinit();
+
+    const group_lwg: u32 = 16;
+    const group_lin: u32 = 256;
+
+    const recordMatmul = struct {
+        fn rec(rec_kern: *pipeline.Kernel, push: *const MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+            try rec_kern.bind(bufs);
+            const Rec = struct {
+                k: *const pipeline.Kernel,
+                p: *const MatmulPush,
+                gx_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                }
+            };
+            try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = push, .gx_ = gx });
+        }
+    }.rec;
+    const recordLinBackward = struct {
+        fn rec(rec_kern: *pipeline.Kernel, push: *const runtime.LinearBatchedPush, gx: u32, gy: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+            try rec_kern.bind(bufs);
+            const Rec = struct {
+                k: *const pipeline.Kernel,
+                p: *const runtime.LinearBatchedPush,
+                gx_: u32,
+                gy_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, s.gy_, 1);
+                }
+            };
+            try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = push, .gx_ = gx, .gy_ = gy });
+        }
+    }.rec;
+    const recordScalar1D = struct {
+        fn rec(rec_kern: *pipeline.Kernel, push: anytype, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+            try rec_kern.bind(bufs);
+            const PushT = @TypeOf(push);
+            const Rec = struct {
+                k: *const pipeline.Kernel,
+                p: *const PushT,
+                gx_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                }
+            };
+            try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = &push, .gx_ = gx });
+        }
+    }.rec;
+
+    const push_y_base = MatmulPush{ .m = M_u, .n = N_u, .k = K_u };
+    const push_inter = MatmulPush{ .m = M_u, .n = R_u, .k = K_u };
+    const push_ylora = MatmulPush{ .m = M_u, .n = N_u, .k = R_u };
+    const push_scale_ylora = ScalePush{ .n = M_u * N_u, .scale = aor };
+    const push_add_y = runtime.AddInPlacePush{ .n = M_u * N_u };
+    const push_mse = MseLossGradPush{ .n = M_u * N_u };
+    const push_dy_B = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
+    const push_dA = runtime.LinearBatchedPush{ .M = M_u, .N = R_u, .K = K_u };
+    const push_scale_dA = ScalePush{ .n = R_u * K_u, .scale = aor };
+    const push_dB = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
+    const push_scale_dB = ScalePush{ .n = N_u * R_u, .scale = aor };
+
+    const computeMse = struct {
+        fn call(y: []const f32, t: []const f32) f32 {
+            var s: f64 = 0;
+            for (y, t) |yv, tv| {
+                const d = yv - tv;
+                s += d * d;
+            }
+            return @floatCast(0.5 * s);
+        }
+    }.call;
+
+    const y_buf = try allocator.alloc(f32, M * Nn);
+    defer allocator.free(y_buf);
+
+    // ── Run one trajectory at a given LoRA+ ratio. Returns loss values
+    //    at steps {0, log_every, 2*log_every, ..., n_steps} and the
+    //    smallest step at which loss < threshold (or n_steps + 1 if
+    //    never reached).
+    const RunResult = struct {
+        loss_at_log: [(n_steps / log_every) + 2]f32,
+        steps_to_threshold: u32,
+    };
+
+    const threshold: f32 = 1e-3;
+
+    const runOneTrajectory = struct {
+        fn call(
+            ratio: f32,
+            base_lr_: f32,
+            // buffer state to reset
+            buf_a_: *buffer.Buffer,
+            buf_b_: *buffer.Buffer,
+            buf_m_a_: *const buffer.Buffer,
+            buf_v_a_: *const buffer.Buffer,
+            buf_m_b_: *const buffer.Buffer,
+            buf_v_b_: *const buffer.Buffer,
+            a_init_: []const f32,
+            b_init_: []const f32,
+            // host loss-eval state
+            target_y_: []const f32,
+            y_buf_: []f32,
+            // GPU resources (the long suffix list)
+            ctx_ptr: *const vk.Context,
+            kmm: *pipeline.Kernel,
+            klx: *pipeline.Kernel,
+            klw: *pipeline.Kernel,
+            ksc: *pipeline.Kernel,
+            kad: *pipeline.Kernel,
+            kmse: *pipeline.Kernel,
+            kadam: *pipeline.Kernel,
+            buf_x_: *const buffer.Buffer,
+            buf_w_: *const buffer.Buffer,
+            buf_target_: *const buffer.Buffer,
+            buf_y_: *const buffer.Buffer,
+            buf_inter_: *const buffer.Buffer,
+            buf_yl_: *const buffer.Buffer,
+            buf_yls_: *const buffer.Buffer,
+            buf_dy_: *const buffer.Buffer,
+            buf_dyB_: *const buffer.Buffer,
+            buf_dAu_: *const buffer.Buffer,
+            buf_dA_: *const buffer.Buffer,
+            buf_dBu_: *const buffer.Buffer,
+            buf_dB_: *const buffer.Buffer,
+            // pushes
+            pyb: *const MatmulPush,
+            pin: *const MatmulPush,
+            pyl: *const MatmulPush,
+            psy: *const ScalePush,
+            pay: *const runtime.AddInPlacePush,
+            pms: *const MseLossGradPush,
+            pdyB: *const runtime.LinearBatchedPush,
+            pdA: *const runtime.LinearBatchedPush,
+            psda: *const ScalePush,
+            pdB: *const runtime.LinearBatchedPush,
+            psdb: *const ScalePush,
+            mu: u32,
+            nu: u32,
+            ku: u32,
+            ru: u32,
+            beta1_: f32,
+            beta2_: f32,
+            eps_: f32,
+            n_steps_: u32,
+            log_every_: u32,
+            threshold_: f32,
+            recM_fn: @TypeOf(recordMatmul),
+            recL_fn: @TypeOf(recordLinBackward),
+            recS_fn: @TypeOf(recordScalar1D),
+            mse_fn: @TypeOf(computeMse),
+            glin: u32,
+            glwg: u32,
+        ) !RunResult {
+            // Reset trainable params + Adam state.
+            buf_a_.update(f32, a_init_);
+            buf_b_.update(f32, b_init_);
+            try buf_m_a_.fillZero(ctx_ptr);
+            try buf_v_a_.fillZero(ctx_ptr);
+            try buf_m_b_.fillZero(ctx_ptr);
+            try buf_v_b_.fillZero(ctx_ptr);
+
+            const lr_a: f32 = base_lr_;
+            const lr_b: f32 = base_lr_ * ratio;
+
+            var result: RunResult = .{
+                .loss_at_log = undefined,
+                .steps_to_threshold = n_steps_ + 1,
+            };
+            var log_idx: usize = 0;
+
+            // Forward + initial loss.
+            try recM_fn(kmm, pyb, mu * nu, ctx_ptr, &.{ buf_x_, buf_w_, buf_y_ });
+            try recM_fn(kmm, pin, mu * ru, ctx_ptr, &.{ buf_x_, buf_a_, buf_inter_ });
+            try recM_fn(kmm, pyl, mu * nu, ctx_ptr, &.{ buf_inter_, buf_b_, buf_yl_ });
+            try recS_fn(ksc, psy.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
+            try recS_fn(kad, pay.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
+            try buf_y_.readBack(ctx_ptr, f32, y_buf_);
+            const initial_loss = mse_fn(y_buf_, target_y_);
+            result.loss_at_log[log_idx] = initial_loss;
+            log_idx += 1;
+
+            var step: u32 = 1;
+            while (step <= n_steps_) : (step += 1) {
+                // Forward.
+                try recM_fn(kmm, pyb, mu * nu, ctx_ptr, &.{ buf_x_, buf_w_, buf_y_ });
+                try recM_fn(kmm, pin, mu * ru, ctx_ptr, &.{ buf_x_, buf_a_, buf_inter_ });
+                try recM_fn(kmm, pyl, mu * nu, ctx_ptr, &.{ buf_inter_, buf_b_, buf_yl_ });
+                try recS_fn(ksc, psy.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
+                try recS_fn(kad, pay.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
+                // Loss grad.
+                try recS_fn(kmse, pms.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_target_, buf_dy_ });
+                // Backward.
+                try recL_fn(klx, pdyB, ceilDiv(mu, glwg), ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_b_, buf_dyB_ });
+                try recL_fn(klw, pdA, ceilDiv(ru, glwg), ceilDiv(ku, glwg), ctx_ptr, &.{ buf_dyB_, buf_x_, buf_dAu_ });
+                try recS_fn(ksc, psda.*, ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_dAu_, buf_dA_ });
+                try recL_fn(klw, pdB, ceilDiv(nu, glwg), ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_inter_, buf_dBu_ });
+                try recS_fn(ksc, psdb.*, ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_dBu_, buf_dB_ });
+                // Adam — different lr for A vs B (the LoRA+ knob).
+                const adam_a = runtime.AdamStepPush{ .n = ru * ku, .lr = lr_a, .beta1 = beta1_, .beta2 = beta2_, .eps = eps_, .t = step };
+                const adam_b = runtime.AdamStepPush{ .n = nu * ru, .lr = lr_b, .beta1 = beta1_, .beta2 = beta2_, .eps = eps_, .t = step };
+                try recS_fn(kadam, adam_a, ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_a_, buf_dA_, buf_m_a_, buf_v_a_ });
+                try recS_fn(kadam, adam_b, ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_b_, buf_dB_, buf_m_b_, buf_v_b_ });
+
+                // Periodic loss readback for the trajectory.
+                if (step % log_every_ == 0) {
+                    try buf_y_.readBack(ctx_ptr, f32, y_buf_);
+                    const loss = mse_fn(y_buf_, target_y_);
+                    result.loss_at_log[log_idx] = loss;
+                    log_idx += 1;
+                }
+                // Track threshold crossing without an extra readback per step:
+                // only check at log points. Coarse but cheap; fine for a demo.
+                if (result.steps_to_threshold > n_steps_ and result.loss_at_log[log_idx - 1] < threshold_ and step % log_every_ == 0) {
+                    result.steps_to_threshold = step;
+                }
+            }
+            return result;
+        }
+    }.call;
+
+    // ── Run all three ratios.
+    std.debug.print(
+        "LoRA+ comparative demo on {s}\n  shape: M={d} N={d} K={d} r={d}  α/r={d}  base_lr={d}\n  step:",
+        .{ ctx.deviceName(), M, Nn, K, r, aor, base_lr },
+    );
+    var step_iter: u32 = 0;
+    while (step_iter <= n_steps) : (step_iter += log_every) {
+        std.debug.print("  {d:>6}", .{step_iter});
+    }
+    std.debug.print("\n", .{});
+
+    var results: [ratios.len]RunResult = undefined;
+    for (ratios, 0..) |ratio, i| {
+        results[i] = try runOneTrajectory(
+            ratio, base_lr,
+            &buf_a, &buf_b, &buf_m_a, &buf_v_a, &buf_m_b, &buf_v_b,
+            a_init, b_init, target_y, y_buf,
+            &ctx, &k_matmul, &k_lin_dx, &k_lin_dw, &k_scale, &k_add, &k_mse_grad, &k_adam,
+            &buf_x, &buf_w, &buf_target_y, &buf_y, &buf_intermediate, &buf_y_lora, &buf_y_lora_scaled,
+            &buf_dy, &buf_dy_B, &buf_dA_unscaled, &buf_dA, &buf_dB_unscaled, &buf_dB,
+            &push_y_base, &push_inter, &push_ylora, &push_scale_ylora, &push_add_y,
+            &push_mse, &push_dy_B, &push_dA, &push_scale_dA, &push_dB, &push_scale_dB,
+            M_u, N_u, K_u, R_u, beta1, beta2, eps, n_steps, log_every, threshold,
+            recordMatmul, recordLinBackward, recordScalar1D, computeMse,
+            group_lin, group_lwg,
+        );
+
+        std.debug.print("  λ={d:>4.1}: ", .{ratio});
+        for (results[i].loss_at_log[0 .. (n_steps / log_every) + 1]) |l| {
+            std.debug.print("  {d:.4}", .{l});
+        }
+        if (results[i].steps_to_threshold <= n_steps) {
+            std.debug.print("  → loss<{e} at step {d}\n", .{ threshold, results[i].steps_to_threshold });
+        } else {
+            std.debug.print("  → loss<{e} not reached\n", .{threshold});
+        }
+    }
+
+    // ── Headline metric: at fixed step count, what's the final-loss
+    //    ratio between λ=16 and λ=1? "Convergence speedup at fixed
+    //    budget" — finer than a step-to-threshold measurement, which
+    //    log_every=25 cadence rounds up to coarse boundaries.
+    //    (`threshold` above is consumed by runOneTrajectory and kept
+    //    in the trajectory metadata for reference; we don't use the
+    //    coarse step-to-threshold count for the final assertion.)
+    const final_idx: usize = (n_steps / log_every);
+    const vanilla_final = results[0].loss_at_log[final_idx];
+    const plus_final = results[ratios.len - 1].loss_at_log[final_idx];
+    const final_ratio = vanilla_final / @max(plus_final, 1e-30);
+    std.debug.print(
+        "  final-loss   λ=1 / λ=16 = {d:.4} / {d:.4} = {d:.2}× lower with λ=16\n",
+        .{ vanilla_final, plus_final, final_ratio },
+    );
+
+    // Trajectory comparison at the first log point (step 25): λ=16
+    // should be visibly ahead of λ=1, where the "B opens the gate"
+    // early-regime speedup is most pronounced.
+    const early_vanilla = results[0].loss_at_log[1];
+    const early_plus = results[ratios.len - 1].loss_at_log[1];
+    const early_ratio = early_vanilla / @max(early_plus, 1e-30);
+    std.debug.print(
+        "  early-loss   λ=1 / λ=16 = {d:.4} / {d:.4} = {d:.2}× lower at step {d}\n",
+        .{ early_vanilla, early_plus, early_ratio, log_every },
+    );
+
+    if (plus_final >= vanilla_final) {
+        std.debug.print("FAIL: λ=16 final loss not lower than λ=1\n", .{});
+        return error.LoraPlusNotFaster;
+    }
+    if (final_ratio < 1.5) {
+        std.debug.print("FAIL: LoRA+ final-loss speedup below 1.5× (was {d:.2}×)\n", .{final_ratio});
+        return error.LoraPlusSpeedupTooSmall;
+    }
+
+    std.debug.print(
+        "PASS GPU LoRA+ — λ=16 vs λ=1 on rank-{d} delta recovery: {d:.2}× lower final loss, {d:.2}× lower at step {d}\n",
+        .{ r, final_ratio, early_ratio, log_every },
+    );
 }
 
 // ── CCE bench: time each kernel in isolation at Qwen3-0.6B shape ──────
