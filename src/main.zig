@@ -114,6 +114,21 @@ pub fn main() !void {
         try runGpuCceBackwardDwSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-train-step-smoke")) {
+        // β-5 end-to-end real-model train. Loads Qwen3-0.6B from HF cache,
+        // runs one Adam step, asserts CE_after < CE_before. The natural
+        // parity gate for the CCE wiring (chunk 4).
+        try runRealModelTrainStepSmoke(allocator);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--decoder-stack-train-smoke")) {
+        // 200-step synthetic-stack convergence smoke. Stronger trajectory
+        // gate than the one-step real-model smoke: asserts final/initial
+        // CE ratio < 1e-2 over 200 Adam steps. Tiny dims (dim=16, vocab=8)
+        // for fast iteration.
+        try runDecoderStackTrainGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
@@ -7612,12 +7627,7 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
     acts_cpu.token_ids = token_ids;
     cpu_train_decoder.stackForward(&stack, &acts_cpu);
     const initial_loss = cpu_train_decoder.softmaxCeLoss(acts_cpu.logits, target_ids, n_pos, vocab);
-
-    // One-hot target for the GPU CE loss-grad.
-    const target_one_hot = try allocator.alloc(f32, n_pos * vocab);
-    defer allocator.free(target_one_hot);
-    @memset(target_one_hot, 0);
-    for (target_ids, 0..) |tid, p| target_one_hot[p * vocab + @as(usize, tid)] = 1.0;
+    // CCE consumes target ids directly — no [n_pos × vocab] one-hot needed.
 
     // ── GPU bring-up via Runner.
     var ctx = try vk.Context.init(allocator);
@@ -7675,7 +7685,7 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
     const n_steps: u32 = 200;
     var step_t: u32 = 0;
     while (step_t < n_steps) : (step_t += 1) {
-        try runner.step(token_ids, target_one_hot);
+        try runner.step(token_ids, target_ids);
     }
 
     const logits_final = try allocator.alloc(f32, n_pos * vocab);
@@ -7819,10 +7829,7 @@ fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
     defer allocator.free(target_ids);
     for (target_ids) |*t| t.* = rng.intRangeLessThan(u32, 0, vocab);
 
-    const target_one_hot = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
-    defer allocator.free(target_one_hot);
-    @memset(target_one_hot, 0);
-    for (target_ids, 0..) |tid, p| target_one_hot[p * vocab + @as(usize, tid)] = 1.0;
+    // CCE takes target ids directly — no one-hot expansion.
 
     // ── GPU bring-up.
     var ctx = try vk.Context.init(allocator);
@@ -7869,7 +7876,7 @@ fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
     const t_start = std.time.nanoTimestamp();
     var step_t: u32 = 0;
     while (step_t < n_steps) : (step_t += 1) {
-        try runner.step(token_ids, target_one_hot);
+        try runner.step(token_ids, target_ids);
         if (step_t % 10 == 0 or step_t == n_steps - 1) {
             // Cheap heartbeat: forward + CE so we can watch the curve.
             try runner.forwardLogits(token_ids, logits_buf);
@@ -8376,13 +8383,8 @@ fn runRealModelTrainStepSmoke(allocator: std.mem.Allocator) !void {
     defer allocator.free(target_ids);
     try ds.batch(0, input_ids, target_ids);
 
-    // ── target_one_hot: trainer's CE-loss-grad shader expects this
-    //    shape (n_pos × vocab, sparse with a single 1 per row).
+    // CCE forward consumes target ids directly — no [n_pos × vocab] one-hot.
     const vocab: usize = cfg.vocab_size;
-    const target_one_hot = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
-    defer allocator.free(target_one_hot);
-    @memset(target_one_hot, 0);
-    for (target_ids, 0..) |tid, p| target_one_hot[p * vocab + @as(usize, tid)] = 1.0;
 
     // ── GPU bring-up + Runner.
     var ctx = try vk.Context.init(allocator);
@@ -8404,7 +8406,7 @@ fn runRealModelTrainStepSmoke(allocator: std.mem.Allocator) !void {
 
     // ── One Adam step on this single batch.
     const t_step_start = std.time.nanoTimestamp();
-    try runner.step(input_ids, target_one_hot);
+    try runner.step(input_ids, target_ids);
     const t_step_end = std.time.nanoTimestamp();
     const step_ms: f64 = @as(f64, @floatFromInt(t_step_end - t_step_start)) / 1.0e6;
 

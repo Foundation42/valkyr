@@ -109,7 +109,14 @@ pub const Runner = struct {
     k_add: pipeline.Kernel,
     k_lin_dx: pipeline.Kernel,
     k_lin_dw: pipeline.Kernel,
-    k_ce_loss_grad: pipeline.Kernel,
+    // CCE forward + backward replace the
+    // matmul(lm_head) → softmax_ce_loss_grad_batched_v2 → linear_backward_dx + linear_backward_dw
+    // chain. Memory wise: drops the [n_pos, vocab] logits + d_logits + one-hot
+    // target tensors, replacing them with a [n_pos] f32 lse cache + [n_pos]
+    // u32 target id buffer.
+    k_cce_forward: pipeline.Kernel,
+    k_cce_backward_dh: pipeline.Kernel,
+    k_cce_backward_dw: pipeline.Kernel,
     k_embed_bw: pipeline.Kernel,
     k_adam: pipeline.Kernel,
 
@@ -123,13 +130,17 @@ pub const Runner = struct {
 
     // ── Per-step host-uploadable inputs.
     buf_token_ids: buffer.Buffer, // dynamic, [n_pos] u32
-    buf_target_oh: buffer.Buffer, // dynamic, [n_pos, vocab] f32
+    buf_target_ids: buffer.Buffer, // dynamic, [n_pos] u32 — CCE replacement for target_oh
 
     // ── Stack-level activations + gradients.
     buf_x_emb: buffer.Buffer,
     buf_final_norm_out: buffer.Buffer,
+    // `buf_logits` is kept for `forwardLogits` (inference / CE measurement)
+    // but is *not* allocated/written in step()'s gradient path — CCE fuses
+    // the LM-head matmul into the loss kernel so logits never materialize.
     buf_logits: buffer.Buffer,
-    buf_d_logits: buffer.Buffer,
+    buf_lse: buffer.Buffer, // device-only, [n_pos] f32 — bridges cce_forward → cce_backward_*
+    buf_loss_per_row: buffer.Buffer, // device-only, [n_pos] f32 — host averages for total loss
     buf_d_final_norm_out: buffer.Buffer,
     buf_d_last_y: buffer.Buffer,
     buf_dw_lm_head: buffer.Buffer,
@@ -261,7 +272,7 @@ pub const Runner = struct {
     push_n_pos_dim: runtime.AddInPlacePush,
     push_swiglu: runtime.SwigluPush,
     push_softmax: runtime.SoftmaxPush,
-    push_ce: runtime.SoftmaxCeLossGradPush,
+    push_cce: runtime.CceForwardPush, // shape struct shared by cce_forward + cce_backward_{dh,dw}
     push_mm_q: runtime.MatmulPush,
     push_mm_k: runtime.MatmulPush,
     push_mm_v: runtime.MatmulPush,
@@ -370,10 +381,16 @@ pub const Runner = struct {
         errdefer k_lin_dx.deinit();
         var k_lin_dw = try pipeline.Kernel.init(ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
         errdefer k_lin_dw.deinit();
-        // v2: cooperative reduction over dim_out — works at vocab-scale
-        // (151 K+) where v1 silently early-returns (MAX_OUT cap of 1024).
-        var k_ce_loss_grad = try pipeline.Kernel.init(ctx, &shaders.softmax_ce_loss_grad_batched_v2, 3, @sizeOf(runtime.SoftmaxCeLossGradPush));
-        errdefer k_ce_loss_grad.deinit();
+        // CCE: fused LM-head matmul + online-softmax CE forward, plus split
+        // backward (d_h is row-major, dW is vocab-major — both atomic-free
+        // and bound to a [n_pos] u32 target buffer + [n_pos] f32 lse cache).
+        // See shaders/cce_*.comp + src/cpu/cce.zig for the math + parity.
+        var k_cce_forward = try pipeline.Kernel.init(ctx, &shaders.cce_forward, 5, @sizeOf(runtime.CceForwardPush));
+        errdefer k_cce_forward.deinit();
+        var k_cce_backward_dh = try pipeline.Kernel.init(ctx, &shaders.cce_backward_dh, 5, @sizeOf(runtime.CceBackwardPush));
+        errdefer k_cce_backward_dh.deinit();
+        var k_cce_backward_dw = try pipeline.Kernel.init(ctx, &shaders.cce_backward_dw, 5, @sizeOf(runtime.CceBackwardPush));
+        errdefer k_cce_backward_dw.deinit();
         var k_embed_bw = try pipeline.Kernel.init(ctx, &shaders.embedding_backward, 3, @sizeOf(runtime.EmbeddingBackwardPush));
         errdefer k_embed_bw.deinit();
         var k_adam = try pipeline.Kernel.init(ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
@@ -404,18 +421,22 @@ pub const Runner = struct {
         // ── Dynamic input buffers.
         const buf_token_ids = try buffer.Buffer.initDynamic(ctx, n_pos * @sizeOf(u32));
         errdefer @constCast(&buf_token_ids).deinit(ctx.device);
-        const buf_target_oh = try buffer.Buffer.initDynamic(ctx, n_pos * vocab * f32sz);
-        errdefer @constCast(&buf_target_oh).deinit(ctx.device);
+        const buf_target_ids = try buffer.Buffer.initDynamic(ctx, n_pos * @sizeOf(u32));
+        errdefer @constCast(&buf_target_ids).deinit(ctx.device);
 
         // ── Stack-level activation + grad buffers.
         const buf_x_emb = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&buf_x_emb).deinit(ctx.device);
         const buf_final_norm_out = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&buf_final_norm_out).deinit(ctx.device);
+        // `buf_logits` only used by `forwardLogits` — step()'s gradient
+        // path goes through cce_forward and never materializes logits.
         const buf_logits = try buffer.Buffer.initDeviceOnly(ctx, n_pos * vocab * f32sz);
         errdefer @constCast(&buf_logits).deinit(ctx.device);
-        const buf_d_logits = try buffer.Buffer.initDeviceOnly(ctx, n_pos * vocab * f32sz);
-        errdefer @constCast(&buf_d_logits).deinit(ctx.device);
+        const buf_lse = try buffer.Buffer.initDeviceOnly(ctx, n_pos * f32sz);
+        errdefer @constCast(&buf_lse).deinit(ctx.device);
+        const buf_loss_per_row = try buffer.Buffer.initDeviceOnly(ctx, n_pos * f32sz);
+        errdefer @constCast(&buf_loss_per_row).deinit(ctx.device);
         const buf_d_final_norm_out = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&buf_d_final_norm_out).deinit(ctx.device);
         const buf_d_last_y = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
@@ -521,7 +542,7 @@ pub const Runner = struct {
         const push_n_pos_dim = runtime.AddInPlacePush{ .n = cfg.n_pos * cfg.dim };
         const push_swiglu = runtime.SwigluPush{ .n = cfg.n_pos * cfg.ff_dim };
         const push_softmax = runtime.SoftmaxPush{ .dim = cfg.n_pos, .stride = cfg.n_pos };
-        const push_ce = runtime.SoftmaxCeLossGradPush{ .dim_out = cfg.vocab_size, .n_samples = cfg.n_pos };
+        const push_cce = runtime.CceForwardPush{ .n_samples = cfg.n_pos, .vocab = cfg.vocab_size, .dim = cfg.dim };
         const push_mm_q = runtime.MatmulPush{ .m = cfg.n_pos, .n = @intCast(q_dim), .k = cfg.dim };
         const push_mm_k = runtime.MatmulPush{ .m = cfg.n_pos, .n = @intCast(kv_dim), .k = cfg.dim };
         const push_mm_v = runtime.MatmulPush{ .m = cfg.n_pos, .n = @intCast(kv_dim), .k = cfg.dim };
@@ -646,7 +667,9 @@ pub const Runner = struct {
             .k_add = k_add,
             .k_lin_dx = k_lin_dx,
             .k_lin_dw = k_lin_dw,
-            .k_ce_loss_grad = k_ce_loss_grad,
+            .k_cce_forward = k_cce_forward,
+            .k_cce_backward_dh = k_cce_backward_dh,
+            .k_cce_backward_dw = k_cce_backward_dw,
             .k_embed_bw = k_embed_bw,
             .k_adam = k_adam,
             .rec = rec,
@@ -654,11 +677,12 @@ pub const Runner = struct {
             .buf_w_final_norm = buf_w_final_norm,
             .buf_w_lm_head = buf_w_lm_head,
             .buf_token_ids = buf_token_ids,
-            .buf_target_oh = buf_target_oh,
+            .buf_target_ids = buf_target_ids,
             .buf_x_emb = buf_x_emb,
             .buf_final_norm_out = buf_final_norm_out,
             .buf_logits = buf_logits,
-            .buf_d_logits = buf_d_logits,
+            .buf_lse = buf_lse,
+            .buf_loss_per_row = buf_loss_per_row,
             .buf_d_final_norm_out = buf_d_final_norm_out,
             .buf_d_last_y = buf_d_last_y,
             .buf_dw_lm_head = buf_dw_lm_head,
@@ -765,7 +789,7 @@ pub const Runner = struct {
             .push_n_pos_dim = push_n_pos_dim,
             .push_swiglu = push_swiglu,
             .push_softmax = push_softmax,
-            .push_ce = push_ce,
+            .push_cce = push_cce,
             .push_mm_q = push_mm_q,
             .push_mm_k = push_mm_k,
             .push_mm_v = push_mm_v,
@@ -804,11 +828,12 @@ pub const Runner = struct {
         self.buf_w_final_norm.deinit(dev);
         self.buf_w_lm_head.deinit(dev);
         self.buf_token_ids.deinit(dev);
-        self.buf_target_oh.deinit(dev);
+        self.buf_target_ids.deinit(dev);
         self.buf_x_emb.deinit(dev);
         self.buf_final_norm_out.deinit(dev);
         self.buf_logits.deinit(dev);
-        self.buf_d_logits.deinit(dev);
+        self.buf_lse.deinit(dev);
+        self.buf_loss_per_row.deinit(dev);
         self.buf_d_final_norm_out.deinit(dev);
         self.buf_d_last_y.deinit(dev);
         self.buf_dw_lm_head.deinit(dev);
@@ -902,23 +927,30 @@ pub const Runner = struct {
         self.k_add.deinit();
         self.k_lin_dx.deinit();
         self.k_lin_dw.deinit();
-        self.k_ce_loss_grad.deinit();
+        self.k_cce_forward.deinit();
+        self.k_cce_backward_dh.deinit();
+        self.k_cce_backward_dw.deinit();
         self.k_embed_bw.deinit();
         self.k_adam.deinit();
         self.rec.deinit();
     }
 
-    /// One Adam training step. `token_ids` length must equal cfg.n_pos.
-    /// `target_one_hot` is the [n_pos, vocab] one-hot label distribution
-    /// (or any soft target — the loss is softmax-CE either way).
-    /// Increments `step_t`.
-    pub fn step(self: *Runner, token_ids: []const u32, target_one_hot: []const f32) !void {
+    /// One Adam training step. `token_ids` and `target_ids` length must
+    /// each equal cfg.n_pos. `target_ids[p]` is the gold next-token id at
+    /// position p — the CCE forward kernel handles the implicit one-hot
+    /// without ever materializing it. Increments `step_t`.
+    pub fn step(self: *Runner, token_ids: []const u32, target_ids: []const u32) !void {
         const cfg = self.cfg;
         if (token_ids.len != cfg.n_pos) return error.TokenIdsLen;
-        if (target_one_hot.len != @as(usize, cfg.n_pos) * cfg.vocab_size) return error.TargetLen;
+        if (target_ids.len != cfg.n_pos) return error.TargetLen;
 
         self.buf_token_ids.update(u32, token_ids);
-        self.buf_target_oh.update(f32, target_one_hot);
+        self.buf_target_ids.update(u32, target_ids);
+
+        // CCE backward dW accumulates (matches embedding_backward, linearBackward
+        // dW), so reset between steps. The other accumulating buffer
+        // (buf_dE_embed) is zeroed in Phase 2 below.
+        try self.buf_dw_lm_head.fillZero(self.ctx);
 
         // ── Phase 1: forward + loss-grad + per-layer backward.
         try self.rec.reset();
@@ -1099,20 +1131,20 @@ pub const Runner = struct {
             1,
             1,
         );
+        // CCE forward: one workgroup per row, fuses h · W_lm^T with
+        // chunked online-softmax CE. No [n_pos, vocab] logit tensor;
+        // outputs are [n_pos] f32 lse (cached for backward) and
+        // [n_pos] f32 per-row loss (host averages for total loss).
         try self.rec.dispatch(
-            &self.k_matmul,
-            &.{ &self.buf_final_norm_out, &self.buf_w_lm_head, &self.buf_logits },
-            &self.push_mm_lm_head,
-            cfg.n_pos * cfg.vocab_size,
-            1,
-            1,
-        );
-        // v2: one workgroup per sample (n_pos workgroups), 256 threads
-        // cooperatively reduce over vocab.
-        try self.rec.dispatch(
-            &self.k_ce_loss_grad,
-            &.{ &self.buf_logits, &self.buf_target_oh, &self.buf_d_logits },
-            &self.push_ce,
+            &self.k_cce_forward,
+            &.{
+                &self.buf_final_norm_out,
+                &self.buf_w_lm_head,
+                &self.buf_target_ids,
+                &self.buf_lse,
+                &self.buf_loss_per_row,
+            },
+            &self.push_cce,
             cfg.n_pos,
             1,
             1,
@@ -1120,21 +1152,40 @@ pub const Runner = struct {
     }
 
     fn recordHeadBackward(self: *Runner) !void {
-        // lm_head dx + dW.
+        const cfg = self.cfg;
+        // CCE backward d_h: one WG per row, recomputes z_chunk on the fly,
+        // derives dz from cached lse, accumulates d_final_norm_out without
+        // ever materializing d_logits. Output is overwritten (no fillZero
+        // required).
         try self.rec.dispatch(
-            &self.k_lin_dx,
-            &.{ &self.buf_d_logits, &self.buf_w_lm_head, &self.buf_d_final_norm_out },
-            &self.push_lin_lm_head,
-            ceilDiv(self.push_lin_lm_head.M, group_lwg),
-            ceilDiv(self.push_lin_lm_head.K, group_lwg),
+            &self.k_cce_backward_dh,
+            &.{
+                &self.buf_final_norm_out,
+                &self.buf_w_lm_head,
+                &self.buf_target_ids,
+                &self.buf_lse,
+                &self.buf_d_final_norm_out,
+            },
+            &self.push_cce,
+            cfg.n_pos,
+            1,
             1,
         );
+        // CCE backward dW: one WG per vocab entry (mirrors embedding_backward's
+        // vocab-major no-atomic layout). Loops over rows internally, accumulates
+        // into buf_dw_lm_head — caller zeroes via fillZero at top of step().
         try self.rec.dispatch(
-            &self.k_lin_dw,
-            &.{ &self.buf_d_logits, &self.buf_final_norm_out, &self.buf_dw_lm_head },
-            &self.push_lin_lm_head,
-            ceilDiv(self.push_lin_lm_head.N, group_lwg),
-            ceilDiv(self.push_lin_lm_head.K, group_lwg),
+            &self.k_cce_backward_dw,
+            &.{
+                &self.buf_final_norm_out,
+                &self.buf_w_lm_head,
+                &self.buf_target_ids,
+                &self.buf_lse,
+                &self.buf_dw_lm_head,
+            },
+            &self.push_cce,
+            cfg.vocab_size,
+            1,
             1,
         );
         // final RMSNorm backward.
