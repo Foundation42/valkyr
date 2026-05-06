@@ -644,6 +644,7 @@ pub fn main() !void {
     try runGpuSigmoidMulSmoke(allocator);
     try runSwiGluCpuSmoke(allocator);
     try runGpuSwiGluSmoke(allocator);
+    try runGpuRopeBatchedSmoke(allocator);
     try runGpuL2normPerHeadSmoke(allocator);
     try runGpuConv1dUpdateSmoke(allocator);
     try runGpuRmsnormGatedSmoke(allocator);
@@ -7104,6 +7105,7 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
             .n_pos = 4,
             .rms_eps = 1e-5,
             .causal = true,
+            .rotary_dim = 8, // full RoPE (rotary_dim = head_dim)
         },
         .n_layers = 2,
         .vocab_size = 8,
@@ -7241,6 +7243,8 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
             .vocab_size = @intCast(vocab),
             .rms_eps = cfg.base.rms_eps,
             .causal = cfg.base.causal,
+            .rotary_dim = @intCast(cfg.base.rotary_dim),
+            .rope_theta = cfg.base.rope_theta,
             .lr = 1e-2,
         },
         .{
@@ -7272,9 +7276,12 @@ fn runDecoderStackTrainGpuSmoke(allocator: std.mem.Allocator) !void {
         return error.LossDidNotDecrease;
     }
 
+    // Per-layer dispatches: 51 baseline (β-3a-2 SwiGLU stack) + 4 when
+    // RoPE is enabled (2 fwd + 2 bw across Q + K).
+    const per_layer_dispatches: usize = if (cfg.base.rotary_dim > 0) 55 else 51;
     std.debug.print(
         "PASS GPU decoder stack fine-tune via Runner (n_layers={d} dim={d} vocab={d} n_pos={d}; CE loss {d:.6} → {d:.6} ({e:.2}× drop) over {d} Adam steps, {d} dispatches/step)\n",
-        .{ cfg.n_layers, dim, vocab, n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps, 11 + 51 * cfg.n_layers },
+        .{ cfg.n_layers, dim, vocab, n_pos, initial_loss, final_loss, 1.0 / ratio, n_steps, 11 + per_layer_dispatches * cfg.n_layers },
     );
 }
 
@@ -7408,6 +7415,7 @@ fn runDecoderStackTrainGpuRealShapeSmoke(allocator: std.mem.Allocator) !void {
             .n_pos = n_pos,
             .n_layers = n_layers,
             .vocab_size = vocab,
+            .rotary_dim = head_dim, // full RoPE
             // Same lr as the toy 8c-α-3 smoke (1e-2). Single-batch
             // overfit is the regime we're in, not pre-training.
             .lr = 1e-2,
@@ -8068,6 +8076,128 @@ fn runGpuSwiGluSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU SwiGLU forward + backward (n={d}, fwd max |Δ| = {e}, bw max |Δ| = {e})\n",
         .{ n, max_fwd, max_bw },
+    );
+}
+
+// ── chunk 8c-β-3a-3: batched RoPE primitive parity ──────────────────
+//
+// Tests the new `rope_partial_batched.comp` + `rope_backward_batched.comp`
+// shaders against the CPU `ropeForwardBatched` / `ropeBackwardBatched`
+// helpers. Operates over [n_pos, n_heads, head_dim] in one dispatch
+// each. Setting rotary_dim < head_dim exercises the partial-rotation
+// path (Qwen3.5-style); we run with rotary_dim = head_dim (full RoPE).
+
+fn runGpuRopeBatchedSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_pos: usize = 4;
+    const n_heads: usize = 2;
+    const head_dim: usize = 8;
+    const rotary_dim: usize = head_dim;
+    const theta_base: f32 = 10_000.0;
+    const total = n_pos * n_heads * head_dim;
+
+    const x = try allocator.alloc(f32, total);
+    defer allocator.free(x);
+    var prng = std.Random.DefaultPrng.init(0xCAFE_B0_BE);
+    const rng = prng.random();
+    for (x) |*v| v.* = rng.float(f32) * 2.0 - 1.0;
+
+    const cpu_y = try allocator.alloc(f32, total);
+    defer allocator.free(cpu_y);
+    try cpu_train_transformer.ropeForwardBatched(cpu_y, x, n_pos, n_heads, head_dim, rotary_dim, theta_base);
+
+    const dy = try allocator.alloc(f32, total);
+    defer allocator.free(dy);
+    for (dy) |*v| v.* = rng.float(f32) * 2.0 - 1.0;
+
+    const cpu_dx = try allocator.alloc(f32, total);
+    defer allocator.free(cpu_dx);
+    try cpu_train_transformer.ropeBackwardBatched(cpu_dx, dy, n_pos, n_heads, head_dim, rotary_dim, theta_base);
+
+    // GPU forward.
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, x);
+    defer buf_x.deinit(ctx.device);
+    var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
+    defer buf_y.deinit(ctx.device);
+    var k_fwd = try pipeline.Kernel.init(&ctx, &shaders.rope_partial_batched, 2, @sizeOf(runtime.RopeBatchedPush));
+    defer k_fwd.deinit();
+    try k_fwd.bind(&.{ &buf_x, &buf_y });
+    const push = runtime.RopeBatchedPush{
+        .n_pos = @intCast(n_pos),
+        .n_heads = @intCast(n_heads),
+        .head_dim = @intCast(head_dim),
+        .rotary_dim = @intCast(rotary_dim),
+        .theta_base = theta_base,
+    };
+    const local: u32 = 256;
+    const groups: u32 = (@as(u32, @intCast(total)) + local - 1) / local;
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.RopeBatchedPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &k_fwd, .push = &push, .groups = groups });
+    const gpu_y = try allocator.alloc(f32, total);
+    defer allocator.free(gpu_y);
+    try buf_y.readBack(&ctx, f32, gpu_y);
+
+    var max_fwd: f32 = 0;
+    for (gpu_y, cpu_y) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_fwd) max_fwd = d;
+    }
+    if (max_fwd > 1e-5) {
+        std.debug.print("RoPE batched fwd: max |Δ| = {e}\n", .{max_fwd});
+        return error.ParityFailed;
+    }
+
+    // GPU backward.
+    var buf_dy = try buffer.Buffer.initStatic(&ctx, f32, dy);
+    defer buf_dy.deinit(ctx.device);
+    var buf_dx = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
+    defer buf_dx.deinit(ctx.device);
+    var k_bw = try pipeline.Kernel.init(&ctx, &shaders.rope_backward_batched, 2, @sizeOf(runtime.RopeBatchedPush));
+    defer k_bw.deinit();
+    try k_bw.bind(&.{ &buf_dy, &buf_dx });
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.RopeBatchedPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &k_bw, .push = &push, .groups = groups });
+    const gpu_dx = try allocator.alloc(f32, total);
+    defer allocator.free(gpu_dx);
+    try buf_dx.readBack(&ctx, f32, gpu_dx);
+
+    var max_bw: f32 = 0;
+    for (gpu_dx, cpu_dx) |g, c| {
+        const d = @abs(g - c);
+        if (d > max_bw) max_bw = d;
+    }
+    if (max_bw > 1e-5) {
+        std.debug.print("RoPE batched bw: max |Δ| = {e}\n", .{max_bw});
+        return error.ParityFailed;
+    }
+
+    // Round-trip: rope_bw(rope_fwd(x)) ≈ x.
+    var max_rt: f32 = 0;
+    const rt_dx = try allocator.alloc(f32, total);
+    defer allocator.free(rt_dx);
+    try cpu_train_transformer.ropeBackwardBatched(rt_dx, cpu_y, n_pos, n_heads, head_dim, rotary_dim, theta_base);
+    for (rt_dx, x) |a, b| {
+        const d = @abs(a - b);
+        if (d > max_rt) max_rt = d;
+    }
+
+    std.debug.print(
+        "PASS GPU RoPE batched fwd + bw (n_pos={d} n_heads={d} head_dim={d}; fwd |Δ|={e}, bw |Δ|={e}, round-trip |Δ|={e})\n",
+        .{ n_pos, n_heads, head_dim, max_fwd, max_bw, max_rt },
     );
 }
 

@@ -36,6 +36,12 @@ pub const Config = struct {
     vocab_size: u32,
     rms_eps: f32 = 1e-5,
     causal: bool = true,
+    /// RoPE rotation dim. 0 disables RoPE; `head_dim` gives full RoPE;
+    /// smaller gives partial (Qwen3.5-style). Forward-pass RoPE applies
+    /// to Q + K post-projection; backward inverts the rotation on the
+    /// gradients before the linear-backward of W_q / W_k.
+    rotary_dim: u32 = 0,
+    rope_theta: f32 = 10_000.0,
     /// Adam learning rate. Sensible default for the toy 8c-α-3 demo:
     /// 1e-2. Mutable across steps; write `runner.lr` between ticks
     /// for schedules.
@@ -88,6 +94,8 @@ pub const Runner = struct {
     k_attn_dk: pipeline.Kernel,
     k_swiglu_fwd: pipeline.Kernel,
     k_swiglu_bw: pipeline.Kernel,
+    k_rope_fwd: pipeline.Kernel,
+    k_rope_bw: pipeline.Kernel,
     k_vec_add: pipeline.Kernel,
     k_add: pipeline.Kernel,
     k_lin_dx: pipeline.Kernel,
@@ -194,6 +202,10 @@ pub const Runner = struct {
     sc_scores: buffer.Buffer,
     sc_o: buffer.Buffer,
     sc_ff_out: buffer.Buffer,
+    sc_q_pre: buffer.Buffer, // pre-RoPE Q (matmul output, RoPE input)
+    sc_k_pre: buffer.Buffer, // pre-RoPE K
+    sc_dQ_pre: buffer.Buffer, // pre-RoPE dQ (RoPE-bw output, lin-bw input)
+    sc_dK_pre: buffer.Buffer, // pre-RoPE dK
     sc_d_gated: buffer.Buffer,
     sc_d_pre_gate: buffer.Buffer,
     sc_d_up_grad: buffer.Buffer,
@@ -233,6 +245,8 @@ pub const Runner = struct {
     push_mm_lm_head: runtime.MatmulPush,
     push_attn_scores: runtime.AttnScoresTrainPush,
     push_attn_output: runtime.AttnOutputTrainPush,
+    push_rope_q: runtime.RopeBatchedPush,
+    push_rope_k: runtime.RopeBatchedPush,
     push_lin_lm_head: runtime.LinearBatchedPush,
     push_lin_down: runtime.LinearBatchedPush,
     push_lin_gate: runtime.LinearBatchedPush,
@@ -312,6 +326,10 @@ pub const Runner = struct {
         errdefer k_swiglu_fwd.deinit();
         var k_swiglu_bw = try pipeline.Kernel.init(ctx, &shaders.swiglu_backward, 5, @sizeOf(runtime.SwigluPush));
         errdefer k_swiglu_bw.deinit();
+        var k_rope_fwd = try pipeline.Kernel.init(ctx, &shaders.rope_partial_batched, 2, @sizeOf(runtime.RopeBatchedPush));
+        errdefer k_rope_fwd.deinit();
+        var k_rope_bw = try pipeline.Kernel.init(ctx, &shaders.rope_backward_batched, 2, @sizeOf(runtime.RopeBatchedPush));
+        errdefer k_rope_bw.deinit();
         var k_vec_add = try pipeline.Kernel.init(ctx, &shaders.vec_add, 3, @sizeOf(runtime.AddInPlacePush));
         errdefer k_vec_add.deinit();
         var k_add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
@@ -335,10 +353,11 @@ pub const Runner = struct {
         //    phase is 8N+3, embed_bw phase is 1. Size for phase-1 with
         //    headroom; descriptors ≤ 5 per dispatch.
         // Phase-1 (forward+loss-grad+backward) per-layer dispatch is
-        //   forward 15 + backward 27 = 42 per layer.
+        //   forward 15 (+2 RoPE if enabled) + backward 27 (+2 RoPE if
+        //   enabled) = 42 to 46 per layer.
         // Plus 9 stack-level (embed + final_norm + lm_head + ce + lm_dx +
-        // lm_dw + final_norm_bw + 2 spare). Headroom: 32 + 42·N.
-        const phase1_dispatches: u32 = 32 + 42 * cfg.n_layers;
+        // lm_dw + final_norm_bw + 2 spare). Headroom: 32 + 46·N.
+        const phase1_dispatches: u32 = 32 + 46 * cfg.n_layers;
         var rec = try recorder_mod.Recorder.init(ctx, phase1_dispatches, 8 * phase1_dispatches);
         errdefer rec.deinit();
 
@@ -410,6 +429,14 @@ pub const Runner = struct {
         errdefer @constCast(&sc_o).deinit(ctx.device);
         const sc_ff_out = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&sc_ff_out).deinit(ctx.device);
+        const sc_q_pre = try buffer.Buffer.initDeviceOnly(ctx, n_pos * q_dim * f32sz);
+        errdefer @constCast(&sc_q_pre).deinit(ctx.device);
+        const sc_k_pre = try buffer.Buffer.initDeviceOnly(ctx, n_pos * kv_dim * f32sz);
+        errdefer @constCast(&sc_k_pre).deinit(ctx.device);
+        const sc_dQ_pre = try buffer.Buffer.initDeviceOnly(ctx, n_pos * q_dim * f32sz);
+        errdefer @constCast(&sc_dQ_pre).deinit(ctx.device);
+        const sc_dK_pre = try buffer.Buffer.initDeviceOnly(ctx, n_pos * kv_dim * f32sz);
+        errdefer @constCast(&sc_dK_pre).deinit(ctx.device);
         const sc_d_gated = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
         errdefer @constCast(&sc_d_gated).deinit(ctx.device);
         const sc_d_pre_gate = try buffer.Buffer.initDeviceOnly(ctx, n_pos * ff_dim * f32sz);
@@ -482,6 +509,20 @@ pub const Runner = struct {
             .kv_stride = @intCast(kv_dim),
             .attn_stride = cfg.n_pos,
         };
+        const push_rope_q = runtime.RopeBatchedPush{
+            .n_pos = cfg.n_pos,
+            .n_heads = cfg.n_heads,
+            .head_dim = cfg.head_dim,
+            .rotary_dim = cfg.rotary_dim,
+            .theta_base = cfg.rope_theta,
+        };
+        const push_rope_k = runtime.RopeBatchedPush{
+            .n_pos = cfg.n_pos,
+            .n_heads = cfg.n_kv_heads,
+            .head_dim = cfg.head_dim,
+            .rotary_dim = cfg.rotary_dim,
+            .theta_base = cfg.rope_theta,
+        };
         const push_lin_lm_head = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.vocab_size, .K = cfg.dim };
         const push_lin_down = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.dim, .K = cfg.ff_dim };
         const push_lin_gate = runtime.LinearBatchedPush{ .M = cfg.n_pos, .N = cfg.ff_dim, .K = cfg.dim };
@@ -553,6 +594,8 @@ pub const Runner = struct {
             .k_attn_dk = k_attn_dk,
             .k_swiglu_fwd = k_swiglu_fwd,
             .k_swiglu_bw = k_swiglu_bw,
+            .k_rope_fwd = k_rope_fwd,
+            .k_rope_bw = k_rope_bw,
             .k_vec_add = k_vec_add,
             .k_add = k_add,
             .k_lin_dx = k_lin_dx,
@@ -636,6 +679,10 @@ pub const Runner = struct {
             .sc_scores = sc_scores,
             .sc_o = sc_o,
             .sc_ff_out = sc_ff_out,
+            .sc_q_pre = sc_q_pre,
+            .sc_k_pre = sc_k_pre,
+            .sc_dQ_pre = sc_dQ_pre,
+            .sc_dK_pre = sc_dK_pre,
             .sc_d_gated = sc_d_gated,
             .sc_d_pre_gate = sc_d_pre_gate,
             .sc_d_up_grad = sc_d_up_grad,
@@ -669,6 +716,8 @@ pub const Runner = struct {
             .push_mm_lm_head = push_mm_lm_head,
             .push_attn_scores = push_attn_scores,
             .push_attn_output = push_attn_output,
+            .push_rope_q = push_rope_q,
+            .push_rope_k = push_rope_k,
             .push_lin_lm_head = push_lin_lm_head,
             .push_lin_down = push_lin_down,
             .push_lin_gate = push_lin_gate,
@@ -741,6 +790,10 @@ pub const Runner = struct {
         self.sc_scores.deinit(dev);
         self.sc_o.deinit(dev);
         self.sc_ff_out.deinit(dev);
+        self.sc_q_pre.deinit(dev);
+        self.sc_k_pre.deinit(dev);
+        self.sc_dQ_pre.deinit(dev);
+        self.sc_dK_pre.deinit(dev);
         self.sc_d_gated.deinit(dev);
         self.sc_d_pre_gate.deinit(dev);
         self.sc_d_up_grad.deinit(dev);
@@ -775,6 +828,8 @@ pub const Runner = struct {
         self.k_attn_dk.deinit();
         self.k_swiglu_fwd.deinit();
         self.k_swiglu_bw.deinit();
+        self.k_rope_fwd.deinit();
+        self.k_rope_bw.deinit();
         self.k_vec_add.deinit();
         self.k_add.deinit();
         self.k_lin_dx.deinit();
@@ -898,10 +953,21 @@ pub const Runner = struct {
 
         // 1. RMSNorm n1.
         try self.rec.dispatch(&self.k_rms, &.{ x_in_buf, &self.buf_w_n1[i], &self.buf_n1[i] }, &self.push_rms, cfg.n_pos, 1, 1);
-        // 2-4. Q/K/V.
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_q[i], &self.buf_q[i] }, &self.push_mm_q, cfg.n_pos * self.push_mm_q.n, 1, 1);
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_k[i], &self.buf_k[i] }, &self.push_mm_k, cfg.n_pos * self.push_mm_k.n, 1, 1);
+        // 2-4. Q/K/V matmuls. When RoPE is enabled, Q + K go to scratch
+        // (sc_q_pre, sc_k_pre) then a RoPE dispatch lands the rotated
+        // result in the saved buf_q[i] / buf_k[i]. With rotary_dim == 0
+        // RoPE is skipped and we matmul straight into the saved buf.
+        const q_dst: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_q_pre else &self.buf_q[i];
+        const k_dst: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_k_pre else &self.buf_k[i];
+        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_q[i], q_dst }, &self.push_mm_q, cfg.n_pos * self.push_mm_q.n, 1, 1);
+        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_k[i], k_dst }, &self.push_mm_k, cfg.n_pos * self.push_mm_k.n, 1, 1);
         try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_v[i], &self.buf_v[i] }, &self.push_mm_v, cfg.n_pos * self.push_mm_v.n, 1, 1);
+        if (cfg.rotary_dim > 0) {
+            const q_total: u32 = cfg.n_pos * cfg.n_heads * cfg.head_dim;
+            const k_total: u32 = cfg.n_pos * cfg.n_kv_heads * cfg.head_dim;
+            try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_q_pre, &self.buf_q[i] }, &self.push_rope_q, ceilDiv(q_total, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_k_pre, &self.buf_k[i] }, &self.push_rope_k, ceilDiv(k_total, group_lin), 1, 1);
+        }
         // 5. attention scores (causal mask via -inf).
         try self.rec.dispatch(&self.k_attn_scores, &.{ &self.buf_q[i], &self.buf_k[i], &self.sc_scores }, &self.push_attn_scores, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
         // 6. softmax.
@@ -1025,12 +1091,26 @@ pub const Runner = struct {
         try self.rec.dispatch(&self.k_softmax_bw, &.{ &self.sc_d_attn, &self.buf_attn[i], &self.sc_d_scores }, &self.push_softmax, cfg.n_pos * cfg.n_heads, 1, 1);
         try self.rec.dispatch(&self.k_attn_dq, &.{ &self.sc_d_scores, &self.buf_k[i], &self.sc_dQ }, &self.push_dq, cfg.n_pos * cfg.n_heads * cfg.head_dim, 1, 1);
         try self.rec.dispatch(&self.k_attn_dk, &.{ &self.sc_d_scores, &self.buf_q[i], &self.sc_dK }, &self.push_dk, cfg.n_pos * cfg.n_kv_heads * cfg.head_dim, 1, 1);
+
+        // RoPE backward: the dQ / dK from SDPA are gradients of the
+        // post-RoPE Q / K. Inverting the rotation lands them as
+        // gradients of the pre-RoPE Q / K, which is what the linear
+        // backward of W_q / W_k expects.
+        const dQ_lin: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_dQ_pre else &self.sc_dQ;
+        const dK_lin: *const buffer.Buffer = if (cfg.rotary_dim > 0) &self.sc_dK_pre else &self.sc_dK;
+        if (cfg.rotary_dim > 0) {
+            const q_total: u32 = cfg.n_pos * cfg.n_heads * cfg.head_dim;
+            const k_total: u32 = cfg.n_pos * cfg.n_kv_heads * cfg.head_dim;
+            try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dQ, &self.sc_dQ_pre }, &self.push_rope_q, ceilDiv(q_total, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dK, &self.sc_dK_pre }, &self.push_rope_k, ceilDiv(k_total, group_lin), 1, 1);
+        }
+
         // Q proj. Writes directly into sc_d_n1 (saves an add_in_place).
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_dQ, &self.buf_w_q[i], &self.sc_d_n1 }, &self.push_lin_q, ceilDiv(self.push_lin_q.M, group_lwg), ceilDiv(self.push_lin_q.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_dQ, &self.buf_n1[i], &self.buf_dw_q[i] }, &self.push_lin_q, ceilDiv(self.push_lin_q.N, group_lwg), ceilDiv(self.push_lin_q.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ dQ_lin, &self.buf_w_q[i], &self.sc_d_n1 }, &self.push_lin_q, ceilDiv(self.push_lin_q.M, group_lwg), ceilDiv(self.push_lin_q.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ dQ_lin, &self.buf_n1[i], &self.buf_dw_q[i] }, &self.push_lin_q, ceilDiv(self.push_lin_q.N, group_lwg), ceilDiv(self.push_lin_q.K, group_lwg), 1);
         // K proj + accumulate into d_n1.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_dK, &self.buf_w_k[i], &self.sc_d_n1_k }, &self.push_lin_k, ceilDiv(self.push_lin_k.M, group_lwg), ceilDiv(self.push_lin_k.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_dK, &self.buf_n1[i], &self.buf_dw_k[i] }, &self.push_lin_k, ceilDiv(self.push_lin_k.N, group_lwg), ceilDiv(self.push_lin_k.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ dK_lin, &self.buf_w_k[i], &self.sc_d_n1_k }, &self.push_lin_k, ceilDiv(self.push_lin_k.M, group_lwg), ceilDiv(self.push_lin_k.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ dK_lin, &self.buf_n1[i], &self.buf_dw_k[i] }, &self.push_lin_k, ceilDiv(self.push_lin_k.N, group_lwg), ceilDiv(self.push_lin_k.K, group_lwg), 1);
         try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n1, &self.sc_d_n1_k }, &self.push_n_pos_dim, add_groups, 1, 1);
         // V proj + accumulate into d_n1.
         try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_dV, &self.buf_w_v[i], &self.sc_d_n1_v }, &self.push_lin_v, ceilDiv(self.push_lin_v.M, group_lwg), ceilDiv(self.push_lin_v.K, group_lwg), 1);

@@ -1,0 +1,62 @@
+#version 460
+// Batched partial-rotation RoPE: applies the same rotation primitive as
+// `rope_partial.comp` but across `n_pos` query positions in one dispatch.
+// Position for row `p` is just `p` (training-style absolute positioning,
+// 0-indexed from the start of the sequence).
+//
+// Layout per row: [n_heads, head_dim] (matching `applyRopePartial`'s
+// input convention). Total elements per row = n_heads * head_dim.
+//
+// One thread per output element across the whole [n_pos, n_heads, head_dim]
+// tensor. Thread index decodes to (p, h, i) where i ∈ [0, head_dim).
+//
+// Setting `rotary_dim = head_dim` gives full RoPE; smaller `rotary_dim`
+// gives a Qwen3.5-style partial rotation with the trailing tail passing
+// through unchanged.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_pos;
+    uint n_heads;
+    uint head_dim;
+    uint rotary_dim;
+    float theta_base;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint head_total = pc.n_heads * pc.head_dim;
+    uint total = pc.n_pos * head_total;
+    if (g >= total) return;
+
+    uint p = g / head_total;
+    uint within = g - p * head_total;
+    uint i = within % pc.head_dim;
+
+    // Pass-through tail.
+    if (i >= pc.rotary_dim) {
+        out_v[g] = in_v[g];
+        return;
+    }
+
+    uint half_r = pc.rotary_dim / 2;
+    uint freq_idx = (i < half_r) ? i : (i - half_r);
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
+    float angle = float(p) * freq;
+    float c_a = cos(angle);
+    float s_a = sin(angle);
+
+    if (i < half_r) {
+        float a = in_v[g];
+        float b = in_v[g + half_r];
+        out_v[g] = a * c_a - b * s_a;
+    } else {
+        float a = in_v[g - half_r];
+        float b = in_v[g];
+        out_v[g] = a * s_a + b * c_a;
+    }
+}

@@ -195,6 +195,17 @@ pub const MseLossGradPush = extern struct { n: u32 };
 /// elementwise over `n` output values; same push struct serves both.
 pub const SwigluPush = extern struct { n: u32 };
 
+/// Batched RoPE (forward + backward share this struct). One dispatch
+/// covers `n_pos` rows of `[n_heads, head_dim]`. Setting `rotary_dim
+/// = head_dim` gives full RoPE; smaller gives Qwen3.5-style partial.
+pub const RopeBatchedPush = extern struct {
+    n_pos: u32,
+    n_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    theta_base: f32,
+};
+
 /// Scaled MSE loss gradient. Bakes the (2/N) factor into the kernel
 /// so the transformer-training side doesn't need a follow-up scale.
 pub const MseLossGradScaledPush = extern struct { n: u32, scale: f32 };

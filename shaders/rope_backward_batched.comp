@@ -1,0 +1,61 @@
+#version 460
+// Batched RoPE backward: inverse rotation (rotation by -angle) across
+// `n_pos` query positions in one dispatch. Mirrors `rope_partial_batched.comp`'s
+// dispatch shape; same tail pass-through for indices ≥ rotary_dim.
+//
+// Forward: out_j        = a · cos − b · sin
+//          out_{j+R/2}  = a · sin + b · cos
+//          (where R = rotary_dim, half_r = R/2, j ∈ [0, half_r))
+//
+// Backward (Jacobian transpose = rotation by -angle):
+//          d_in_j        = cos · d_out_j     + sin · d_out_{j+R/2}
+//          d_in_{j+R/2}  = −sin · d_out_j    + cos · d_out_{j+R/2}
+//
+// Tail (i ≥ rotary_dim) is identity in forward → identity in backward.
+// No parameters.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer DOut { float d_out[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer DIn  { float d_in[];  };
+
+layout(push_constant) uniform Pc {
+    uint n_pos;
+    uint n_heads;
+    uint head_dim;
+    uint rotary_dim;
+    float theta_base;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint head_total = pc.n_heads * pc.head_dim;
+    uint total = pc.n_pos * head_total;
+    if (g >= total) return;
+
+    uint p = g / head_total;
+    uint within = g - p * head_total;
+    uint i = within % pc.head_dim;
+
+    if (i >= pc.rotary_dim) {
+        d_in[g] = d_out[g];
+        return;
+    }
+
+    uint half_r = pc.rotary_dim / 2;
+    uint freq_idx = (i < half_r) ? i : (i - half_r);
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
+    float angle = float(p) * freq;
+    float c_a = cos(angle);
+    float s_a = sin(angle);
+
+    if (i < half_r) {
+        float da = d_out[g];
+        float db = d_out[g + half_r];
+        d_in[g] = c_a * da + s_a * db;
+    } else {
+        float da = d_out[g - half_r];
+        float db = d_out[g];
+        d_in[g] = -s_a * da + c_a * db;
+    }
+}

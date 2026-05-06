@@ -66,6 +66,11 @@ pub const Config = struct {
     n_pos: usize,
     rms_eps: f32 = 1e-5,
     causal: bool = true,
+    /// RoPE rotation dim. 0 disables RoPE entirely (pre-β-3a-3 behaviour);
+    /// `head_dim` gives full RoPE; smaller values give Qwen3.5-style
+    /// partial rotation.
+    rotary_dim: usize = 0,
+    rope_theta: f32 = 10_000.0,
 };
 
 /// All learnable parameters. `[N, K]` row-major; bias-free.
@@ -187,6 +192,13 @@ pub fn forward(layer: *const Layer, acts: *Acts) void {
     matmulNt(acts.q, acts.n1, layer.w_q, n_pos, q_dim, dim);
     matmulNt(acts.k, acts.n1, layer.w_k, n_pos, kv_dim, dim);
     matmulNt(acts.v, acts.n1, layer.w_v, n_pos, kv_dim, dim);
+
+    // RoPE on Q + K (in-place; pos = row index). Skipped when
+    // rotary_dim == 0 — preserves the pre-β-3a-3 numeric trajectory.
+    if (cfg.rotary_dim > 0) {
+        tt.ropeForwardBatched(acts.q, acts.q, n_pos, cfg.n_heads, cfg.head_dim, cfg.rotary_dim, cfg.rope_theta) catch unreachable;
+        tt.ropeForwardBatched(acts.k, acts.k, n_pos, cfg.n_kv_heads, cfg.head_dim, cfg.rotary_dim, cfg.rope_theta) catch unreachable;
+    }
 
     // SDPA
     tt.attentionForward(
@@ -387,6 +399,20 @@ pub fn backwardFromDy(
         dK,
         dV,
     );
+
+    // RoPE backward on dQ + dK — undoes the forward rotation so the
+    // gradient matches the *pre-RoPE* Q/K, which is what the linear
+    // backward of W_q/W_k expects.
+    if (cfg.rotary_dim > 0) {
+        const dQ_pre = try gpa.alloc(f32, n_pos * q_dim);
+        defer gpa.free(dQ_pre);
+        const dK_pre = try gpa.alloc(f32, n_pos * kv_dim);
+        defer gpa.free(dK_pre);
+        try tt.ropeBackwardBatched(dQ_pre, dQ, n_pos, cfg.n_heads, cfg.head_dim, cfg.rotary_dim, cfg.rope_theta);
+        try tt.ropeBackwardBatched(dK_pre, dK, n_pos, cfg.n_kv_heads, cfg.head_dim, cfg.rotary_dim, cfg.rope_theta);
+        @memcpy(dQ, dQ_pre);
+        @memcpy(dK, dK_pre);
+    }
 
     // ── 9. Q = n1 @ W_Qᵀ etc. Sum into d_n1.
     const d_n1 = try gpa.alloc(f32, n_pos * dim);

@@ -82,6 +82,8 @@ pub fn build(b: *std.Build) void {
     const softmax_ce_loss_grad_batched_v2_spv = compileShader(b, "softmax_ce_loss_grad_batched_v2");
     const swiglu_forward_spv = compileShader(b, "swiglu_forward");
     const swiglu_backward_spv = compileShader(b, "swiglu_backward");
+    const rope_partial_batched_spv = compileShader(b, "rope_partial_batched");
+    const rope_backward_batched_spv = compileShader(b, "rope_backward_batched");
     const mlp2_mse_loss_batched_spv = compileShader(b, "mlp2_mse_loss_batched");
     const mlp2_ce_loss_batched_spv = compileShader(b, "mlp2_ce_loss_batched");
 
@@ -163,6 +165,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(softmax_ce_loss_grad_batched_v2_spv, "softmax_ce_loss_grad_batched_v2.spv");
     _ = wf.addCopyFile(swiglu_forward_spv, "swiglu_forward.spv");
     _ = wf.addCopyFile(swiglu_backward_spv, "swiglu_backward.spv");
+    _ = wf.addCopyFile(rope_partial_batched_spv, "rope_partial_batched.spv");
+    _ = wf.addCopyFile(rope_backward_batched_spv, "rope_backward_batched.spv");
     _ = wf.addCopyFile(mlp2_mse_loss_batched_spv, "mlp2_mse_loss_batched.spv");
     _ = wf.addCopyFile(mlp2_ce_loss_batched_spv, "mlp2_ce_loss_batched.spv");
     const shader_mod = wf.add("shaders.zig",
@@ -239,6 +243,8 @@ pub fn build(b: *std.Build) void {
         \\pub const softmax_ce_loss_grad_batched_v2 align(4) = @embedFile("softmax_ce_loss_grad_batched_v2.spv").*;
         \\pub const swiglu_forward align(4) = @embedFile("swiglu_forward.spv").*;
         \\pub const swiglu_backward align(4) = @embedFile("swiglu_backward.spv").*;
+        \\pub const rope_partial_batched align(4) = @embedFile("rope_partial_batched.spv").*;
+        \\pub const rope_backward_batched align(4) = @embedFile("rope_backward_batched.spv").*;
         \\pub const mlp2_mse_loss_batched align(4) = @embedFile("mlp2_mse_loss_batched.spv").*;
         \\pub const mlp2_ce_loss_batched align(4) = @embedFile("mlp2_ce_loss_batched.spv").*;
     );

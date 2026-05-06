@@ -481,6 +481,87 @@ pub fn ropeBackward(
     return ropeBackwardPartial(d_in, d_out, n_heads, head_dim, head_dim, pos, theta_base);
 }
 
+/// Batched RoPE forward over `n_pos` rows of `[n_heads, head_dim]`.
+/// Position for row `p` is just `p`. Setting `rotary_dim = head_dim`
+/// gives full RoPE. Sister to `cpu_math.applyRope` but loops the
+/// position outside, matching the GPU `rope_partial_batched.comp`
+/// dispatch shape.
+pub fn ropeForwardBatched(
+    out: []f32,
+    in: []const f32,
+    n_pos: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta_base: f32,
+) !void {
+    const row_stride = n_heads * head_dim;
+    if (in.len != n_pos * row_stride or out.len != n_pos * row_stride) return error.LengthMismatch;
+    if (rotary_dim > head_dim) return error.RotaryDimTooLarge;
+    if (rotary_dim % 2 != 0) return error.OddRotaryDim;
+    const half = rotary_dim / 2;
+    const rdim_f: f32 = @floatFromInt(rotary_dim);
+    for (0..n_pos) |p| {
+        const row_off = p * row_stride;
+        const pos_f: f32 = @floatFromInt(p);
+        for (0..n_heads) |h| {
+            const off = row_off + h * head_dim;
+            for (0..half) |j| {
+                const freq = 1.0 / std.math.pow(f32, theta_base, (2.0 * @as(f32, @floatFromInt(j))) / rdim_f);
+                const angle = pos_f * freq;
+                const cos_a = @cos(angle);
+                const sin_a = @sin(angle);
+                const a = in[off + j];
+                const b = in[off + j + half];
+                out[off + j] = a * cos_a - b * sin_a;
+                out[off + j + half] = a * sin_a + b * cos_a;
+            }
+            if (rotary_dim < head_dim) {
+                for (rotary_dim..head_dim) |i| out[off + i] = in[off + i];
+            }
+        }
+    }
+}
+
+/// Batched RoPE backward over `n_pos` rows of `[n_heads, head_dim]`.
+/// Mirrors the forward; output `d_in` is *overwritten* (not accumulated).
+pub fn ropeBackwardBatched(
+    d_in: []f32,
+    d_out: []const f32,
+    n_pos: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta_base: f32,
+) !void {
+    const row_stride = n_heads * head_dim;
+    if (d_in.len != n_pos * row_stride or d_out.len != n_pos * row_stride) return error.LengthMismatch;
+    if (rotary_dim > head_dim) return error.RotaryDimTooLarge;
+    if (rotary_dim % 2 != 0) return error.OddRotaryDim;
+    const half = rotary_dim / 2;
+    const rdim_f: f32 = @floatFromInt(rotary_dim);
+    for (0..n_pos) |p| {
+        const row_off = p * row_stride;
+        const pos_f: f32 = @floatFromInt(p);
+        for (0..n_heads) |h| {
+            const off = row_off + h * head_dim;
+            for (0..half) |j| {
+                const freq = 1.0 / std.math.pow(f32, theta_base, (2.0 * @as(f32, @floatFromInt(j))) / rdim_f);
+                const angle = pos_f * freq;
+                const cos_a = @cos(angle);
+                const sin_a = @sin(angle);
+                const da = d_out[off + j];
+                const db = d_out[off + j + half];
+                d_in[off + j] = cos_a * da + sin_a * db;
+                d_in[off + j + half] = -sin_a * da + cos_a * db;
+            }
+            if (rotary_dim < head_dim) {
+                for (rotary_dim..head_dim) |i| d_in[off + i] = d_out[off + i];
+            }
+        }
+    }
+}
+
 // ── Scaled-dot-product attention forward + backward ────────────────
 //
 // Generic shape covers both training-style multi-query and decode-style
