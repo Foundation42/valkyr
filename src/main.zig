@@ -637,6 +637,7 @@ pub fn main() !void {
     try runDecoderStackTrainGpuSmoke(allocator);
     try runDecoderStackTrainGpuRealShapeSmoke(allocator);
     try runRealModelLoadSmoke(allocator);
+    try runRealModelForwardSmoke(allocator);
     try runDecoderBackwardGpuParitySmoke(allocator);
     try runDecoderTrainGpuSmoke(allocator);
     try runGpuGegluSmoke(allocator);
@@ -7633,6 +7634,174 @@ fn runRealModelLoadSmoke(allocator: std.mem.Allocator) !void {
         "PASS real Qwen3-0.6B weight load (n_layers={d} dim={d} GQA {d}/{d} head_dim={d} ff_dim={d} vocab={d}; rope_theta={d:.0} rms_eps={e}; {d:.1} MiB fp32 host)\n",
         .{ cfg.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.ff_dim, cfg.vocab_size, cfg.rope_theta, cfg.rms_eps, total_mib },
     );
+}
+
+// ── chunk 8c-β-3b: real Qwen3 forward sanity ─────────────────────────
+//
+// β-3a proved the bytes-on-disk → fp32 conversion is correct shape-
+// and value-wise; this proves they're plumbed through the trainer's
+// forward path correctly. Catches anything β-3a's element-count gate
+// misses: row/column-major confusion, RoPE convention drift, Q/K-norm
+// applied at the wrong point, RMSNorm formula divergence, etc — every
+// one of which would silently produce garbage logits.
+//
+// Method: load Qwen3-0.6B, instantiate `train_transformer.Runner` at
+// n_pos=16 (cheap activations), tokenize a short fluent English
+// prompt, run `forwardLogits`, then score CE for next-token prediction
+// at every real prompt position. A correctly-wired Qwen3-0.6B should
+// average ~2-5 nats on coherent English; ≥10 means the architecture
+// pipeline is mis-wired (random-uniform CE is ln(151936) ≈ 11.93).
+//
+// Pass criterion: every logit finite + mean CE < 8.0. The window is
+// generous so a small first-iteration RoPE-base/eps mismatch doesn't
+// fail the gate; if mean CE comes back near 11-12 we know to dig.
+//
+// SKIP on `error.HfModelNotInCache`.
+
+fn runRealModelForwardSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3-0.6B";
+    const n_pos: u32 = 16;
+    const prompt_text = "The capital of France is Paris.";
+    const ce_threshold: f32 = 8.0;
+
+    // ── Resolve the model dir (also gives us a place to find the
+    //    tokenizer.json without hard-coding the snapshot hash).
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.HfModelNotInCache => {
+            std.debug.print("SKIP runRealModelForwardSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    // ── Load fp32 train weights. Reuses the β-3a path (already
+    //    validated by `runRealModelLoadSmoke`).
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+    var weights = try train_load_real.loadTrainWeights(allocator, &cpu, n_pos);
+    defer weights.deinit();
+
+    // ── Tokenize the prompt. We need this *before* dropping the CPU
+    //    model so we have a tokenizer. (Loader is the natural sibling
+    //    that bundles tokenizer + weights, but β-3a's TrainWeights
+    //    intentionally doesn't carry a tokenizer; β-4 will introduce
+    //    a dataset abstraction that owns it.)
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+    const prompt_ids = try tok.encode(allocator, prompt_text);
+    defer allocator.free(prompt_ids);
+    const real_len: usize = prompt_ids.len;
+    if (real_len < 2 or real_len > n_pos) {
+        std.debug.print("Forward smoke: prompt tokenized to {d} ids; want 2..={d}\n", .{ real_len, n_pos });
+        return error.PromptTokenLenOutOfRange;
+    }
+
+    // ── Build the n_pos token window: prompt followed by repeats of
+    //    the last real id. Padding choice doesn't affect CE at real
+    //    positions (we only score p in [0..real_len-2]), but sticking
+    //    to in-vocab ids keeps the embedding lookup well-behaved.
+    const token_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(token_ids);
+    for (0..n_pos) |p| {
+        token_ids[p] = if (p < real_len) prompt_ids[p] else prompt_ids[real_len - 1];
+    }
+
+    // ── GPU bring-up + Runner instantiation.
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var runner = try train_transformer.Runner.init(allocator, &ctx, weights.cfg, weights.view());
+    defer runner.deinit();
+
+    const logits = try allocator.alloc(f32, @as(usize, n_pos) * weights.cfg.vocab_size);
+    defer allocator.free(logits);
+
+    try runner.forwardLogits(token_ids, logits);
+
+    // ── Finite-check (sampled). 16 positions × 151936 vocab is 2.4M
+    //    elements — full scan is fine, but we mirror β-3a's stride
+    //    sample to keep the smoke under a second.
+    {
+        const stride: usize = @max(1, logits.len / 4096);
+        var i: usize = 0;
+        while (i < logits.len) : (i += stride) {
+            if (!std.math.isFinite(logits[i])) {
+                std.debug.print("Forward smoke: non-finite logit at index {d}: {d}\n", .{ i, logits[i] });
+                return error.NonFiniteLogit;
+            }
+        }
+    }
+
+    // ── Per-position CE for next-token prediction. logits[p] is the
+    //    distribution over the token at position p+1, so we score
+    //    pairs (logits[p], target=token_ids[p+1]) for p in [0..real_len-2].
+    const vocab: usize = weights.cfg.vocab_size;
+    var ce_sum: f64 = 0;
+    var ce_n: usize = 0;
+    for (0..real_len - 1) |p| {
+        const off = p * vocab;
+        // Numerically stable log-softmax: log Z = max + log Σ exp(x - max).
+        var m: f32 = -std.math.inf(f32);
+        for (0..vocab) |o| m = @max(m, logits[off + o]);
+        var sum_e: f64 = 0;
+        for (0..vocab) |o| sum_e += @exp(@as(f64, logits[off + o]) - @as(f64, m));
+        const log_z: f64 = @as(f64, m) + @log(sum_e);
+        const tgt: u32 = token_ids[p + 1];
+        ce_sum += log_z - @as(f64, logits[off + tgt]);
+        ce_n += 1;
+    }
+    const ce_mean: f32 = @floatCast(ce_sum / @as(f64, @floatFromInt(ce_n)));
+
+    // ── Argmax at logits[real_len - 1]: the model's prediction for
+    //    the token *immediately after* the prompt ends. No ground
+    //    truth here (so no CE for this position), but it's the most
+    //    illuminating qualitative signal — a sensibly-wired forward
+    //    pass on "The capital of France is Paris." should suggest a
+    //    plausible continuation (whitespace, a connective, EOS, etc).
+    var argmax_after_prompt: u32 = 0;
+    var argmax_score: f32 = -std.math.inf(f32);
+    {
+        const off = (real_len - 1) * vocab;
+        for (0..vocab) |o| {
+            if (logits[off + o] > argmax_score) {
+                argmax_score = logits[off + o];
+                argmax_after_prompt = @intCast(o);
+            }
+        }
+    }
+
+    if (!std.math.isFinite(ce_mean)) {
+        std.debug.print("Forward smoke: mean CE not finite ({d})\n", .{ce_mean});
+        return error.CeNotFinite;
+    }
+    if (ce_mean >= ce_threshold) {
+        std.debug.print(
+            "Forward smoke: mean CE {d:.3} ≥ threshold {d:.3} — model output looks random; check architecture wiring\n",
+            .{ ce_mean, ce_threshold },
+        );
+        return error.CeAboveThreshold;
+    }
+
+    // Best-effort decode of the predicted post-prompt token for the
+    // PASS line. decodeForDisplay handles GPT-2-style byte mapping
+    // and special tokens; if it fails (rare), fall back to id only.
+    const decoded = tok.decodeForDisplay(allocator, argmax_after_prompt) catch null;
+    defer if (decoded) |d| allocator.free(d);
+
+    if (decoded) |d| {
+        std.debug.print(
+            "PASS real Qwen3-0.6B forward sanity (n_pos={d} prompt_tokens={d} mean_CE={d:.3} nats; argmax-after-prompt={d} \"{s}\")\n",
+            .{ n_pos, real_len, ce_mean, argmax_after_prompt, d },
+        );
+    } else {
+        std.debug.print(
+            "PASS real Qwen3-0.6B forward sanity (n_pos={d} prompt_tokens={d} mean_CE={d:.3} nats; argmax-after-prompt={d})\n",
+            .{ n_pos, real_len, ce_mean, argmax_after_prompt },
+        );
+    }
 }
 
 // ── chunk 8b stage A: gpu backward chain parity vs cpu oracle ────────
