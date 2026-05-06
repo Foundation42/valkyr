@@ -129,6 +129,14 @@ pub fn main() !void {
         try runDecoderStackTrainGpuSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--cce-bench")) {
+        // Time each CCE kernel in isolation at Qwen3-0.6B shape. No
+        // parity — just dispatch with vkQueueWaitIdle between calls
+        // and report per-kernel ms. Shows where the LM-head bucket's
+        // time actually goes.
+        try runCceBench(allocator);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
@@ -4341,6 +4349,156 @@ fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
             .{ cs.name, cs.n, cs.v, cs.d, mean_loss_cpu, lse_rel, loss_rel, mean_rel },
         );
     }
+}
+
+// ── CCE bench: time each kernel in isolation at Qwen3-0.6B shape ──────
+//
+// Reports per-kernel wall-clock ms after `vkQueueWaitIdle`, plus the
+// fillZero(buf_dw_lm_head) cost that the wired-in step() pays once
+// per training step. Driven against synthetic random inputs — no
+// parity check; the standalone --cce-{forward,backward-dh,backward-dw}-smoke
+// flags handle that.
+//
+// At n_pos=16 (β-5 shape) we expect cce_forward and cce_backward_dh
+// to be tiny (only 16 WGs each) and cce_backward_dw to dominate
+// (151,936 WGs). At training-realistic n_pos>>SM count, all three
+// should be HBM-bound at single-digit ms.
+
+fn runCceBench(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Qwen3-0.6B shape (matches the β-5 smoke).
+    const n: u32 = 16;
+    const v: u32 = 151_936;
+    const d: u32 = 1024;
+    const warmup_iters: u32 = 3;
+    const bench_iters: u32 = 5;
+
+    std.debug.print(
+        "CCE bench on {s}\n  shape: N={d} V={d} D={d} (Qwen3-0.6B β-5)\n  warmup {d} / measure {d}\n",
+        .{ ctx.deviceName(), n, v, d, warmup_iters, bench_iters },
+    );
+
+    // ── Allocate buffers (random-init host data, deterministic seed).
+    var prng = std.Random.DefaultPrng.init(0xBE_AB_AB);
+    const rng = prng.random();
+
+    const h = try allocator.alloc(f32, n * d);
+    defer allocator.free(h);
+    const w_lm = try allocator.alloc(f32, v * d);
+    defer allocator.free(w_lm);
+    const targets = try allocator.alloc(u32, n);
+    defer allocator.free(targets);
+    const lse_host = try allocator.alloc(f32, n);
+    defer allocator.free(lse_host);
+
+    for (h) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+    for (w_lm) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+    for (targets) |*t| t.* = rng.intRangeLessThan(u32, 0, v);
+    for (lse_host) |*x| x.* = 0.0;
+
+    var buf_h = try buffer.Buffer.initStatic(&ctx, f32, h);
+    defer buf_h.deinit(ctx.device);
+    var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w_lm);
+    defer buf_w.deinit(ctx.device);
+    var buf_t = try buffer.Buffer.initStatic(&ctx, u32, targets);
+    defer buf_t.deinit(ctx.device);
+    var buf_lse = try buffer.Buffer.initStatic(&ctx, f32, lse_host);
+    defer buf_lse.deinit(ctx.device);
+    var buf_loss = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
+    defer buf_loss.deinit(ctx.device);
+    var buf_dh = try buffer.Buffer.initDeviceOnly(&ctx, n * d * @sizeOf(f32));
+    defer buf_dh.deinit(ctx.device);
+    var buf_dw = try buffer.Buffer.initDeviceOnly(&ctx, v * d * @sizeOf(f32));
+    defer buf_dw.deinit(ctx.device);
+
+    // ── Pipelines.
+    var k_fwd = try pipeline.Kernel.init(&ctx, &shaders.cce_forward, 5, @sizeOf(runtime.CceForwardPush));
+    defer k_fwd.deinit();
+    var k_bw_dh = try pipeline.Kernel.init(&ctx, &shaders.cce_backward_dh, 5, @sizeOf(runtime.CceBackwardPush));
+    defer k_bw_dh.deinit();
+    var k_bw_dw = try pipeline.Kernel.init(&ctx, &shaders.cce_backward_dw, 5, @sizeOf(runtime.CceBackwardPush));
+    defer k_bw_dw.deinit();
+
+    try k_fwd.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_loss });
+    const push_fwd = runtime.CceForwardPush{ .n_samples = n, .vocab = v, .dim = d };
+
+    try k_bw_dh.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_dh });
+    const push_bw = runtime.CceBackwardPush{ .n_samples = n, .vocab = v, .dim = d };
+
+    try k_bw_dw.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_dw });
+
+    const ns_per_ms: f64 = 1.0e6;
+
+    // Helper: time `iters` runs of `submitOneShot` of `kern` with `gx` workgroups.
+    const runKernel = struct {
+        fn call(c_ctx: *const vk.Context, kern: *const pipeline.Kernel, push: anytype, gx: u32, iters: u32) !f64 {
+            var total_ns: u64 = 0;
+            const PushT = @TypeOf(push);
+            const Recorder = struct {
+                k: *const pipeline.Kernel,
+                p: *const PushT,
+                gx_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                }
+            };
+            for (0..iters) |_| {
+                const t0 = std.time.nanoTimestamp();
+                try buffer.submitOneShot(c_ctx, Recorder{ .k = kern, .p = &push, .gx_ = gx });
+                const t1 = std.time.nanoTimestamp();
+                total_ns += @intCast(t1 - t0);
+            }
+            return @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(iters));
+        }
+    }.call;
+
+    // ── Warmup.
+    _ = try runKernel(&ctx, &k_fwd, push_fwd, n, warmup_iters);
+    _ = try runKernel(&ctx, &k_bw_dh, push_bw, n, warmup_iters);
+    _ = try runKernel(&ctx, &k_bw_dw, push_bw, v, warmup_iters);
+
+    // ── Measure.
+    const t_fwd = try runKernel(&ctx, &k_fwd, push_fwd, n, bench_iters);
+    const t_bw_dh = try runKernel(&ctx, &k_bw_dh, push_bw, n, bench_iters);
+    const t_bw_dw = try runKernel(&ctx, &k_bw_dw, push_bw, v, bench_iters);
+
+    // fillZero(buf_dw) — what step() pays once per Adam step to reset the
+    // accumulator between iterations.
+    var t_fill_total: u64 = 0;
+    for (0..bench_iters) |_| {
+        const t0 = std.time.nanoTimestamp();
+        try buf_dw.fillZero(&ctx);
+        const t1 = std.time.nanoTimestamp();
+        t_fill_total += @intCast(t1 - t0);
+    }
+    const t_fill = @as(f64, @floatFromInt(t_fill_total)) / @as(f64, @floatFromInt(bench_iters));
+
+    std.debug.print(
+        "  cce_forward       (gx={d:>6} ): {d:>8.3} ms\n",
+        .{ n, t_fwd / ns_per_ms },
+    );
+    std.debug.print(
+        "  cce_backward_dh   (gx={d:>6} ): {d:>8.3} ms\n",
+        .{ n, t_bw_dh / ns_per_ms },
+    );
+    std.debug.print(
+        "  cce_backward_dw   (gx={d:>6}): {d:>8.3} ms\n",
+        .{ v, t_bw_dw / ns_per_ms },
+    );
+    std.debug.print(
+        "  fillZero(buf_dw,  {d:>6} MB): {d:>8.3} ms  ({d:.1} GB/s)\n",
+        .{
+            @divTrunc(@as(u64, v) * @as(u64, d) * 4, 1024 * 1024),
+            t_fill / ns_per_ms,
+            @as(f64, @floatFromInt(@as(u64, v) * @as(u64, d) * 4)) / t_fill,
+        },
+    );
+    std.debug.print(
+        "  TOTAL CCE bucket             : {d:>8.3} ms\n",
+        .{(t_fwd + t_bw_dh + t_bw_dw + t_fill) / ns_per_ms},
+    );
 }
 
 // ── GPU CCE backward d_h smoke: vs CPU oracle ─────────────────────────
