@@ -1,0 +1,96 @@
+#version 460
+// Fused QK partial-RoPE forward — applies the same rotation primitive as
+// `rope_partial_batched.comp` to BOTH the Q and K projections in a
+// single dispatch.
+//
+// The unfused path that this replaces issues two back-to-back dispatches
+// of `rope_partial_batched.comp` per layer (one for Q over n_q_heads,
+// one for K over n_kv_heads). Per the Chronicals paper §"Fused QK-RoPE"
+// (Algorithm 8), folding both into one kernel saves command-processor
+// launch overhead and lets cos/sin computation be amortized across
+// adjacent (Q, K) head positions that share the same (p, i) pair —
+// the SM sees twice as many threads at the same trig argument, which
+// the warp scheduler can co-issue.
+//
+// Layout:
+//   q_in / q_out  per row [n_q_heads, head_dim]    (HF Q layout)
+//   k_in / k_out  per row [n_kv_heads, head_dim]   (HF K under MQA/GQA)
+//   row index p ∈ [0, n_pos); RoPE position is p (training-style
+//   absolute positioning, 0-indexed from start of sequence).
+//
+// One thread per element across the combined [n_pos, n_q_heads+n_kv_heads,
+// head_dim] tensor. The first n_q_heads heads route to Q; the next
+// n_kv_heads heads route to K. For each (p, h, i) we recompute the
+// freq/angle locally — same scalar math as the unfused shader.
+//
+// Setting `rotary_dim = head_dim` gives full RoPE (the Qwen3 case);
+// smaller `rotary_dim` gives a Qwen3.5-style partial rotation with the
+// trailing tail passing through unchanged.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Qin  { float q_in[];  };
+layout(set = 0, binding = 1, std430) writeonly buffer Qout { float q_out[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer Kin  { float k_in[];  };
+layout(set = 0, binding = 3, std430) writeonly buffer Kout { float k_out[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_pos;
+    uint n_q_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint rotary_dim;
+    float theta_base;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint combined_heads = pc.n_q_heads + pc.n_kv_heads;
+    uint head_total = combined_heads * pc.head_dim;
+    uint total = pc.n_pos * head_total;
+    if (g >= total) return;
+
+    uint p = g / head_total;
+    uint within = g - p * head_total;
+    uint h = within / pc.head_dim;
+    uint i = within - h * pc.head_dim;
+
+    // Route to Q or K. The first n_q_heads heads index into Q's per-row
+    // [n_q_heads, head_dim] tensor; the next n_kv_heads heads index into
+    // K's per-row [n_kv_heads, head_dim] tensor.
+    bool is_q = h < pc.n_q_heads;
+    uint h_local = is_q ? h : (h - pc.n_q_heads);
+    uint heads_local = is_q ? pc.n_q_heads : pc.n_kv_heads;
+    uint local_off = (p * heads_local + h_local) * pc.head_dim + i;
+
+    // Pass-through tail (i ≥ rotary_dim) — identity rotation.
+    if (i >= pc.rotary_dim) {
+        if (is_q) q_out[local_off] = q_in[local_off];
+        else      k_out[local_off] = k_in[local_off];
+        return;
+    }
+
+    // HuggingFace half-split RoPE: pair (i, i + rotary_dim/2) for
+    // i ∈ [0, rotary_dim/2). Each thread handles one element of the
+    // pair — figure out which half and the partner offset from i.
+    uint half_r = pc.rotary_dim / 2;
+    uint freq_idx = (i < half_r) ? i : (i - half_r);
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
+    float angle = float(p) * freq;
+    float c_a = cos(angle);
+    float s_a = sin(angle);
+
+    if (is_q) {
+        uint partner_off = (p * heads_local + h_local) * pc.head_dim + ((i < half_r) ? (i + half_r) : (i - half_r));
+        float a = q_in[(i < half_r) ? local_off : partner_off];
+        float b = q_in[(i < half_r) ? partner_off : local_off];
+        if (i < half_r) q_out[local_off] = a * c_a - b * s_a;
+        else            q_out[local_off] = a * s_a + b * c_a;
+    } else {
+        uint partner_off = (p * heads_local + h_local) * pc.head_dim + ((i < half_r) ? (i + half_r) : (i - half_r));
+        float a = k_in[(i < half_r) ? local_off : partner_off];
+        float b = k_in[(i < half_r) ? partner_off : local_off];
+        if (i < half_r) k_out[local_off] = a * c_a - b * s_a;
+        else            k_out[local_off] = a * s_a + b * c_a;
+    }
+}

@@ -103,6 +103,11 @@ pub const Runner = struct {
     k_attn_dk: pipeline.Kernel,
     k_swiglu_fwd: pipeline.Kernel,
     k_swiglu_bw: pipeline.Kernel,
+    // Fused QK-RoPE: one dispatch processes both Q (n_q_heads) and K
+    // (n_kv_heads) — replaces a back-to-back rope_partial_batched pair.
+    // Saves command-processor launch overhead and lets cos/sin be
+    // co-issued for adjacent (Q, K) head positions sharing the same
+    // (p, i) — see shaders/qk_rope_*_batched.comp.
     k_rope_fwd: pipeline.Kernel,
     k_rope_bw: pipeline.Kernel,
     k_vec_add: pipeline.Kernel,
@@ -283,8 +288,7 @@ pub const Runner = struct {
     push_mm_lm_head: runtime.MatmulPush,
     push_attn_scores: runtime.AttnScoresTrainPush,
     push_attn_output: runtime.AttnOutputTrainPush,
-    push_rope_q: runtime.RopeBatchedPush,
-    push_rope_k: runtime.RopeBatchedPush,
+    push_rope_qk: runtime.QkRopeBatchedPush,
     push_rms_qk: runtime.RmsnormPush, // dim = head_dim; same for q-norm + k-norm
     push_lin_lm_head: runtime.LinearBatchedPush,
     push_lin_down: runtime.LinearBatchedPush,
@@ -369,9 +373,9 @@ pub const Runner = struct {
         errdefer k_swiglu_fwd.deinit();
         var k_swiglu_bw = try pipeline.Kernel.init(ctx, &shaders.swiglu_backward, 5, @sizeOf(runtime.SwigluPush));
         errdefer k_swiglu_bw.deinit();
-        var k_rope_fwd = try pipeline.Kernel.init(ctx, &shaders.rope_partial_batched, 2, @sizeOf(runtime.RopeBatchedPush));
+        var k_rope_fwd = try pipeline.Kernel.init(ctx, &shaders.qk_rope_partial_batched, 4, @sizeOf(runtime.QkRopeBatchedPush));
         errdefer k_rope_fwd.deinit();
-        var k_rope_bw = try pipeline.Kernel.init(ctx, &shaders.rope_backward_batched, 2, @sizeOf(runtime.RopeBatchedPush));
+        var k_rope_bw = try pipeline.Kernel.init(ctx, &shaders.qk_rope_backward_batched, 4, @sizeOf(runtime.QkRopeBatchedPush));
         errdefer k_rope_bw.deinit();
         var k_vec_add = try pipeline.Kernel.init(ctx, &shaders.vec_add, 3, @sizeOf(runtime.AddInPlacePush));
         errdefer k_vec_add.deinit();
@@ -591,16 +595,10 @@ pub const Runner = struct {
             .kv_stride = @intCast(kv_dim),
             .attn_stride = cfg.n_pos,
         };
-        const push_rope_q = runtime.RopeBatchedPush{
+        const push_rope_qk = runtime.QkRopeBatchedPush{
             .n_pos = cfg.n_pos,
-            .n_heads = cfg.n_heads,
-            .head_dim = cfg.head_dim,
-            .rotary_dim = cfg.rotary_dim,
-            .theta_base = cfg.rope_theta,
-        };
-        const push_rope_k = runtime.RopeBatchedPush{
-            .n_pos = cfg.n_pos,
-            .n_heads = cfg.n_kv_heads,
+            .n_q_heads = cfg.n_heads,
+            .n_kv_heads = cfg.n_kv_heads,
             .head_dim = cfg.head_dim,
             .rotary_dim = cfg.rotary_dim,
             .theta_base = cfg.rope_theta,
@@ -820,8 +818,7 @@ pub const Runner = struct {
             .push_mm_lm_head = push_mm_lm_head,
             .push_attn_scores = push_attn_scores,
             .push_attn_output = push_attn_output,
-            .push_rope_q = push_rope_q,
-            .push_rope_k = push_rope_k,
+            .push_rope_qk = push_rope_qk,
             .push_rms_qk = push_rms_qk,
             .push_lin_lm_head = push_lin_lm_head,
             .push_lin_down = push_lin_down,
@@ -1109,10 +1106,9 @@ pub const Runner = struct {
             try self.rec.dispatch(&self.k_rms, &.{ &self.buf_k_pre_norm[i], &self.buf_w_k_norm[i], k_dst }, &self.push_rms_qk, cfg.n_pos * cfg.n_kv_heads, 1, 1);
         }
         if (cfg.rotary_dim > 0) {
-            const q_total: u32 = cfg.n_pos * cfg.n_heads * cfg.head_dim;
-            const k_total: u32 = cfg.n_pos * cfg.n_kv_heads * cfg.head_dim;
-            try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_q_pre, &self.buf_q[i] }, &self.push_rope_q, ceilDiv(q_total, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_k_pre, &self.buf_k[i] }, &self.push_rope_k, ceilDiv(k_total, group_lin), 1, 1);
+            // Fused QK-RoPE: one dispatch over n_pos × (n_heads + n_kv_heads) × head_dim.
+            const qk_total: u32 = cfg.n_pos * (cfg.n_heads + cfg.n_kv_heads) * cfg.head_dim;
+            try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_q_pre, &self.buf_q[i], &self.sc_k_pre, &self.buf_k[i] }, &self.push_rope_qk, ceilDiv(qk_total, group_lin), 1, 1);
         }
         // 5. attention scores (causal mask via -inf).
         try self.rec.dispatch(&self.k_attn_scores, &.{ &self.buf_q[i], &self.buf_k[i], &self.sc_scores }, &self.push_attn_scores, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
@@ -1263,10 +1259,9 @@ pub const Runner = struct {
         // output when qk_norm is on, or of the matmul output when
         // it's off).
         if (cfg.rotary_dim > 0) {
-            const q_total: u32 = cfg.n_pos * cfg.n_heads * cfg.head_dim;
-            const k_total: u32 = cfg.n_pos * cfg.n_kv_heads * cfg.head_dim;
-            try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dQ, &self.sc_dQ_pre }, &self.push_rope_q, ceilDiv(q_total, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dK, &self.sc_dK_pre }, &self.push_rope_k, ceilDiv(k_total, group_lin), 1, 1);
+            // Fused QK-RoPE backward — one dispatch covers both dQ and dK.
+            const qk_total: u32 = self.cfg.n_pos * (self.cfg.n_heads + self.cfg.n_kv_heads) * self.cfg.head_dim;
+            try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dQ, &self.sc_dQ_pre, &self.sc_dK, &self.sc_dK_pre }, &self.push_rope_qk, ceilDiv(qk_total, group_lin), 1, 1);
         }
 
         // Q/K-norm backward: rmsnorm_bw needs the pre-norm input

@@ -1,0 +1,78 @@
+#version 460
+// Fused QK partial-RoPE backward — Jacobian transpose of the fused
+// forward (qk_rope_partial_batched.comp). Applies the inverse rotation
+// (rotation by -angle) to BOTH dQ and dK in a single dispatch.
+//
+// Mirrors the dispatch shape of the forward: one thread per element in
+// the combined [n_pos, n_q_heads + n_kv_heads, head_dim] tensor. The
+// first n_q_heads heads route to dQ, the next n_kv_heads to dK.
+//
+// Math (per pair (i, i + R/2) where R = rotary_dim, j = i for i < R/2):
+//   forward:   out_j        = a · cos − b · sin
+//              out_{j+R/2}  = a · sin + b · cos
+//   backward:  d_in_j       =  cos · d_out_j     + sin · d_out_{j+R/2}
+//              d_in_{j+R/2} = −sin · d_out_j     + cos · d_out_{j+R/2}
+//
+// Tail (i ≥ rotary_dim) is identity in fwd → identity in bwd.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer DQout { float dq_out[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer DQin  { float dq_in[];  };
+layout(set = 0, binding = 2, std430) readonly  buffer DKout { float dk_out[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer DKin  { float dk_in[];  };
+
+layout(push_constant) uniform Pc {
+    uint n_pos;
+    uint n_q_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint rotary_dim;
+    float theta_base;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint combined_heads = pc.n_q_heads + pc.n_kv_heads;
+    uint head_total = combined_heads * pc.head_dim;
+    uint total = pc.n_pos * head_total;
+    if (g >= total) return;
+
+    uint p = g / head_total;
+    uint within = g - p * head_total;
+    uint h = within / pc.head_dim;
+    uint i = within - h * pc.head_dim;
+
+    bool is_q = h < pc.n_q_heads;
+    uint h_local = is_q ? h : (h - pc.n_q_heads);
+    uint heads_local = is_q ? pc.n_q_heads : pc.n_kv_heads;
+    uint local_off = (p * heads_local + h_local) * pc.head_dim + i;
+
+    // Tail pass-through.
+    if (i >= pc.rotary_dim) {
+        if (is_q) dq_in[local_off] = dq_out[local_off];
+        else      dk_in[local_off] = dk_out[local_off];
+        return;
+    }
+
+    uint half_r = pc.rotary_dim / 2;
+    uint freq_idx = (i < half_r) ? i : (i - half_r);
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
+    float angle = float(p) * freq;
+    float c_a = cos(angle);
+    float s_a = sin(angle);
+
+    uint partner_off = (p * heads_local + h_local) * pc.head_dim + ((i < half_r) ? (i + half_r) : (i - half_r));
+
+    if (is_q) {
+        float da = dq_out[(i < half_r) ? local_off : partner_off];
+        float db = dq_out[(i < half_r) ? partner_off : local_off];
+        if (i < half_r) dq_in[local_off] =  c_a * da + s_a * db;
+        else            dq_in[local_off] = -s_a * da + c_a * db;
+    } else {
+        float da = dk_out[(i < half_r) ? local_off : partner_off];
+        float db = dk_out[(i < half_r) ? partner_off : local_off];
+        if (i < half_r) dk_in[local_off] =  c_a * da + s_a * db;
+        else            dk_in[local_off] = -s_a * da + c_a * db;
+    }
+}

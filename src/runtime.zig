@@ -206,6 +206,21 @@ pub const RopeBatchedPush = extern struct {
     theta_base: f32,
 };
 
+/// Push struct for the fused QK-RoPE shaders (qk_rope_partial_batched +
+/// qk_rope_backward_batched). Both Q and K are processed in one
+/// dispatch — the kernel routes the first n_q_heads heads to Q's
+/// buffer and the next n_kv_heads heads to K's buffer. Otherwise the
+/// rotation math is identical to the unfused rope_partial_batched
+/// pair, so the parity is bit-equal modulo subgroup ordering.
+pub const QkRopeBatchedPush = extern struct {
+    n_pos: u32,
+    n_q_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    theta_base: f32,
+};
+
 /// Scaled MSE loss gradient. Bakes the (2/N) factor into the kernel
 /// so the transformer-training side doesn't need a follow-up scale.
 pub const MseLossGradScaledPush = extern struct { n: u32, scale: f32 };
