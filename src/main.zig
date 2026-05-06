@@ -146,6 +146,13 @@ pub fn main() !void {
         try runGpuLoraSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-train-demo")) {
+        // End-to-end LoRA training demo: synthetic problem with a target
+        // rank-r delta on a frozen base, train Adam-LoRA to recover it.
+        // The "does it actually train?" gate for LoRA on GPU.
+        try runGpuLoraTrainDemo(allocator);
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
@@ -4641,6 +4648,342 @@ fn runGpuLoraSmoke(allocator: std.mem.Allocator) !void {
             .{ cs.name, cs.aor, y_rel, dx_rel, dA_rel, dB_rel },
         );
     }
+}
+
+// ── LoRA train demo: end-to-end "does it actually train" gate ─────────
+//
+// Synthetic recovery task. Construct a frozen base W and a rank-r
+// target delta (B_target · A_target). Generate target_y by running
+// linear forward with W_eff = W + (α/r) · B_target · A_target. Train
+// the LoRA adapter (A trainable, B = 0 init) with Adam against MSE
+// loss vs target_y; assert the loss drops by > 100× over 100 steps.
+//
+// Why this gate matters: it's the smallest end-to-end signal that
+//   1. The fwd / bwd dispatch chain matches the math (already proven
+//      by --lora-smoke at the per-kernel level — this exercises it
+//      in a closed-loop optimizer setting where bugs accumulate),
+//   2. The B = 0 / ∇A = 0 init asymmetry doesn't deadlock training
+//      (B's gradient kicks in at step 1, A's at step 2 once B ≠ 0),
+//   3. AdamW updates the LoRA params correctly without disturbing
+//      the frozen base.
+//
+// Loss convention matches the existing mse_loss_grad shader:
+// half-sum MSE, L = ½ Σ(y - target)². The gradient `dy = y - target`
+// is what mse_loss_grad emits; Adam's effective LR absorbs the 1/(M·N)
+// factor that a mean-MSE convention would carry. Per-step compute
+// is independent of the convention; only the displayed loss scale
+// differs.
+
+fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Problem shape — small enough for a 100-step run to be sub-second
+    // but big enough that the rank-r recovery is non-trivial.
+    const M_u: u32 = 16; // batch size
+    const N_u: u32 = 32; // output dim
+    const K_u: u32 = 64; // input dim
+    const R_u: u32 = 8; // LoRA rank
+    const aor: f32 = 2.0; // α/r (LoRA paper canonical)
+    const lr: f32 = 1e-2;
+    const beta1: f32 = 0.9;
+    const beta2: f32 = 0.999;
+    const eps: f32 = 1e-8;
+    const n_steps: u32 = 100;
+    const log_every: u32 = 25;
+
+    const M: usize = M_u;
+    const Nn: usize = N_u; // shadows top-level vec_add `const N`
+    const K: usize = K_u;
+    const r: usize = R_u;
+
+    // ── Construct synthetic problem.
+    var prng = std.Random.DefaultPrng.init(0x10AAFADE);
+    const rng = prng.random();
+
+    const w = try allocator.alloc(f32, Nn * K);
+    defer allocator.free(w);
+    for (w) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+
+    // The target rank-r delta we want LoRA to recover.
+    const a_target = try allocator.alloc(f32, r * K);
+    defer allocator.free(a_target);
+    const b_target = try allocator.alloc(f32, Nn * r);
+    defer allocator.free(b_target);
+    for (a_target) |*v| v.* = (rng.float(f32) - 0.5) * 0.5;
+    for (b_target) |*v| v.* = (rng.float(f32) - 0.5) * 0.5;
+
+    // x batch (fixed across steps — overfit-on-batch demo).
+    const x = try allocator.alloc(f32, M * K);
+    defer allocator.free(x);
+    for (x) |*v| v.* = (rng.float(f32) - 0.5);
+
+    // target_y = x · (W + (α/r)·B_target·A_target)ᵀ
+    const w_eff_target = try allocator.alloc(f32, Nn * K);
+    defer allocator.free(w_eff_target);
+    @memcpy(w_eff_target, w);
+    for (0..Nn) |n_| {
+        for (0..K) |k_| {
+            var s: f64 = 0;
+            for (0..r) |ri_| s += @as(f64, b_target[n_ * r + ri_]) * @as(f64, a_target[ri_ * K + k_]);
+            w_eff_target[n_ * K + k_] += aor * @as(f32, @floatCast(s));
+        }
+    }
+    const target_y = try allocator.alloc(f32, M * Nn);
+    defer allocator.free(target_y);
+    for (0..M) |m_| {
+        for (0..Nn) |n_| {
+            var s: f64 = 0;
+            for (0..K) |k_| s += @as(f64, x[m_ * K + k_]) * @as(f64, w_eff_target[n_ * K + k_]);
+            target_y[m_ * Nn + n_] = @floatCast(s);
+        }
+    }
+
+    // ── Trainable LoRA params: A small random, B zero (canonical init).
+    const a_init = try allocator.alloc(f32, r * K);
+    defer allocator.free(a_init);
+    for (a_init) |*v| v.* = (rng.float(f32) - 0.5) * 0.1;
+    const b_init = try allocator.alloc(f32, Nn * r);
+    defer allocator.free(b_init);
+    @memset(b_init, 0);
+
+    // ── GPU buffer allocation.
+    var buf_x = try buffer.Buffer.initStatic(&ctx, f32, x);
+    defer buf_x.deinit(ctx.device);
+    var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+    defer buf_w.deinit(ctx.device);
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a_init); // mutable on GPU side
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, f32, b_init);
+    defer buf_b.deinit(ctx.device);
+    var buf_target_y = try buffer.Buffer.initStatic(&ctx, f32, target_y);
+    defer buf_target_y.deinit(ctx.device);
+
+    var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_y.deinit(ctx.device);
+    var buf_intermediate = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+    defer buf_intermediate.deinit(ctx.device);
+    var buf_y_lora = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_y_lora.deinit(ctx.device);
+    var buf_y_lora_scaled = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_y_lora_scaled.deinit(ctx.device);
+    var buf_dy = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+    defer buf_dy.deinit(ctx.device);
+    var buf_dy_B = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+    defer buf_dy_B.deinit(ctx.device);
+    var buf_dA_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_dA_unscaled.deinit(ctx.device);
+    var buf_dA = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_dA.deinit(ctx.device);
+    var buf_dB_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_dB_unscaled.deinit(ctx.device);
+    var buf_dB = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_dB.deinit(ctx.device);
+
+    // Adam state (zero-init via initDeviceOnly).
+    var buf_m_a = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_m_a.deinit(ctx.device);
+    var buf_v_a = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+    defer buf_v_a.deinit(ctx.device);
+    var buf_m_b = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_m_b.deinit(ctx.device);
+    var buf_v_b = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+    defer buf_v_b.deinit(ctx.device);
+
+    // ── Pipelines.
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    defer k_matmul.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dx.deinit();
+    var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dw.deinit();
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(ScalePush));
+    defer k_scale.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    defer k_mse_grad.deinit();
+    var k_adam = try pipeline.Kernel.init(&ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
+    defer k_adam.deinit();
+
+    const group_lwg: u32 = 16;
+    const group_lin: u32 = 256;
+
+    // Helpers.
+    const recordMatmul = struct {
+        fn rec(rec_kern: *pipeline.Kernel, push: *const MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+            try rec_kern.bind(bufs);
+            const Rec = struct {
+                k: *const pipeline.Kernel,
+                p: *const MatmulPush,
+                gx_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                }
+            };
+            try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = push, .gx_ = gx });
+        }
+    }.rec;
+    const recordLinBackward = struct {
+        fn rec(rec_kern: *pipeline.Kernel, push: *const runtime.LinearBatchedPush, gx: u32, gy: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+            try rec_kern.bind(bufs);
+            const Rec = struct {
+                k: *const pipeline.Kernel,
+                p: *const runtime.LinearBatchedPush,
+                gx_: u32,
+                gy_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, s.gy_, 1);
+                }
+            };
+            try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = push, .gx_ = gx, .gy_ = gy });
+        }
+    }.rec;
+    const recordScalar1D = struct {
+        fn rec(rec_kern: *pipeline.Kernel, push: anytype, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+            try rec_kern.bind(bufs);
+            const PushT = @TypeOf(push);
+            const Rec = struct {
+                k: *const pipeline.Kernel,
+                p: *const PushT,
+                gx_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                }
+            };
+            try buffer.submitOneShot(c_ctx, Rec{ .k = rec_kern, .p = &push, .gx_ = gx });
+        }
+    }.rec;
+
+    // Push constants reused across steps.
+    const push_y_base = MatmulPush{ .m = M_u, .n = N_u, .k = K_u };
+    const push_inter = MatmulPush{ .m = M_u, .n = R_u, .k = K_u };
+    const push_ylora = MatmulPush{ .m = M_u, .n = N_u, .k = R_u };
+    const push_scale_ylora = ScalePush{ .n = M_u * N_u, .scale = aor };
+    const push_add_y = runtime.AddInPlacePush{ .n = M_u * N_u };
+    const push_mse = MseLossGradPush{ .n = M_u * N_u };
+    const push_dy_B = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
+    const push_dA = runtime.LinearBatchedPush{ .M = M_u, .N = R_u, .K = K_u };
+    const push_scale_dA = ScalePush{ .n = R_u * K_u, .scale = aor };
+    const push_dB = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
+    const push_scale_dB = ScalePush{ .n = N_u * R_u, .scale = aor };
+
+    // Loss helper (host-side, half-sum MSE matching the shader convention).
+    const computeMse = struct {
+        fn call(y: []const f32, t: []const f32) f32 {
+            var s: f64 = 0;
+            for (y, t) |yv, tv| {
+                const d = yv - tv;
+                s += d * d;
+            }
+            return @floatCast(0.5 * s);
+        }
+    }.call;
+
+    // Forward pass — 5 dispatches.
+    const runForward = struct {
+        fn call(
+            c_ctx: *const vk.Context,
+            kmm: *pipeline.Kernel,
+            ksc: *pipeline.Kernel,
+            kad: *pipeline.Kernel,
+            bx: *const buffer.Buffer,
+            bw: *const buffer.Buffer,
+            ba: *const buffer.Buffer,
+            bb: *const buffer.Buffer,
+            bint: *const buffer.Buffer,
+            bylora: *const buffer.Buffer,
+            byloras: *const buffer.Buffer,
+            by: *const buffer.Buffer,
+            pyb: *const MatmulPush,
+            pin: *const MatmulPush,
+            pyl: *const MatmulPush,
+            psy: *const ScalePush,
+            pay: *const runtime.AddInPlacePush,
+            mu: u32,
+            nu: u32,
+            ru: u32,
+            recM_fn: @TypeOf(recordMatmul),
+            recS_fn: @TypeOf(recordScalar1D),
+            glin: u32,
+        ) !void {
+            try recM_fn(kmm, pyb, mu * nu, c_ctx, &.{ bx, bw, by });
+            try recM_fn(kmm, pin, mu * ru, c_ctx, &.{ bx, ba, bint });
+            try recM_fn(kmm, pyl, mu * nu, c_ctx, &.{ bint, bb, bylora });
+            try recS_fn(ksc, psy.*, ceilDiv(mu * nu, glin), c_ctx, &.{ bylora, byloras });
+            try recS_fn(kad, pay.*, ceilDiv(mu * nu, glin), c_ctx, &.{ by, byloras });
+        }
+    }.call;
+
+    // ── Initial loss.
+    try runForward(
+        &ctx, &k_matmul, &k_scale, &k_add,
+        &buf_x, &buf_w, &buf_a, &buf_b,
+        &buf_intermediate, &buf_y_lora, &buf_y_lora_scaled, &buf_y,
+        &push_y_base, &push_inter, &push_ylora, &push_scale_ylora, &push_add_y,
+        M_u, N_u, R_u, recordMatmul, recordScalar1D, group_lin,
+    );
+    const y_buf = try allocator.alloc(f32, M * Nn);
+    defer allocator.free(y_buf);
+    try buf_y.readBack(&ctx, f32, y_buf);
+    const initial_loss = computeMse(y_buf, target_y);
+    std.debug.print(
+        "LoRA train demo on {s}\n  shape: M={d} N={d} K={d} r={d}  α/r={d}  lr={d}\n  step    0 (init): loss = {d:.6}\n",
+        .{ ctx.deviceName(), M, Nn, K, r, aor, lr, initial_loss },
+    );
+
+    // ── Train loop.
+    const t_start = std.time.nanoTimestamp();
+    var step: u32 = 1;
+    while (step <= n_steps) : (step += 1) {
+        // Forward.
+        try runForward(
+            &ctx, &k_matmul, &k_scale, &k_add,
+            &buf_x, &buf_w, &buf_a, &buf_b,
+            &buf_intermediate, &buf_y_lora, &buf_y_lora_scaled, &buf_y,
+            &push_y_base, &push_inter, &push_ylora, &push_scale_ylora, &push_add_y,
+            M_u, N_u, R_u, recordMatmul, recordScalar1D, group_lin,
+        );
+        // Loss grad: dy = y - target  (shader is half-sum MSE).
+        try recordScalar1D(&k_mse_grad, push_mse, ceilDiv(M_u * N_u, group_lin), &ctx, &.{ &buf_y, &buf_target_y, &buf_dy });
+        // Backward — dx is not computed (no upstream).
+        // dy_B = dy · B
+        try recordLinBackward(&k_lin_dx, &push_dy_B, ceilDiv(M_u, group_lwg), ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
+        // ∇A_unscaled = dy_Bᵀ · x ; ∇A = (α/r) · ∇A_unscaled
+        try recordLinBackward(&k_lin_dw, &push_dA, ceilDiv(R_u, group_lwg), ceilDiv(K_u, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
+        try recordScalar1D(&k_scale, push_scale_dA, ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
+        // ∇B_unscaled = dyᵀ · intermediate ; ∇B = (α/r) · ∇B_unscaled
+        try recordLinBackward(&k_lin_dw, &push_dB, ceilDiv(N_u, group_lwg), ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
+        try recordScalar1D(&k_scale, push_scale_dB, ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
+        // Adam updates on A and B.
+        const adam_a = runtime.AdamStepPush{ .n = R_u * K_u, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = step };
+        const adam_b = runtime.AdamStepPush{ .n = N_u * R_u, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = step };
+        try recordScalar1D(&k_adam, adam_a, ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_a, &buf_dA, &buf_m_a, &buf_v_a });
+        try recordScalar1D(&k_adam, adam_b, ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_b, &buf_dB, &buf_m_b, &buf_v_b });
+
+        if (step % log_every == 0) {
+            try buf_y.readBack(&ctx, f32, y_buf);
+            const loss = computeMse(y_buf, target_y);
+            std.debug.print("  step {d:>4}        : loss = {d:.6}\n", .{ step, loss });
+        }
+    }
+    const t_end = std.time.nanoTimestamp();
+    const total_ms: f64 = @as(f64, @floatFromInt(t_end - t_start)) / 1.0e6;
+
+    try buf_y.readBack(&ctx, f32, y_buf);
+    const final_loss = computeMse(y_buf, target_y);
+    const ratio = final_loss / @max(initial_loss, 1e-30);
+
+    std.debug.print(
+        "  step {d:>4} (final): loss = {d:.6}\n  drop: {d:.4}× over {d} steps in {d:.1} ms ({d:.2} ms/step)\n",
+        .{ n_steps, final_loss, 1.0 / ratio, n_steps, total_ms, total_ms / @as(f64, @floatFromInt(n_steps)) },
+    );
+
+    if (ratio > 1e-2) {
+        std.debug.print("FAIL: loss did not drop ≥ 100×  (ratio = {d:.4})\n", .{ratio});
+        return error.LossDidNotDecrease;
+    }
+    std.debug.print("PASS GPU LoRA train demo — recovered rank-{d} delta, loss {d:.4} → {d:.4} ({d:.2}× drop)\n", .{ r, initial_loss, final_loss, 1.0 / ratio });
 }
 
 // ── CCE bench: time each kernel in isolation at Qwen3-0.6B shape ──────
