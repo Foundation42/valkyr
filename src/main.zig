@@ -642,6 +642,8 @@ pub fn main() !void {
     try runGpuRopePartialSmoke(allocator);
     try runGpuSplitQGateSmoke(allocator);
     try runGpuSigmoidMulSmoke(allocator);
+    try runSwiGluCpuSmoke(allocator);
+    try runGpuSwiGluSmoke(allocator);
     try runGpuL2normPerHeadSmoke(allocator);
     try runGpuConv1dUpdateSmoke(allocator);
     try runGpuRmsnormGatedSmoke(allocator);
@@ -8843,6 +8845,197 @@ fn runGpuSigmoidMulSmoke(allocator: std.mem.Allocator) !void {
         return error.ParityFailed;
     }
     std.debug.print("PASS GPU sigmoid_mul (1024 elems, max |Δ| vs CPU = {e})\n", .{max_abs});
+}
+
+// ── chunk 8c-β-3a-1: SwiGLU primitive parity (CPU + GPU) ────────────
+//
+// CPU oracle: numeric-grad parity for swigluForward / swigluBackward.
+// GPU parity: swiglu_forward + swiglu_backward shaders match the
+// `cpu_train_transformer.swigluForward` / `swigluBackward` reference
+// to fp32 tolerance.
+//
+// SwiGLU is the FFN nonlinearity for Llama / Qwen / Mistral; this
+// primitive replaces the toy stack's ReLU FFN in a follow-up
+// integration chunk (β-3a-2). Here we just verify the math.
+
+fn runSwiGluCpuSmoke(allocator: std.mem.Allocator) !void {
+    const n: usize = 64;
+    var prng = std.Random.DefaultPrng.init(0x5C_16_1A_AA);
+    const rng = prng.random();
+
+    const pre_gate = try allocator.alloc(f32, n);
+    defer allocator.free(pre_gate);
+    const up = try allocator.alloc(f32, n);
+    defer allocator.free(up);
+    // Scale ±1 matches the other primitive parity smokes; the central-
+    // difference truncation error scales with the input curvature, so
+    // wider inputs blow past 1% rel-err even when the analytical
+    // gradient is correct (verified by hand at probe points).
+    for (pre_gate) |*v| v.* = rng.float(f32) * 2.0 - 1.0;
+    for (up) |*v| v.* = rng.float(f32) * 2.0 - 1.0;
+
+    const gated = try allocator.alloc(f32, n);
+    defer allocator.free(gated);
+    cpu_train_transformer.swigluForward(pre_gate, up, gated);
+
+    // Random upstream gradient.
+    const d_gated = try allocator.alloc(f32, n);
+    defer allocator.free(d_gated);
+    for (d_gated) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 0.5;
+
+    const d_pre_gate = try allocator.alloc(f32, n);
+    defer allocator.free(d_pre_gate);
+    const d_up = try allocator.alloc(f32, n);
+    defer allocator.free(d_up);
+    cpu_train_transformer.swigluBackward(d_gated, pre_gate, up, d_pre_gate, d_up);
+
+    // Numeric-grad check against the analytical backward. Loss
+    // L = Σ d_gated · gated; dL/d_pre_gate and dL/d_up should match.
+    const eps: f32 = 1e-3;
+    var max_rel: f32 = 0;
+    const n_probes: usize = 8;
+    for (0..n_probes) |pi| {
+        const i = (pi * 7 + 3) % n;
+        // d/d_pre_gate
+        const pg_p = pre_gate[i] + eps;
+        const pg_m = pre_gate[i] - eps;
+        const sig_p = 1.0 / (1.0 + @exp(-pg_p));
+        const sig_m = 1.0 / (1.0 + @exp(-pg_m));
+        const gated_p = pg_p * sig_p * up[i];
+        const gated_m = pg_m * sig_m * up[i];
+        const num_dpg = d_gated[i] * (gated_p - gated_m) / (2.0 * eps);
+        const denom_pg = @max(@abs(num_dpg), 1e-6);
+        const rel_pg = @abs(num_dpg - d_pre_gate[i]) / denom_pg;
+        if (rel_pg > max_rel) max_rel = rel_pg;
+        // d/d_up
+        const u_p = up[i] + eps;
+        const u_m = up[i] - eps;
+        const sig_z = 1.0 / (1.0 + @exp(-pre_gate[i]));
+        const silu_z = pre_gate[i] * sig_z;
+        const gu_p = silu_z * u_p;
+        const gu_m = silu_z * u_m;
+        const num_du = d_gated[i] * (gu_p - gu_m) / (2.0 * eps);
+        const denom_u = @max(@abs(num_du), 1e-6);
+        const rel_u = @abs(num_du - d_up[i]) / denom_u;
+        if (rel_u > max_rel) max_rel = rel_u;
+    }
+    if (max_rel > 1e-2) {
+        std.debug.print("SwiGLU CPU: max numeric-grad rel-err = {e}\n", .{max_rel});
+        return error.ParityFailed;
+    }
+    std.debug.print("PASS SwiGLU CPU oracle (n={d}, numeric-grad parity ≤ {e})\n", .{ n, max_rel });
+}
+
+fn runGpuSwiGluSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n: usize = 1024;
+    const pre_gate = try allocator.alloc(f32, n);
+    defer allocator.free(pre_gate);
+    const up = try allocator.alloc(f32, n);
+    defer allocator.free(up);
+    const d_gated = try allocator.alloc(f32, n);
+    defer allocator.free(d_gated);
+    var prng = std.Random.DefaultPrng.init(0x5C_16_1A_BB);
+    const rng = prng.random();
+    for (pre_gate) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 3.0;
+    for (up) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 3.0;
+    for (d_gated) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * 0.5;
+
+    // CPU references.
+    const want_gated = try allocator.alloc(f32, n);
+    defer allocator.free(want_gated);
+    cpu_train_transformer.swigluForward(pre_gate, up, want_gated);
+    const want_d_pre_gate = try allocator.alloc(f32, n);
+    defer allocator.free(want_d_pre_gate);
+    const want_d_up = try allocator.alloc(f32, n);
+    defer allocator.free(want_d_up);
+    cpu_train_transformer.swigluBackward(d_gated, pre_gate, up, want_d_pre_gate, want_d_up);
+
+    // GPU forward.
+    var buf_pg = try buffer.Buffer.initStatic(&ctx, f32, pre_gate);
+    defer buf_pg.deinit(ctx.device);
+    var buf_up = try buffer.Buffer.initStatic(&ctx, f32, up);
+    defer buf_up.deinit(ctx.device);
+    var buf_gated = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
+    defer buf_gated.deinit(ctx.device);
+
+    var k_fwd = try pipeline.Kernel.init(&ctx, &shaders.swiglu_forward, 3, @sizeOf(runtime.SwigluPush));
+    defer k_fwd.deinit();
+    try k_fwd.bind(&.{ &buf_pg, &buf_up, &buf_gated });
+
+    const local: u32 = 256;
+    const groups: u32 = (@as(u32, @intCast(n)) + local - 1) / local;
+    const push = runtime.SwigluPush{ .n = @intCast(n) };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.SwigluPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &k_fwd, .push = &push, .groups = groups });
+
+    const got_gated = try allocator.alloc(f32, n);
+    defer allocator.free(got_gated);
+    try buf_gated.readBack(&ctx, f32, got_gated);
+
+    var max_fwd: f32 = 0;
+    for (got_gated, want_gated) |g, w| {
+        const d = @abs(g - w);
+        if (d > max_fwd) max_fwd = d;
+    }
+    if (max_fwd > 1e-6) {
+        std.debug.print("SwiGLU GPU forward: max |Δ| = {e}\n", .{max_fwd});
+        return error.ParityFailed;
+    }
+
+    // GPU backward.
+    var buf_dg = try buffer.Buffer.initStatic(&ctx, f32, d_gated);
+    defer buf_dg.deinit(ctx.device);
+    var buf_dpg = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
+    defer buf_dpg.deinit(ctx.device);
+    var buf_du = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
+    defer buf_du.deinit(ctx.device);
+
+    var k_bw = try pipeline.Kernel.init(&ctx, &shaders.swiglu_backward, 5, @sizeOf(runtime.SwigluPush));
+    defer k_bw.deinit();
+    try k_bw.bind(&.{ &buf_dg, &buf_pg, &buf_up, &buf_dpg, &buf_du });
+
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.SwigluPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &k_bw, .push = &push, .groups = groups });
+
+    const got_dpg = try allocator.alloc(f32, n);
+    defer allocator.free(got_dpg);
+    const got_du = try allocator.alloc(f32, n);
+    defer allocator.free(got_du);
+    try buf_dpg.readBack(&ctx, f32, got_dpg);
+    try buf_du.readBack(&ctx, f32, got_du);
+
+    var max_bw: f32 = 0;
+    for (got_dpg, want_d_pre_gate) |g, w| {
+        const d = @abs(g - w);
+        if (d > max_bw) max_bw = d;
+    }
+    for (got_du, want_d_up) |g, w| {
+        const d = @abs(g - w);
+        if (d > max_bw) max_bw = d;
+    }
+    if (max_bw > 1e-6) {
+        std.debug.print("SwiGLU GPU backward: max |Δ| = {e}\n", .{max_bw});
+        return error.ParityFailed;
+    }
+    std.debug.print(
+        "PASS GPU SwiGLU forward + backward (n={d}, fwd max |Δ| = {e}, bw max |Δ| = {e})\n",
+        .{ n, max_fwd, max_bw },
+    );
 }
 
 // ── gpu l2norm-per-head smoke: synthetic vs CPU ─────────────────────

@@ -191,6 +191,10 @@ pub const AdamStepPush = extern struct {
 
 pub const MseLossGradPush = extern struct { n: u32 };
 
+/// SwiGLU FFN nonlinearity. Both forward and backward kernels are
+/// elementwise over `n` output values; same push struct serves both.
+pub const SwigluPush = extern struct { n: u32 };
+
 /// Scaled MSE loss gradient. Bakes the (2/N) factor into the kernel
 /// so the transformer-training side doesn't need a follow-up scale.
 pub const MseLossGradScaledPush = extern struct { n: u32, scale: f32 };

@@ -713,3 +713,82 @@ pub fn attentionBackward(
         }
     }
 }
+
+// ── SwiGLU FFN ────────────────────────────────────────────────────────
+//
+// SwiGLU is the FFN used by Llama / Qwen / Mistral. Replaces the toy
+// stack's FF1 → ReLU → FF2 with a gated path:
+//
+//     gate     = silu(x @ W_gate^T)         silu(z) = z · σ(z)
+//     up       = x @ W_up^T
+//     gated    = gate · up                  (elementwise)
+//     y        = gated @ W_down^T
+//
+// Three weight tensors instead of two; the gate's nonlinearity is
+// SiLU (a.k.a. swish-1). The matmuls themselves reuse the existing
+// linear primitive — only the SwiGLU non-linearity (silu plus the
+// gate·up multiply) needs new oracle code.
+//
+// Backward, given d_gated = ∂L/∂gated (the gradient flowing down from
+// the W_down dx step):
+//
+//     d_up         = d_gated · gate
+//     d_gate       = d_gated · up
+//     d_pre_gate_i = d_gate_i · silu'(pre_gate_i)
+//
+// where silu'(z) = σ(z) · (1 + z·(1 − σ(z))) — derived via product
+// rule from silu(z) = z · σ(z) and σ'(z) = σ(z)·(1 − σ(z)).
+//
+// Saved activations: `pre_gate` and `up` (sufficient — `gate` and
+// `gated` are recomputed in the kernels rather than stored, since
+// silu is cheap and the alternative inflates per-layer activation
+// memory). The fused-shader implementation will follow the same
+// recompute strategy on the GPU.
+//
+// fp64 accumulator is unnecessary here: every operation is per-element
+// — no cross-element reduction.
+
+fn sigmoidf(z: f32) f32 {
+    return 1.0 / (1.0 + @exp(-z));
+}
+
+/// SwiGLU forward: `gated[i] = silu(pre_gate[i]) · up[i]`. All three
+/// slices must have the same length. `gated` is the input that the
+/// W_down matmul consumes.
+pub fn swigluForward(
+    pre_gate: []const f32,
+    up: []const f32,
+    gated: []f32,
+) void {
+    std.debug.assert(pre_gate.len == up.len);
+    std.debug.assert(gated.len == pre_gate.len);
+    for (pre_gate, up, gated) |z, u, *g| {
+        const sig = sigmoidf(z);
+        const silu_z = z * sig;
+        g.* = silu_z * u;
+    }
+}
+
+/// SwiGLU backward. Given the upstream gradient `d_gated` and the saved
+/// pre_gate / up activations, writes the gradients into `d_pre_gate`
+/// and `d_up`. Outputs *overwrite* (not accumulate) — caller zeroes if
+/// it needs accumulation.
+pub fn swigluBackward(
+    d_gated: []const f32,
+    pre_gate: []const f32,
+    up: []const f32,
+    d_pre_gate: []f32,
+    d_up: []f32,
+) void {
+    std.debug.assert(d_gated.len == pre_gate.len);
+    std.debug.assert(up.len == pre_gate.len);
+    std.debug.assert(d_pre_gate.len == pre_gate.len);
+    std.debug.assert(d_up.len == pre_gate.len);
+    for (d_gated, pre_gate, up, d_pre_gate, d_up) |dg, z, u, *dpg, *du| {
+        const sig = sigmoidf(z);
+        const silu_z = z * sig;
+        const silu_grad = sig + silu_z * (1.0 - sig);
+        du.* = dg * silu_z;
+        dpg.* = dg * u * silu_grad;
+    }
+}

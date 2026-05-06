@@ -1,0 +1,31 @@
+#version 460
+// SwiGLU forward elementwise:
+//
+//     gated[i] = silu(pre_gate[i]) · up[i]
+//             = pre_gate[i] · sigmoid(pre_gate[i]) · up[i]
+//
+// One thread per element. CPU-side `swigluForward` is the reference.
+// All three buffers have the same length.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer PG    { float pre_gate[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Up    { float up_v[];      };
+layout(set = 0, binding = 2, std430) writeonly buffer Out   { float gated[];     };
+
+layout(push_constant) uniform Pc {
+    uint n;
+} pc;
+
+float sigmoidf(float z) {
+    return 1.0 / (1.0 + exp(-z));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float z = pre_gate[i];
+    float sig = sigmoidf(z);
+    float silu_z = z * sig;
+    gated[i] = silu_z * up_v[i];
+}

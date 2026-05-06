@@ -1,0 +1,42 @@
+#version 460
+// SwiGLU backward elementwise. Given d_gated (upstream from the W_down
+// matmul dx) plus the saved pre_gate / up activations:
+//
+//     sig          = sigmoid(pre_gate)
+//     silu_z       = pre_gate · sig
+//     silu_grad    = sig + silu_z · (1 − sig)
+//                  = sig · (1 + pre_gate · (1 − sig))
+//     d_up         = d_gated · silu_z
+//     d_pre_gate   = d_gated · up · silu_grad
+//
+// Outputs *overwrite* — caller zeroes if it wants accumulation.
+// One thread per element. CPU-side `swigluBackward` is the reference.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer DG  { float d_gated[];     };
+layout(set = 0, binding = 1, std430) readonly  buffer PG  { float pre_gate[];    };
+layout(set = 0, binding = 2, std430) readonly  buffer Up  { float up_v[];        };
+layout(set = 0, binding = 3, std430) writeonly buffer DPG { float d_pre_gate[];  };
+layout(set = 0, binding = 4, std430) writeonly buffer DU  { float d_up[];        };
+
+layout(push_constant) uniform Pc {
+    uint n;
+} pc;
+
+float sigmoidf(float z) {
+    return 1.0 / (1.0 + exp(-z));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float z = pre_gate[i];
+    float u = up_v[i];
+    float dg = d_gated[i];
+    float sig = sigmoidf(z);
+    float silu_z = z * sig;
+    float silu_grad = sig + silu_z * (1.0 - sig);
+    d_up[i] = dg * silu_z;
+    d_pre_gate[i] = dg * u * silu_grad;
+}
