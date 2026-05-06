@@ -531,8 +531,28 @@ pub const Runner = struct {
         errdefer @constCast(&sc_d_n1_v).deinit(ctx.device);
 
         // ── Host scratch for dw_partial reduce.
-        const dw_partial_host = try allocator.alloc(f32, n_pos * dim);
+        // Sized for the largest (n_rows × dim_per_row) shape any of the
+        // partial buffers can have:
+        //   final_norm / n1 / n2 partials → n_pos · dim
+        //   q-norm partial               → n_pos · n_heads · head_dim
+        //   k-norm partial               → n_pos · n_kv_heads · head_dim
+        // For most LLMs n_heads · head_dim == dim, but Qwen3-0.6B has
+        // n_heads · head_dim = 16 · 128 = 2048 vs dim = 1024 (q-side
+        // expanded for non-GQA path), so the q-norm partial is the
+        // limiting factor there. Pre-CCE this overflowed silently in
+        // ReleaseFast (assertion compiled out) and panicked in Debug.
+        const head_dim_usz: usize = @intCast(cfg.head_dim);
+        const max_partial_row: usize = @max(
+            dim,
+            @max(
+                @as(usize, cfg.n_heads) * head_dim_usz,
+                @as(usize, cfg.n_kv_heads) * head_dim_usz,
+            ),
+        );
+        const dw_partial_host = try allocator.alloc(f32, n_pos * max_partial_row);
         errdefer allocator.free(dw_partial_host);
+        // dw_reduced takes the per-row width (dim, or head_dim for q/k-norm).
+        // dim ≥ head_dim always, so sizing to dim is sufficient.
         const dw_reduced = try allocator.alloc(f32, dim);
         errdefer allocator.free(dw_reduced);
 
@@ -1353,13 +1373,18 @@ pub const Runner = struct {
     fn reduceDwPartial(self: *Runner, partial: *const buffer.Buffer, dst_dynamic: *buffer.Buffer) !void {
         const dim: usize = @intCast(self.cfg.dim);
         const n_pos: usize = @intCast(self.cfg.n_pos);
-        try partial.readBack(self.ctx, f32, self.dw_partial_host);
-        @memset(self.dw_reduced, 0);
+        // dw_partial_host is sized for the *largest* partial shape (n_pos *
+        // max(dim, n_heads * head_dim, n_kv_heads * head_dim)). Slice it
+        // to the actual readback size (n_pos * dim) so we don't try to
+        // read past the partial buffer's end.
+        const total = n_pos * dim;
+        try partial.readBack(self.ctx, f32, self.dw_partial_host[0..total]);
+        @memset(self.dw_reduced[0..dim], 0);
         for (0..n_pos) |row| {
             const off = row * dim;
             for (0..dim) |idx| self.dw_reduced[idx] += self.dw_partial_host[off + idx];
         }
-        dst_dynamic.update(f32, self.dw_reduced);
+        dst_dynamic.update(f32, self.dw_reduced[0..dim]);
     }
 
     /// Generic per-row reduce: partial is [n_rows × dim_per_row], dst
