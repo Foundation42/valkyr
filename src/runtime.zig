@@ -300,6 +300,10 @@ pub const CceForwardPush = extern struct {
     n_samples: u32,
     vocab: u32,
     dim: u32,
+    /// Optional z-loss scale (Chronicals §"Z-Loss"). Adds λ_z · lse² to
+    /// the per-row loss. Default 0 ⇒ plain CE; typical training value
+    /// is 1e-4. Cost is one scalar add per row in the shader.
+    z_loss_scale: f32 = 0.0,
 };
 
 /// CCE backward — d_h component (one WG per row) and dW component (one
@@ -310,6 +314,10 @@ pub const CceBackwardPush = extern struct {
     n_samples: u32,
     vocab: u32,
     dim: u32,
+    /// Must match the value used in the matching cce_forward dispatch:
+    /// the gradient picks up a (1 + 2·λ_z·lse) factor on the softmax
+    /// part of dz when λ_z > 0. Default 0 ⇒ plain CE backward.
+    z_loss_scale: f32 = 0.0,
 };
 
 pub const Mlp2LossBatchedPush = extern struct {

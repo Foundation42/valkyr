@@ -48,6 +48,7 @@ layout(push_constant) uniform Pc {
     uint N;
     uint V;
     uint D;
+    float z_loss_scale; // λ_z; multiplies softmax part of dz by (1 + 2·λ_z·lse)
 } pc;
 
 shared float sg_partials[32];   // up to 32 subgroups
@@ -81,13 +82,17 @@ void main() {
         barrier();
 
         // ── Step 2: cross-subgroup reduce + dz, broadcast via shared.
+        // Z-loss multiplies the softmax part of dz by (1 + 2·λ_z·lse).
+        // λ_z = 0 ⇒ factor = 1 ⇒ plain CE backward.
         if (warp_id == 0) {
             float vv = (lane < num_warps) ? sg_partials[lane] : 0.0;
             float total = subgroupAdd(vv);
             if (subgroupElect()) {
-                float p     = exp(total - lse[n]);
-                float t_ind = (v == tgt[n]) ? 1.0 : 0.0;
-                row_dz = (p - t_ind) * inv_n;
+                float lse_n          = lse[n];
+                float p              = exp(total - lse_n);
+                float t_ind          = (v == tgt[n]) ? 1.0 : 0.0;
+                float softmax_factor = 1.0 + 2.0 * pc.z_loss_scale * lse_n;
+                row_dz = (softmax_factor * p - t_ind) * inv_n;
             }
         }
         barrier();

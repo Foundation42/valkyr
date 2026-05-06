@@ -69,6 +69,7 @@ layout(push_constant) uniform Pc {
     uint N;
     uint V;
     uint D;
+    float z_loss_scale; // λ_z; 0 ⇒ plain CE, typical training value 1e-4
 } pc;
 
 shared float z_chunk[CHUNK];
@@ -174,6 +175,12 @@ void main() {
     if (tid == 0) {
         float lse_val = log(row_d) + row_m;
         lse[row] = lse_val;
-        loss_row[row] = lse_val - row_z_target;
+        // Z-loss penalty: + λ_z · lse² added to the per-row loss
+        // (Chronicals §"Z-Loss" / PaLM eq. 15). With λ_z = 0 this
+        // collapses to the plain CE loss; otherwise it caps logit
+        // magnitudes by penalizing large logsumexp values.
+        float ce = lse_val - row_z_target;
+        float z_pen = pc.z_loss_scale * lse_val * lse_val;
+        loss_row[row] = ce + z_pen;
     }
 }

@@ -68,6 +68,15 @@ const std = @import("std");
 /// materializing logits. Writes per-row log-sum-exp into `lse_out` for
 /// the backward pass to reuse.
 ///
+/// `z_loss_scale` (Chronicals §"Z-Loss", PaLM eq. 15) adds a quadratic
+/// penalty on logsumexp:
+///
+///     L_total = L_CE + λ_z · lse²
+///
+/// to prevent fp16 overflow during long-context training. Pass 0.0 to
+/// recover plain CE; typical values are 1e-4. The cost is one extra
+/// scalar add per row (after the chunk loop) — no per-vocab work.
+///
 /// Asserts (in debug) on shape and chunk-size sanity.
 pub fn cceForward(
     h: []const f32,
@@ -77,6 +86,7 @@ pub fn cceForward(
     vocab: usize,
     dim: usize,
     chunk: usize,
+    z_loss_scale: f32,
     lse_out: []f32,
 ) f32 {
     std.debug.assert(h.len == n * dim);
@@ -135,7 +145,9 @@ pub fn cceForward(
 
         const lse: f32 = @floatCast(@log(d_acc) + @as(f64, m));
         lse_out[row] = lse;
-        total_loss += @as(f64, lse) - @as(f64, z_target);
+        const ce_loss: f64 = @as(f64, lse) - @as(f64, z_target);
+        const z_penalty: f64 = @as(f64, z_loss_scale) * @as(f64, lse) * @as(f64, lse);
+        total_loss += ce_loss + z_penalty;
     }
 
     return @floatCast(total_loss / @as(f64, @floatFromInt(n)));
@@ -150,6 +162,9 @@ pub fn cceForward(
 /// will look "close" but be wrong); call sites should treat the
 /// (lse, h, w_lm) triple as an atomic carry across forward and
 /// backward.
+/// `z_loss_scale` (Chronicals §"Z-Loss") adds 2·λ_z·lse·softmax_v to
+/// the per-element gradient — equivalent to a softmax-factor multiplier
+/// of (1 + 2·λ_z·lse). Must match the same value passed to `cceForward`.
 pub fn cceBackward(
     h: []const f32,
     w_lm: []const f32,
@@ -159,6 +174,7 @@ pub fn cceBackward(
     vocab: usize,
     dim: usize,
     chunk: usize,
+    z_loss_scale: f32,
     d_h: []f32,
     dW: []f32,
 ) void {
@@ -181,6 +197,10 @@ pub fn cceBackward(
         const h_off = row * dim;
         const lse_row: f32 = lse[row];
         const tgt: usize = @intCast(target_ids[row]);
+        // Z-loss multiplies the softmax part of the gradient by
+        // (1 + 2·λ_z·lse). When λ_z = 0 this is exactly 1 and we
+        // recover plain CE. Computed once per row (not per element).
+        const softmax_factor: f32 = 1.0 + 2.0 * z_loss_scale * lse_row;
 
         var c_start: usize = 0;
         while (c_start < vocab) : (c_start += chunk) {
@@ -201,13 +221,13 @@ pub fn cceBackward(
                 z[o] = @floatCast(s);
             }
 
-            // For each o in chunk, derive dz_o = (softmax_o − [o==t]) / N
+            // For each o in chunk, derive dz_o = (softmax_factor · softmax_o − [o==t]) / N
             // and stream into d_h[row] and dW[c_start+o] in one pass.
             for (0..z.len) |o| {
                 const vocab_idx = c_start + o;
                 const p: f32 = @floatCast(@exp(@as(f64, z[o]) - @as(f64, lse_row)));
                 const t_indicator: f32 = if (vocab_idx == tgt) 1.0 else 0.0;
-                const dz: f32 = (p - t_indicator) * inv_n;
+                const dz: f32 = (softmax_factor * p - t_indicator) * inv_n;
 
                 const w_off = vocab_idx * dim;
                 // d_h[row, k] += dz · W[vocab_idx, k]
@@ -351,7 +371,7 @@ test "cceForward matches materialized softmaxCeLoss across chunk sizes" {
     const lse = try gpa.alloc(f32, n);
     defer gpa.free(lse);
     for (chunks) |c| {
-        const cce_loss = cceForward(h, w, targets, n, vocab, dim, c, lse);
+        const cce_loss = cceForward(h, w, targets, n, vocab, dim, c, 0.0, lse);
         const rel = @abs(cce_loss - ref_loss) / @max(@abs(ref_loss), 1e-30);
         try testing.expect(rel < 1e-5);
     }
@@ -397,14 +417,14 @@ test "cceBackward matches materialized softmaxCeLossGrad → linearBackward" {
     // CCE path: cceForward (caches lse) → cceBackward.
     const lse = try gpa.alloc(f32, n);
     defer gpa.free(lse);
-    _ = cceForward(h, w, targets, n, vocab, dim, chunk, lse);
+    _ = cceForward(h, w, targets, n, vocab, dim, chunk, 0.0, lse);
 
     const d_h_cce = try gpa.alloc(f32, n * dim);
     defer gpa.free(d_h_cce);
     const dW_cce = try gpa.alloc(f32, vocab * dim);
     defer gpa.free(dW_cce);
     @memset(dW_cce, 0);
-    cceBackward(h, w, targets, lse, n, vocab, dim, chunk, d_h_cce, dW_cce);
+    cceBackward(h, w, targets, lse, n, vocab, dim, chunk, 0.0, d_h_cce, dW_cce);
 
     const d_h_rel = maxAbsRelDiff(d_h_ref, d_h_cce);
     const dW_rel = maxAbsRelDiff(dW_ref, dW_cce);
@@ -436,26 +456,26 @@ test "cceForward + cceBackward agree across chunk sizes (chunk irrelevance)" {
     // softmax) and compare against multiple smaller chunk sizes.
     const lse_full = try gpa.alloc(f32, n);
     defer gpa.free(lse_full);
-    const loss_full = cceForward(h, w, targets, n, vocab, dim, vocab, lse_full);
+    const loss_full = cceForward(h, w, targets, n, vocab, dim, vocab, 0.0, lse_full);
     const d_h_full = try gpa.alloc(f32, n * dim);
     defer gpa.free(d_h_full);
     const dW_full = try gpa.alloc(f32, vocab * dim);
     defer gpa.free(dW_full);
     @memset(dW_full, 0);
-    cceBackward(h, w, targets, lse_full, n, vocab, dim, vocab, d_h_full, dW_full);
+    cceBackward(h, w, targets, lse_full, n, vocab, dim, vocab, 0.0, d_h_full, dW_full);
 
     const chunks = [_]usize{ 32, 64, 128, 250, 333 };
     for (chunks) |c| {
         const lse_c = try gpa.alloc(f32, n);
         defer gpa.free(lse_c);
-        const loss_c = cceForward(h, w, targets, n, vocab, dim, c, lse_c);
+        const loss_c = cceForward(h, w, targets, n, vocab, dim, c, 0.0, lse_c);
 
         const d_h_c = try gpa.alloc(f32, n * dim);
         defer gpa.free(d_h_c);
         const dW_c = try gpa.alloc(f32, vocab * dim);
         defer gpa.free(dW_c);
         @memset(dW_c, 0);
-        cceBackward(h, w, targets, lse_c, n, vocab, dim, c, d_h_c, dW_c);
+        cceBackward(h, w, targets, lse_c, n, vocab, dim, c, 0.0, d_h_c, dW_c);
 
         const loss_rel = @abs(loss_c - loss_full) / @max(@abs(loss_full), 1e-30);
         try testing.expect(loss_rel < 1e-5);
@@ -488,7 +508,7 @@ test "cceBackward accumulates into dW (does not overwrite)" {
 
     const lse = try gpa.alloc(f32, n);
     defer gpa.free(lse);
-    _ = cceForward(h, w, targets, n, vocab, dim, chunk, lse);
+    _ = cceForward(h, w, targets, n, vocab, dim, chunk, 0.0, lse);
 
     const d_h = try gpa.alloc(f32, n * dim);
     defer gpa.free(d_h);
@@ -499,12 +519,12 @@ test "cceBackward accumulates into dW (does not overwrite)" {
     const dW_a = try gpa.alloc(f32, vocab * dim);
     defer gpa.free(dW_a);
     @memset(dW_a, 0);
-    cceBackward(h, w, targets, lse, n, vocab, dim, chunk, d_h, dW_a);
+    cceBackward(h, w, targets, lse, n, vocab, dim, chunk, 0.0, d_h, dW_a);
 
     const dW_b = try gpa.alloc(f32, vocab * dim);
     defer gpa.free(dW_b);
     @memcpy(dW_b, dW_a);
-    cceBackward(h, w, targets, lse, n, vocab, dim, chunk, d_h, dW_b);
+    cceBackward(h, w, targets, lse, n, vocab, dim, chunk, 0.0, d_h, dW_b);
 
     // dW_b should equal 2 × dW_a (within reduction-order f32 noise)
     for (dW_a, dW_b) |a, b| {
@@ -512,4 +532,95 @@ test "cceBackward accumulates into dW (does not overwrite)" {
         const denom = @max(@abs(expected), 1e-30);
         try testing.expect(@abs(b - expected) / denom < 1e-5);
     }
+}
+
+test "Z-loss: forward + backward match materialized reference" {
+    const gpa = testing.allocator;
+    const n: usize = 4;
+    const dim: usize = 32;
+    const vocab: usize = 1024;
+    const chunk: usize = 256;
+    const zlc: f32 = 1e-4; // canonical PaLM-style z-loss scale
+
+    var prng = std.Random.DefaultPrng.init(0xC10_5550);
+    const rng = prng.random();
+
+    const h = try gpa.alloc(f32, n * dim);
+    defer gpa.free(h);
+    const w = try gpa.alloc(f32, vocab * dim);
+    defer gpa.free(w);
+    const targets = try gpa.alloc(u32, n);
+    defer gpa.free(targets);
+
+    for (h) |*v| v.* = (rng.float(f32) - 0.5) * 0.1;
+    for (w) |*v| v.* = (rng.float(f32) - 0.5) * 0.1;
+    for (targets) |*t| t.* = rng.intRangeLessThan(u32, 0, vocab);
+
+    // ── CCE forward + backward with z-loss enabled.
+    const lse_cce = try gpa.alloc(f32, n);
+    defer gpa.free(lse_cce);
+    const loss_cce = cceForward(h, w, targets, n, vocab, dim, chunk, zlc, lse_cce);
+
+    const d_h_cce = try gpa.alloc(f32, n * dim);
+    defer gpa.free(d_h_cce);
+    const dW_cce = try gpa.alloc(f32, vocab * dim);
+    defer gpa.free(dW_cce);
+    @memset(dW_cce, 0);
+    cceBackward(h, w, targets, lse_cce, n, vocab, dim, chunk, zlc, d_h_cce, dW_cce);
+
+    // ── Reference: materialize logits + add zlc · lse² to per-row loss
+    //    and (1 + 2·zlc·lse) · softmax to per-element gradient.
+    const logits = try gpa.alloc(f32, n * vocab);
+    defer gpa.free(logits);
+    refMatmulNt(logits, h, w, n, vocab, dim);
+
+    var ref_total_loss: f64 = 0;
+    var ref_lse: [16]f32 = undefined; // n ≤ 16 in this test
+    std.debug.assert(n <= ref_lse.len);
+    for (0..n) |p| {
+        const off = p * vocab;
+        var max_z: f32 = -std.math.inf(f32);
+        for (0..vocab) |o| max_z = @max(max_z, logits[off + o]);
+        var sum_e: f64 = 0;
+        for (0..vocab) |o| sum_e += @exp(@as(f64, logits[off + o]) - @as(f64, max_z));
+        const lse_v: f32 = @floatCast(@log(sum_e) + @as(f64, max_z));
+        ref_lse[p] = lse_v;
+        const tgt: usize = @intCast(targets[p]);
+        const ce_loss: f64 = @as(f64, lse_v) - @as(f64, logits[off + tgt]);
+        const z_pen: f64 = @as(f64, zlc) * @as(f64, lse_v) * @as(f64, lse_v);
+        ref_total_loss += ce_loss + z_pen;
+    }
+    const ref_loss: f32 = @floatCast(ref_total_loss / @as(f64, @floatFromInt(n)));
+
+    // Reference d_logits with z-loss factor: dz_v = (1 + 2·zlc·lse)·softmax_v − δ_{v,t}, /N
+    const d_logits = try gpa.alloc(f32, n * vocab);
+    defer gpa.free(d_logits);
+    const inv_n: f32 = 1.0 / @as(f32, @floatFromInt(n));
+    for (0..n) |p| {
+        const off = p * vocab;
+        const lse_v = ref_lse[p];
+        const sm_factor: f32 = 1.0 + 2.0 * zlc * lse_v;
+        const tgt: usize = @intCast(targets[p]);
+        for (0..vocab) |o| {
+            const sm: f32 = @floatCast(@exp(@as(f64, logits[off + o]) - @as(f64, lse_v)));
+            const t_o: f32 = if (o == tgt) 1.0 else 0.0;
+            d_logits[off + o] = (sm_factor * sm - t_o) * inv_n;
+        }
+    }
+
+    // Reference d_h, dW via materialized linear backward.
+    const d_h_ref = try gpa.alloc(f32, n * dim);
+    defer gpa.free(d_h_ref);
+    const dW_ref = try gpa.alloc(f32, vocab * dim);
+    defer gpa.free(dW_ref);
+    @memset(dW_ref, 0);
+    refLinearBackward(d_logits, h, w, n, vocab, dim, d_h_ref, dW_ref);
+
+    // ── Diff.
+    const loss_rel = @abs(loss_cce - ref_loss) / @max(@abs(ref_loss), 1e-30);
+    const d_h_rel = maxAbsRelDiff(d_h_ref, d_h_cce);
+    const dW_rel = maxAbsRelDiff(dW_ref, dW_cce);
+    try testing.expect(loss_rel < 1e-5);
+    try testing.expect(d_h_rel < 1e-5);
+    try testing.expect(dW_rel < 1e-5);
 }
