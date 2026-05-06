@@ -276,6 +276,17 @@ pub const SoftmaxCeLossGradPush = extern struct {
     n_samples: u32,
 };
 
+/// Cut Cross-Entropy forward — fused LM-head matmul + online-softmax CE.
+/// One workgroup per row (n_samples WGs). The shader hardcodes
+/// CHUNK == local_size_x == 256, so the only runtime parameters are the
+/// problem shape: `n_samples` rows of `dim`-wide hidden states against a
+/// `vocab`-row LM-head weight matrix. CPU oracle is in src/cpu/cce.zig.
+pub const CceForwardPush = extern struct {
+    n_samples: u32,
+    vocab: u32,
+    dim: u32,
+};
+
 pub const Mlp2LossBatchedPush = extern struct {
     dim_out: u32,
     n_samples: u32,

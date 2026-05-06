@@ -21,6 +21,7 @@ const q4_k = @import("cpu/q4_k.zig");
 const cpu_train = @import("cpu/train.zig");
 const cpu_train_transformer = @import("cpu/train_transformer.zig");
 const cpu_train_decoder = @import("cpu/train_decoder.zig");
+const cpu_cce = @import("cpu/cce.zig");
 const train_runner = @import("train/runner.zig");
 const train_runner_n = @import("train/runner_n.zig");
 const train_transformer = @import("train/transformer.zig");
@@ -93,6 +94,14 @@ pub fn main() !void {
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--list")) {
         try runList(allocator);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--cce-forward-smoke")) {
+        // Fast-path for iterating on the CCE forward kernel.
+        // Drives `cce_forward.comp` against the cce.zig CPU oracle on
+        // three Qwen-flavoured shapes (multi-chunk, partial-chunk,
+        // single-chunk).
+        try runGpuCceForwardSmoke(allocator);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
@@ -619,6 +628,7 @@ pub fn main() !void {
     try runTrainingRunnerNAttachedSmoke(allocator);
     try runWeightDecayCosineLrSmoke(allocator);
     try runGpuMatmulV2Smoke(allocator);
+    try runGpuCceForwardSmoke(allocator);
     try runEmbeddedAttachSmoke(allocator);
     try runEmbeddedRecorderSmoke(allocator);
     try runGpuMatmulQ4_0Smoke(allocator);
@@ -4167,6 +4177,158 @@ fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("PASS GPU matmul_nt synthetic (2×3 · (4×3)ᵀ → 2×4) on {s}\n", .{ctx.deviceName()});
+}
+
+// ── GPU CCE forward smoke: fused matmul + online-softmax CE vs CPU oracle ─
+//
+// Drives `cce_forward.comp` against `cpu_cce.cceForward` on Qwen-flavoured
+// shapes — one pass exercising multi-chunk online softmax (V > CHUNK) and
+// one with V < CHUNK to cover the boundary mask. Asserts per-row lse and
+// per-row loss agree to 1e-5 global rel-err. The shader hardcodes
+// CHUNK = 256, so we drive the CPU oracle with chunk = 256 to compare
+// like-for-like.
+
+fn runGpuCceForwardSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const SmokeCase = struct {
+        name: []const u8,
+        n: u32,
+        v: u32,
+        d: u32,
+    };
+    const cases = [_]SmokeCase{
+        .{ .name = "multi-chunk (V=2048, 8 chunks)", .n = 4, .v = 2048, .d = 896 },
+        .{ .name = "partial-chunk (V=300, 1+ chunks)", .n = 3, .v = 300, .d = 64 },
+        .{ .name = "single-chunk (V=256, exactly CHUNK)", .n = 2, .v = 256, .d = 128 },
+    };
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.cce_forward, 5, @sizeOf(runtime.CceForwardPush));
+    defer kern.deinit();
+
+    for (cases) |cs| {
+        // ── Generate inputs (h, W, targets) on host. Deterministic seed
+        //    per case so failure repros. Small magnitudes keep logits in
+        //    a numerically benign range (we already test stability against
+        //    larger inputs in cce.zig's own tests).
+        var prng = std.Random.DefaultPrng.init(0xCCE0_F00D + cs.v);
+        const rng = prng.random();
+
+        const h = try allocator.alloc(f32, cs.n * cs.d);
+        defer allocator.free(h);
+        const w_lm = try allocator.alloc(f32, cs.v * cs.d);
+        defer allocator.free(w_lm);
+        const targets = try allocator.alloc(u32, cs.n);
+        defer allocator.free(targets);
+
+        for (h) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+        for (w_lm) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+        for (targets) |*t| t.* = rng.intRangeLessThan(u32, 0, cs.v);
+
+        // ── CPU oracle.
+        const lse_cpu = try allocator.alloc(f32, cs.n);
+        defer allocator.free(lse_cpu);
+        const mean_loss_cpu = cpu_cce.cceForward(
+            h,
+            w_lm,
+            targets,
+            cs.n,
+            cs.v,
+            cs.d,
+            256, // shader hardcodes CHUNK = 256
+            lse_cpu,
+        );
+
+        // ── GPU dispatch.
+        var buf_h = try buffer.Buffer.initStatic(&ctx, f32, h);
+        defer buf_h.deinit(ctx.device);
+        var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w_lm);
+        defer buf_w.deinit(ctx.device);
+        var buf_t = try buffer.Buffer.initStatic(&ctx, u32, targets);
+        defer buf_t.deinit(ctx.device);
+        var buf_lse = try buffer.Buffer.initDeviceOnly(&ctx, cs.n * @sizeOf(f32));
+        defer buf_lse.deinit(ctx.device);
+        var buf_loss = try buffer.Buffer.initDeviceOnly(&ctx, cs.n * @sizeOf(f32));
+        defer buf_loss.deinit(ctx.device);
+
+        try kern.bind(&.{ &buf_h, &buf_w, &buf_t, &buf_lse, &buf_loss });
+
+        const push = runtime.CceForwardPush{ .n_samples = cs.n, .vocab = cs.v, .dim = cs.d };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.CceForwardPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &kern, .push = &push, .gx = cs.n });
+
+        const lse_gpu = try allocator.alloc(f32, cs.n);
+        defer allocator.free(lse_gpu);
+        const loss_gpu = try allocator.alloc(f32, cs.n);
+        defer allocator.free(loss_gpu);
+        try buf_lse.readBack(&ctx, f32, lse_gpu);
+        try buf_loss.readBack(&ctx, f32, loss_gpu);
+
+        // GPU writes per-row loss; reduce to mean for comparison against
+        // the CPU oracle's scalar return value.
+        var sum_gpu: f64 = 0;
+        for (loss_gpu) |x| sum_gpu += x;
+        const mean_loss_gpu: f32 = @floatCast(sum_gpu / @as(f64, @floatFromInt(cs.n)));
+
+        // ── Reconstruct per-row CPU loss for diff. The CPU oracle
+        //    returns mean(loss); per-row loss[n] = lse[n] - z_target[n]
+        //    where z_target[n] = h[n] · w_lm[target[n]]ᵀ. Recompute the
+        //    target-row dot product on the host (one row each).
+        const loss_cpu_per_row = try allocator.alloc(f32, cs.n);
+        defer allocator.free(loss_cpu_per_row);
+        for (0..cs.n) |row| {
+            const tgt: usize = @intCast(targets[row]);
+            var s: f64 = 0;
+            for (0..cs.d) |k| {
+                s += @as(f64, h[row * cs.d + k]) * @as(f64, w_lm[tgt * cs.d + k]);
+            }
+            const z_target: f32 = @floatCast(s);
+            loss_cpu_per_row[row] = lse_cpu[row] - z_target;
+        }
+
+        // Global rel-err (max|diff| / max|ref|) — same metric as cce.zig's
+        // parity tests, robust to noise-floor entries.
+        const lse_rel = globalRelDiff(lse_cpu, lse_gpu);
+        const loss_rel = globalRelDiff(loss_cpu_per_row, loss_gpu);
+        const mean_rel = @abs(mean_loss_gpu - mean_loss_cpu) /
+            @max(@abs(mean_loss_cpu), 1e-30);
+
+        const tol: f32 = 1e-5;
+        if (lse_rel >= tol or loss_rel >= tol or mean_rel >= tol) {
+            std.debug.print(
+                "CCE smoke ({s}) FAIL: lse_rel={e} loss_rel={e} mean_rel={e}  cpu_mean={d:.6} gpu_mean={d:.6}\n",
+                .{ cs.name, lse_rel, loss_rel, mean_rel, mean_loss_cpu, mean_loss_gpu },
+            );
+            return error.ParityFailed;
+        }
+
+        std.debug.print(
+            "PASS GPU CCE forward — {s}  N={d} V={d} D={d}  mean_loss={d:.4}  rel(lse/loss/mean)=({e},{e},{e})\n",
+            .{ cs.name, cs.n, cs.v, cs.d, mean_loss_cpu, lse_rel, loss_rel, mean_rel },
+        );
+    }
+}
+
+/// Global relative-difference metric: `max|a − b| / max|a|`. Matches
+/// `cce.zig`'s in-file parity test. Robust to noise-floor entries where
+/// individual values are at f32 round-off from zero.
+fn globalRelDiff(a: []const f32, b: []const f32) f32 {
+    std.debug.assert(a.len == b.len);
+    var max_diff: f32 = 0;
+    var max_a: f32 = 0;
+    for (a, b) |av, bv| {
+        const diff = @abs(av - bv);
+        if (diff > max_diff) max_diff = diff;
+        if (@abs(av) > max_a) max_a = @abs(av);
+    }
+    return if (max_a > 1e-30) max_diff / max_a else max_diff;
 }
 
 // ── gpu matmul_nt_v2 smoke: cooperative-K kernel vs hand-checked ───

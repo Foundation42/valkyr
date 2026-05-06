@@ -1,0 +1,165 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Cut Cross-Entropy forward — fused LM-head matmul + online-softmax + CE
+// loss. Never materializes the [N, V] logit tensor.
+//
+// Algorithm (mirrors src/cpu/cce.zig):
+//
+//   for each row n (one workgroup):
+//     m, d ← -inf, 0                              -- online softmax stats
+//     z_target ← 0
+//     for each vocab chunk c of width CHUNK:
+//       z_chunk[CHUNK] ← h[n] · W[c : c + CHUNK]ᵀ -- compute, never store to HBM
+//       m_new          ← max(m, max(z_chunk))
+//       d              ← d · exp(m − m_new) + Σ exp(z_chunk − m_new)
+//       m              ← m_new
+//       if target_id[n] ∈ chunk: z_target ← z_chunk[target_id[n] − c]
+//     lse[n]      ← log(d) + m
+//     loss_row[n] ← lse[n] − z_target
+//
+// Workgroup layout: 256 threads, organized into 8 subgroups (NVIDIA wave32)
+// or 4 subgroups (AMD wave64). Within a chunk, each subgroup processes a
+// strided slice of CHUNK outputs; for each output, 32 (or 64) lanes
+// cooperate over the head dim D via subgroupAdd. This gives coalesced
+// W-row reads (lanes within a warp read consecutive D elements of one
+// W row) and fully utilizes the SM.
+//
+// CHUNK = 256 is hardcoded for v0 simplicity. Picking CHUNK == local_size_x
+// lets the post-matmul online-softmax merge use one z_chunk element per
+// thread directly.
+//
+// Shapes:
+//   h[]        [N, D]                  fp32
+//   w_lm[]     [V, D]                  fp32  (HF row-major: each row = one vocab output)
+//   tgt[]      [N]                     u32
+//   lse[]      [N]                     fp32  (out — cached for backward)
+//   loss_row[] [N]                     fp32  (out — host averages for total loss)
+//
+// CPU oracle: src/cpu/cce.zig#cceForward. Parity asserted by the
+// run-cce-forward-smoke driver in main.zig (1e-5 global rel-err).
+
+layout(local_size_x = 256) in;
+
+#define CHUNK 256
+#define NEG_INF (uintBitsToFloat(0xff800000u))
+
+layout(set = 0, binding = 0, std430) readonly  buffer H { float h[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer W { float w_lm[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer T { uint  tgt[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer L { float lse[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer R { float loss_row[]; };
+
+layout(push_constant) uniform Pc {
+    uint N;
+    uint V;
+    uint D;
+} pc;
+
+shared float z_chunk[CHUNK];
+shared float sg_partials[32];   // up to 32 subgroups (3090: 8, AMD wave64: 4)
+shared float row_m;
+shared float row_d;
+shared float row_z_target;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.N) return;
+
+    uint tid       = gl_LocalInvocationID.x;
+    uint warp_id   = gl_SubgroupID;
+    uint num_warps = gl_NumSubgroups;
+    uint lane      = gl_SubgroupInvocationID;
+    uint sg_size   = gl_SubgroupSize;
+    uint h_off     = row * pc.D;
+    uint tgt_id    = tgt[row];
+
+    if (tid == 0) {
+        row_m = NEG_INF;        // sentinel; first chunk's max replaces it
+        row_d = 0.0;
+        row_z_target = 0.0;
+    }
+    barrier();
+
+    for (uint c = 0; c < pc.V; c += CHUNK) {
+        // ── Step 1: compute z_chunk[CHUNK] cooperatively.
+        // Each warp owns a strided slice of outputs in [0, CHUNK). For
+        // each owned output, all `sg_size` lanes in the warp cooperate
+        // over D via subgroupAdd. This pattern coalesces W reads —
+        // adjacent lanes in a warp read consecutive D elements of one
+        // W row — same idea as matmul_nt_v2.comp.
+        for (uint o = warp_id; o < CHUNK; o += num_warps) {
+            uint o_global = c + o;
+            float partial = 0.0;
+            if (o_global < pc.V) {
+                uint w_off = o_global * pc.D;
+                for (uint k = lane; k < pc.D; k += sg_size) {
+                    partial += h[h_off + k] * w_lm[w_off + k];
+                }
+            }
+            float total = subgroupAdd(partial);
+            if (subgroupElect()) {
+                z_chunk[o] = (o_global < pc.V) ? total : NEG_INF;
+            }
+        }
+        barrier();
+
+        // ── Step 2: capture target logit if it's in this chunk.
+        if (tid == 0) {
+            if (tgt_id >= c && tgt_id < c + CHUNK) {
+                row_z_target = z_chunk[tgt_id - c];
+            }
+        }
+        // (No barrier — row_z_target is only read by tid==0 at the end.)
+
+        // ── Step 3: chunk_max via two-stage cooperative reduction.
+        float my_z = z_chunk[tid];
+        float sg_m = subgroupMax(my_z);
+        if (subgroupElect()) sg_partials[warp_id] = sg_m;
+        barrier();
+        if (warp_id == 0) {
+            float v = (lane < num_warps) ? sg_partials[lane] : NEG_INF;
+            float total = subgroupMax(v);
+            if (subgroupElect()) sg_partials[0] = total;
+        }
+        barrier();
+        float chunk_max = sg_partials[0];
+
+        // ── Step 4: online merge.
+        // Trick: every thread reads `row_m` (shared, broadcast),
+        // computes the same `m_new = max(row_m, chunk_max)` locally,
+        // then adds its `exp(z[tid] − m_new)` to a cross-thread sum.
+        //   m_new           = max(row_m, chunk_max)
+        //   d_new           = row_d · exp(row_m − m_new) + Σ exp(z − m_new)
+        // The `row_m == NEG_INF` branch handles the first chunk:
+        // exp(−inf − m_new) is 0 in IEEE-754, so we'd get the right
+        // d_new = 0 + Σ exp(z − m_new) — but that relies on the
+        // subnormal-flush behaviour of the GPU's exp() implementation.
+        // Explicit guard is safer.
+        float old_m = row_m;
+        bool init = !isinf(old_m);
+        float m_new = init ? max(old_m, chunk_max) : chunk_max;
+        float exp_term = exp(my_z - m_new);
+        float sg_sum_v = subgroupAdd(exp_term);
+        if (subgroupElect()) sg_partials[warp_id] = sg_sum_v;
+        barrier();
+        if (warp_id == 0) {
+            float v = (lane < num_warps) ? sg_partials[lane] : 0.0;
+            float total = subgroupAdd(v);
+            if (subgroupElect()) {
+                float rescale = init ? exp(old_m - m_new) : 0.0;
+                row_d = row_d * rescale + total;
+                row_m = m_new;
+            }
+        }
+        barrier();
+    }
+
+    // ── Final write.
+    if (tid == 0) {
+        float lse_val = log(row_d) + row_m;
+        lse[row] = lse_val;
+        loss_row[row] = lse_val - row_z_target;
+    }
+}
