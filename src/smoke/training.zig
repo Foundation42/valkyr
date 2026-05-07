@@ -11,14 +11,14 @@ const cpu_train = @import("../cpu/train.zig");
 const train_runner = @import("../train/runner.zig");
 const train_runner_n = @import("../train/runner_n.zig");
 const runtime = @import("../runtime.zig");
-const runtime_hybrid = @import("../runtime_hybrid.zig");
 const shaders = @import("shaders");
 
+const aliases = @import("../runtime_aliases.zig");
+const helpers = @import("../smoke/helpers.zig");
+
 // Aliases for runtime push-constant types referenced inside the moved
-// code. ReluPush + a few others were already declared inline in the
+// code. aliases.ReluPush + a few others were already declared inline in the
 // extracted block; the rest mirror what main.zig still keeps.
-const MatmulPush = runtime.MatmulPush;
-const SliceCopyPush = runtime_hybrid.SliceCopyPush;
 
 // ── tiny-MLP GPU forward smoke: matmul → bias → relu → matmul → bias ──
 //
@@ -33,8 +33,6 @@ const SliceCopyPush = runtime_hybrid.SliceCopyPush;
 // shader is a ~30-line port once the composition is verified, but the
 // composition exposes the building blocks the upcoming backward
 // shaders also need (matmul, transposed matmul, relu).
-
-const ReluPush = runtime.ReluPush;
 
 pub fn runGpuMlpForwardSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -88,11 +86,11 @@ pub fn runGpuMlpForwardSmoke(allocator: std.mem.Allocator) !void {
     defer buf_y.deinit(ctx.device);
 
     // ── Pipelines ──────────────────────────────────────────────────
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
     var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
     defer k_add.deinit();
-    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(aliases.ReluPush));
     defer k_relu.deinit();
 
     // ── Record + submit ────────────────────────────────────────────
@@ -103,20 +101,20 @@ pub fn runGpuMlpForwardSmoke(allocator: std.mem.Allocator) !void {
     defer rec.deinit();
     try rec.begin();
 
-    const matmul1_push = MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
-    const matmul2_push = MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
+    const matmul1_push = aliases.MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
+    const matmul2_push = aliases.MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
     const add1_push = runtime.AddInPlacePush{ .n = @intCast(dim_h) };
     const add2_push = runtime.AddInPlacePush{ .n = @intCast(dim_out) };
-    const relu_push = ReluPush{ .n = @intCast(dim_h) };
+    const relu_push = aliases.ReluPush{ .n = @intCast(dim_h) };
 
     // matmul_nt grid is (ceil(M/16), ceil(N/16)) — for M=1, N≤16 the
     // whole work is one workgroup, which is correct (threads outside
     // bound early-out).
     try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
-    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
     try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
     try rec.endAndSubmit();
 
@@ -155,10 +153,6 @@ pub fn runGpuMlpForwardSmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
-fn ceilDiv(num: u32, den: u32) u32 {
-    return (num + den - 1) / den;
-}
-
 // ── tiny-MLP GPU backward smoke: gradients vs CPU oracle ────────────
 //
 // Chunk 3 of training-v0. Runs the full forward + backward pipeline on
@@ -174,10 +168,6 @@ fn ceilDiv(num: u32, den: u32) u32 {
 // is computed in a single host-side op against `add_in_place`-style
 // staging — kept on host because it's one fp32 subtract per step at
 // dim_out scale, not worth a shader.
-
-const ReluBackwardPush = runtime.ReluBackwardPush;
-const LinearBackwardDxPush = runtime.LinearBackwardDxPush;
-const OuterProductPush = runtime.OuterProductPush;
 
 pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -248,19 +238,19 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
     defer buf_db2.deinit(ctx.device);
 
     // ── Pipelines ──────────────────────────────────────────────────
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
     var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
     defer k_add.deinit();
-    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(aliases.ReluPush));
     defer k_relu.deinit();
-    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(ReluBackwardPush));
+    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(aliases.ReluBackwardPush));
     defer k_relu_bw.deinit();
-    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(LinearBackwardDxPush));
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(aliases.LinearBackwardDxPush));
     defer k_lin_dx.deinit();
-    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(OuterProductPush));
+    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(aliases.OuterProductPush));
     defer k_outer.deinit();
-    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush));
+    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(aliases.SliceCopyPush));
     defer k_copy.deinit();
 
     var rec = try gpu_recorder.Recorder.init(&ctx, 32, 128);
@@ -268,67 +258,67 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
     try rec.begin();
 
     // ── Forward (same as chunk 2) ──────────────────────────────────
-    const matmul1_push = MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
-    const matmul2_push = MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
+    const matmul1_push = aliases.MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
+    const matmul2_push = aliases.MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
     const add1_push = runtime.AddInPlacePush{ .n = @intCast(dim_h) };
     const add2_push = runtime.AddInPlacePush{ .n = @intCast(dim_out) };
-    const relu_push = ReluPush{ .n = @intCast(dim_h) };
+    const relu_push = aliases.ReluPush{ .n = @intCast(dim_h) };
     try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
-    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
     try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
     // ── Backward ───────────────────────────────────────────────────
     // dL/db2 = dL/dy   (slice_copy 0..dim_out → 0..dim_out).
-    const copy_db2 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_out) };
-    try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+    const copy_db2 = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_out) };
+    try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
     // dL/dW2[i, j] = dL/dy[i] · h[j]   (outer product, [dim_out, dim_h]).
-    const op_dw2 = OuterProductPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    const op_dw2 = aliases.OuterProductPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
     try rec.dispatch(
         &k_outer,
         &.{ &buf_dL_dy, &buf_h, &buf_dw2 },
         &op_dw2,
-        ceilDiv(@as(u32, dim_out), 16),
-        ceilDiv(@as(u32, dim_h), 16),
+        helpers.ceilDiv(@as(u32, dim_out), 16),
+        helpers.ceilDiv(@as(u32, dim_h), 16),
         1,
     );
 
     // dL/dh = W2^T · dL/dy  (transposed matvec).
-    const lin_dx_push = LinearBackwardDxPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    const lin_dx_push = aliases.LinearBackwardDxPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
     try rec.dispatch(
         &k_lin_dx,
         &.{ &buf_dL_dy, &buf_w2, &buf_dh },
         &lin_dx_push,
-        ceilDiv(@as(u32, dim_h), 256),
+        helpers.ceilDiv(@as(u32, dim_h), 256),
         1,
         1,
     );
 
     // dL/dh_pre = dL/dh · 1[h_pre > 0].
-    const relu_bw_push = ReluBackwardPush{ .n = @intCast(dim_h) };
+    const relu_bw_push = aliases.ReluBackwardPush{ .n = @intCast(dim_h) };
     try rec.dispatch(
         &k_relu_bw,
         &.{ &buf_dh, &buf_h_pre, &buf_dh_pre },
         &relu_bw_push,
-        ceilDiv(@as(u32, dim_h), 256),
+        helpers.ceilDiv(@as(u32, dim_h), 256),
         1,
         1,
     );
 
     // dL/db1 = dL/dh_pre.
-    const copy_db1 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_h) };
-    try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    const copy_db1 = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_h) };
+    try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
 
     // dL/dW1[j, k] = dL/dh_pre[j] · x[k].
-    const op_dw1 = OuterProductPush{ .dim_out = @intCast(dim_h), .dim_in = @intCast(dim_in) };
+    const op_dw1 = aliases.OuterProductPush{ .dim_out = @intCast(dim_h), .dim_in = @intCast(dim_in) };
     try rec.dispatch(
         &k_outer,
         &.{ &buf_dh_pre, &buf_x, &buf_dw1 },
         &op_dw1,
-        ceilDiv(@as(u32, dim_h), 16),
-        ceilDiv(@as(u32, dim_in), 16),
+        helpers.ceilDiv(@as(u32, dim_h), 16),
+        helpers.ceilDiv(@as(u32, dim_in), 16),
         1,
     );
 
@@ -390,9 +380,6 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
 // loss). Every intermediate step is pure GPU — same shape as the
 // in-frame training the engine integration needs.
 
-const SgdStepPush = runtime.SgdStepPush;
-const MseLossGradPush = runtime.MseLossGradPush;
-
 pub fn runGpuMlpTrainSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -451,42 +438,42 @@ pub fn runGpuMlpTrainSmoke(allocator: std.mem.Allocator) !void {
     defer buf_db2.deinit(ctx.device);
 
     // ── Pipelines ──────────────────────────────────────────────────
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
     var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
     defer k_add.deinit();
-    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(aliases.ReluPush));
     defer k_relu.deinit();
-    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(ReluBackwardPush));
+    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(aliases.ReluBackwardPush));
     defer k_relu_bw.deinit();
-    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(LinearBackwardDxPush));
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(aliases.LinearBackwardDxPush));
     defer k_lin_dx.deinit();
-    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(OuterProductPush));
+    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(aliases.OuterProductPush));
     defer k_outer.deinit();
-    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush));
+    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(aliases.SliceCopyPush));
     defer k_copy.deinit();
-    var k_sgd = try pipeline.Kernel.init(&ctx, &shaders.sgd_step, 2, @sizeOf(SgdStepPush));
+    var k_sgd = try pipeline.Kernel.init(&ctx, &shaders.sgd_step, 2, @sizeOf(aliases.SgdStepPush));
     defer k_sgd.deinit();
-    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(aliases.MseLossGradPush));
     defer k_mse_grad.deinit();
 
     // Push constants reused across steps.
-    const matmul1_push = MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
-    const matmul2_push = MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
+    const matmul1_push = aliases.MatmulPush{ .m = 1, .n = @intCast(dim_h), .k = @intCast(dim_in) };
+    const matmul2_push = aliases.MatmulPush{ .m = 1, .n = @intCast(dim_out), .k = @intCast(dim_h) };
     const add1_push = runtime.AddInPlacePush{ .n = @intCast(dim_h) };
     const add2_push = runtime.AddInPlacePush{ .n = @intCast(dim_out) };
-    const relu_push = ReluPush{ .n = @intCast(dim_h) };
-    const mse_grad_push = MseLossGradPush{ .n = @intCast(dim_out) };
-    const op_dw2 = OuterProductPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
-    const lin_dx_push = LinearBackwardDxPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
-    const relu_bw_push = ReluBackwardPush{ .n = @intCast(dim_h) };
-    const op_dw1 = OuterProductPush{ .dim_out = @intCast(dim_h), .dim_in = @intCast(dim_in) };
-    const copy_db2 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_out) };
-    const copy_db1 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_h) };
-    const sgd_w1_push = SgdStepPush{ .n = @intCast(mlp_cpu.w1.len), .lr = lr };
-    const sgd_b1_push = SgdStepPush{ .n = @intCast(mlp_cpu.b1.len), .lr = lr };
-    const sgd_w2_push = SgdStepPush{ .n = @intCast(mlp_cpu.w2.len), .lr = lr };
-    const sgd_b2_push = SgdStepPush{ .n = @intCast(mlp_cpu.b2.len), .lr = lr };
+    const relu_push = aliases.ReluPush{ .n = @intCast(dim_h) };
+    const mse_grad_push = aliases.MseLossGradPush{ .n = @intCast(dim_out) };
+    const op_dw2 = aliases.OuterProductPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    const lin_dx_push = aliases.LinearBackwardDxPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
+    const relu_bw_push = aliases.ReluBackwardPush{ .n = @intCast(dim_h) };
+    const op_dw1 = aliases.OuterProductPush{ .dim_out = @intCast(dim_h), .dim_in = @intCast(dim_in) };
+    const copy_db2 = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_out) };
+    const copy_db1 = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_h) };
+    const sgd_w1_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.w1.len), .lr = lr };
+    const sgd_b1_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.b1.len), .lr = lr };
+    const sgd_w2_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.w2.len), .lr = lr };
+    const sgd_b2_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.b2.len), .lr = lr };
 
     // ── Run N steps on each side ──────────────────────────────────
     // Two GPU snapshots taken: after step 1 (single-step parity) and
@@ -532,30 +519,30 @@ pub fn runGpuMlpTrainSmoke(allocator: std.mem.Allocator) !void {
 
         // Forward.
         try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
-        try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
         try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
-        try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+        try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
         // Loss grad.
-        try rec.dispatch(&k_mse_grad, &.{ &buf_y, &buf_target, &buf_dL_dy }, &mse_grad_push, ceilDiv(@as(u32, dim_out), 256), 1, 1);
+        try rec.dispatch(&k_mse_grad, &.{ &buf_y, &buf_target, &buf_dL_dy }, &mse_grad_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
         // Backward.
-        try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, ceilDiv(@as(u32, dim_out), 256), 1, 1);
-        try rec.dispatch(&k_outer, &.{ &buf_dL_dy, &buf_h, &buf_dw2 }, &op_dw2, ceilDiv(@as(u32, dim_out), 16), ceilDiv(@as(u32, dim_h), 16), 1);
-        try rec.dispatch(&k_lin_dx, &.{ &buf_dL_dy, &buf_w2, &buf_dh }, &lin_dx_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_relu_bw, &.{ &buf_dh, &buf_h_pre, &buf_dh_pre }, &relu_bw_push, ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_outer, &.{ &buf_dh_pre, &buf_x, &buf_dw1 }, &op_dw1, ceilDiv(@as(u32, dim_h), 16), ceilDiv(@as(u32, dim_in), 16), 1);
+        try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
+        try rec.dispatch(&k_outer, &.{ &buf_dL_dy, &buf_h, &buf_dw2 }, &op_dw2, helpers.ceilDiv(@as(u32, dim_out), 16), helpers.ceilDiv(@as(u32, dim_h), 16), 1);
+        try rec.dispatch(&k_lin_dx, &.{ &buf_dL_dy, &buf_w2, &buf_dh }, &lin_dx_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_relu_bw, &.{ &buf_dh, &buf_h_pre, &buf_dh_pre }, &relu_bw_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_outer, &.{ &buf_dh_pre, &buf_x, &buf_dw1 }, &op_dw1, helpers.ceilDiv(@as(u32, dim_h), 16), helpers.ceilDiv(@as(u32, dim_in), 16), 1);
 
         // SGD step (param -= lr · grad). Note W2 is updated BEFORE the
         // dh = W2^T · dL/dy dispatch reads W2 — which is fine because
         // dh was computed earlier in this same recorder, and the next
         // step's W2-read starts a fresh recorder with a barrier.
-        try rec.dispatch(&k_sgd, &.{ &buf_w1, &buf_dw1 }, &sgd_w1_push, ceilDiv(@intCast(mlp_cpu.w1.len), 256), 1, 1);
-        try rec.dispatch(&k_sgd, &.{ &buf_b1, &buf_db1 }, &sgd_b1_push, ceilDiv(@intCast(mlp_cpu.b1.len), 256), 1, 1);
-        try rec.dispatch(&k_sgd, &.{ &buf_w2, &buf_dw2 }, &sgd_w2_push, ceilDiv(@intCast(mlp_cpu.w2.len), 256), 1, 1);
-        try rec.dispatch(&k_sgd, &.{ &buf_b2, &buf_db2 }, &sgd_b2_push, ceilDiv(@intCast(mlp_cpu.b2.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_w1, &buf_dw1 }, &sgd_w1_push, helpers.ceilDiv(@intCast(mlp_cpu.w1.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_b1, &buf_db1 }, &sgd_b1_push, helpers.ceilDiv(@intCast(mlp_cpu.b1.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_w2, &buf_dw2 }, &sgd_w2_push, helpers.ceilDiv(@intCast(mlp_cpu.w2.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_b2, &buf_db2 }, &sgd_b2_push, helpers.ceilDiv(@intCast(mlp_cpu.b2.len), 256), 1, 1);
 
         try rec.endAndSubmit();
 
@@ -752,23 +739,23 @@ pub fn runGpuMlpNTrainSmoke(allocator: std.mem.Allocator) !void {
     }
 
     // ── Pipelines ──────────────────────────────────────────────────
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
     var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
     defer k_add.deinit();
-    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(ReluPush));
+    var k_relu = try pipeline.Kernel.init(&ctx, &shaders.relu, 2, @sizeOf(aliases.ReluPush));
     defer k_relu.deinit();
-    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(ReluBackwardPush));
+    var k_relu_bw = try pipeline.Kernel.init(&ctx, &shaders.relu_backward, 3, @sizeOf(aliases.ReluBackwardPush));
     defer k_relu_bw.deinit();
-    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(LinearBackwardDxPush));
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx, 3, @sizeOf(aliases.LinearBackwardDxPush));
     defer k_lin_dx.deinit();
-    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(OuterProductPush));
+    var k_outer = try pipeline.Kernel.init(&ctx, &shaders.outer_product, 3, @sizeOf(aliases.OuterProductPush));
     defer k_outer.deinit();
-    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush));
+    var k_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(aliases.SliceCopyPush));
     defer k_copy.deinit();
-    var k_sgd = try pipeline.Kernel.init(&ctx, &shaders.sgd_step, 2, @sizeOf(SgdStepPush));
+    var k_sgd = try pipeline.Kernel.init(&ctx, &shaders.sgd_step, 2, @sizeOf(aliases.SgdStepPush));
     defer k_sgd.deinit();
-    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(aliases.MseLossGradPush));
     defer k_mse_grad.deinit();
 
     // ── CPU oracle to compare each step against ────────────────────
@@ -808,26 +795,26 @@ pub fn runGpuMlpNTrainSmoke(allocator: std.mem.Allocator) !void {
             const dim_o: u32 = @intCast(layer_dims[L + 1]);
             const dim_i: u32 = @intCast(layer_dims[L]);
             const input_buf = if (L == 0) &buf_x else &bufs_post[L - 1];
-            const matmul_push = MatmulPush{ .m = 1, .n = dim_o, .k = dim_i };
+            const matmul_push = aliases.MatmulPush{ .m = 1, .n = dim_o, .k = dim_i };
             try rec.dispatch(&k_matmul, &.{ input_buf, &bufs_w[L], &bufs_pre[L] }, &matmul_push, 1, 1, 1);
             const add_push = runtime.AddInPlacePush{ .n = dim_o };
-            try rec.dispatch(&k_add, &.{ &bufs_pre[L], &bufs_b[L] }, &add_push, ceilDiv(dim_o, 256), 1, 1);
+            try rec.dispatch(&k_add, &.{ &bufs_pre[L], &bufs_b[L] }, &add_push, helpers.ceilDiv(dim_o, 256), 1, 1);
             if (L + 1 < n) {
-                const relu_push = ReluPush{ .n = dim_o };
-                try rec.dispatch(&k_relu, &.{ &bufs_pre[L], &bufs_post[L] }, &relu_push, ceilDiv(dim_o, 256), 1, 1);
+                const relu_push = aliases.ReluPush{ .n = dim_o };
+                try rec.dispatch(&k_relu, &.{ &bufs_pre[L], &bufs_post[L] }, &relu_push, helpers.ceilDiv(dim_o, 256), 1, 1);
             } else {
                 // Output layer has no ReLU — copy pre→post so backward
                 // and the host can both read the prediction from
                 // bufs_post[n-1] uniformly.
-                const copy_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
-                try rec.dispatch(&k_copy, &.{ &bufs_pre[L], &bufs_post[L] }, &copy_push, ceilDiv(dim_o, 256), 1, 1);
+                const copy_push = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
+                try rec.dispatch(&k_copy, &.{ &bufs_pre[L], &bufs_post[L] }, &copy_push, helpers.ceilDiv(dim_o, 256), 1, 1);
             }
         }
 
         // Loss-grad seeds d_pre on the output layer (no ReLU there).
         const dim_out_u: u32 = @intCast(layer_dims[n]);
-        const mse_grad_push = MseLossGradPush{ .n = dim_out_u };
-        try rec.dispatch(&k_mse_grad, &.{ &bufs_post[n - 1], &buf_target, &bufs_dpre[n - 1] }, &mse_grad_push, ceilDiv(dim_out_u, 256), 1, 1);
+        const mse_grad_push = aliases.MseLossGradPush{ .n = dim_out_u };
+        try rec.dispatch(&k_mse_grad, &.{ &bufs_post[n - 1], &buf_target, &bufs_dpre[n - 1] }, &mse_grad_push, helpers.ceilDiv(dim_out_u, 256), 1, 1);
 
         // Backward pass per layer, top-down. db = d_pre; dW = d_pre ⊗ input;
         // if not the bottom layer, propagate d_post and apply the ReLU mask.
@@ -839,27 +826,27 @@ pub fn runGpuMlpNTrainSmoke(allocator: std.mem.Allocator) !void {
             const input_buf = if (L == 0) &buf_x else &bufs_post[L - 1];
 
             // db[L] = d_pre[L]
-            const copy_db = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
-            try rec.dispatch(&k_copy, &.{ &bufs_dpre[L], &bufs_db[L] }, &copy_db, ceilDiv(dim_o, 256), 1, 1);
+            const copy_db = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
+            try rec.dispatch(&k_copy, &.{ &bufs_dpre[L], &bufs_db[L] }, &copy_db, helpers.ceilDiv(dim_o, 256), 1, 1);
             // dW[L] = d_pre[L] ⊗ input
-            const op_push = OuterProductPush{ .dim_out = dim_o, .dim_in = dim_i };
-            try rec.dispatch(&k_outer, &.{ &bufs_dpre[L], input_buf, &bufs_dw[L] }, &op_push, ceilDiv(dim_o, 16), ceilDiv(dim_i, 16), 1);
+            const op_push = aliases.OuterProductPush{ .dim_out = dim_o, .dim_in = dim_i };
+            try rec.dispatch(&k_outer, &.{ &bufs_dpre[L], input_buf, &bufs_dw[L] }, &op_push, helpers.ceilDiv(dim_o, 16), helpers.ceilDiv(dim_i, 16), 1);
             // Propagate to layer L-1's d_pre, with ReLU mask on its pre.
             if (L > 0) {
-                const lin_dx_push = LinearBackwardDxPush{ .dim_out = dim_o, .dim_in = dim_i };
-                try rec.dispatch(&k_lin_dx, &.{ &bufs_dpre[L], &bufs_w[L], &bufs_dpost[L] }, &lin_dx_push, ceilDiv(dim_i, 256), 1, 1);
-                const relu_bw_push = ReluBackwardPush{ .n = dim_i };
-                try rec.dispatch(&k_relu_bw, &.{ &bufs_dpost[L], &bufs_pre[L - 1], &bufs_dpre[L - 1] }, &relu_bw_push, ceilDiv(dim_i, 256), 1, 1);
+                const lin_dx_push = aliases.LinearBackwardDxPush{ .dim_out = dim_o, .dim_in = dim_i };
+                try rec.dispatch(&k_lin_dx, &.{ &bufs_dpre[L], &bufs_w[L], &bufs_dpost[L] }, &lin_dx_push, helpers.ceilDiv(dim_i, 256), 1, 1);
+                const relu_bw_push = aliases.ReluBackwardPush{ .n = dim_i };
+                try rec.dispatch(&k_relu_bw, &.{ &bufs_dpost[L], &bufs_pre[L - 1], &bufs_dpre[L - 1] }, &relu_bw_push, helpers.ceilDiv(dim_i, 256), 1, 1);
             }
         }
 
         // SGD updates run after all gradients have been computed using
         // pre-update weights. Order across layers doesn't matter.
         for (0..n) |L| {
-            const sgd_w_push = SgdStepPush{ .n = @intCast(mlp_cpu.weights[L].len), .lr = lr };
-            try rec.dispatch(&k_sgd, &.{ &bufs_w[L], &bufs_dw[L] }, &sgd_w_push, ceilDiv(@intCast(mlp_cpu.weights[L].len), 256), 1, 1);
-            const sgd_b_push = SgdStepPush{ .n = @intCast(mlp_cpu.biases[L].len), .lr = lr };
-            try rec.dispatch(&k_sgd, &.{ &bufs_b[L], &bufs_db[L] }, &sgd_b_push, ceilDiv(@intCast(mlp_cpu.biases[L].len), 256), 1, 1);
+            const sgd_w_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.weights[L].len), .lr = lr };
+            try rec.dispatch(&k_sgd, &.{ &bufs_w[L], &bufs_dw[L] }, &sgd_w_push, helpers.ceilDiv(@intCast(mlp_cpu.weights[L].len), 256), 1, 1);
+            const sgd_b_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.biases[L].len), .lr = lr };
+            try rec.dispatch(&k_sgd, &.{ &bufs_b[L], &bufs_db[L] }, &sgd_b_push, helpers.ceilDiv(@intCast(mlp_cpu.biases[L].len), 256), 1, 1);
         }
 
         try rec.endAndSubmit();

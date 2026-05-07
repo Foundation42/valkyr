@@ -14,13 +14,11 @@ const turboquant = @import("../cpu/turboquant.zig");
 const q4_0 = @import("../cpu/q4_0.zig");
 const q4_k = @import("../cpu/q4_k.zig");
 const runtime = @import("../runtime.zig");
-const runtime_hybrid = @import("../runtime_hybrid.zig");
 const shaders = @import("shaders");
 
+const aliases = @import("../runtime_aliases.zig");
 
 // ── gpu geglu smoke: synthetic vs CPU geglu ─────────────────────────
-
-const GegluPush = runtime.GegluPush;
 
 pub fn runGpuGegluSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -50,16 +48,16 @@ pub fn runGpuGegluSmoke(allocator: std.mem.Allocator) !void {
     var buf_o = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
     defer buf_o.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(aliases.GegluPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_g, &buf_u, &buf_o });
 
     const local: u32 = 256;
     const groups: u32 = (@as(u32, @intCast(n)) + local - 1) / local;
-    const push = GegluPush{ .n = @intCast(n) };
+    const push = aliases.GegluPush{ .n = @intCast(n) };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const GegluPush,
+        push: *const aliases.GegluPush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -84,9 +82,6 @@ pub fn runGpuGegluSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu rope smoke: pos=0 identity + pos=1 vs CPU ───────────────────
 
-const RopePush = runtime.RopePush;
-const RopePartialPush = runtime.RopePartialPush;
-
 pub fn runGpuRopeSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -104,7 +99,7 @@ pub fn runGpuRopeSmoke(allocator: std.mem.Allocator) !void {
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(aliases.RopePush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_in, &buf_out });
 
@@ -113,10 +108,10 @@ pub fn runGpuRopeSmoke(allocator: std.mem.Allocator) !void {
     const pairs: u32 = @intCast(n_heads * (head_dim / 2));
     const groups: u32 = (pairs + local - 1) / local;
 
-    const push0 = RopePush{ .n_heads = @intCast(n_heads), .head_dim = @intCast(head_dim), .pos = 0, .theta_base = 10000.0 };
+    const push0 = aliases.RopePush{ .n_heads = @intCast(n_heads), .head_dim = @intCast(head_dim), .pos = 0, .theta_base = 10000.0 };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const RopePush,
+        push: *const aliases.RopePush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -138,10 +133,10 @@ pub fn runGpuRopeSmoke(allocator: std.mem.Allocator) !void {
     defer allocator.free(want);
     try cpu_math.applyRope(want, in_v, n_heads, head_dim, 1, 10000.0);
 
-    const push1 = RopePush{ .n_heads = @intCast(n_heads), .head_dim = @intCast(head_dim), .pos = 1, .theta_base = 10000.0 };
+    const push1 = aliases.RopePush{ .n_heads = @intCast(n_heads), .head_dim = @intCast(head_dim), .pos = 1, .theta_base = 10000.0 };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const RopePush,
+        push: *const aliases.RopePush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -186,7 +181,7 @@ pub fn runGpuRopePartialSmoke(allocator: std.mem.Allocator) !void {
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope_partial, 2, @sizeOf(aliases.RopePartialPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_in, &buf_out });
 
@@ -200,7 +195,7 @@ pub fn runGpuRopePartialSmoke(allocator: std.mem.Allocator) !void {
     defer allocator.free(want);
     try cpu_math.applyRopePartial(want, in_v, n_heads, head_dim, rotary_dim, 3, theta_base);
 
-    const push = RopePartialPush{
+    const push = aliases.RopePartialPush{
         .n_heads = @intCast(n_heads),
         .head_dim = @intCast(head_dim),
         .rotary_dim = @intCast(rotary_dim),
@@ -209,7 +204,7 @@ pub fn runGpuRopePartialSmoke(allocator: std.mem.Allocator) !void {
     };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const RopePartialPush,
+        push: *const aliases.RopePartialPush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -249,8 +244,6 @@ pub fn runGpuRopePartialSmoke(allocator: std.mem.Allocator) !void {
 // layout produced by the 2× q_proj is correctly demuxed into two flat
 // `(num_heads*head_dim)` buffers preserving per-head ordering.
 
-const SplitQGatePush = runtime_hybrid.SplitQGatePush;
-
 pub fn runGpuSplitQGateSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -278,16 +271,16 @@ pub fn runGpuSplitQGateSmoke(allocator: std.mem.Allocator) !void {
     var buf_gate = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
     defer buf_gate.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.split_q_gate, 3, @sizeOf(SplitQGatePush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.split_q_gate, 3, @sizeOf(aliases.SplitQGatePush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_in, &buf_q, &buf_gate });
 
     const local: u32 = 256;
     const groups: u32 = (@as(u32, @intCast(total)) + local - 1) / local;
-    const push = SplitQGatePush{ .num_heads = @intCast(num_heads), .head_dim = @intCast(head_dim) };
+    const push = aliases.SplitQGatePush{ .num_heads = @intCast(num_heads), .head_dim = @intCast(head_dim) };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const SplitQGatePush,
+        push: *const aliases.SplitQGatePush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -317,8 +310,6 @@ pub fn runGpuSplitQGateSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu sigmoid_mul smoke: out = a * sigmoid(b) vs CPU ──────────────
 
-const SigmoidMulPush = runtime_hybrid.SigmoidMulPush;
-
 pub fn runGpuSigmoidMulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -340,16 +331,16 @@ pub fn runGpuSigmoidMulSmoke(allocator: std.mem.Allocator) !void {
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.sigmoid_mul, 3, @sizeOf(SigmoidMulPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.sigmoid_mul, 3, @sizeOf(aliases.SigmoidMulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_out });
 
     const local: u32 = 256;
     const groups: u32 = (@as(u32, @intCast(n)) + local - 1) / local;
-    const push = SigmoidMulPush{ .n_elem = @intCast(n) };
+    const push = aliases.SigmoidMulPush{ .n_elem = @intCast(n) };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const SigmoidMulPush,
+        push: *const aliases.SigmoidMulPush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -688,8 +679,6 @@ pub fn runGpuRopeBatchedSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu l2norm-per-head smoke: synthetic vs CPU ─────────────────────
 
-const L2normPush = runtime_hybrid.L2normPush;
-
 pub fn runGpuL2normPerHeadSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -716,14 +705,14 @@ pub fn runGpuL2normPerHeadSmoke(allocator: std.mem.Allocator) !void {
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.l2norm_per_head, 2, @sizeOf(L2normPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.l2norm_per_head, 2, @sizeOf(aliases.L2normPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_in, &buf_out });
 
-    const push = L2normPush{ .head_dim = @intCast(head_dim), .eps = eps };
+    const push = aliases.L2normPush{ .head_dim = @intCast(head_dim), .eps = eps };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const L2normPush,
+        push: *const aliases.L2normPush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -762,8 +751,6 @@ pub fn runGpuL2normPerHeadSmoke(allocator: std.mem.Allocator) !void {
 // place state shift across multiple decode steps; if the shift / append
 // got transposed, the third output diverges immediately.
 
-const Conv1dUpdatePush = runtime_hybrid.Conv1dUpdatePush;
-
 pub fn runGpuConv1dUpdateSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -783,7 +770,7 @@ pub fn runGpuConv1dUpdateSmoke(allocator: std.mem.Allocator) !void {
     var buf_state = try buffer.Buffer.initDeviceOnly(&ctx, conv_dim * kernel * @sizeOf(f32));
     defer buf_state.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.conv1d_update, 4, @sizeOf(Conv1dUpdatePush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.conv1d_update, 4, @sizeOf(aliases.Conv1dUpdatePush));
     defer kern.deinit();
 
     // CPU mirror state (same zero init).
@@ -791,7 +778,7 @@ pub fn runGpuConv1dUpdateSmoke(allocator: std.mem.Allocator) !void {
     defer allocator.free(cpu_state);
     @memset(cpu_state, 0.0);
 
-    const push = Conv1dUpdatePush{ .conv_dim = @intCast(conv_dim), .kernel_size = @intCast(kernel) };
+    const push = aliases.Conv1dUpdatePush{ .conv_dim = @intCast(conv_dim), .kernel_size = @intCast(kernel) };
 
     for (0..3) |step| {
         const x = try allocator.alloc(f32, conv_dim);
@@ -808,7 +795,7 @@ pub fn runGpuConv1dUpdateSmoke(allocator: std.mem.Allocator) !void {
         const groups: u32 = (@as(u32, @intCast(conv_dim)) + local - 1) / local;
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
-            push: *const Conv1dUpdatePush,
+            push: *const aliases.Conv1dUpdatePush,
             groups: u32,
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -848,8 +835,6 @@ pub fn runGpuConv1dUpdateSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu rmsnorm_gated smoke: synthetic vs CPU ───────────────────────
 
-const RmsnormGatedPush = runtime_hybrid.RmsnormGatedPush;
-
 pub fn runGpuRmsnormGatedSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -878,14 +863,14 @@ pub fn runGpuRmsnormGatedSmoke(allocator: std.mem.Allocator) !void {
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_gated, 4, @sizeOf(RmsnormGatedPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_gated, 4, @sizeOf(aliases.RmsnormGatedPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_x, &buf_z, &buf_w, &buf_out });
 
-    const push = RmsnormGatedPush{ .head_dim = @intCast(head_dim), .eps = eps };
+    const push = aliases.RmsnormGatedPush{ .head_dim = @intCast(head_dim), .eps = eps };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const RmsnormGatedPush,
+        push: *const aliases.RmsnormGatedPush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -929,8 +914,6 @@ pub fn runGpuRmsnormGatedSmoke(allocator: std.mem.Allocator) !void {
 // Hot kernel of the Qwen3.5 GatedDeltaNet decode. Two back-to-back
 // invocations to exercise both the readout AND the in-place state
 // update; if the state update lands wrong, step 2 diverges.
-
-const GatedDeltaStepPush = runtime_hybrid.GatedDeltaStepPush;
 
 pub fn runGpuGatedDeltaStepSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -989,11 +972,11 @@ pub fn runGpuGatedDeltaStepSmoke(allocator: std.mem.Allocator) !void {
     var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, num_v_heads * head_v * @sizeOf(f32));
     defer buf_y.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.gated_delta_step, 9, @sizeOf(GatedDeltaStepPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.gated_delta_step, 9, @sizeOf(aliases.GatedDeltaStepPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_state, &buf_q, &buf_k, &buf_v, &buf_b, &buf_a, &buf_alog, &buf_dt, &buf_y });
 
-    const push = GatedDeltaStepPush{
+    const push = aliases.GatedDeltaStepPush{
         .num_k_heads = @intCast(num_k_heads),
         .num_v_heads = @intCast(num_v_heads),
         .head_k = @intCast(head_k),
@@ -1009,7 +992,7 @@ pub fn runGpuGatedDeltaStepSmoke(allocator: std.mem.Allocator) !void {
         // GPU dispatch (one workgroup per V-head, head_v threads each).
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
-            push: *const GatedDeltaStepPush,
+            push: *const aliases.GatedDeltaStepPush,
             n_v: u32,
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.n_v, 1, 1);
@@ -1082,8 +1065,6 @@ pub fn runGpuGatedDeltaStepSmoke(allocator: std.mem.Allocator) !void {
 
 // ── gpu softmax smoke: synthetic vs CPU softmax ─────────────────────
 
-const SoftmaxPush = runtime.SoftmaxPush;
-
 pub fn runGpuSoftmaxSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -1106,14 +1087,14 @@ pub fn runGpuSoftmaxSmoke(allocator: std.mem.Allocator) !void {
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, dim * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(aliases.SoftmaxPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_in, &buf_out });
 
-    const push = SoftmaxPush{ .dim = @intCast(dim), .stride = @intCast(dim) };
+    const push = aliases.SoftmaxPush{ .dim = @intCast(dim), .stride = @intCast(dim) };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const SoftmaxPush,
+        push: *const aliases.SoftmaxPush,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, 1, 1, 1);
         }
@@ -1498,8 +1479,6 @@ pub fn runGpuTq4RoundTripSmoke(allocator: std.mem.Allocator) !void {
 // once. Each reconstructed block must match the corresponding
 // CPU pack→dequant output.
 
-const Tq4PackPush = runtime.Tq4PackPush;
-
 pub fn runGpuTq4PackToCacheSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
@@ -1527,7 +1506,7 @@ pub fn runGpuTq4PackToCacheSmoke(allocator: std.mem.Allocator) !void {
     var deq_buf = try buffer.Buffer.initDeviceOnly(&ctx, n_blocks * 256 * @sizeOf(f32));
     defer deq_buf.deinit(ctx.device);
 
-    var pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(Tq4PackPush));
+    var pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(aliases.Tq4PackPush));
     defer pack.deinit();
     var unpack = try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0);
     defer unpack.deinit();
@@ -1542,7 +1521,7 @@ pub fn runGpuTq4PackToCacheSmoke(allocator: std.mem.Allocator) !void {
         var rec = try gpu_recorder.Recorder.init(&ctx, 8, 16);
         defer rec.deinit();
         try rec.begin();
-        var push = Tq4PackPush{ .dst_block_idx = 0 };
+        var push = aliases.Tq4PackPush{ .dst_block_idx = 0 };
         try rec.dispatch(&pack, &.{ &stage_buf, &cache_buf }, &push, 1, 1, 1);
         try rec.endAndSubmit();
     }
@@ -1552,7 +1531,7 @@ pub fn runGpuTq4PackToCacheSmoke(allocator: std.mem.Allocator) !void {
         var rec = try gpu_recorder.Recorder.init(&ctx, 8, 16);
         defer rec.deinit();
         try rec.begin();
-        var push = Tq4PackPush{ .dst_block_idx = @intCast(b) };
+        var push = aliases.Tq4PackPush{ .dst_block_idx = @intCast(b) };
         try rec.dispatch(&pack, &.{ &s, &cache_buf }, &push, 1, 1, 1);
         try rec.endAndSubmit();
     }
@@ -2047,5 +2026,4 @@ pub fn runQ4_KSmoke(allocator: std.mem.Allocator) !void {
 
     std.debug.print("PASS q4_K CPU oracle (constant block, scales packing, Gaussian round-trip)\n", .{});
 }
-
 

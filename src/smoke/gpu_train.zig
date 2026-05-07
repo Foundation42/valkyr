@@ -20,23 +20,10 @@ const safetensors = @import("../safetensors.zig");
 const q4_0 = @import("../cpu/q4_0.zig");
 const q4_k = @import("../cpu/q4_k.zig");
 const runtime = @import("../runtime.zig");
-const runtime_hybrid = @import("../runtime_hybrid.zig");
 const shaders = @import("shaders");
 
-// Push-constant aliases. main.zig also keeps copies for whatever still
-// lives there (currently nothing using these — but leaving the mirror
-// keeps the pattern consistent with chat.zig / gpu_gen.zig / training.zig).
-const MatmulPush = runtime.MatmulPush;
-const MseLossGradPush = runtime.MseLossGradPush;
-const ScalePush = runtime_hybrid.ScalePush;
-const RmsnormPush = runtime.RmsnormPush;
-const RopePartialPush = runtime.RopePartialPush;
-const SoftmaxPush = runtime.SoftmaxPush;
-
-fn ceilDiv(num: u32, den: u32) u32 {
-    return (num + den - 1) / den;
-}
-
+const aliases = @import("../runtime_aliases.zig");
+const helpers = @import("../smoke/helpers.zig");
 
 pub fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -57,18 +44,18 @@ pub fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
     defer buf_c.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
 
     const local_xy: u32 = 16;
     const groups_x: u32 = (m + local_xy - 1) / local_xy;
     const groups_y: u32 = (n + local_xy - 1) / local_xy;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
 
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const MatmulPush,
+        push: *const aliases.MatmulPush,
         gx: u32,
         gy: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
@@ -307,13 +294,13 @@ pub fn runGpuLoraSmoke(allocator: std.mem.Allocator) !void {
     };
 
     // Build pipelines once — reused across cases.
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
     var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
     defer k_lin_dx.deinit();
     var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
     defer k_lin_dw.deinit();
-    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(ScalePush));
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(aliases.ScalePush));
     defer k_scale.deinit();
     var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
     defer k_add.deinit();
@@ -413,11 +400,11 @@ pub fn runGpuLoraSmoke(allocator: std.mem.Allocator) !void {
 
         // Helper: dispatch one matmul_nt_v2 (1D, gx output cells).
         const recordMatmul = struct {
-            fn rec(rec_kern: *pipeline.Kernel, push: *const MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+            fn rec(rec_kern: *pipeline.Kernel, push: *const aliases.MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
                 try rec_kern.bind(bufs);
                 const Rec = struct {
                     k: *const pipeline.Kernel,
-                    p: *const MatmulPush,
+                    p: *const aliases.MatmulPush,
                     gx_: u32,
                     pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                         s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
@@ -463,49 +450,49 @@ pub fn runGpuLoraSmoke(allocator: std.mem.Allocator) !void {
 
         // ── FORWARD chain.
         // 1. y_base = x · Wᵀ
-        const push_y_base = MatmulPush{ .m = M_u32, .n = N_u32, .k = K_u32 };
+        const push_y_base = aliases.MatmulPush{ .m = M_u32, .n = N_u32, .k = K_u32 };
         try recordMatmul(&k_matmul, &push_y_base, M_u32 * N_u32, &ctx, &.{ &buf_x, &buf_w, &buf_y });
         // 2. intermediate = x · Aᵀ
-        const push_inter = MatmulPush{ .m = M_u32, .n = R_u32, .k = K_u32 };
+        const push_inter = aliases.MatmulPush{ .m = M_u32, .n = R_u32, .k = K_u32 };
         try recordMatmul(&k_matmul, &push_inter, M_u32 * R_u32, &ctx, &.{ &buf_x, &buf_a, &buf_intermediate });
         // 3. y_lora = intermediate · Bᵀ
-        const push_ylora = MatmulPush{ .m = M_u32, .n = N_u32, .k = R_u32 };
+        const push_ylora = aliases.MatmulPush{ .m = M_u32, .n = N_u32, .k = R_u32 };
         try recordMatmul(&k_matmul, &push_ylora, M_u32 * N_u32, &ctx, &.{ &buf_intermediate, &buf_b, &buf_y_lora });
         // 4. y_lora_scaled = y_lora * (α/r)
-        const push_scale_ylora = ScalePush{ .n = M_u32 * N_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_ylora, ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y_lora, &buf_y_lora_scaled });
+        const push_scale_ylora = aliases.ScalePush{ .n = M_u32 * N_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_ylora, helpers.ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y_lora, &buf_y_lora_scaled });
         // 5. y += y_lora_scaled  (in place into buf_y)
         const push_add_y = runtime.AddInPlacePush{ .n = M_u32 * N_u32 };
-        try recordScalar1D(&k_add, push_add_y, ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y, &buf_y_lora_scaled });
+        try recordScalar1D(&k_add, push_add_y, helpers.ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y, &buf_y_lora_scaled });
 
         // ── BACKWARD chain.
         // 1. dx_base = dy · W                  (shape M×K = M×Nn · Nn×K)
         const push_dx_base = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = K_u32 };
-        try recordLinBackward(&k_lin_dx, &push_dx_base, ceilDiv(M_u32, group_lwg), ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_w, &buf_dx });
+        try recordLinBackward(&k_lin_dx, &push_dx_base, helpers.ceilDiv(M_u32, group_lwg), helpers.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_w, &buf_dx });
         // 2. dy_B = dy · B                     (shape M×r = M×Nn · Nn×r). LinearBatchedPush.K = r.
         const push_dy_B = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = R_u32 };
-        try recordLinBackward(&k_lin_dx, &push_dy_B, ceilDiv(M_u32, group_lwg), ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
+        try recordLinBackward(&k_lin_dx, &push_dy_B, helpers.ceilDiv(M_u32, group_lwg), helpers.ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
         // 3. dx_lora = dy_B · A                (shape M×K = M×r · r×K). Nn=r in the linear-backward sense.
         const push_dx_lora = runtime.LinearBatchedPush{ .M = M_u32, .N = R_u32, .K = K_u32 };
-        try recordLinBackward(&k_lin_dx, &push_dx_lora, ceilDiv(M_u32, group_lwg), ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_a, &buf_dx_lora });
+        try recordLinBackward(&k_lin_dx, &push_dx_lora, helpers.ceilDiv(M_u32, group_lwg), helpers.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_a, &buf_dx_lora });
         // 4. dx_lora_scaled = dx_lora * (α/r)
-        const push_scale_dxlora = ScalePush{ .n = M_u32 * K_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_dxlora, ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx_lora, &buf_dx_lora_scaled });
+        const push_scale_dxlora = aliases.ScalePush{ .n = M_u32 * K_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_dxlora, helpers.ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx_lora, &buf_dx_lora_scaled });
         // 5. dx += dx_lora_scaled
         const push_add_dx = runtime.AddInPlacePush{ .n = M_u32 * K_u32 };
-        try recordScalar1D(&k_add, push_add_dx, ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx, &buf_dx_lora_scaled });
+        try recordScalar1D(&k_add, push_add_dx, helpers.ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx, &buf_dx_lora_scaled });
         // 6. ∇A_unscaled = dy_Bᵀ · x          (shape r×K). dW[Nn=r, K]
         const push_dA = runtime.LinearBatchedPush{ .M = M_u32, .N = R_u32, .K = K_u32 };
-        try recordLinBackward(&k_lin_dw, &push_dA, ceilDiv(R_u32, group_lwg), ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
+        try recordLinBackward(&k_lin_dw, &push_dA, helpers.ceilDiv(R_u32, group_lwg), helpers.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
         // 7. ∇A = ∇A_unscaled * (α/r)
-        const push_scale_dA = ScalePush{ .n = R_u32 * K_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_dA, ceilDiv(R_u32 * K_u32, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
+        const push_scale_dA = aliases.ScalePush{ .n = R_u32 * K_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_dA, helpers.ceilDiv(R_u32 * K_u32, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
         // 8. ∇B_unscaled = dyᵀ · intermediate (shape Nn×r). dW[Nn, K=r]
         const push_dB = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = R_u32 };
-        try recordLinBackward(&k_lin_dw, &push_dB, ceilDiv(N_u32, group_lwg), ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
+        try recordLinBackward(&k_lin_dw, &push_dB, helpers.ceilDiv(N_u32, group_lwg), helpers.ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
         // 9. ∇B = ∇B_unscaled * (α/r)
-        const push_scale_dB = ScalePush{ .n = N_u32 * R_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_dB, ceilDiv(N_u32 * R_u32, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
+        const push_scale_dB = aliases.ScalePush{ .n = N_u32 * R_u32, .scale = cs.aor };
+        try recordScalar1D(&k_scale, push_scale_dB, helpers.ceilDiv(N_u32 * R_u32, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
 
         // ── Read back + diff.
         const y_gpu = try allocator.alloc(f32, M * Nn);
@@ -681,17 +668,17 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
     defer buf_v_b.deinit(ctx.device);
 
     // ── Pipelines.
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
     var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
     defer k_lin_dx.deinit();
     var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
     defer k_lin_dw.deinit();
-    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(ScalePush));
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(aliases.ScalePush));
     defer k_scale.deinit();
     var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
     defer k_add.deinit();
-    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(aliases.MseLossGradPush));
     defer k_mse_grad.deinit();
     var k_adam = try pipeline.Kernel.init(&ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
     defer k_adam.deinit();
@@ -701,11 +688,11 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
 
     // Helpers.
     const recordMatmul = struct {
-        fn rec(rec_kern: *pipeline.Kernel, push: *const MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+        fn rec(rec_kern: *pipeline.Kernel, push: *const aliases.MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
             try rec_kern.bind(bufs);
             const Rec = struct {
                 k: *const pipeline.Kernel,
-                p: *const MatmulPush,
+                p: *const aliases.MatmulPush,
                 gx_: u32,
                 pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                     s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
@@ -746,17 +733,17 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
     }.rec;
 
     // Push constants reused across steps.
-    const push_y_base = MatmulPush{ .m = M_u, .n = N_u, .k = K_u };
-    const push_inter = MatmulPush{ .m = M_u, .n = R_u, .k = K_u };
-    const push_ylora = MatmulPush{ .m = M_u, .n = N_u, .k = R_u };
-    const push_scale_ylora = ScalePush{ .n = M_u * N_u, .scale = aor };
+    const push_y_base = aliases.MatmulPush{ .m = M_u, .n = N_u, .k = K_u };
+    const push_inter = aliases.MatmulPush{ .m = M_u, .n = R_u, .k = K_u };
+    const push_ylora = aliases.MatmulPush{ .m = M_u, .n = N_u, .k = R_u };
+    const push_scale_ylora = aliases.ScalePush{ .n = M_u * N_u, .scale = aor };
     const push_add_y = runtime.AddInPlacePush{ .n = M_u * N_u };
-    const push_mse = MseLossGradPush{ .n = M_u * N_u };
+    const push_mse = aliases.MseLossGradPush{ .n = M_u * N_u };
     const push_dy_B = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
     const push_dA = runtime.LinearBatchedPush{ .M = M_u, .N = R_u, .K = K_u };
-    const push_scale_dA = ScalePush{ .n = R_u * K_u, .scale = aor };
+    const push_scale_dA = aliases.ScalePush{ .n = R_u * K_u, .scale = aor };
     const push_dB = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
-    const push_scale_dB = ScalePush{ .n = N_u * R_u, .scale = aor };
+    const push_scale_dB = aliases.ScalePush{ .n = N_u * R_u, .scale = aor };
 
     // Loss helper (host-side, half-sum MSE matching the shader convention).
     const computeMse = struct {
@@ -785,10 +772,10 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
             bylora: *const buffer.Buffer,
             byloras: *const buffer.Buffer,
             by: *const buffer.Buffer,
-            pyb: *const MatmulPush,
-            pin: *const MatmulPush,
-            pyl: *const MatmulPush,
-            psy: *const ScalePush,
+            pyb: *const aliases.MatmulPush,
+            pin: *const aliases.MatmulPush,
+            pyl: *const aliases.MatmulPush,
+            psy: *const aliases.ScalePush,
             pay: *const runtime.AddInPlacePush,
             mu: u32,
             nu: u32,
@@ -800,8 +787,8 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
             try recM_fn(kmm, pyb, mu * nu, c_ctx, &.{ bx, bw, by });
             try recM_fn(kmm, pin, mu * ru, c_ctx, &.{ bx, ba, bint });
             try recM_fn(kmm, pyl, mu * nu, c_ctx, &.{ bint, bb, bylora });
-            try recS_fn(ksc, psy.*, ceilDiv(mu * nu, glin), c_ctx, &.{ bylora, byloras });
-            try recS_fn(kad, pay.*, ceilDiv(mu * nu, glin), c_ctx, &.{ by, byloras });
+            try recS_fn(ksc, psy.*, helpers.ceilDiv(mu * nu, glin), c_ctx, &.{ bylora, byloras });
+            try recS_fn(kad, pay.*, helpers.ceilDiv(mu * nu, glin), c_ctx, &.{ by, byloras });
         }
     }.call;
 
@@ -835,21 +822,21 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
             M_u, N_u, R_u, recordMatmul, recordScalar1D, group_lin,
         );
         // Loss grad: dy = y - target  (shader is half-sum MSE).
-        try recordScalar1D(&k_mse_grad, push_mse, ceilDiv(M_u * N_u, group_lin), &ctx, &.{ &buf_y, &buf_target_y, &buf_dy });
+        try recordScalar1D(&k_mse_grad, push_mse, helpers.ceilDiv(M_u * N_u, group_lin), &ctx, &.{ &buf_y, &buf_target_y, &buf_dy });
         // Backward — dx is not computed (no upstream).
         // dy_B = dy · B
-        try recordLinBackward(&k_lin_dx, &push_dy_B, ceilDiv(M_u, group_lwg), ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
+        try recordLinBackward(&k_lin_dx, &push_dy_B, helpers.ceilDiv(M_u, group_lwg), helpers.ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
         // ∇A_unscaled = dy_Bᵀ · x ; ∇A = (α/r) · ∇A_unscaled
-        try recordLinBackward(&k_lin_dw, &push_dA, ceilDiv(R_u, group_lwg), ceilDiv(K_u, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
-        try recordScalar1D(&k_scale, push_scale_dA, ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
+        try recordLinBackward(&k_lin_dw, &push_dA, helpers.ceilDiv(R_u, group_lwg), helpers.ceilDiv(K_u, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
+        try recordScalar1D(&k_scale, push_scale_dA, helpers.ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
         // ∇B_unscaled = dyᵀ · intermediate ; ∇B = (α/r) · ∇B_unscaled
-        try recordLinBackward(&k_lin_dw, &push_dB, ceilDiv(N_u, group_lwg), ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
-        try recordScalar1D(&k_scale, push_scale_dB, ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
+        try recordLinBackward(&k_lin_dw, &push_dB, helpers.ceilDiv(N_u, group_lwg), helpers.ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
+        try recordScalar1D(&k_scale, push_scale_dB, helpers.ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
         // Adam updates on A and B.
         const adam_a = runtime.AdamStepPush{ .n = R_u * K_u, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = step };
         const adam_b = runtime.AdamStepPush{ .n = N_u * R_u, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = step };
-        try recordScalar1D(&k_adam, adam_a, ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_a, &buf_dA, &buf_m_a, &buf_v_a });
-        try recordScalar1D(&k_adam, adam_b, ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_b, &buf_dB, &buf_m_b, &buf_v_b });
+        try recordScalar1D(&k_adam, adam_a, helpers.ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_a, &buf_dA, &buf_m_a, &buf_v_a });
+        try recordScalar1D(&k_adam, adam_b, helpers.ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_b, &buf_dB, &buf_m_b, &buf_v_b });
 
         if (step % log_every == 0) {
             try buf_y.readBack(&ctx, f32, y_buf);
@@ -1011,17 +998,17 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
     defer buf_v_b.deinit(ctx.device);
 
     // ── Pipelines.
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
     var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
     defer k_lin_dx.deinit();
     var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
     defer k_lin_dw.deinit();
-    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(ScalePush));
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(aliases.ScalePush));
     defer k_scale.deinit();
     var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
     defer k_add.deinit();
-    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(MseLossGradPush));
+    var k_mse_grad = try pipeline.Kernel.init(&ctx, &shaders.mse_loss_grad, 3, @sizeOf(aliases.MseLossGradPush));
     defer k_mse_grad.deinit();
     var k_adam = try pipeline.Kernel.init(&ctx, &shaders.adam_step, 4, @sizeOf(runtime.AdamStepPush));
     defer k_adam.deinit();
@@ -1030,11 +1017,11 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
     const group_lin: u32 = 256;
 
     const recordMatmul = struct {
-        fn rec(rec_kern: *pipeline.Kernel, push: *const MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
+        fn rec(rec_kern: *pipeline.Kernel, push: *const aliases.MatmulPush, gx: u32, c_ctx: *const vk.Context, bufs: []const *const buffer.Buffer) !void {
             try rec_kern.bind(bufs);
             const Rec = struct {
                 k: *const pipeline.Kernel,
-                p: *const MatmulPush,
+                p: *const aliases.MatmulPush,
                 gx_: u32,
                 pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                     s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
@@ -1074,17 +1061,17 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
         }
     }.rec;
 
-    const push_y_base = MatmulPush{ .m = M_u, .n = N_u, .k = K_u };
-    const push_inter = MatmulPush{ .m = M_u, .n = R_u, .k = K_u };
-    const push_ylora = MatmulPush{ .m = M_u, .n = N_u, .k = R_u };
-    const push_scale_ylora = ScalePush{ .n = M_u * N_u, .scale = aor };
+    const push_y_base = aliases.MatmulPush{ .m = M_u, .n = N_u, .k = K_u };
+    const push_inter = aliases.MatmulPush{ .m = M_u, .n = R_u, .k = K_u };
+    const push_ylora = aliases.MatmulPush{ .m = M_u, .n = N_u, .k = R_u };
+    const push_scale_ylora = aliases.ScalePush{ .n = M_u * N_u, .scale = aor };
     const push_add_y = runtime.AddInPlacePush{ .n = M_u * N_u };
-    const push_mse = MseLossGradPush{ .n = M_u * N_u };
+    const push_mse = aliases.MseLossGradPush{ .n = M_u * N_u };
     const push_dy_B = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
     const push_dA = runtime.LinearBatchedPush{ .M = M_u, .N = R_u, .K = K_u };
-    const push_scale_dA = ScalePush{ .n = R_u * K_u, .scale = aor };
+    const push_scale_dA = aliases.ScalePush{ .n = R_u * K_u, .scale = aor };
     const push_dB = runtime.LinearBatchedPush{ .M = M_u, .N = N_u, .K = R_u };
-    const push_scale_dB = ScalePush{ .n = N_u * R_u, .scale = aor };
+    const push_scale_dB = aliases.ScalePush{ .n = N_u * R_u, .scale = aor };
 
     const computeMse = struct {
         fn call(y: []const f32, t: []const f32) f32 {
@@ -1150,17 +1137,17 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
             buf_dBu_: *const buffer.Buffer,
             buf_dB_: *const buffer.Buffer,
             // pushes
-            pyb: *const MatmulPush,
-            pin: *const MatmulPush,
-            pyl: *const MatmulPush,
-            psy: *const ScalePush,
+            pyb: *const aliases.MatmulPush,
+            pin: *const aliases.MatmulPush,
+            pyl: *const aliases.MatmulPush,
+            psy: *const aliases.ScalePush,
             pay: *const runtime.AddInPlacePush,
-            pms: *const MseLossGradPush,
+            pms: *const aliases.MseLossGradPush,
             pdyB: *const runtime.LinearBatchedPush,
             pdA: *const runtime.LinearBatchedPush,
-            psda: *const ScalePush,
+            psda: *const aliases.ScalePush,
             pdB: *const runtime.LinearBatchedPush,
-            psdb: *const ScalePush,
+            psdb: *const aliases.ScalePush,
             mu: u32,
             nu: u32,
             ku: u32,
@@ -1199,8 +1186,8 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
             try recM_fn(kmm, pyb, mu * nu, ctx_ptr, &.{ buf_x_, buf_w_, buf_y_ });
             try recM_fn(kmm, pin, mu * ru, ctx_ptr, &.{ buf_x_, buf_a_, buf_inter_ });
             try recM_fn(kmm, pyl, mu * nu, ctx_ptr, &.{ buf_inter_, buf_b_, buf_yl_ });
-            try recS_fn(ksc, psy.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
-            try recS_fn(kad, pay.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
+            try recS_fn(ksc, psy.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
+            try recS_fn(kad, pay.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
             try buf_y_.readBack(ctx_ptr, f32, y_buf_);
             const initial_loss = mse_fn(y_buf_, target_y_);
             result.loss_at_log[log_idx] = initial_loss;
@@ -1212,21 +1199,21 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
                 try recM_fn(kmm, pyb, mu * nu, ctx_ptr, &.{ buf_x_, buf_w_, buf_y_ });
                 try recM_fn(kmm, pin, mu * ru, ctx_ptr, &.{ buf_x_, buf_a_, buf_inter_ });
                 try recM_fn(kmm, pyl, mu * nu, ctx_ptr, &.{ buf_inter_, buf_b_, buf_yl_ });
-                try recS_fn(ksc, psy.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
-                try recS_fn(kad, pay.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
+                try recS_fn(ksc, psy.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
+                try recS_fn(kad, pay.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
                 // Loss grad.
-                try recS_fn(kmse, pms.*, ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_target_, buf_dy_ });
+                try recS_fn(kmse, pms.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_target_, buf_dy_ });
                 // Backward.
-                try recL_fn(klx, pdyB, ceilDiv(mu, glwg), ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_b_, buf_dyB_ });
-                try recL_fn(klw, pdA, ceilDiv(ru, glwg), ceilDiv(ku, glwg), ctx_ptr, &.{ buf_dyB_, buf_x_, buf_dAu_ });
-                try recS_fn(ksc, psda.*, ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_dAu_, buf_dA_ });
-                try recL_fn(klw, pdB, ceilDiv(nu, glwg), ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_inter_, buf_dBu_ });
-                try recS_fn(ksc, psdb.*, ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_dBu_, buf_dB_ });
+                try recL_fn(klx, pdyB, helpers.ceilDiv(mu, glwg), helpers.ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_b_, buf_dyB_ });
+                try recL_fn(klw, pdA, helpers.ceilDiv(ru, glwg), helpers.ceilDiv(ku, glwg), ctx_ptr, &.{ buf_dyB_, buf_x_, buf_dAu_ });
+                try recS_fn(ksc, psda.*, helpers.ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_dAu_, buf_dA_ });
+                try recL_fn(klw, pdB, helpers.ceilDiv(nu, glwg), helpers.ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_inter_, buf_dBu_ });
+                try recS_fn(ksc, psdb.*, helpers.ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_dBu_, buf_dB_ });
                 // Adam — different lr for A vs B (the LoRA+ knob).
                 const adam_a = runtime.AdamStepPush{ .n = ru * ku, .lr = lr_a, .beta1 = beta1_, .beta2 = beta2_, .eps = eps_, .t = step };
                 const adam_b = runtime.AdamStepPush{ .n = nu * ru, .lr = lr_b, .beta1 = beta1_, .beta2 = beta2_, .eps = eps_, .t = step };
-                try recS_fn(kadam, adam_a, ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_a_, buf_dA_, buf_m_a_, buf_v_a_ });
-                try recS_fn(kadam, adam_b, ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_b_, buf_dB_, buf_m_b_, buf_v_b_ });
+                try recS_fn(kadam, adam_a, helpers.ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_a_, buf_dA_, buf_m_a_, buf_v_a_ });
+                try recS_fn(kadam, adam_b, helpers.ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_b_, buf_dB_, buf_m_b_, buf_v_b_ });
 
                 // Periodic loss readback for the trajectory.
                 if (step % log_every_ == 0) {
@@ -1748,16 +1735,16 @@ pub fn runGpuMatmulV2Smoke(allocator: std.mem.Allocator) !void {
     var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
     defer buf_c.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
 
     // v2 dispatches one WG per output cell — total = M*N WGs.
     const groups: u32 = m * n;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const MatmulPush,
+        push: *const aliases.MatmulPush,
         gx: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
@@ -1826,18 +1813,18 @@ pub fn runEmbeddedAttachSmoke(allocator: std.mem.Allocator) !void {
     var buf_c = try buffer.Buffer.initDeviceOnly(&attached, m * n * @sizeOf(f32));
     defer buf_c.deinit(attached.device);
 
-    var kern = try pipeline.Kernel.init(&attached, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var kern = try pipeline.Kernel.init(&attached, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
 
     const local_xy: u32 = 16;
     const groups_x: u32 = (m + local_xy - 1) / local_xy;
     const groups_y: u32 = (n + local_xy - 1) / local_xy;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
 
     try buffer.submitOneShot(&attached, struct {
         kern: *const pipeline.Kernel,
-        push: *const MatmulPush,
+        push: *const aliases.MatmulPush,
         gx: u32,
         gy: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
@@ -1902,7 +1889,7 @@ pub fn runEmbeddedRecorderSmoke(allocator: std.mem.Allocator) !void {
     var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
     defer buf_c.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
 
@@ -1940,7 +1927,7 @@ pub fn runEmbeddedRecorderSmoke(allocator: std.mem.Allocator) !void {
     try rec.begin(); // no-op in attached mode; resets dispatch counter
 
     const groups: u32 = m * n;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
     try rec.dispatch(&kern, &.{ &buf_a, &buf_b, &buf_c }, &push, groups, 1, 1);
 
     // endAndSubmit on an attached recorder must refuse — the host owns
@@ -2047,15 +2034,15 @@ pub fn runGpuMatmulQ4_0Smoke(allocator: std.mem.Allocator) !void {
     var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
     defer buf_c.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_0, 3, @sizeOf(MatmulPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_0, 3, @sizeOf(aliases.MatmulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
 
     const groups: u32 = m * n;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const MatmulPush,
+        push: *const aliases.MatmulPush,
         gx: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
@@ -2140,15 +2127,15 @@ pub fn runGpuMatmulQ4_KSmoke(allocator: std.mem.Allocator) !void {
     var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
     defer buf_c.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_k, 3, @sizeOf(MatmulPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_k, 3, @sizeOf(aliases.MatmulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
 
     const groups: u32 = m * n;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const MatmulPush,
+        push: *const aliases.MatmulPush,
         gx: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
@@ -2170,7 +2157,6 @@ pub fn runGpuMatmulQ4_KSmoke(allocator: std.mem.Allocator) !void {
 }
 
 // ── gpu rmsnorm smoke: synthetic vs CPU rmsnorm ────────────────────
-
 
 pub fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -2206,18 +2192,18 @@ pub fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {
         var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, dim * @sizeOf(f32));
         defer buf_c.deinit(ctx.device);
 
-        var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+        var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(aliases.RmsnormPush));
         defer kern.deinit();
         try kern.bind(&.{ &buf_a, &buf_w, &buf_c });
 
-        const push = RmsnormPush{
+        const push = aliases.RmsnormPush{
             .dim = @intCast(dim),
             .eps = 1e-6,
             .gemma_quirk = if (gemma_quirk) 1 else 0,
         };
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
-            push: *const RmsnormPush,
+            push: *const aliases.RmsnormPush,
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, 1, 1, 1);
             }
@@ -2291,18 +2277,18 @@ pub fn runGpuRmsnormBackwardSmoke(allocator: std.mem.Allocator) !void {
         var buf_dw_partial = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
         defer buf_dw_partial.deinit(ctx.device);
 
-        var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_backward, 5, @sizeOf(RmsnormPush));
+        var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_backward, 5, @sizeOf(aliases.RmsnormPush));
         defer kern.deinit();
         try kern.bind(&.{ &buf_dy, &buf_x, &buf_w, &buf_dx, &buf_dw_partial });
 
-        const push = RmsnormPush{
+        const push = aliases.RmsnormPush{
             .dim = @intCast(dim),
             .eps = eps,
             .gemma_quirk = if (gemma_quirk) 1 else 0,
         };
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
-            push: *const RmsnormPush,
+            push: *const aliases.RmsnormPush,
             n_rows: u32,
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.n_rows, 1, 1);
@@ -2856,14 +2842,14 @@ pub fn runSoftmaxBackwardSmoke(allocator: std.mem.Allocator) !void {
     var buf_dx = try buffer.Buffer.initDeviceOnly(&ctx, n_rows * dim * @sizeOf(f32));
     defer buf_dx.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.softmax_backward, 3, @sizeOf(runtime.SoftmaxPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.softmax_backward, 3, @sizeOf(aliases.SoftmaxPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_dy, &buf_y, &buf_dx });
 
-    const push = runtime.SoftmaxPush{ .dim = @intCast(dim), .stride = @intCast(dim) };
+    const push = aliases.SoftmaxPush{ .dim = @intCast(dim), .stride = @intCast(dim) };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const runtime.SoftmaxPush,
+        push: *const aliases.SoftmaxPush,
         n_rows: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.n_rows, 1, 1);
@@ -3368,11 +3354,11 @@ pub fn runRopeBackwardSmoke(allocator: std.mem.Allocator) !void {
     var buf_din = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
     defer buf_din.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope_backward, 2, @sizeOf(runtime.RopePartialPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope_backward, 2, @sizeOf(aliases.RopePartialPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_dout, &buf_din });
 
-    const push = runtime.RopePartialPush{
+    const push = aliases.RopePartialPush{
         .n_heads = @intCast(n_heads),
         .head_dim = @intCast(head_dim),
         .rotary_dim = @intCast(rotary_dim),
@@ -3381,7 +3367,7 @@ pub fn runRopeBackwardSmoke(allocator: std.mem.Allocator) !void {
     };
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const runtime.RopePartialPush,
+        push: *const aliases.RopePartialPush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);

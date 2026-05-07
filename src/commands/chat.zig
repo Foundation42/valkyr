@@ -15,36 +15,11 @@ const cpu_forward = @import("../cpu/forward.zig");
 const gpu_model = @import("../gpu/model.zig");
 const gpu_scratch = @import("../gpu/scratch.zig");
 const gpu_recorder = @import("../gpu/recorder.zig");
-const runtime = @import("../runtime.zig");
-const runtime_hybrid = @import("../runtime_hybrid.zig");
 const chat_template_mod = @import("../chat_template.zig");
 const probe = @import("../probe.zig");
 const shaders = @import("shaders");
 
-// Shorter aliases so the moved code reads exactly as it did in main.zig.
-// Each `runtime.X` is also referenced from non-chat smoke tests still
-// living in main.zig — we keep the aliases there too rather than try to
-// hoist them into a shared module mid-refactor.
-const ChatKernels = runtime.ChatKernels;
-const Tq4VHooks = runtime.Tq4VHooks;
-const Tq4PackPush = runtime.Tq4PackPush;
-const ForwardPushes = runtime.ForwardPushes;
-const EmbedLookupPush = runtime.EmbedLookupPush;
-const computeForwardPushes = runtime.computeForwardPushes;
-const recordOneLayer = runtime.recordOneLayer;
-const recordForwardStep = runtime.recordForwardStep;
-const recDispatch1D = runtime.recDispatch1D;
-const recDispatchPerRow = runtime.recDispatchPerRow;
-const recDispatchMatmul = runtime.recDispatchMatmul;
-
-const HybridChatKernels = runtime_hybrid.ChatKernels;
-const HybridChatScratch = runtime_hybrid.Scratch;
-const HybridChatState = runtime_hybrid.State;
-const HybridTq4VHooks = runtime_hybrid.Tq4VHooks;
-const HybridForwardPushes = runtime_hybrid.ForwardPushes;
-const computeHybridForwardPushes = runtime_hybrid.computeForwardPushes;
-const recordOneHybridLayer = runtime_hybrid.recordOneLayer;
-const recordHybridForwardStep = runtime_hybrid.recordForwardStep;
+const aliases = @import("../runtime_aliases.zig");
 
 /// One entry from a `--prompts` TSV: `<label>\t<prompt>` per line.
 /// Both fields are slices into the file's read buffer (LoadedPrompts);
@@ -150,7 +125,7 @@ pub fn runChat(
         null;
     defer if (kv_tq4) |*c| c.deinit(ctx.device);
 
-    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family);
     defer k.deinit();
 
     // TQ4 pack/unpack kernels — picked by head_dim, only built in
@@ -166,7 +141,7 @@ pub fn runChat(
     else
         &shaders.tq4_unpack256;
     var tq_pack: ?pipeline.Kernel = if (tq4v)
-        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(Tq4PackPush))
+        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(aliases.Tq4PackPush))
     else
         null;
     defer if (tq_pack) |*kk| kk.deinit();
@@ -176,8 +151,8 @@ pub fn runChat(
         null;
     defer if (tq_unpack) |*kk| kk.deinit();
 
-    const tq4_hooks: ?Tq4VHooks = if (tq4v)
-        Tq4VHooks{ .pack = &tq_pack.?, .unpack = &tq_unpack.?, .cache = &kv_tq4.? }
+    const tq4_hooks: ?aliases.Tq4VHooks = if (tq4v)
+        aliases.Tq4VHooks{ .pack = &tq_pack.?, .unpack = &tq_unpack.?, .cache = &kv_tq4.? }
     else
         null;
 
@@ -259,7 +234,7 @@ pub fn runChat(
         try stdout.print("probe: computing null prior (BOS={d})...\n", .{bos});
         try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, bos, tq4_hooks, true);
+        try aliases.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, bos, tq4_hooks, true);
         try rec.endAndSubmit();
         try sc.logits.readBack(&ctx, f32, logits);
         // KV slot at pos 0 is now dirty with the BOS forward. The chat
@@ -305,7 +280,7 @@ pub fn runChat(
         defer gpa.free(null_prior_buf);
         try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, bos, tq4_hooks, true);
+        try aliases.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, bos, tq4_hooks, true);
         try rec.endAndSubmit();
         try sc.logits.readBack(&ctx, f32, null_prior_buf);
 
@@ -411,7 +386,7 @@ fn chatTurn(
     gm: *const gpu_model.GpuModel,
     kv: *const gpu_scratch.GpuKvCache,
     cfg: config_mod.Config,
-    k: *const ChatKernels,
+    k: *const aliases.ChatKernels,
     tok: *const tokenizer_mod.Tokenizer,
     user_msg: []const u8,
     pos: *usize,
@@ -421,7 +396,7 @@ fn chatTurn(
     rng: std.Random,
     tmpl: chat_template_mod.ChatTemplate,
     is_repl: bool,
-    tq4_v: ?Tq4VHooks,
+    tq4_v: ?aliases.Tq4VHooks,
     probe_bus: ?*probe.Bus,
     probe_info: probe.ModelInfo,
     probe_token_index: *u32,
@@ -511,7 +486,7 @@ fn chatTurn(
         } else {
             if (pos.* > 0) try rec.reset();
             try rec.begin();
-            try recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, tq4_v, is_last_prefill_or_decoding);
+            try aliases.recordForwardStep(rec, sc, gm, kv, cfg, k, pos.*, current, tq4_v, is_last_prefill_or_decoding);
             try rec.endAndSubmit();
         }
 
@@ -656,7 +631,7 @@ fn hexDigit(c: u8) ?u8 {
     };
 }
 
-/// Probed forward: same model dispatches as `recordForwardStep` but
+/// Probed forward: same model dispatches as `aliases.recordForwardStep` but
 /// split across multiple submits so the host can read back per-layer
 /// hidden state into the bus between layers. Slow path, only invoked
 /// when the bus has a probe that wants `hidden_post_layer`. Generation
@@ -670,10 +645,10 @@ fn forwardStepProbed(
     gm: *const gpu_model.GpuModel,
     kv: *const gpu_scratch.GpuKvCache,
     cfg: config_mod.Config,
-    k: *const ChatKernels,
+    k: *const aliases.ChatKernels,
     pos: usize,
     token_id: u32,
-    tq4_v: ?Tq4VHooks,
+    tq4_v: ?aliases.Tq4VHooks,
     compute_logits: bool,
     bus: *const probe.Bus,
     info: probe.ModelInfo,
@@ -685,9 +660,9 @@ fn forwardStepProbed(
     const hidden: u32 = @intCast(cfg.hidden_size);
     const vocab: u32 = @intCast(cfg.vocab_size);
 
-    const pushes = computeForwardPushes(cfg, sc, pos);
+    const pushes = aliases.computeForwardPushes(cfg, sc, pos);
 
-    const embed_push = EmbedLookupPush{
+    const embed_push = aliases.EmbedLookupPush{
         .token_id = token_id,
         .dim = hidden,
         .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
@@ -696,7 +671,7 @@ fn forwardStepProbed(
     // ── Embed ───────────────────────────────────────────────────────
     try rec.reset();
     try rec.begin();
-    try recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+    try aliases.recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
     try rec.endAndSubmit();
 
     // ── Per layer ──────────────────────────────────────────────────
@@ -719,7 +694,7 @@ fn forwardStepProbed(
 
         try rec.reset();
         try rec.begin();
-        try recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
+        try aliases.recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
         try rec.endAndSubmit();
 
         // sc.scores holds this layer's post-softmax attention weights
@@ -742,14 +717,14 @@ fn forwardStepProbed(
     if (compute_logits) {
         try rec.reset();
         try rec.begin();
-        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
-        try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+        try aliases.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
+        try aliases.recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
         try rec.endAndSubmit();
     }
 }
 
 /// Probed forward through the hybrid path: same dispatches as
-/// recordHybridForwardStep but split across multiple submits so the
+/// aliases.recordHybridForwardStep but split across multiple submits so the
 /// host can read back per-layer hidden state and (on full-attention
 /// layers only) post-softmax attention weights between layers.
 /// Generation output is bit-identical to the fast path because the
@@ -758,15 +733,15 @@ fn forwardStepProbed(
 fn forwardStepProbedHybrid(
     rec: *gpu_recorder.Recorder,
     vk_ctx: *const vk.Context,
-    sc: *const HybridChatScratch,
-    state: *const HybridChatState,
+    sc: *const aliases.HybridChatScratch,
+    state: *const aliases.HybridChatState,
     gm: *const gpu_model.GpuModel,
     cfg: config_mod.Config,
-    k: *const HybridChatKernels,
+    k: *const aliases.HybridChatKernels,
     pos: usize,
     token_id: u32,
     max_pos: u32,
-    tq4_v: ?HybridTq4VHooks,
+    tq4_v: ?aliases.HybridTq4VHooks,
     compute_logits: bool,
     bus: *const probe.Bus,
     info: probe.ModelInfo,
@@ -778,13 +753,13 @@ fn forwardStepProbedHybrid(
     const hidden: u32 = @intCast(cfg.hidden_size);
     const vocab: u32 = @intCast(cfg.vocab_size);
 
-    const pushes = computeHybridForwardPushes(cfg, pos, max_pos);
-    const embed_push = EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
+    const pushes = aliases.computeHybridForwardPushes(cfg, pos, max_pos);
+    const embed_push = aliases.EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
 
     // ── Embed ───────────────────────────────────────────────────────
     try rec.reset();
     try rec.begin();
-    try recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+    try aliases.recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
     try rec.endAndSubmit();
 
     // ── Per layer ──────────────────────────────────────────────────
@@ -805,7 +780,7 @@ fn forwardStepProbedHybrid(
 
         try rec.reset();
         try rec.begin();
-        try recordOneHybridLayer(rec, sc, state, gm, cfg, k, layer_idx, pos, &pushes, tq4_v);
+        try aliases.recordOneHybridLayer(rec, sc, state, gm, cfg, k, layer_idx, pos, &pushes, tq4_v);
         try rec.endAndSubmit();
 
         // sc.scores holds post-softmax attention weights ONLY on
@@ -829,8 +804,8 @@ fn forwardStepProbedHybrid(
     if (compute_logits) {
         try rec.reset();
         try rec.begin();
-        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
-        try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+        try aliases.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
+        try aliases.recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
         try rec.endAndSubmit();
     }
 }
@@ -889,11 +864,11 @@ pub fn runChatQwen35(
     const tq4v_active = tq4v and (cfg.head_dim == 128 or cfg.head_dim == 256);
 
     const max_pos: u32 = 2048;
-    var sc = try HybridChatScratch.init(&ctx, cfg, max_pos, tq4v_active);
+    var sc = try aliases.HybridChatScratch.init(&ctx, cfg, max_pos, tq4v_active);
     defer sc.deinit(ctx.device);
-    var state = try HybridChatState.init(gpa, &ctx, cfg, max_pos, tq4v_active);
+    var state = try aliases.HybridChatState.init(gpa, &ctx, cfg, max_pos, tq4v_active);
     defer state.deinit(ctx.device);
-    var ks = try HybridChatKernels.init(&ctx, gm.precision);
+    var ks = try aliases.HybridChatKernels.init(&ctx, gm.precision);
     defer ks.deinit();
 
     // TQ4 pack/unpack kernels — picked by head_dim, only built when
@@ -908,7 +883,7 @@ pub fn runChatQwen35(
     else
         &shaders.tq4_unpack256;
     var tq_pack: ?pipeline.Kernel = if (tq4v_active)
-        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(Tq4PackPush))
+        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(aliases.Tq4PackPush))
     else
         null;
     defer if (tq_pack) |*kk| kk.deinit();
@@ -917,7 +892,7 @@ pub fn runChatQwen35(
     else
         null;
     defer if (tq_unpack) |*kk| kk.deinit();
-    const tq4_hooks: ?HybridTq4VHooks = if (tq4v_active) HybridTq4VHooks{
+    const tq4_hooks: ?aliases.HybridTq4VHooks = if (tq4v_active) aliases.HybridTq4VHooks{
         .pack = &tq_pack.?,
         .unpack = &tq_unpack.?,
         .n_blocks_per_pos = @intCast(cfg.num_key_value_heads),
@@ -988,7 +963,7 @@ pub fn runChatQwen35(
         try stdout.print("probe: computing null prior (BOS={d})...\n", .{bos});
         try rec.reset();
         try rec.begin();
-        try recordHybridForwardStep(&rec, &sc, &state, &gm, cfg, &ks, 0, bos, max_pos, tq4_hooks, true);
+        try aliases.recordHybridForwardStep(&rec, &sc, &state, &gm, cfg, &ks, 0, bos, max_pos, tq4_hooks, true);
         try rec.endAndSubmit();
         try sc.logits.readBack(&ctx, f32, logits);
         // KV/SSM slots at pos 0 are now dirty with the BOS forward.
@@ -1021,7 +996,7 @@ pub fn runChatQwen35(
     //
     // Same shape as runChat's batch path. Additional reset between
     // prompts: zero the per-layer SSM (conv + recurrent) state via
-    // HybridChatState.reset, since Gated DeltaNet's recurrent state
+    // aliases.HybridChatState.reset, since Gated DeltaNet's recurrent state
     // is a constant-size vector that always matters regardless of
     // pos and would otherwise leak the previous prompt's trajectory
     // into the next prompt's first decode steps.
@@ -1032,7 +1007,7 @@ pub fn runChatQwen35(
         defer gpa.free(null_prior_buf);
         try rec.reset();
         try rec.begin();
-        try recordHybridForwardStep(&rec, &sc, &state, &gm, cfg, &ks, 0, bos, max_pos, tq4_hooks, true);
+        try aliases.recordHybridForwardStep(&rec, &sc, &state, &gm, cfg, &ks, 0, bos, max_pos, tq4_hooks, true);
         try rec.endAndSubmit();
         try sc.logits.readBack(&ctx, f32, null_prior_buf);
 
@@ -1127,11 +1102,11 @@ fn chatTurnHybrid(
     gpa: std.mem.Allocator,
     ctx: *const vk.Context,
     rec: *gpu_recorder.Recorder,
-    sc: *const HybridChatScratch,
-    state: *const HybridChatState,
+    sc: *const aliases.HybridChatScratch,
+    state: *const aliases.HybridChatState,
     gm: *const gpu_model.GpuModel,
     cfg: config_mod.Config,
-    ks: *const HybridChatKernels,
+    ks: *const aliases.HybridChatKernels,
     tok: *const tokenizer_mod.Tokenizer,
     user_msg: []const u8,
     pos: *usize,
@@ -1142,7 +1117,7 @@ fn chatTurnHybrid(
     tmpl: chat_template_mod.ChatTemplate,
     is_repl: bool,
     max_pos: u32,
-    tq4_v: ?HybridTq4VHooks,
+    tq4_v: ?aliases.HybridTq4VHooks,
     probe_bus: ?*probe.Bus,
     probe_info: probe.ModelInfo,
     probe_token_index: *u32,
@@ -1220,7 +1195,7 @@ fn chatTurnHybrid(
         } else {
             if (pos.* > 0) try rec.reset();
             try rec.begin();
-            try recordHybridForwardStep(rec, sc, state, gm, cfg, ks, pos.*, current, max_pos, tq4_v, is_last_prefill_or_decoding);
+            try aliases.recordHybridForwardStep(rec, sc, state, gm, cfg, ks, pos.*, current, max_pos, tq4_v, is_last_prefill_or_decoding);
             try rec.endAndSubmit();
         }
 

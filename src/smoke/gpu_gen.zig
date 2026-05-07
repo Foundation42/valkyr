@@ -17,79 +17,10 @@ const dtype = @import("../dtype.zig");
 const gpu_model = @import("../gpu/model.zig");
 const gpu_scratch = @import("../gpu/scratch.zig");
 const gpu_recorder = @import("../gpu/recorder.zig");
-const runtime = @import("../runtime.zig");
-const runtime_hybrid = @import("../runtime_hybrid.zig");
 const shaders = @import("shaders");
 
-// Aliases mirroring main.zig — duplicated so this module compiles
-// standalone; the originals stay in main.zig only when other code
-// there still uses them.
-const ChatKernels = runtime.ChatKernels;
-const Tq4VHooks = runtime.Tq4VHooks;
-const Tq4PackPush = runtime.Tq4PackPush;
-const ForwardPushes = runtime.ForwardPushes;
-const EmbedLookupPush = runtime.EmbedLookupPush;
-const AttnScoresPush = runtime.AttnScoresPush;
-const AttnOutputPush = runtime.AttnOutputPush;
-const KvWritePush = runtime.KvWritePush;
-const computeForwardPushes = runtime.computeForwardPushes;
-const recordOneLayer = runtime.recordOneLayer;
-const recordForwardStep = runtime.recordForwardStep;
-const recDispatch1D = runtime.recDispatch1D;
-const recDispatchPerRow = runtime.recDispatchPerRow;
-const recDispatchMatmul = runtime.recDispatchMatmul;
-const recDispatchRope = runtime.recDispatchRope;
-const RopePartialPush = runtime.RopePartialPush;
-const RmsnormPush = runtime.RmsnormPush;
-const MatmulPush = runtime.MatmulPush;
-const RopePush = runtime.RopePush;
-const AddInPlacePush = runtime.AddInPlacePush;
-const GegluPush = runtime.GegluPush;
-
-// Local extern struct shared with main.zig's gpu-layer0-test path.
-// Duplicated here so this module compiles standalone.
-const AttnDecodeSinglePush = extern struct { n_heads: u32, heads_per_kv: u32, head_dim: u32 };
-
-const HybridChatKernels = runtime_hybrid.ChatKernels;
-const HybridChatScratch = runtime_hybrid.Scratch;
-const HybridChatState = runtime_hybrid.State;
-const HybridTq4VHooks = runtime_hybrid.Tq4VHooks;
-const HybridForwardPushes = runtime_hybrid.ForwardPushes;
-const computeHybridForwardPushes = runtime_hybrid.computeForwardPushes;
-const recordOneHybridLayer = runtime_hybrid.recordOneLayer;
-const recordHybridForwardStep = runtime_hybrid.recordForwardStep;
-const SplitQGatePush = runtime_hybrid.SplitQGatePush;
-const ScalePush = runtime_hybrid.ScalePush;
-const SliceCopyPush = runtime_hybrid.SliceCopyPush;
-const SigmoidMulPush = runtime_hybrid.SigmoidMulPush;
-const Conv1dUpdatePush = runtime_hybrid.Conv1dUpdatePush;
-const GatedDeltaStepPush = runtime_hybrid.GatedDeltaStepPush;
-const L2normPush = runtime_hybrid.L2normPush;
-const RmsnormGatedPush = runtime_hybrid.RmsnormGatedPush;
-const SoftmaxPush = runtime.SoftmaxPush;
-
-fn truncateStr(s: []const u8, n: usize) []const u8 {
-    return if (s.len <= n) s else s[0..n];
-}
-
-const TopKEntry = struct { id: usize, value: f32 };
-
-fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
-    const out = try gpa.alloc(TopKEntry, k);
-    for (out) |*e| e.* = .{ .id = 0, .value = -std.math.inf(f32) };
-    for (logits, 0..) |v, i| {
-        if (v <= out[k - 1].value) continue;
-        // Insert into sorted (descending) list.
-        var j: usize = k - 1;
-        out[j] = .{ .id = i, .value = v };
-        while (j > 0 and out[j].value > out[j - 1].value) : (j -= 1) {
-            const tmp = out[j];
-            out[j] = out[j - 1];
-            out[j - 1] = tmp;
-        }
-    }
-    return out;
-}
+const aliases = @import("../runtime_aliases.zig");
+const helpers = @import("../smoke/helpers.zig");
 
 // ── gpu-gen-many: multi-token generation with KV cache ─────────────
 
@@ -118,7 +49,7 @@ pub fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: 
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family);
     defer k.deinit();
 
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
@@ -139,7 +70,7 @@ pub fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: 
     while (pos < n_tokens) : (pos += 1) {
         if (pos > 0) try rec.reset();
         try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, pos, current_token, null, true);
+        try aliases.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, pos, current_token, null, true);
 
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
@@ -168,7 +99,7 @@ pub fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: 
 
 // ── gpu-gen-tq4v: GPU forward with TQ4 V-cache vs fp32 V baseline ──
 //
-// Same input token, two passes through recordForwardStep — once with
+// Same input token, two passes through aliases.recordForwardStep — once with
 // tq4_v = null (existing fp32 V path), once with the TQ4 hooks set
 // up. Reads back logits for both, prints argmax + top-5 (with decoded
 // text) + max / mean / rms divergence over the full vocab. The
@@ -202,14 +133,14 @@ pub fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32
     var kv_tq4 = try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos);
     defer kv_tq4.deinit(ctx.device);
 
-    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family);
     defer k.deinit();
 
-    var tq_pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(Tq4PackPush));
+    var tq_pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(aliases.Tq4PackPush));
     defer tq_pack.deinit();
     var tq_unpack = try pipeline.Kernel.init(&ctx, &shaders.tq4_unpack256, 2, 0);
     defer tq_unpack.deinit();
-    const tq4_hooks = Tq4VHooks{ .pack = &tq_pack, .unpack = &tq_unpack, .cache = &kv_tq4 };
+    const tq4_hooks = aliases.Tq4VHooks{ .pack = &tq_pack, .unpack = &tq_unpack, .cache = &kv_tq4 };
 
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
     defer rec.deinit();
@@ -221,20 +152,20 @@ pub fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32
 
     // Pass 1: fp32 V baseline.
     try rec.begin();
-    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, token_id, null, true);
+    try aliases.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, token_id, null, true);
     try rec.endAndSubmit();
     try sc.logits.readBack(&ctx, f32, logits_a);
 
     // Pass 2: TQ4 V.
     try rec.reset();
     try rec.begin();
-    try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, token_id, tq4_hooks, true);
+    try aliases.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, 0, token_id, tq4_hooks, true);
     try rec.endAndSubmit();
     try sc.logits.readBack(&ctx, f32, logits_b);
 
-    const top_a = try topK(gpa, logits_a, 5);
+    const top_a = try helpers.topK(gpa, logits_a, 5);
     defer gpa.free(top_a);
-    const top_b = try topK(gpa, logits_b, 5);
+    const top_b = try helpers.topK(gpa, logits_b, 5);
     defer gpa.free(top_b);
 
     try stdout.print("            fp32 V baseline                     TQ4 V\n", .{});
@@ -246,7 +177,7 @@ pub fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32
         const ta_text = tok.decode(ta.id) orelse "?";
         const tb_text = tok.decode(tb.id) orelse "?";
         try stdout.print("{d:>4}   {d:>6}   {d:>6.2}   {s:<16}   {d:>6}   {d:>6.2}   {s:<16}\n", .{
-            i, ta.id, ta.value, truncateStr(ta_text, 16), tb.id, tb.value, truncateStr(tb_text, 16),
+            i, ta.id, ta.value, helpers.truncateStr(ta_text, 16), tb.id, tb.value, helpers.truncateStr(tb_text, 16),
         });
     }
 
@@ -310,19 +241,19 @@ pub fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
     defer sc.deinit(ctx.device);
 
     // ── Build kernels once, rebind per-layer ────────────────────────
-    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush));
+    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(aliases.EmbedLookupPush));
     defer k_embed.deinit();
-    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(aliases.RmsnormPush));
     defer k_rmsnorm.deinit();
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
-    var k_rope = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    var k_rope = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(aliases.RopePush));
     defer k_rope.deinit();
-    var k_attn = try pipeline.Kernel.init(&ctx, &shaders.attn_decode_single, 2, @sizeOf(AttnDecodeSinglePush));
+    var k_attn = try pipeline.Kernel.init(&ctx, &shaders.attn_decode_single, 2, @sizeOf(helpers.AttnDecodeSinglePush));
     defer k_attn.deinit();
-    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush));
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(aliases.AddInPlacePush));
     defer k_add.deinit();
-    var k_geglu = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    var k_geglu = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(aliases.GegluPush));
     defer k_geglu.deinit();
 
     const hidden: u32 = @intCast(cfg.hidden_size);
@@ -339,27 +270,27 @@ pub fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
     defer rec.deinit();
 
-    const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
-    const add_push = AddInPlacePush{ .n = hidden };
-    const attn_push = AttnDecodeSinglePush{
+    const rms_push = aliases.RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    const add_push = aliases.AddInPlacePush{ .n = hidden };
+    const attn_push = helpers.AttnDecodeSinglePush{
         .n_heads = @intCast(cfg.num_attention_heads),
         .heads_per_kv = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads),
         .head_dim = @intCast(cfg.head_dim),
     };
-    const rope_q_push = RopePush{
+    const rope_q_push = aliases.RopePush{
         .n_heads = @intCast(cfg.num_attention_heads),
         .head_dim = @intCast(cfg.head_dim),
         .pos = 0,
         .theta_base = cfg.rope_theta,
     };
-    const rope_k_push = RopePush{
+    const rope_k_push = aliases.RopePush{
         .n_heads = @intCast(cfg.num_key_value_heads),
         .head_dim = @intCast(cfg.head_dim),
         .pos = 0,
         .theta_base = cfg.rope_theta,
     };
-    const geglu_push = GegluPush{ .n = inter };
-    const embed_push = EmbedLookupPush{
+    const geglu_push = aliases.GegluPush{ .n = inter };
+    const embed_push = aliases.EmbedLookupPush{
         .token_id = token_id,
         .dim = hidden,
         .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
@@ -370,40 +301,40 @@ pub fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
     try rec.begin();
 
     // Embed lookup → residual stream.
-    try recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+    try aliases.recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
 
     // 18 transformer blocks.
     for (gm.layers) |*layer| {
-        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
+        try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
 
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
 
-        try recDispatchRope(&rec, &k_rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
-        try recDispatchRope(&rec, &k_rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+        try aliases.recDispatchRope(&rec, &k_rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+        try aliases.recDispatchRope(&rec, &k_rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
 
-        try recDispatch1D(&rec, &k_attn, &.{ &sc.v, &sc.head_out }, &attn_push, q_dim);
+        try aliases.recDispatch1D(&rec, &k_attn, &.{ &sc.v, &sc.head_out }, &attn_push, q_dim);
 
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
 
-        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
+        try aliases.recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
 
-        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
+        try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
 
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
 
-        try recDispatch1D(&rec, &k_geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
+        try aliases.recDispatch1D(&rec, &k_geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
 
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
 
-        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
+        try aliases.recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
     }
 
     // Final rmsnorm + LM head.
-    try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
-    try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+    try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
 
     try rec.endAndSubmit();
 
@@ -425,33 +356,33 @@ pub fn runGpuGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !v
     try rec.reset();
     const t_warm0 = std.time.nanoTimestamp();
     try rec.begin();
-    try recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
+    try aliases.recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
     for (gm.layers) |*layer| {
-        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
-        try recDispatchRope(&rec, &k_rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
-        try recDispatchRope(&rec, &k_rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
-        try recDispatch1D(&rec, &k_attn, &.{ &sc.v, &sc.head_out }, &attn_push, q_dim);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
-        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
-        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
-        try recDispatch1D(&rec, &k_geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
-        try recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
+        try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &rms_push, 1);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
+        try aliases.recDispatchRope(&rec, &k_rope, &.{ &sc.q, &sc.q_rot }, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
+        try aliases.recDispatchRope(&rec, &k_rope, &.{ &sc.k, &sc.k_rot }, &rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+        try aliases.recDispatch1D(&rec, &k_attn, &.{ &sc.v, &sc.head_out }, &attn_push, q_dim);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
+        try aliases.recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.attn_out }, &add_push, hidden);
+        try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &rms_push, 1);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
+        try aliases.recDispatch1D(&rec, &k_geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &geglu_push, inter);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
+        try aliases.recDispatch1D(&rec, &k_add, &.{ &sc.stream, &sc.ffn_out }, &add_push, hidden);
     }
-    try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
-    try recDispatchMatmul(&rec, &k_matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &rms_push, 1);
+    try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
     try rec.endAndSubmit();
     const t_warm1 = std.time.nanoTimestamp();
     const warm_ms = @as(f64, @floatFromInt(t_warm1 - t_warm0)) / 1_000_000.0;
     try stdout.print("forward (warm, 2nd pass)                          : {d:.0} ms\n", .{warm_ms});
 
     const k_top: usize = 5;
-    const top = try topK(gpa, logits, k_top);
+    const top = try helpers.topK(gpa, logits, k_top);
     defer gpa.free(top);
     try stdout.print("\ntop {d} logits (GPU):\n", .{k_top});
     for (top) |entry| {
@@ -671,41 +602,41 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
     };
 
     // ── Kernels ─────────────────────────────────────────────────────
-    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush));
+    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(aliases.EmbedLookupPush));
     defer k_embed.deinit();
-    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(aliases.RmsnormPush));
     defer k_rmsnorm.deinit();
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
-    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush));
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(aliases.AddInPlacePush));
     defer k_add.deinit();
-    var k_swiglu = try pipeline.Kernel.init(&ctx, &shaders.swiglu, 3, @sizeOf(GegluPush));
+    var k_swiglu = try pipeline.Kernel.init(&ctx, &shaders.swiglu, 3, @sizeOf(aliases.GegluPush));
     defer k_swiglu.deinit();
-    var k_rope_p = try pipeline.Kernel.init(&ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush));
+    var k_rope_p = try pipeline.Kernel.init(&ctx, &shaders.rope_partial, 2, @sizeOf(aliases.RopePartialPush));
     defer k_rope_p.deinit();
-    var k_split_qg = try pipeline.Kernel.init(&ctx, &shaders.split_q_gate, 3, @sizeOf(SplitQGatePush));
+    var k_split_qg = try pipeline.Kernel.init(&ctx, &shaders.split_q_gate, 3, @sizeOf(aliases.SplitQGatePush));
     defer k_split_qg.deinit();
-    var k_sigmul = try pipeline.Kernel.init(&ctx, &shaders.sigmoid_mul, 3, @sizeOf(SigmoidMulPush));
+    var k_sigmul = try pipeline.Kernel.init(&ctx, &shaders.sigmoid_mul, 3, @sizeOf(aliases.SigmoidMulPush));
     defer k_sigmul.deinit();
-    var k_l2 = try pipeline.Kernel.init(&ctx, &shaders.l2norm_per_head, 2, @sizeOf(L2normPush));
+    var k_l2 = try pipeline.Kernel.init(&ctx, &shaders.l2norm_per_head, 2, @sizeOf(aliases.L2normPush));
     defer k_l2.deinit();
-    var k_conv1d = try pipeline.Kernel.init(&ctx, &shaders.conv1d_update, 4, @sizeOf(Conv1dUpdatePush));
+    var k_conv1d = try pipeline.Kernel.init(&ctx, &shaders.conv1d_update, 4, @sizeOf(aliases.Conv1dUpdatePush));
     defer k_conv1d.deinit();
-    var k_rms_gated = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_gated, 4, @sizeOf(RmsnormGatedPush));
+    var k_rms_gated = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm_gated, 4, @sizeOf(aliases.RmsnormGatedPush));
     defer k_rms_gated.deinit();
-    var k_gds = try pipeline.Kernel.init(&ctx, &shaders.gated_delta_step, 9, @sizeOf(GatedDeltaStepPush));
+    var k_gds = try pipeline.Kernel.init(&ctx, &shaders.gated_delta_step, 9, @sizeOf(aliases.GatedDeltaStepPush));
     defer k_gds.deinit();
-    var k_kv_write = try pipeline.Kernel.init(&ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush));
+    var k_kv_write = try pipeline.Kernel.init(&ctx, &shaders.kv_write, 2, @sizeOf(aliases.KvWritePush));
     defer k_kv_write.deinit();
-    var k_scores = try pipeline.Kernel.init(&ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush));
+    var k_scores = try pipeline.Kernel.init(&ctx, &shaders.attn_scores, 3, @sizeOf(aliases.AttnScoresPush));
     defer k_scores.deinit();
-    var k_softmax = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush));
+    var k_softmax = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(aliases.SoftmaxPush));
     defer k_softmax.deinit();
-    var k_attn_out = try pipeline.Kernel.init(&ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush));
+    var k_attn_out = try pipeline.Kernel.init(&ctx, &shaders.attn_output, 3, @sizeOf(aliases.AttnOutputPush));
     defer k_attn_out.deinit();
-    var k_slice_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush));
+    var k_slice_copy = try pipeline.Kernel.init(&ctx, &shaders.slice_copy, 2, @sizeOf(aliases.SliceCopyPush));
     defer k_slice_copy.deinit();
-    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(ScalePush));
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(aliases.ScalePush));
     defer k_scale.deinit();
 
     // ── Recorder: one command buffer for the entire forward ────────
@@ -714,38 +645,38 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
 
     // ── Common push constants ───────────────────────────────────────
     const gemma_quirk: u32 = if (cfg.family.rmsnormAddOne()) 1 else 0;
-    const rms_push = RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
-    const qkn_push = RmsnormPush{ .dim = head_dim, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
-    const add_push = AddInPlacePush{ .n = hidden };
-    const embed_push = EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
-    const swiglu_push = GegluPush{ .n = inter };
-    const conv1d_push = Conv1dUpdatePush{ .conv_dim = conv_dim, .kernel_size = conv_kernel };
-    const l2_push = L2normPush{ .head_dim = head_k, .eps = 1e-6 };
-    const rms_gated_push = RmsnormGatedPush{ .head_dim = head_v, .eps = cfg.rms_norm_eps };
-    const gds_push = GatedDeltaStepPush{
+    const rms_push = aliases.RmsnormPush{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    const qkn_push = aliases.RmsnormPush{ .dim = head_dim, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk };
+    const add_push = aliases.AddInPlacePush{ .n = hidden };
+    const embed_push = aliases.EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
+    const swiglu_push = aliases.GegluPush{ .n = inter };
+    const conv1d_push = aliases.Conv1dUpdatePush{ .conv_dim = conv_dim, .kernel_size = conv_kernel };
+    const l2_push = aliases.L2normPush{ .head_dim = head_k, .eps = 1e-6 };
+    const rms_gated_push = aliases.RmsnormGatedPush{ .head_dim = head_v, .eps = cfg.rms_norm_eps };
+    const gds_push = aliases.GatedDeltaStepPush{
         .num_k_heads = n_k_heads_lin,
         .num_v_heads = n_v_heads,
         .head_k = head_k,
         .head_v = head_v,
     };
-    const split_push = SplitQGatePush{ .num_heads = n_q_heads, .head_dim = head_dim };
-    const sigmul_push = SigmoidMulPush{ .n_elem = q_dim };
-    const rope_q_push = RopePartialPush{
+    const split_push = aliases.SplitQGatePush{ .num_heads = n_q_heads, .head_dim = head_dim };
+    const sigmul_push = aliases.SigmoidMulPush{ .n_elem = q_dim };
+    const rope_q_push = aliases.RopePartialPush{
         .n_heads = n_q_heads,
         .head_dim = head_dim,
         .rotary_dim = rotary_dim,
         .pos = 0,
         .theta_base = cfg.rope_theta,
     };
-    const rope_k_push = RopePartialPush{
+    const rope_k_push = aliases.RopePartialPush{
         .n_heads = n_kv_heads,
         .head_dim = head_dim,
         .rotary_dim = rotary_dim,
         .pos = 0,
         .theta_base = cfg.rope_theta,
     };
-    const kv_write_push = KvWritePush{ .n = kv_dim, .dst_off = 0 }; // pos=0
-    const scores_push = AttnScoresPush{
+    const kv_write_push = aliases.KvWritePush{ .n = kv_dim, .dst_off = 0 }; // pos=0
+    const scores_push = aliases.AttnScoresPush{
         .n_heads = n_q_heads,
         .heads_per_kv = heads_per_kv,
         .head_dim = head_dim,
@@ -754,8 +685,8 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
         .scores_stride = max_pos,
         .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
     };
-    const softmax_push = SoftmaxPush{ .dim = 1, .stride = max_pos };
-    const attn_out_push = AttnOutputPush{
+    const softmax_push = aliases.SoftmaxPush{ .dim = 1, .stride = max_pos };
+    const attn_out_push = aliases.AttnOutputPush{
         .n_heads = n_q_heads,
         .heads_per_kv = heads_per_kv,
         .head_dim = head_dim,
@@ -768,7 +699,7 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
     try rec.begin();
 
     // Embed lookup → residual stream.
-    try recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc_stream }, &embed_push, hidden);
+    try aliases.recDispatch1D(&rec, &k_embed, &.{ &gm.embed_tokens, &sc_stream }, &embed_push, hidden);
 
     // Diagnostic knob: stop after this many layers (env QWEN35_STOP).
     // -1 / unset means run all. Useful for layer-bisection debugging.
@@ -780,31 +711,31 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
 
     for (gm.layers, 0..) |*layer, i| {
         if (stop_after >= 0 and @as(i32, @intCast(i)) >= stop_after) break;
-        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_stream, &layer.input_layernorm, &sc_x_norm }, &rms_push, 1);
+        try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_stream, &layer.input_layernorm, &sc_x_norm }, &rms_push, 1);
 
         switch (layer.layer_type) {
             .linear_attention => {
                 // 1. Input projections.
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_qkv.?, &sc_mixed_qkv }, 1, conv_dim, hidden);
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_z.?, &sc_z }, 1, value_dim, hidden);
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_b.?, &sc_braw }, 1, n_v_heads, hidden);
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_a.?, &sc_araw }, 1, n_v_heads, hidden);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_qkv.?, &sc_mixed_qkv }, 1, conv_dim, hidden);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_z.?, &sc_z }, 1, value_dim, hidden);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_b.?, &sc_braw }, 1, n_v_heads, hidden);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.in_proj_a.?, &sc_araw }, 1, n_v_heads, hidden);
 
                 // 2. Causal conv1d update + SiLU. Read from
                 //    sc_mixed_qkv, write to sc_mixed_qkv_post (distinct
                 //    buffers to avoid Vulkan readonly/writeonly aliasing).
-                try recDispatch1D(&rec, &k_conv1d, &.{ &sc_mixed_qkv, &layer.conv1d_weight.?, &ssm_conv[i].?, &sc_mixed_qkv_post }, &conv1d_push, conv_dim);
+                try aliases.recDispatch1D(&rec, &k_conv1d, &.{ &sc_mixed_qkv, &layer.conv1d_weight.?, &ssm_conv[i].?, &sc_mixed_qkv_post }, &conv1d_push, conv_dim);
 
                 // 3. Split mixed_qkv_post into (q_lin, k_lin, v_lin).
                 //    The in_proj_qkv block lays them out contiguously:
                 //    q[0..key_dim], k[key_dim..2*key_dim],
                 //    v[2*key_dim..conv_dim].
-                const slice_q_push = SliceCopyPush{ .src_off = 0,           .dst_off = 0, .n_elem = key_dim };
-                const slice_k_push = SliceCopyPush{ .src_off = key_dim,     .dst_off = 0, .n_elem = key_dim };
-                const slice_v_push = SliceCopyPush{ .src_off = 2 * key_dim, .dst_off = 0, .n_elem = value_dim };
-                try recDispatch1D(&rec, &k_slice_copy, &.{ &sc_mixed_qkv_post, &sc_qlin }, &slice_q_push, key_dim);
-                try recDispatch1D(&rec, &k_slice_copy, &.{ &sc_mixed_qkv_post, &sc_klin }, &slice_k_push, key_dim);
-                try recDispatch1D(&rec, &k_slice_copy, &.{ &sc_mixed_qkv_post, &sc_vlin }, &slice_v_push, value_dim);
+                const slice_q_push = aliases.SliceCopyPush{ .src_off = 0,           .dst_off = 0, .n_elem = key_dim };
+                const slice_k_push = aliases.SliceCopyPush{ .src_off = key_dim,     .dst_off = 0, .n_elem = key_dim };
+                const slice_v_push = aliases.SliceCopyPush{ .src_off = 2 * key_dim, .dst_off = 0, .n_elem = value_dim };
+                try aliases.recDispatch1D(&rec, &k_slice_copy, &.{ &sc_mixed_qkv_post, &sc_qlin }, &slice_q_push, key_dim);
+                try aliases.recDispatch1D(&rec, &k_slice_copy, &.{ &sc_mixed_qkv_post, &sc_klin }, &slice_k_push, key_dim);
+                try aliases.recDispatch1D(&rec, &k_slice_copy, &.{ &sc_mixed_qkv_post, &sc_vlin }, &slice_v_push, value_dim);
 
                 // 4. Per-head L2-norm on Q and K (each over head_k).
                 try rec.dispatch(&k_l2, &.{ &sc_qlin, &sc_qlin_n }, &l2_push, n_k_heads_lin, 1, 1);
@@ -813,8 +744,8 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
                 // 4b. Apply 1/sqrt(head_k) scale to Q (in place via
                 //    a separate output slot — Vulkan disallows binding
                 //    the same buffer to a writeonly + readonly slot).
-                const scale_push = ScalePush{ .n = key_dim, .scale = q_scale };
-                try recDispatch1D(&rec, &k_scale, &.{ &sc_qlin_n, &sc_qlin }, &scale_push, key_dim);
+                const scale_push = aliases.ScalePush{ .n = key_dim, .scale = q_scale };
+                try aliases.recDispatch1D(&rec, &k_scale, &.{ &sc_qlin_n, &sc_qlin }, &scale_push, key_dim);
 
                 // 5. Recurrent gated-delta step. After step 4b,
                 //    `sc_qlin` holds the L2-normed AND scaled Q;
@@ -829,64 +760,63 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
                 try rec.dispatch(&k_rms_gated, &.{ &sc_y, &sc_z, &layer.ssm_norm_weight.?, &sc_post_norm }, &rms_gated_push, n_v_heads, 1, 1);
 
                 // 7. Output projection.
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_post_norm, &layer.out_proj.?, &sc_attn_out }, 1, hidden, value_dim);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_post_norm, &layer.out_proj.?, &sc_attn_out }, 1, hidden, value_dim);
             },
             .full_attention => {
                 // Q-projection 2× wide, then split into (q, gate).
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.q_proj.?, &sc_q_gate }, 1, q_proj_rows, hidden);
-                try recDispatch1D(&rec, &k_split_qg, &.{ &sc_q_gate, &sc_q, &sc_gate_attn }, &split_push, q_dim);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.q_proj.?, &sc_q_gate }, 1, q_proj_rows, hidden);
+                try aliases.recDispatch1D(&rec, &k_split_qg, &.{ &sc_q_gate, &sc_q, &sc_gate_attn }, &split_push, q_dim);
 
                 // K and V projections.
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.k_proj.?, &sc_k }, 1, kv_dim, hidden);
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.v_proj.?, &sc_v }, 1, kv_dim, hidden);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.k_proj.?, &sc_k }, 1, kv_dim, hidden);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_x_norm, &layer.v_proj.?, &sc_v }, 1, kv_dim, hidden);
 
                 // Per-head q_norm and k_norm, with the (1+w) form.
-                try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_q, &layer.q_norm.?, &sc_q }, &qkn_push, n_q_heads);
-                try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_k, &layer.k_norm.?, &sc_k }, &qkn_push, n_kv_heads);
+                try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_q, &layer.q_norm.?, &sc_q }, &qkn_push, n_q_heads);
+                try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_k, &layer.k_norm.?, &sc_k }, &qkn_push, n_kv_heads);
 
                 // Partial RoPE on Q and K.
-                try recDispatch1D(&rec, &k_rope_p, &.{ &sc_q, &sc_qrot }, &rope_q_push, n_q_heads * head_dim);
-                try recDispatch1D(&rec, &k_rope_p, &.{ &sc_k, &sc_krot }, &rope_k_push, n_kv_heads * head_dim);
+                try aliases.recDispatch1D(&rec, &k_rope_p, &.{ &sc_q, &sc_qrot }, &rope_q_push, n_q_heads * head_dim);
+                try aliases.recDispatch1D(&rec, &k_rope_p, &.{ &sc_k, &sc_krot }, &rope_k_push, n_kv_heads * head_dim);
 
                 // KV cache write (single slot at pos=0).
-                try recDispatch1D(&rec, &k_kv_write, &.{ &sc_krot, &kv_k[i].? }, &kv_write_push, kv_dim);
-                try recDispatch1D(&rec, &k_kv_write, &.{ &sc_v, &kv_v[i].? }, &kv_write_push, kv_dim);
+                try aliases.recDispatch1D(&rec, &k_kv_write, &.{ &sc_krot, &kv_k[i].? }, &kv_write_push, kv_dim);
+                try aliases.recDispatch1D(&rec, &k_kv_write, &.{ &sc_v, &kv_v[i].? }, &kv_write_push, kv_dim);
 
                 // Attention scores → softmax → attn output.
                 try rec.dispatch(&k_scores, &.{ &sc_qrot, &kv_k[i].?, &sc_scores }, &scores_push, n_q_heads * 1, 1, 1);
-                try recDispatchPerRow(&rec, &k_softmax, &.{ &sc_scores, &sc_scores }, &softmax_push, n_q_heads);
+                try aliases.recDispatchPerRow(&rec, &k_softmax, &.{ &sc_scores, &sc_scores }, &softmax_push, n_q_heads);
                 try rec.dispatch(&k_attn_out, &.{ &sc_scores, &kv_v[i].?, &sc_head_out }, &attn_out_push, n_q_heads * head_dim, 1, 1);
 
                 // sigmoid(gate) * head_out.
-                try recDispatch1D(&rec, &k_sigmul, &.{ &sc_head_out, &sc_gate_attn, &sc_head_out_gated }, &sigmul_push, q_dim);
+                try aliases.recDispatch1D(&rec, &k_sigmul, &.{ &sc_head_out, &sc_gate_attn, &sc_head_out_gated }, &sigmul_push, q_dim);
 
                 // o_proj.
-                try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_head_out_gated, &layer.o_proj.?, &sc_attn_out }, 1, hidden, q_dim);
+                try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_head_out_gated, &layer.o_proj.?, &sc_attn_out }, 1, hidden, q_dim);
             },
         }
 
         // First residual.
-        try recDispatch1D(&rec, &k_add, &.{ &sc_stream, &sc_attn_out }, &add_push, hidden);
+        try aliases.recDispatch1D(&rec, &k_add, &.{ &sc_stream, &sc_attn_out }, &add_push, hidden);
 
         // Post-attention norm.
-        try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_stream, &layer.post_attention_layernorm, &sc_mid_norm }, &rms_push, 1);
+        try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_stream, &layer.post_attention_layernorm, &sc_mid_norm }, &rms_push, 1);
 
         // SwiGLU MLP.
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_mid_norm, &layer.gate_proj, &sc_gate }, 1, inter, hidden);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_mid_norm, &layer.up_proj, &sc_up }, 1, inter, hidden);
-        try recDispatch1D(&rec, &k_swiglu, &.{ &sc_gate, &sc_up, &sc_fused }, &swiglu_push, inter);
-        try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_fused, &layer.down_proj, &sc_ffn_out }, 1, hidden, inter);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_mid_norm, &layer.gate_proj, &sc_gate }, 1, inter, hidden);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_mid_norm, &layer.up_proj, &sc_up }, 1, inter, hidden);
+        try aliases.recDispatch1D(&rec, &k_swiglu, &.{ &sc_gate, &sc_up, &sc_fused }, &swiglu_push, inter);
+        try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_fused, &layer.down_proj, &sc_ffn_out }, 1, hidden, inter);
 
         // Second residual.
-        try recDispatch1D(&rec, &k_add, &.{ &sc_stream, &sc_ffn_out }, &add_push, hidden);
+        try aliases.recDispatch1D(&rec, &k_add, &.{ &sc_stream, &sc_ffn_out }, &add_push, hidden);
     }
 
     // Final norm + LM head.
-    try recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_stream, &gm.final_norm, &sc_final_norm_out }, &rms_push, 1);
-    try recDispatchMatmul(&rec, &k_matmul, &.{ &sc_final_norm_out, &gm.lm_head, &sc_logits }, 1, vocab, hidden);
+    try aliases.recDispatchPerRow(&rec, &k_rmsnorm, &.{ &sc_stream, &gm.final_norm, &sc_final_norm_out }, &rms_push, 1);
+    try aliases.recDispatchMatmul(&rec, &k_matmul, &.{ &sc_final_norm_out, &gm.lm_head, &sc_logits }, 1, vocab, hidden);
 
     try rec.endAndSubmit();
-
 
     const t_gpu1 = std.time.nanoTimestamp();
     try stdout.print("forward (GPU): {d:.0} ms\n", .{@as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0});
@@ -900,7 +830,7 @@ pub fn runGpuGenQwen35(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
     const out_str = tok.decode(sampled) orelse "<unknown>";
 
     const k_top: usize = 5;
-    const top = try topK(gpa, logits, k_top);
+    const top = try helpers.topK(gpa, logits, k_top);
     defer gpa.free(top);
     try stdout.print("\ntop {d} logits (GPU):\n", .{k_top});
     for (top) |entry| {

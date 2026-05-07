@@ -21,16 +21,10 @@ const safetensors = @import("../safetensors.zig");
 const turboquant = @import("../cpu/turboquant.zig");
 const gpu_model = @import("../gpu/model.zig");
 const gpu_scratch = @import("../gpu/scratch.zig");
-const runtime = @import("../runtime.zig");
-const runtime_hybrid = @import("../runtime_hybrid.zig");
 const shaders = @import("shaders");
 
-// Push-constant aliases for the moved code; main.zig has its own copies
-// for any code still living there.
-const RmsnormPush = runtime.RmsnormPush;
-const MatmulPush = runtime.MatmulPush;
-const RopePush = runtime.RopePush;
-const GegluPush = runtime.GegluPush;
+const aliases = @import("../runtime_aliases.zig");
+const helpers = @import("../smoke/helpers.zig");
 
 // ── rmsnorm-test: first math primitive on a real layer ──────────────
 
@@ -723,9 +717,9 @@ pub fn runGenTq4V(allocator: std.mem.Allocator, dir_path: []const u8, token_id: 
     try cpu_forward.forwardTq4V(&model, token_id, 0, arena.allocator(), logits_b);
 
     // Top-5 of each.
-    const top_a = try topK(allocator, logits_a, 5);
+    const top_a = try helpers.topK(allocator, logits_a, 5);
     defer allocator.free(top_a);
-    const top_b = try topK(allocator, logits_b, 5);
+    const top_b = try helpers.topK(allocator, logits_b, 5);
     defer allocator.free(top_b);
 
     try stdout.print("            fp32 baseline                       TQ4-V\n", .{});
@@ -737,7 +731,7 @@ pub fn runGenTq4V(allocator: std.mem.Allocator, dir_path: []const u8, token_id: 
         const ta_text = tok.decode(ta.id) orelse "?";
         const tb_text = tok.decode(tb.id) orelse "?";
         try stdout.print("{d:>4}   {d:>6}   {d:>6.2}   {s:<16}   {d:>6}   {d:>6.2}   {s:<16}\n", .{
-            i, ta.id, ta.value, truncateStr(ta_text, 16), tb.id, tb.value, truncateStr(tb_text, 16),
+            i, ta.id, ta.value, helpers.truncateStr(ta_text, 16), tb.id, tb.value, helpers.truncateStr(tb_text, 16),
         });
     }
 
@@ -780,10 +774,6 @@ pub fn runGenTq4V(allocator: std.mem.Allocator, dir_path: []const u8, token_id: 
         }
     }
     try stdout.print("top-5 ID overlap: {d}/5\n", .{top5_match});
-}
-
-fn truncateStr(s: []const u8, n: usize) []const u8 {
-    return if (s.len <= n) s else s[0..n];
 }
 
 // ── gen: full forward + greedy + tokenizer decode ──────────────────
@@ -829,7 +819,7 @@ pub fn runGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void
     // Top-K logits — useful sanity, especially when the argmax is a
     // dud token like <pad>.
     const k_top: usize = 5;
-    const top = try topK(gpa, logits, k_top);
+    const top = try helpers.topK(gpa, logits, k_top);
     defer gpa.free(top);
 
     try stdout.print("\ntop {d} logits:\n", .{k_top});
@@ -843,32 +833,7 @@ pub fn runGen(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void
     try stdout.print("\nsampled (greedy): id={d}  string={s}\n", .{ sampled, out_str });
 }
 
-const TopKEntry = struct { id: usize, value: f32 };
-
-fn topK(gpa: std.mem.Allocator, logits: []const f32, k: usize) ![]TopKEntry {
-    const out = try gpa.alloc(TopKEntry, k);
-    for (out) |*e| e.* = .{ .id = 0, .value = -std.math.inf(f32) };
-    for (logits, 0..) |v, i| {
-        if (v <= out[k - 1].value) continue;
-        // Insert into sorted (descending) list.
-        var j: usize = k - 1;
-        out[j] = .{ .id = i, .value = v };
-        while (j > 0 and out[j].value > out[j - 1].value) : (j -= 1) {
-            const tmp = out[j];
-            out[j] = out[j - 1];
-            out[j - 1] = tmp;
-        }
-    }
-    return out;
-}
-
 // ── gpu-layer0-test: full layer 0 forward on GPU vs CPU ────────────
-
-const EmbedLookupPush = runtime.EmbedLookupPush;
-const AddInPlacePush = runtime.AddInPlacePush;
-const AttnDecodeSinglePush = extern struct { n_heads: u32, heads_per_kv: u32, head_dim: u32 };
-const ScalePush = runtime_hybrid.ScalePush;
-const SliceCopyPush = runtime_hybrid.SliceCopyPush;
 
 pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
@@ -890,24 +855,24 @@ pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: 
     defer sc.deinit(ctx.device);
 
     // ── Build kernels ───────────────────────────────────────────────
-    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(EmbedLookupPush));
+    var k_embed = try pipeline.Kernel.init(&ctx, &shaders.embed_lookup, 2, @sizeOf(aliases.EmbedLookupPush));
     defer k_embed.deinit();
-    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+    var k_rmsnorm = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(aliases.RmsnormPush));
     defer k_rmsnorm.deinit();
-    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer k_matmul.deinit();
-    var k_rope = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    var k_rope = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(aliases.RopePush));
     defer k_rope.deinit();
-    var k_attn = try pipeline.Kernel.init(&ctx, &shaders.attn_decode_single, 2, @sizeOf(AttnDecodeSinglePush));
+    var k_attn = try pipeline.Kernel.init(&ctx, &shaders.attn_decode_single, 2, @sizeOf(helpers.AttnDecodeSinglePush));
     defer k_attn.deinit();
-    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush));
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(aliases.AddInPlacePush));
     defer k_add.deinit();
-    var k_geglu = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    var k_geglu = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(aliases.GegluPush));
     defer k_geglu.deinit();
 
     // ── Stage 0: embed → scale ──────────────────────────────────────
     try k_embed.bind(&.{ &gm.embed_tokens, &sc.stream });
-    const embed_push = EmbedLookupPush{
+    const embed_push = aliases.EmbedLookupPush{
         .token_id = token_id,
         .dim = @intCast(cfg.hidden_size),
         .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))) else 1.0,
@@ -916,7 +881,7 @@ pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: 
 
     // ── Stage 1: rmsnorm₁ ───────────────────────────────────────────
     try k_rmsnorm.bind(&.{ &sc.stream, &gm.layers[0].input_layernorm, &sc.x_norm });
-    const rms1_push = RmsnormPush{
+    const rms1_push = aliases.RmsnormPush{
         .dim = @intCast(cfg.hidden_size),
         .eps = cfg.rms_norm_eps,
         .gemma_quirk = if (cfg.family == .gemma) 1 else 0,
@@ -936,7 +901,7 @@ pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: 
 
     // ── Stage 3: RoPE on Q and K ────────────────────────────────────
     try k_rope.bind(&.{ &sc.q, &sc.q_rot });
-    const rope_q_push = RopePush{
+    const rope_q_push = aliases.RopePush{
         .n_heads = @intCast(cfg.num_attention_heads),
         .head_dim = @intCast(cfg.head_dim),
         .pos = 0,
@@ -945,7 +910,7 @@ pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: 
     try dispatchRope(&ctx, &k_rope, &rope_q_push, cfg.num_attention_heads, cfg.head_dim);
 
     try k_rope.bind(&.{ &sc.k, &sc.k_rot });
-    const rope_k_push = RopePush{
+    const rope_k_push = aliases.RopePush{
         .n_heads = @intCast(cfg.num_key_value_heads),
         .head_dim = @intCast(cfg.head_dim),
         .pos = 0,
@@ -956,7 +921,7 @@ pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: 
     // ── Stage 4: attention (single-position degenerate) ─────────────
     // No KV history → softmax over 1 score = 1.0 → head_out[h] = V[kv_h(h)].
     try k_attn.bind(&.{ &sc.v, &sc.head_out });
-    const attn_push = AttnDecodeSinglePush{
+    const attn_push = helpers.AttnDecodeSinglePush{
         .n_heads = @intCast(cfg.num_attention_heads),
         .heads_per_kv = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads),
         .head_dim = @intCast(cfg.head_dim),
@@ -969,7 +934,7 @@ pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: 
 
     // ── Stage 6: residual add (stream += attn_out) ──────────────────
     try k_add.bind(&.{ &sc.stream, &sc.attn_out });
-    const add_push = AddInPlacePush{ .n = hidden };
+    const add_push = aliases.AddInPlacePush{ .n = hidden };
     try dispatch1D(&ctx, &k_add, &add_push, hidden);
 
     // ── Stage 7: rmsnorm₂ ───────────────────────────────────────────
@@ -985,7 +950,7 @@ pub fn runGpuLayer0Test(gpa: std.mem.Allocator, dir_path: []const u8, token_id: 
 
     // ── Stage 9: GeGLU ─────────────────────────────────────────────
     try k_geglu.bind(&.{ &sc.gate, &sc.up, &sc.fused });
-    const geglu_push = GegluPush{ .n = inter };
+    const geglu_push = aliases.GegluPush{ .n = inter };
     try dispatch1D(&ctx, &k_geglu, &geglu_push, inter);
 
     // ── Stage 10: down_proj ─────────────────────────────────────────
@@ -1099,11 +1064,6 @@ fn cpuLayer0Forward(gpa: std.mem.Allocator, cpu: *const model_mod.Model, token_i
 
 // ── Recorder-based dispatch helpers (single source of truth: runtime.zig) ──
 
-const recDispatch1D = runtime.recDispatch1D;
-const recDispatchPerRow = runtime.recDispatchPerRow;
-const recDispatchMatmul = runtime.recDispatchMatmul;
-const recDispatchRope = runtime.recDispatchRope;
-
 // ── Dispatch helpers — keep call sites readable ──────────────────────
 
 fn dispatch1D(
@@ -1150,10 +1110,10 @@ fn dispatchMatmul(
     const local_xy: u32 = 16;
     const gx: u32 = (m + local_xy - 1) / local_xy;
     const gy: u32 = (n + local_xy - 1) / local_xy;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
     try buffer.submitOneShot(ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const MatmulPush,
+        push: *const aliases.MatmulPush,
         gx: u32,
         gy: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
@@ -1165,7 +1125,7 @@ fn dispatchMatmul(
 fn dispatchRope(
     ctx: *const vk.Context,
     kern: *const pipeline.Kernel,
-    push: *const RopePush,
+    push: *const aliases.RopePush,
     n_heads: usize,
     head_dim: usize,
 ) !void {
@@ -1174,7 +1134,7 @@ fn dispatchRope(
     const groups: u32 = (pairs + local - 1) / local;
     try buffer.submitOneShot(ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const RopePush,
+        push: *const aliases.RopePush,
         gx: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
@@ -1312,11 +1272,11 @@ pub fn runGpuRmsnormTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id:
     var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, cfg.hidden_size * @sizeOf(f32));
     defer buf_c.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rmsnorm, 3, @sizeOf(aliases.RmsnormPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_w, &buf_c });
 
-    const push = RmsnormPush{
+    const push = aliases.RmsnormPush{
         .dim = @intCast(cfg.hidden_size),
         .eps = cfg.rms_norm_eps,
         .gemma_quirk = if (cfg.family == .gemma) 1 else 0,
@@ -1325,7 +1285,7 @@ pub fn runGpuRmsnormTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id:
     const t_gpu0 = std.time.nanoTimestamp();
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const RmsnormPush,
+        push: *const aliases.RmsnormPush,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, 1, 1, 1);
         }
@@ -1401,14 +1361,14 @@ pub fn runGpuRopeTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u3
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, q_dim * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(RopePush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope, 2, @sizeOf(aliases.RopePush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_in, &buf_out });
 
     const local: u32 = 256;
     const pairs: u32 = @intCast(cfg.num_attention_heads * (cfg.head_dim / 2));
     const groups: u32 = (pairs + local - 1) / local;
-    const push = RopePush{
+    const push = aliases.RopePush{
         .n_heads = @intCast(cfg.num_attention_heads),
         .head_dim = @intCast(cfg.head_dim),
         .pos = 1,
@@ -1418,7 +1378,7 @@ pub fn runGpuRopeTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u3
     const t_gpu0 = std.time.nanoTimestamp();
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const RopePush,
+        push: *const aliases.RopePush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -1528,19 +1488,19 @@ pub fn runGpuGegluTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
     var buf_o = try buffer.Buffer.initDeviceOnly(&ctx, inter * @sizeOf(f32));
     defer buf_o.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(GegluPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.geglu, 3, @sizeOf(aliases.GegluPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_g, &buf_u, &buf_o });
 
     const local: u32 = 256;
     const n_u32: u32 = @intCast(inter);
     const groups: u32 = (n_u32 + local - 1) / local;
-    const push = GegluPush{ .n = n_u32 };
+    const push = aliases.GegluPush{ .n = n_u32 };
 
     const t_gpu0 = std.time.nanoTimestamp();
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const GegluPush,
+        push: *const aliases.GegluPush,
         groups: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
             s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
@@ -1629,7 +1589,7 @@ pub fn runGpuQprojTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
     var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, q_dim * @sizeOf(f32));
     defer buf_c.deinit(ctx.device);
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(MatmulPush));
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt, 3, @sizeOf(aliases.MatmulPush));
     defer kern.deinit();
     try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
 
@@ -1639,12 +1599,12 @@ pub fn runGpuQprojTest(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u
     const k: u32 = @intCast(cfg.hidden_size);
     const groups_x: u32 = (m + local_xy - 1) / local_xy;
     const groups_y: u32 = (n + local_xy - 1) / local_xy;
-    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
 
     const t_gpu0 = std.time.nanoTimestamp();
     try buffer.submitOneShot(&ctx, struct {
         kern: *const pipeline.Kernel,
-        push: *const MatmulPush,
+        push: *const aliases.MatmulPush,
         gx: u32,
         gy: u32,
         pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
