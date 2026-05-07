@@ -105,7 +105,7 @@ pub fn runInspect(allocator: std.mem.Allocator, path: []const u8) !void {
         }
     }.lessThan);
 
-    var totals = [_]u64{0} ** @typeInfo(safetensors.Dtype).@"enum".fields.len;
+    var totals = [_]u64{0} ** @typeInfo(safetensors.Dtype).Enum.fields.len;
     for (names.items) |name| {
         const t = st.get(name).?;
         totals[@intFromEnum(t.dtype)] += t.bytes.len;
@@ -121,7 +121,7 @@ pub fn runInspect(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 
     try stdout.print("\nDtype totals:\n", .{});
-    inline for (@typeInfo(safetensors.Dtype).@"enum".fields) |f| {
+    inline for (@typeInfo(safetensors.Dtype).Enum.fields) |f| {
         const idx: usize = f.value;
         if (totals[idx] > 0) {
             try stdout.print("  {s:<6} {d:.2} MiB\n", .{

@@ -35,6 +35,7 @@ const recordOneLayer = runtime.recordOneLayer;
 const recordForwardStep = runtime.recordForwardStep;
 const recDispatch1D = runtime.recDispatch1D;
 const recDispatchPerRow = runtime.recDispatchPerRow;
+const recDispatchMatmul = runtime.recDispatchMatmul;
 
 const HybridChatKernels = runtime_hybrid.ChatKernels;
 const HybridChatScratch = runtime_hybrid.Scratch;
