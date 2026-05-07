@@ -18,6 +18,7 @@
 //! real Qwen dims without copying everything again.
 
 const std = @import("std");
+const util = @import("../util.zig");
 const vk = @import("../gpu/vk.zig");
 const buffer = @import("../gpu/buffer.zig");
 const pipeline = @import("../gpu/pipeline.zig");
@@ -1062,7 +1063,7 @@ pub const Runner = struct {
             &self.k_embed,
             &.{ &self.buf_w_embed, &self.buf_token_ids, &self.buf_x_emb },
             &self.push_embed,
-            ceilDiv(total, group_lin),
+            util.ceilDiv(total, group_lin),
             1,
             1,
         );
@@ -1108,7 +1109,7 @@ pub const Runner = struct {
         if (cfg.rotary_dim > 0) {
             // Fused QK-RoPE: one dispatch over n_pos × (n_heads + n_kv_heads) × head_dim.
             const qk_total: u32 = cfg.n_pos * (cfg.n_heads + cfg.n_kv_heads) * cfg.head_dim;
-            try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_q_pre, &self.buf_q[i], &self.sc_k_pre, &self.buf_k[i] }, &self.push_rope_qk, ceilDiv(qk_total, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_q_pre, &self.buf_q[i], &self.sc_k_pre, &self.buf_k[i] }, &self.push_rope_qk, util.ceilDiv(qk_total, group_lin), 1, 1);
         }
         // 5. attention scores (causal mask via -inf).
         try self.rec.dispatch(&self.k_attn_scores, &.{ &self.buf_q[i], &self.buf_k[i], &self.sc_scores }, &self.push_attn_scores, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
@@ -1119,7 +1120,7 @@ pub const Runner = struct {
         // 8. O projection.
         try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_attn_out[i], &self.buf_w_o[i], &self.sc_o }, &self.push_mm_o, cfg.n_pos * self.push_mm_o.n, 1, 1);
         // 9. mid = x_in + o (residual).
-        const add_groups: u32 = ceilDiv(self.push_n_pos_dim.n, group_lin);
+        const add_groups: u32 = util.ceilDiv(self.push_n_pos_dim.n, group_lin);
         try self.rec.dispatch(&self.k_vec_add, &.{ x_in_buf, &self.sc_o, &self.buf_mid[i] }, &self.push_n_pos_dim, add_groups, 1, 1);
         // 10. RMSNorm n2.
         try self.rec.dispatch(&self.k_rms, &.{ &self.buf_mid[i], &self.buf_w_n2[i], &self.buf_n2[i] }, &self.push_rms, cfg.n_pos, 1, 1);
@@ -1128,7 +1129,7 @@ pub const Runner = struct {
         // 12. W_up matmul.
         try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n2[i], &self.buf_w_up[i], &self.buf_up[i] }, &self.push_mm_up, cfg.n_pos * self.push_mm_up.n, 1, 1);
         // 13. SwiGLU fwd: gated = silu(pre_gate) · up.
-        const swiglu_groups: u32 = ceilDiv(self.push_swiglu.n, group_lin);
+        const swiglu_groups: u32 = util.ceilDiv(self.push_swiglu.n, group_lin);
         try self.rec.dispatch(&self.k_swiglu_fwd, &.{ &self.buf_pre_gate[i], &self.buf_up[i], &self.buf_gated[i] }, &self.push_swiglu, swiglu_groups, 1, 1);
         // 14. W_down matmul → ff_out.
         try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_gated[i], &self.buf_w_down[i], &self.sc_ff_out }, &self.push_mm_down, cfg.n_pos * self.push_mm_down.n, 1, 1);
@@ -1224,28 +1225,28 @@ pub const Runner = struct {
         const d_x_in_out = &self.buf_d_x_in[i];
         const x_in_buf: *const buffer.Buffer = if (li == 0) &self.buf_x_emb else &self.buf_y[i - 1];
 
-        const add_groups: u32 = ceilDiv(self.push_n_pos_dim.n, group_lin);
-        const swiglu_groups: u32 = ceilDiv(self.push_swiglu.n, group_lin);
+        const add_groups: u32 = util.ceilDiv(self.push_n_pos_dim.n, group_lin);
+        const swiglu_groups: u32 = util.ceilDiv(self.push_swiglu.n, group_lin);
 
         // W_down dx + dW (treats d_y_in as d_ff_out).
-        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_down[i], &self.sc_d_gated }, &self.push_lin_down, ceilDiv(self.push_lin_down.M, group_lwg), ceilDiv(self.push_lin_down.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_gated[i], &self.buf_dw_down[i] }, &self.push_lin_down, ceilDiv(self.push_lin_down.N, group_lwg), ceilDiv(self.push_lin_down.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_down[i], &self.sc_d_gated }, &self.push_lin_down, util.ceilDiv(self.push_lin_down.M, group_lwg), util.ceilDiv(self.push_lin_down.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_gated[i], &self.buf_dw_down[i] }, &self.push_lin_down, util.ceilDiv(self.push_lin_down.N, group_lwg), util.ceilDiv(self.push_lin_down.K, group_lwg), 1);
         // SwiGLU bw: (d_gated, pre_gate, up) → (d_pre_gate, d_up).
         try self.rec.dispatch(&self.k_swiglu_bw, &.{ &self.sc_d_gated, &self.buf_pre_gate[i], &self.buf_up[i], &self.sc_d_pre_gate, &self.sc_d_up_grad }, &self.push_swiglu, swiglu_groups, 1, 1);
         // W_gate dx + dW (writes d_n2).
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_pre_gate, &self.buf_w_gate[i], &self.sc_d_n2 }, &self.push_lin_gate, ceilDiv(self.push_lin_gate.M, group_lwg), ceilDiv(self.push_lin_gate.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_pre_gate, &self.buf_n2[i], &self.buf_dw_gate[i] }, &self.push_lin_gate, ceilDiv(self.push_lin_gate.N, group_lwg), ceilDiv(self.push_lin_gate.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_pre_gate, &self.buf_w_gate[i], &self.sc_d_n2 }, &self.push_lin_gate, util.ceilDiv(self.push_lin_gate.M, group_lwg), util.ceilDiv(self.push_lin_gate.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_pre_gate, &self.buf_n2[i], &self.buf_dw_gate[i] }, &self.push_lin_gate, util.ceilDiv(self.push_lin_gate.N, group_lwg), util.ceilDiv(self.push_lin_gate.K, group_lwg), 1);
         // W_up dx + dW + accumulate into d_n2.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_up_grad, &self.buf_w_up[i], &self.sc_d_n2_up }, &self.push_lin_up, ceilDiv(self.push_lin_up.M, group_lwg), ceilDiv(self.push_lin_up.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_up_grad, &self.buf_n2[i], &self.buf_dw_up[i] }, &self.push_lin_up, ceilDiv(self.push_lin_up.N, group_lwg), ceilDiv(self.push_lin_up.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_up_grad, &self.buf_w_up[i], &self.sc_d_n2_up }, &self.push_lin_up, util.ceilDiv(self.push_lin_up.M, group_lwg), util.ceilDiv(self.push_lin_up.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_up_grad, &self.buf_n2[i], &self.buf_dw_up[i] }, &self.push_lin_up, util.ceilDiv(self.push_lin_up.N, group_lwg), util.ceilDiv(self.push_lin_up.K, group_lwg), 1);
         try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n2, &self.sc_d_n2_up }, &self.push_n_pos_dim, add_groups, 1, 1);
         // RMSNorm n2 bw → d_mid_norm + dw_n2_partial.
         try self.rec.dispatch(&self.k_rms_bw, &.{ &self.sc_d_n2, &self.buf_mid[i], &self.buf_w_n2[i], &self.sc_d_mid_norm, &self.buf_dw_n2_partial[i] }, &self.push_rms, cfg.n_pos, 1, 1);
         // d_y_in += d_mid_norm. From here, d_y_in holds d_mid_total.
         try self.rec.dispatch(&self.k_add, &.{ d_y_in, &self.sc_d_mid_norm }, &self.push_n_pos_dim, add_groups, 1, 1);
         // O projection dx + dW.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_o[i], &self.sc_d_attn_out }, &self.push_lin_o, ceilDiv(self.push_lin_o.M, group_lwg), ceilDiv(self.push_lin_o.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_attn_out[i], &self.buf_dw_o[i] }, &self.push_lin_o, ceilDiv(self.push_lin_o.N, group_lwg), ceilDiv(self.push_lin_o.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_o[i], &self.sc_d_attn_out }, &self.push_lin_o, util.ceilDiv(self.push_lin_o.M, group_lwg), util.ceilDiv(self.push_lin_o.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_attn_out[i], &self.buf_dw_o[i] }, &self.push_lin_o, util.ceilDiv(self.push_lin_o.N, group_lwg), util.ceilDiv(self.push_lin_o.K, group_lwg), 1);
         // SDPA backward.
         try self.rec.dispatch(&self.k_attn_dattn, &.{ &self.sc_d_attn_out, &self.buf_v[i], &self.sc_d_attn }, &self.push_dattn, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
         try self.rec.dispatch(&self.k_attn_dv, &.{ &self.buf_attn[i], &self.sc_d_attn_out, &self.sc_dV }, &self.push_dv, cfg.n_pos * cfg.n_kv_heads * cfg.head_dim, 1, 1);
@@ -1261,7 +1262,7 @@ pub const Runner = struct {
         if (cfg.rotary_dim > 0) {
             // Fused QK-RoPE backward — one dispatch covers both dQ and dK.
             const qk_total: u32 = self.cfg.n_pos * (self.cfg.n_heads + self.cfg.n_kv_heads) * self.cfg.head_dim;
-            try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dQ, &self.sc_dQ_pre, &self.sc_dK, &self.sc_dK_pre }, &self.push_rope_qk, ceilDiv(qk_total, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_rope_bw, &.{ &self.sc_dQ, &self.sc_dQ_pre, &self.sc_dK, &self.sc_dK_pre }, &self.push_rope_qk, util.ceilDiv(qk_total, group_lin), 1, 1);
         }
 
         // Q/K-norm backward: rmsnorm_bw needs the pre-norm input
@@ -1294,15 +1295,15 @@ pub const Runner = struct {
             &self.sc_dK;
 
         // Q proj. Writes directly into sc_d_n1 (saves an add_in_place).
-        try self.rec.dispatch(&self.k_lin_dx, &.{ dQ_lin, &self.buf_w_q[i], &self.sc_d_n1 }, &self.push_lin_q, ceilDiv(self.push_lin_q.M, group_lwg), ceilDiv(self.push_lin_q.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ dQ_lin, &self.buf_n1[i], &self.buf_dw_q[i] }, &self.push_lin_q, ceilDiv(self.push_lin_q.N, group_lwg), ceilDiv(self.push_lin_q.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ dQ_lin, &self.buf_w_q[i], &self.sc_d_n1 }, &self.push_lin_q, util.ceilDiv(self.push_lin_q.M, group_lwg), util.ceilDiv(self.push_lin_q.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ dQ_lin, &self.buf_n1[i], &self.buf_dw_q[i] }, &self.push_lin_q, util.ceilDiv(self.push_lin_q.N, group_lwg), util.ceilDiv(self.push_lin_q.K, group_lwg), 1);
         // K proj + accumulate into d_n1.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ dK_lin, &self.buf_w_k[i], &self.sc_d_n1_k }, &self.push_lin_k, ceilDiv(self.push_lin_k.M, group_lwg), ceilDiv(self.push_lin_k.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ dK_lin, &self.buf_n1[i], &self.buf_dw_k[i] }, &self.push_lin_k, ceilDiv(self.push_lin_k.N, group_lwg), ceilDiv(self.push_lin_k.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ dK_lin, &self.buf_w_k[i], &self.sc_d_n1_k }, &self.push_lin_k, util.ceilDiv(self.push_lin_k.M, group_lwg), util.ceilDiv(self.push_lin_k.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ dK_lin, &self.buf_n1[i], &self.buf_dw_k[i] }, &self.push_lin_k, util.ceilDiv(self.push_lin_k.N, group_lwg), util.ceilDiv(self.push_lin_k.K, group_lwg), 1);
         try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n1, &self.sc_d_n1_k }, &self.push_n_pos_dim, add_groups, 1, 1);
         // V proj + accumulate into d_n1.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_dV, &self.buf_w_v[i], &self.sc_d_n1_v }, &self.push_lin_v, ceilDiv(self.push_lin_v.M, group_lwg), ceilDiv(self.push_lin_v.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_dV, &self.buf_n1[i], &self.buf_dw_v[i] }, &self.push_lin_v, ceilDiv(self.push_lin_v.N, group_lwg), ceilDiv(self.push_lin_v.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_dV, &self.buf_w_v[i], &self.sc_d_n1_v }, &self.push_lin_v, util.ceilDiv(self.push_lin_v.M, group_lwg), util.ceilDiv(self.push_lin_v.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_dV, &self.buf_n1[i], &self.buf_dw_v[i] }, &self.push_lin_v, util.ceilDiv(self.push_lin_v.N, group_lwg), util.ceilDiv(self.push_lin_v.K, group_lwg), 1);
         try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n1, &self.sc_d_n1_v }, &self.push_n_pos_dim, add_groups, 1, 1);
         // RMSNorm n1 bw → writes the rmsnorm.dx contribution to d_x_in_out.
         try self.rec.dispatch(&self.k_rms_bw, &.{ &self.sc_d_n1, x_in_buf, &self.buf_w_n1[i], d_x_in_out, &self.buf_dw_n1_partial[i] }, &self.push_rms, cfg.n_pos, 1, 1);
@@ -1330,7 +1331,7 @@ pub const Runner = struct {
         const n_down_w: u32 = cfg.dim * cfg.ff_dim;
 
         const adam_embed = runtime.AdamStepPush{ .n = n_embed, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_embed, &self.buf_dE_embed, &self.buf_m_embed, &self.buf_v_embed }, &adam_embed, ceilDiv(n_embed, group_lin), 1, 1);
+        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_embed, &self.buf_dE_embed, &self.buf_m_embed, &self.buf_v_embed }, &adam_embed, util.ceilDiv(n_embed, group_lin), 1, 1);
 
         for (0..cfg.n_layers) |i| {
             const adam_n1 = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
@@ -1343,26 +1344,26 @@ pub const Runner = struct {
             const adam_up = runtime.AdamStepPush{ .n = n_up_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
             const adam_down = runtime.AdamStepPush{ .n = n_down_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
 
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n1[i], &self.buf_dw_n1[i], &self.buf_m_n1[i], &self.buf_v_n1[i] }, &adam_n1, ceilDiv(dim_n, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q[i], &self.buf_dw_q[i], &self.buf_m_q[i], &self.buf_v_q[i] }, &adam_q, ceilDiv(n_q_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_k[i], &self.buf_dw_k[i], &self.buf_m_k[i], &self.buf_v_k[i] }, &adam_k, ceilDiv(n_k_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_v[i], &self.buf_dw_v[i], &self.buf_m_v[i], &self.buf_v_v[i] }, &adam_v, ceilDiv(n_v_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_o[i], &self.buf_dw_o[i], &self.buf_m_o[i], &self.buf_v_o[i] }, &adam_o, ceilDiv(n_o_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n2[i], &self.buf_dw_n2[i], &self.buf_m_n2[i], &self.buf_v_n2[i] }, &adam_n2, ceilDiv(dim_n, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_gate[i], &self.buf_dw_gate[i], &self.buf_m_gate[i], &self.buf_v_gate[i] }, &adam_gate, ceilDiv(n_gate_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_up[i], &self.buf_dw_up[i], &self.buf_m_up[i], &self.buf_v_up[i] }, &adam_up, ceilDiv(n_up_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_down[i], &self.buf_dw_down[i], &self.buf_m_down[i], &self.buf_v_down[i] }, &adam_down, ceilDiv(n_down_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n1[i], &self.buf_dw_n1[i], &self.buf_m_n1[i], &self.buf_v_n1[i] }, &adam_n1, util.ceilDiv(dim_n, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q[i], &self.buf_dw_q[i], &self.buf_m_q[i], &self.buf_v_q[i] }, &adam_q, util.ceilDiv(n_q_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_k[i], &self.buf_dw_k[i], &self.buf_m_k[i], &self.buf_v_k[i] }, &adam_k, util.ceilDiv(n_k_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_v[i], &self.buf_dw_v[i], &self.buf_m_v[i], &self.buf_v_v[i] }, &adam_v, util.ceilDiv(n_v_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_o[i], &self.buf_dw_o[i], &self.buf_m_o[i], &self.buf_v_o[i] }, &adam_o, util.ceilDiv(n_o_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n2[i], &self.buf_dw_n2[i], &self.buf_m_n2[i], &self.buf_v_n2[i] }, &adam_n2, util.ceilDiv(dim_n, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_gate[i], &self.buf_dw_gate[i], &self.buf_m_gate[i], &self.buf_v_gate[i] }, &adam_gate, util.ceilDiv(n_gate_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_up[i], &self.buf_dw_up[i], &self.buf_m_up[i], &self.buf_v_up[i] }, &adam_up, util.ceilDiv(n_up_w, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_down[i], &self.buf_dw_down[i], &self.buf_m_down[i], &self.buf_v_down[i] }, &adam_down, util.ceilDiv(n_down_w, group_lin), 1, 1);
             if (cfg.qk_norm) {
                 const adam_qn = runtime.AdamStepPush{ .n = cfg.head_dim, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q_norm[i], &self.buf_dw_q_norm[i], &self.buf_m_q_norm[i], &self.buf_v_q_norm[i] }, &adam_qn, ceilDiv(cfg.head_dim, group_lin), 1, 1);
-                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_k_norm[i], &self.buf_dw_k_norm[i], &self.buf_m_k_norm[i], &self.buf_v_k_norm[i] }, &adam_qn, ceilDiv(cfg.head_dim, group_lin), 1, 1);
+                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q_norm[i], &self.buf_dw_q_norm[i], &self.buf_m_q_norm[i], &self.buf_v_q_norm[i] }, &adam_qn, util.ceilDiv(cfg.head_dim, group_lin), 1, 1);
+                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_k_norm[i], &self.buf_dw_k_norm[i], &self.buf_m_k_norm[i], &self.buf_v_k_norm[i] }, &adam_qn, util.ceilDiv(cfg.head_dim, group_lin), 1, 1);
             }
         }
 
         const adam_final_norm = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
         const adam_lm_head = runtime.AdamStepPush{ .n = n_lm_head, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_final_norm, &self.buf_dw_final_norm, &self.buf_m_final_norm, &self.buf_v_final_norm }, &adam_final_norm, ceilDiv(dim_n, group_lin), 1, 1);
-        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_lm_head, &self.buf_dw_lm_head, &self.buf_m_lm_head, &self.buf_v_lm_head }, &adam_lm_head, ceilDiv(n_lm_head, group_lin), 1, 1);
+        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_final_norm, &self.buf_dw_final_norm, &self.buf_m_final_norm, &self.buf_v_final_norm }, &adam_final_norm, util.ceilDiv(dim_n, group_lin), 1, 1);
+        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_lm_head, &self.buf_dw_lm_head, &self.buf_m_lm_head, &self.buf_v_lm_head }, &adam_lm_head, util.ceilDiv(n_lm_head, group_lin), 1, 1);
     }
 
     fn reduceDwPartial(self: *Runner, partial: *const buffer.Buffer, dst_dynamic: *buffer.Buffer) !void {
@@ -1413,9 +1414,6 @@ pub const Runner = struct {
 const group_lin: u32 = 256;
 const group_lwg: u32 = 16;
 
-fn ceilDiv(num: u32, den: u32) u32 {
-    return (num + den - 1) / den;
-}
 
 /// Bag of per-layer slice arrays used during init. Keeps `init()`
 /// readable by isolating the per-layer alloc-and-rollback logic.

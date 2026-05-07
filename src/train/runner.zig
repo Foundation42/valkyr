@@ -19,6 +19,7 @@
 //! "Unsloth" full-transformer training port in the roadmap).
 
 const std = @import("std");
+const util = @import("../util.zig");
 const vk = @import("../gpu/vk.zig");
 const buffer = @import("../gpu/buffer.zig");
 const pipeline = @import("../gpu/pipeline.zig");
@@ -739,7 +740,7 @@ pub const TrainingRunner = struct {
             &k,
             &.{ &self.w1, &self.b1, &self.w2, &self.b2, &xb, &yb },
             &push,
-            ceilDiv(n, 64),
+            util.ceilDiv(n, 64),
             1,
             1,
         );
@@ -1013,7 +1014,7 @@ pub const TrainingRunner = struct {
             &k,
             &.{ &self.w1, &self.b1, &self.w2, &self.b2, &xb, &yb },
             &push,
-            ceilDiv(n_samples, 64),
+            util.ceilDiv(n_samples, 64),
             1,
             1,
         );
@@ -1033,10 +1034,10 @@ pub const TrainingRunner = struct {
         const relu_push = runtime.ReluPush{ .n = dim_h };
 
         try rec.dispatch(&self.k_matmul, &.{ &self.x_buf, &self.w1, &self.h_pre }, &matmul1_push, 1, 1, 1);
-        try rec.dispatch(&self.k_add, &.{ &self.h_pre, &self.b1 }, &add1_push, ceilDiv(dim_h, 256), 1, 1);
-        try rec.dispatch(&self.k_relu, &.{ &self.h_pre, &self.h }, &relu_push, ceilDiv(dim_h, 256), 1, 1);
+        try rec.dispatch(&self.k_add, &.{ &self.h_pre, &self.b1 }, &add1_push, util.ceilDiv(dim_h, 256), 1, 1);
+        try rec.dispatch(&self.k_relu, &.{ &self.h_pre, &self.h }, &relu_push, util.ceilDiv(dim_h, 256), 1, 1);
         try rec.dispatch(&self.k_matmul, &.{ &self.h, &self.w2, &self.y }, &matmul2_push, 1, 1, 1);
-        try rec.dispatch(&self.k_add, &.{ &self.y, &self.b2 }, &add2_push, ceilDiv(dim_out, 256), 1, 1);
+        try rec.dispatch(&self.k_add, &.{ &self.y, &self.b2 }, &add2_push, util.ceilDiv(dim_out, 256), 1, 1);
     }
 
     /// Record a complete batched optimizer step into `rec`. 11 dispatches:
@@ -1073,7 +1074,7 @@ pub const TrainingRunner = struct {
             k_fwd,
             &.{ &self.w1, &self.b1, &self.w2, &self.b2, x_train, h_pre_b, h_b, y_b },
             &fwd_push,
-            ceilDiv(n_samples, 64),
+            util.ceilDiv(n_samples, 64),
             1,
             1,
         );
@@ -1089,7 +1090,7 @@ pub const TrainingRunner = struct {
                     k_dy,
                     &.{ y_b, tgt, dy_b },
                     &dy_push,
-                    ceilDiv(dim_out * n_samples, 256),
+                    util.ceilDiv(dim_out * n_samples, 256),
                     1,
                     1,
                 );
@@ -1101,7 +1102,7 @@ pub const TrainingRunner = struct {
                     k_ce,
                     &.{ y_b, tgt, dy_b },
                     &ce_push,
-                    ceilDiv(n_samples, 64),
+                    util.ceilDiv(n_samples, 64),
                     1,
                     1,
                 );
@@ -1118,7 +1119,7 @@ pub const TrainingRunner = struct {
             k_dhp,
             &.{ dy_b, &self.w2, h_pre_b, dhp_b },
             &dhp_push,
-            ceilDiv(dim_h * n_samples, 256),
+            util.ceilDiv(dim_h * n_samples, 256),
             1,
             1,
         );
@@ -1133,8 +1134,8 @@ pub const TrainingRunner = struct {
             k_dw,
             &.{ dy_b, h_b, &self.dw2 },
             &dw2_push,
-            ceilDiv(dim_out, 16),
-            ceilDiv(dim_h, 16),
+            util.ceilDiv(dim_out, 16),
+            util.ceilDiv(dim_h, 16),
             1,
         );
 
@@ -1144,7 +1145,7 @@ pub const TrainingRunner = struct {
             k_db,
             &.{ dy_b, &self.db2 },
             &db2_push,
-            ceilDiv(dim_out, 256),
+            util.ceilDiv(dim_out, 256),
             1,
             1,
         );
@@ -1159,8 +1160,8 @@ pub const TrainingRunner = struct {
             k_dw,
             &.{ dhp_b, x_train, &self.dw1 },
             &dw1_push,
-            ceilDiv(dim_h, 16),
-            ceilDiv(dim_in, 16),
+            util.ceilDiv(dim_h, 16),
+            util.ceilDiv(dim_in, 16),
             1,
         );
 
@@ -1170,7 +1171,7 @@ pub const TrainingRunner = struct {
             k_db,
             &.{ dhp_b, &self.db1 },
             &db1_push,
-            ceilDiv(dim_h, 256),
+            util.ceilDiv(dim_h, 256),
             1,
             1,
         );
@@ -1184,10 +1185,10 @@ pub const TrainingRunner = struct {
                 const sgd_b1 = runtime.SgdStepPush{ .n = dim_h, .lr = self.lr, .weight_decay = 0.0 };
                 const sgd_w2 = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr, .weight_decay = self.weight_decay };
                 const sgd_b2 = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr, .weight_decay = 0.0 };
-                try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1, ceilDiv(w1_n, 256), 1, 1);
-                try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1, ceilDiv(dim_h, 256), 1, 1);
-                try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2, ceilDiv(w2_n, 256), 1, 1);
-                try rec.dispatch(&self.k_sgd, &.{ &self.b2, &self.db2 }, &sgd_b2, ceilDiv(dim_out, 256), 1, 1);
+                try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1, util.ceilDiv(w1_n, 256), 1, 1);
+                try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1, util.ceilDiv(dim_h, 256), 1, 1);
+                try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2, util.ceilDiv(w2_n, 256), 1, 1);
+                try rec.dispatch(&self.k_sgd, &.{ &self.b2, &self.db2 }, &sgd_b2, util.ceilDiv(dim_out, 256), 1, 1);
             },
             .adam => {
                 // Step counter is 1-indexed at dispatch — host bumps it
@@ -1224,10 +1225,10 @@ pub const TrainingRunner = struct {
                     .beta2 = self.cfg.adam_beta2, .eps = self.cfg.adam_eps, .t = t,
                     .weight_decay = 0.0,
                 };
-                try rec.dispatch(k_adam, &.{ &self.w1, &self.dw1, m_w1, v_w1 }, &adam_w1, ceilDiv(w1_n, 256), 1, 1);
-                try rec.dispatch(k_adam, &.{ &self.b1, &self.db1, m_b1, v_b1 }, &adam_b1, ceilDiv(dim_h, 256), 1, 1);
-                try rec.dispatch(k_adam, &.{ &self.w2, &self.dw2, m_w2, v_w2 }, &adam_w2, ceilDiv(w2_n, 256), 1, 1);
-                try rec.dispatch(k_adam, &.{ &self.b2, &self.db2, m_b2, v_b2 }, &adam_b2, ceilDiv(dim_out, 256), 1, 1);
+                try rec.dispatch(k_adam, &.{ &self.w1, &self.dw1, m_w1, v_w1 }, &adam_w1, util.ceilDiv(w1_n, 256), 1, 1);
+                try rec.dispatch(k_adam, &.{ &self.b1, &self.db1, m_b1, v_b1 }, &adam_b1, util.ceilDiv(dim_h, 256), 1, 1);
+                try rec.dispatch(k_adam, &.{ &self.w2, &self.dw2, m_w2, v_w2 }, &adam_w2, util.ceilDiv(w2_n, 256), 1, 1);
+                try rec.dispatch(k_adam, &.{ &self.b2, &self.db2, m_b2, v_b2 }, &adam_b2, util.ceilDiv(dim_out, 256), 1, 1);
             },
         }
     }
@@ -1257,7 +1258,7 @@ pub const TrainingRunner = struct {
             k_fwd,
             &.{ &self.w1, &self.b1, &self.w2, &self.b2, x_train, h_pre_b, h_b, y_b },
             &fwd_push,
-            ceilDiv(n_samples, 64),
+            util.ceilDiv(n_samples, 64),
             1,
             1,
         );
@@ -1300,7 +1301,7 @@ pub const TrainingRunner = struct {
 
         // Loss grad.
         const mse_grad_push = runtime.MseLossGradPush{ .n = dim_out };
-        try rec.dispatch(&self.k_mse_grad, &.{ &self.y, &self.target_buf, &self.dL_dy }, &mse_grad_push, ceilDiv(dim_out, 256), 1, 1);
+        try rec.dispatch(&self.k_mse_grad, &.{ &self.y, &self.target_buf, &self.dL_dy }, &mse_grad_push, util.ceilDiv(dim_out, 256), 1, 1);
 
         // Backward.
         const SliceCopyPush = extern struct { src_off: u32, dst_off: u32, n_elem: u32 };
@@ -1311,12 +1312,12 @@ pub const TrainingRunner = struct {
         const copy_db2 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_out };
         const copy_db1 = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_h };
 
-        try rec.dispatch(&self.k_copy, &.{ &self.dL_dy, &self.db2 }, &copy_db2, ceilDiv(dim_out, 256), 1, 1);
-        try rec.dispatch(&self.k_outer, &.{ &self.dL_dy, &self.h, &self.dw2 }, &op_dw2, ceilDiv(dim_out, 16), ceilDiv(dim_h, 16), 1);
-        try rec.dispatch(&self.k_lin_dx, &.{ &self.dL_dy, &self.w2, &self.dh }, &lin_dx_push, ceilDiv(dim_h, 256), 1, 1);
-        try rec.dispatch(&self.k_relu_bw, &.{ &self.dh, &self.h_pre, &self.dh_pre }, &relu_bw_push, ceilDiv(dim_h, 256), 1, 1);
-        try rec.dispatch(&self.k_copy, &.{ &self.dh_pre, &self.db1 }, &copy_db1, ceilDiv(dim_h, 256), 1, 1);
-        try rec.dispatch(&self.k_outer, &.{ &self.dh_pre, &self.x_buf, &self.dw1 }, &op_dw1, ceilDiv(dim_h, 16), ceilDiv(dim_in, 16), 1);
+        try rec.dispatch(&self.k_copy, &.{ &self.dL_dy, &self.db2 }, &copy_db2, util.ceilDiv(dim_out, 256), 1, 1);
+        try rec.dispatch(&self.k_outer, &.{ &self.dL_dy, &self.h, &self.dw2 }, &op_dw2, util.ceilDiv(dim_out, 16), util.ceilDiv(dim_h, 16), 1);
+        try rec.dispatch(&self.k_lin_dx, &.{ &self.dL_dy, &self.w2, &self.dh }, &lin_dx_push, util.ceilDiv(dim_h, 256), 1, 1);
+        try rec.dispatch(&self.k_relu_bw, &.{ &self.dh, &self.h_pre, &self.dh_pre }, &relu_bw_push, util.ceilDiv(dim_h, 256), 1, 1);
+        try rec.dispatch(&self.k_copy, &.{ &self.dh_pre, &self.db1 }, &copy_db1, util.ceilDiv(dim_h, 256), 1, 1);
+        try rec.dispatch(&self.k_outer, &.{ &self.dh_pre, &self.x_buf, &self.dw1 }, &op_dw1, util.ceilDiv(dim_h, 16), util.ceilDiv(dim_in, 16), 1);
 
         // SGD: param[i] -= lr · grad[i]. Same shader for every buffer.
         const w1_n: u32 = dim_h * dim_in;
@@ -1326,13 +1327,10 @@ pub const TrainingRunner = struct {
         const sgd_w2_push = runtime.SgdStepPush{ .n = w2_n, .lr = self.lr, .weight_decay = self.weight_decay };
         const sgd_b2_push = runtime.SgdStepPush{ .n = dim_out, .lr = self.lr, .weight_decay = 0.0 };
 
-        try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1_push, ceilDiv(w1_n, 256), 1, 1);
-        try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1_push, ceilDiv(dim_h, 256), 1, 1);
-        try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2_push, ceilDiv(w2_n, 256), 1, 1);
-        try rec.dispatch(&self.k_sgd, &.{ &self.b2, &self.db2 }, &sgd_b2_push, ceilDiv(dim_out, 256), 1, 1);
+        try rec.dispatch(&self.k_sgd, &.{ &self.w1, &self.dw1 }, &sgd_w1_push, util.ceilDiv(w1_n, 256), 1, 1);
+        try rec.dispatch(&self.k_sgd, &.{ &self.b1, &self.db1 }, &sgd_b1_push, util.ceilDiv(dim_h, 256), 1, 1);
+        try rec.dispatch(&self.k_sgd, &.{ &self.w2, &self.dw2 }, &sgd_w2_push, util.ceilDiv(w2_n, 256), 1, 1);
+        try rec.dispatch(&self.k_sgd, &.{ &self.b2, &self.db2 }, &sgd_b2_push, util.ceilDiv(dim_out, 256), 1, 1);
     }
 };
 
-fn ceilDiv(num: u32, den: u32) u32 {
-    return (num + den - 1) / den;
-}

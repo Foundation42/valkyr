@@ -4,13 +4,6 @@
 
 const std = @import("std");
 
-/// `(num + den - 1) / den`. The boring ceiling-divide for u32 dispatch
-/// counts. Cheap to inline-rewrite at call sites; lifted out so a future
-/// "where do we count workgroups" search has one obvious target.
-pub fn ceilDiv(num: u32, den: u32) u32 {
-    return (num + den - 1) / den;
-}
-
 /// Truncate `s` to at most `n` bytes — no codepoint awareness, just a
 /// quick "trim long tokenizer strings before printing" for the per-step
 /// debug logs.

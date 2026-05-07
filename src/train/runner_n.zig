@@ -19,6 +19,7 @@
 //! with per-layer parameter, activation, and gradient buffers.
 
 const std = @import("std");
+const util = @import("../util.zig");
 const vk = @import("../gpu/vk.zig");
 const buffer = @import("../gpu/buffer.zig");
 const pipeline = @import("../gpu/pipeline.zig");
@@ -407,16 +408,16 @@ pub const MlpNRunner = struct {
             const matmul_push = runtime.MatmulPush{ .m = 1, .n = dim_o, .k = dim_i };
             try rec.dispatch(&self.k_matmul, &.{ input_buf, &self.weights[L], &self.pre[L] }, &matmul_push, 1, 1, 1);
             const add_push = runtime.AddInPlacePush{ .n = dim_o };
-            try rec.dispatch(&self.k_add, &.{ &self.pre[L], &self.biases[L] }, &add_push, ceilDiv(dim_o, 256), 1, 1);
+            try rec.dispatch(&self.k_add, &.{ &self.pre[L], &self.biases[L] }, &add_push, util.ceilDiv(dim_o, 256), 1, 1);
             if (L + 1 < n) {
                 const relu_push = runtime.ReluPush{ .n = dim_o };
-                try rec.dispatch(&self.k_relu, &.{ &self.pre[L], &self.post[L] }, &relu_push, ceilDiv(dim_o, 256), 1, 1);
+                try rec.dispatch(&self.k_relu, &.{ &self.pre[L], &self.post[L] }, &relu_push, util.ceilDiv(dim_o, 256), 1, 1);
             } else {
                 // Output layer has no ReLU — copy pre→post so all
                 // downstream readers see a uniform "y is in post[n-1]".
                 const SliceCopyPush = extern struct { src_off: u32, dst_off: u32, n_elem: u32 };
                 const copy_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
-                try rec.dispatch(&self.k_copy, &.{ &self.pre[L], &self.post[L] }, &copy_push, ceilDiv(dim_o, 256), 1, 1);
+                try rec.dispatch(&self.k_copy, &.{ &self.pre[L], &self.post[L] }, &copy_push, util.ceilDiv(dim_o, 256), 1, 1);
             }
         }
     }
@@ -432,7 +433,7 @@ pub const MlpNRunner = struct {
             &self.k_mse_grad,
             &.{ &self.post[n - 1], &self.target_buf, &self.dpre[n - 1] },
             &mse_grad_push,
-            ceilDiv(dim_out, 256),
+            util.ceilDiv(dim_out, 256),
             1,
             1,
         );
@@ -449,14 +450,14 @@ pub const MlpNRunner = struct {
             const input_buf = if (L == 0) &self.x_buf else &self.post[L - 1];
 
             const copy_db = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
-            try rec.dispatch(&self.k_copy, &.{ &self.dpre[L], &self.db[L] }, &copy_db, ceilDiv(dim_o, 256), 1, 1);
+            try rec.dispatch(&self.k_copy, &.{ &self.dpre[L], &self.db[L] }, &copy_db, util.ceilDiv(dim_o, 256), 1, 1);
             const op_push = runtime.OuterProductPush{ .dim_out = dim_o, .dim_in = dim_i };
-            try rec.dispatch(&self.k_outer, &.{ &self.dpre[L], input_buf, &self.dw[L] }, &op_push, ceilDiv(dim_o, 16), ceilDiv(dim_i, 16), 1);
+            try rec.dispatch(&self.k_outer, &.{ &self.dpre[L], input_buf, &self.dw[L] }, &op_push, util.ceilDiv(dim_o, 16), util.ceilDiv(dim_i, 16), 1);
             if (L > 0) {
                 const lin_dx_push = runtime.LinearBackwardDxPush{ .dim_out = dim_o, .dim_in = dim_i };
-                try rec.dispatch(&self.k_lin_dx, &.{ &self.dpre[L], &self.weights[L], &self.dpost[L] }, &lin_dx_push, ceilDiv(dim_i, 256), 1, 1);
+                try rec.dispatch(&self.k_lin_dx, &.{ &self.dpre[L], &self.weights[L], &self.dpost[L] }, &lin_dx_push, util.ceilDiv(dim_i, 256), 1, 1);
                 const relu_bw_push = runtime.ReluBackwardPush{ .n = dim_i };
-                try rec.dispatch(&self.k_relu_bw, &.{ &self.dpost[L], &self.pre[L - 1], &self.dpre[L - 1] }, &relu_bw_push, ceilDiv(dim_i, 256), 1, 1);
+                try rec.dispatch(&self.k_relu_bw, &.{ &self.dpost[L], &self.pre[L - 1], &self.dpre[L - 1] }, &relu_bw_push, util.ceilDiv(dim_i, 256), 1, 1);
             }
         }
 
@@ -469,13 +470,10 @@ pub const MlpNRunner = struct {
             const dim_i: u32 = self.layer_dims[L];
             const w_n: u32 = dim_o * dim_i;
             const sgd_w_push = runtime.SgdStepPush{ .n = w_n, .lr = self.lr, .weight_decay = self.weight_decay };
-            try rec.dispatch(&self.k_sgd, &.{ &self.weights[L], &self.dw[L] }, &sgd_w_push, ceilDiv(w_n, 256), 1, 1);
+            try rec.dispatch(&self.k_sgd, &.{ &self.weights[L], &self.dw[L] }, &sgd_w_push, util.ceilDiv(w_n, 256), 1, 1);
             const sgd_b_push = runtime.SgdStepPush{ .n = dim_o, .lr = self.lr, .weight_decay = 0.0 };
-            try rec.dispatch(&self.k_sgd, &.{ &self.biases[L], &self.db[L] }, &sgd_b_push, ceilDiv(dim_o, 256), 1, 1);
+            try rec.dispatch(&self.k_sgd, &.{ &self.biases[L], &self.db[L] }, &sgd_b_push, util.ceilDiv(dim_o, 256), 1, 1);
         }
     }
 };
 
-fn ceilDiv(num: u32, den: u32) u32 {
-    return (num + den - 1) / den;
-}

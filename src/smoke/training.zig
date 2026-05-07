@@ -15,6 +15,7 @@ const shaders = @import("shaders");
 
 const aliases = @import("../runtime_aliases.zig");
 const helpers = @import("../smoke/helpers.zig");
+const util = @import("../util.zig");
 
 // Aliases for runtime push-constant types referenced inside the moved
 // code. aliases.ReluPush + a few others were already declared inline in the
@@ -111,10 +112,10 @@ pub fn runGpuMlpForwardSmoke(allocator: std.mem.Allocator) !void {
     // whole work is one workgroup, which is correct (threads outside
     // bound early-out).
     try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
-    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
     try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, util.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
     try rec.endAndSubmit();
 
@@ -264,15 +265,15 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
     const add2_push = runtime.AddInPlacePush{ .n = @intCast(dim_out) };
     const relu_push = aliases.ReluPush{ .n = @intCast(dim_h) };
     try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
-    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
     try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
-    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
+    try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, util.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
     // ── Backward ───────────────────────────────────────────────────
     // dL/db2 = dL/dy   (slice_copy 0..dim_out → 0..dim_out).
     const copy_db2 = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_out) };
-    try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
+    try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, util.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
     // dL/dW2[i, j] = dL/dy[i] · h[j]   (outer product, [dim_out, dim_h]).
     const op_dw2 = aliases.OuterProductPush{ .dim_out = @intCast(dim_out), .dim_in = @intCast(dim_h) };
@@ -280,8 +281,8 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
         &k_outer,
         &.{ &buf_dL_dy, &buf_h, &buf_dw2 },
         &op_dw2,
-        helpers.ceilDiv(@as(u32, dim_out), 16),
-        helpers.ceilDiv(@as(u32, dim_h), 16),
+        util.ceilDiv(@as(u32, dim_out), 16),
+        util.ceilDiv(@as(u32, dim_h), 16),
         1,
     );
 
@@ -291,7 +292,7 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
         &k_lin_dx,
         &.{ &buf_dL_dy, &buf_w2, &buf_dh },
         &lin_dx_push,
-        helpers.ceilDiv(@as(u32, dim_h), 256),
+        util.ceilDiv(@as(u32, dim_h), 256),
         1,
         1,
     );
@@ -302,14 +303,14 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
         &k_relu_bw,
         &.{ &buf_dh, &buf_h_pre, &buf_dh_pre },
         &relu_bw_push,
-        helpers.ceilDiv(@as(u32, dim_h), 256),
+        util.ceilDiv(@as(u32, dim_h), 256),
         1,
         1,
     );
 
     // dL/db1 = dL/dh_pre.
     const copy_db1 = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = @intCast(dim_h) };
-    try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+    try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
 
     // dL/dW1[j, k] = dL/dh_pre[j] · x[k].
     const op_dw1 = aliases.OuterProductPush{ .dim_out = @intCast(dim_h), .dim_in = @intCast(dim_in) };
@@ -317,8 +318,8 @@ pub fn runGpuMlpBackwardSmoke(allocator: std.mem.Allocator) !void {
         &k_outer,
         &.{ &buf_dh_pre, &buf_x, &buf_dw1 },
         &op_dw1,
-        helpers.ceilDiv(@as(u32, dim_h), 16),
-        helpers.ceilDiv(@as(u32, dim_in), 16),
+        util.ceilDiv(@as(u32, dim_h), 16),
+        util.ceilDiv(@as(u32, dim_in), 16),
         1,
     );
 
@@ -519,30 +520,30 @@ pub fn runGpuMlpTrainSmoke(allocator: std.mem.Allocator) !void {
 
         // Forward.
         try rec.dispatch(&k_matmul, &.{ &buf_x, &buf_w1, &buf_h_pre }, &matmul1_push, 1, 1, 1);
-        try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_add, &.{ &buf_h_pre, &buf_b1 }, &add1_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_relu, &.{ &buf_h_pre, &buf_h }, &relu_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
         try rec.dispatch(&k_matmul, &.{ &buf_h, &buf_w2, &buf_y }, &matmul2_push, 1, 1, 1);
-        try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
+        try rec.dispatch(&k_add, &.{ &buf_y, &buf_b2 }, &add2_push, util.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
         // Loss grad.
-        try rec.dispatch(&k_mse_grad, &.{ &buf_y, &buf_target, &buf_dL_dy }, &mse_grad_push, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
+        try rec.dispatch(&k_mse_grad, &.{ &buf_y, &buf_target, &buf_dL_dy }, &mse_grad_push, util.ceilDiv(@as(u32, dim_out), 256), 1, 1);
 
         // Backward.
-        try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, helpers.ceilDiv(@as(u32, dim_out), 256), 1, 1);
-        try rec.dispatch(&k_outer, &.{ &buf_dL_dy, &buf_h, &buf_dw2 }, &op_dw2, helpers.ceilDiv(@as(u32, dim_out), 16), helpers.ceilDiv(@as(u32, dim_h), 16), 1);
-        try rec.dispatch(&k_lin_dx, &.{ &buf_dL_dy, &buf_w2, &buf_dh }, &lin_dx_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_relu_bw, &.{ &buf_dh, &buf_h_pre, &buf_dh_pre }, &relu_bw_push, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, helpers.ceilDiv(@as(u32, dim_h), 256), 1, 1);
-        try rec.dispatch(&k_outer, &.{ &buf_dh_pre, &buf_x, &buf_dw1 }, &op_dw1, helpers.ceilDiv(@as(u32, dim_h), 16), helpers.ceilDiv(@as(u32, dim_in), 16), 1);
+        try rec.dispatch(&k_copy, &.{ &buf_dL_dy, &buf_db2 }, &copy_db2, util.ceilDiv(@as(u32, dim_out), 256), 1, 1);
+        try rec.dispatch(&k_outer, &.{ &buf_dL_dy, &buf_h, &buf_dw2 }, &op_dw2, util.ceilDiv(@as(u32, dim_out), 16), util.ceilDiv(@as(u32, dim_h), 16), 1);
+        try rec.dispatch(&k_lin_dx, &.{ &buf_dL_dy, &buf_w2, &buf_dh }, &lin_dx_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_relu_bw, &.{ &buf_dh, &buf_h_pre, &buf_dh_pre }, &relu_bw_push, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_copy, &.{ &buf_dh_pre, &buf_db1 }, &copy_db1, util.ceilDiv(@as(u32, dim_h), 256), 1, 1);
+        try rec.dispatch(&k_outer, &.{ &buf_dh_pre, &buf_x, &buf_dw1 }, &op_dw1, util.ceilDiv(@as(u32, dim_h), 16), util.ceilDiv(@as(u32, dim_in), 16), 1);
 
         // SGD step (param -= lr · grad). Note W2 is updated BEFORE the
         // dh = W2^T · dL/dy dispatch reads W2 — which is fine because
         // dh was computed earlier in this same recorder, and the next
         // step's W2-read starts a fresh recorder with a barrier.
-        try rec.dispatch(&k_sgd, &.{ &buf_w1, &buf_dw1 }, &sgd_w1_push, helpers.ceilDiv(@intCast(mlp_cpu.w1.len), 256), 1, 1);
-        try rec.dispatch(&k_sgd, &.{ &buf_b1, &buf_db1 }, &sgd_b1_push, helpers.ceilDiv(@intCast(mlp_cpu.b1.len), 256), 1, 1);
-        try rec.dispatch(&k_sgd, &.{ &buf_w2, &buf_dw2 }, &sgd_w2_push, helpers.ceilDiv(@intCast(mlp_cpu.w2.len), 256), 1, 1);
-        try rec.dispatch(&k_sgd, &.{ &buf_b2, &buf_db2 }, &sgd_b2_push, helpers.ceilDiv(@intCast(mlp_cpu.b2.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_w1, &buf_dw1 }, &sgd_w1_push, util.ceilDiv(@intCast(mlp_cpu.w1.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_b1, &buf_db1 }, &sgd_b1_push, util.ceilDiv(@intCast(mlp_cpu.b1.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_w2, &buf_dw2 }, &sgd_w2_push, util.ceilDiv(@intCast(mlp_cpu.w2.len), 256), 1, 1);
+        try rec.dispatch(&k_sgd, &.{ &buf_b2, &buf_db2 }, &sgd_b2_push, util.ceilDiv(@intCast(mlp_cpu.b2.len), 256), 1, 1);
 
         try rec.endAndSubmit();
 
@@ -798,23 +799,23 @@ pub fn runGpuMlpNTrainSmoke(allocator: std.mem.Allocator) !void {
             const matmul_push = aliases.MatmulPush{ .m = 1, .n = dim_o, .k = dim_i };
             try rec.dispatch(&k_matmul, &.{ input_buf, &bufs_w[L], &bufs_pre[L] }, &matmul_push, 1, 1, 1);
             const add_push = runtime.AddInPlacePush{ .n = dim_o };
-            try rec.dispatch(&k_add, &.{ &bufs_pre[L], &bufs_b[L] }, &add_push, helpers.ceilDiv(dim_o, 256), 1, 1);
+            try rec.dispatch(&k_add, &.{ &bufs_pre[L], &bufs_b[L] }, &add_push, util.ceilDiv(dim_o, 256), 1, 1);
             if (L + 1 < n) {
                 const relu_push = aliases.ReluPush{ .n = dim_o };
-                try rec.dispatch(&k_relu, &.{ &bufs_pre[L], &bufs_post[L] }, &relu_push, helpers.ceilDiv(dim_o, 256), 1, 1);
+                try rec.dispatch(&k_relu, &.{ &bufs_pre[L], &bufs_post[L] }, &relu_push, util.ceilDiv(dim_o, 256), 1, 1);
             } else {
                 // Output layer has no ReLU — copy pre→post so backward
                 // and the host can both read the prediction from
                 // bufs_post[n-1] uniformly.
                 const copy_push = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
-                try rec.dispatch(&k_copy, &.{ &bufs_pre[L], &bufs_post[L] }, &copy_push, helpers.ceilDiv(dim_o, 256), 1, 1);
+                try rec.dispatch(&k_copy, &.{ &bufs_pre[L], &bufs_post[L] }, &copy_push, util.ceilDiv(dim_o, 256), 1, 1);
             }
         }
 
         // Loss-grad seeds d_pre on the output layer (no ReLU there).
         const dim_out_u: u32 = @intCast(layer_dims[n]);
         const mse_grad_push = aliases.MseLossGradPush{ .n = dim_out_u };
-        try rec.dispatch(&k_mse_grad, &.{ &bufs_post[n - 1], &buf_target, &bufs_dpre[n - 1] }, &mse_grad_push, helpers.ceilDiv(dim_out_u, 256), 1, 1);
+        try rec.dispatch(&k_mse_grad, &.{ &bufs_post[n - 1], &buf_target, &bufs_dpre[n - 1] }, &mse_grad_push, util.ceilDiv(dim_out_u, 256), 1, 1);
 
         // Backward pass per layer, top-down. db = d_pre; dW = d_pre ⊗ input;
         // if not the bottom layer, propagate d_post and apply the ReLU mask.
@@ -827,16 +828,16 @@ pub fn runGpuMlpNTrainSmoke(allocator: std.mem.Allocator) !void {
 
             // db[L] = d_pre[L]
             const copy_db = aliases.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = dim_o };
-            try rec.dispatch(&k_copy, &.{ &bufs_dpre[L], &bufs_db[L] }, &copy_db, helpers.ceilDiv(dim_o, 256), 1, 1);
+            try rec.dispatch(&k_copy, &.{ &bufs_dpre[L], &bufs_db[L] }, &copy_db, util.ceilDiv(dim_o, 256), 1, 1);
             // dW[L] = d_pre[L] ⊗ input
             const op_push = aliases.OuterProductPush{ .dim_out = dim_o, .dim_in = dim_i };
-            try rec.dispatch(&k_outer, &.{ &bufs_dpre[L], input_buf, &bufs_dw[L] }, &op_push, helpers.ceilDiv(dim_o, 16), helpers.ceilDiv(dim_i, 16), 1);
+            try rec.dispatch(&k_outer, &.{ &bufs_dpre[L], input_buf, &bufs_dw[L] }, &op_push, util.ceilDiv(dim_o, 16), util.ceilDiv(dim_i, 16), 1);
             // Propagate to layer L-1's d_pre, with ReLU mask on its pre.
             if (L > 0) {
                 const lin_dx_push = aliases.LinearBackwardDxPush{ .dim_out = dim_o, .dim_in = dim_i };
-                try rec.dispatch(&k_lin_dx, &.{ &bufs_dpre[L], &bufs_w[L], &bufs_dpost[L] }, &lin_dx_push, helpers.ceilDiv(dim_i, 256), 1, 1);
+                try rec.dispatch(&k_lin_dx, &.{ &bufs_dpre[L], &bufs_w[L], &bufs_dpost[L] }, &lin_dx_push, util.ceilDiv(dim_i, 256), 1, 1);
                 const relu_bw_push = aliases.ReluBackwardPush{ .n = dim_i };
-                try rec.dispatch(&k_relu_bw, &.{ &bufs_dpost[L], &bufs_pre[L - 1], &bufs_dpre[L - 1] }, &relu_bw_push, helpers.ceilDiv(dim_i, 256), 1, 1);
+                try rec.dispatch(&k_relu_bw, &.{ &bufs_dpost[L], &bufs_pre[L - 1], &bufs_dpre[L - 1] }, &relu_bw_push, util.ceilDiv(dim_i, 256), 1, 1);
             }
         }
 
@@ -844,9 +845,9 @@ pub fn runGpuMlpNTrainSmoke(allocator: std.mem.Allocator) !void {
         // pre-update weights. Order across layers doesn't matter.
         for (0..n) |L| {
             const sgd_w_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.weights[L].len), .lr = lr };
-            try rec.dispatch(&k_sgd, &.{ &bufs_w[L], &bufs_dw[L] }, &sgd_w_push, helpers.ceilDiv(@intCast(mlp_cpu.weights[L].len), 256), 1, 1);
+            try rec.dispatch(&k_sgd, &.{ &bufs_w[L], &bufs_dw[L] }, &sgd_w_push, util.ceilDiv(@intCast(mlp_cpu.weights[L].len), 256), 1, 1);
             const sgd_b_push = aliases.SgdStepPush{ .n = @intCast(mlp_cpu.biases[L].len), .lr = lr };
-            try rec.dispatch(&k_sgd, &.{ &bufs_b[L], &bufs_db[L] }, &sgd_b_push, helpers.ceilDiv(@intCast(mlp_cpu.biases[L].len), 256), 1, 1);
+            try rec.dispatch(&k_sgd, &.{ &bufs_b[L], &bufs_db[L] }, &sgd_b_push, util.ceilDiv(@intCast(mlp_cpu.biases[L].len), 256), 1, 1);
         }
 
         try rec.endAndSubmit();

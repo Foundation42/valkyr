@@ -24,6 +24,7 @@ const shaders = @import("shaders");
 
 const aliases = @import("../runtime_aliases.zig");
 const helpers = @import("../smoke/helpers.zig");
+const util = @import("../util.zig");
 
 pub fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -460,39 +461,39 @@ pub fn runGpuLoraSmoke(allocator: std.mem.Allocator) !void {
         try recordMatmul(&k_matmul, &push_ylora, M_u32 * N_u32, &ctx, &.{ &buf_intermediate, &buf_b, &buf_y_lora });
         // 4. y_lora_scaled = y_lora * (α/r)
         const push_scale_ylora = aliases.ScalePush{ .n = M_u32 * N_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_ylora, helpers.ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y_lora, &buf_y_lora_scaled });
+        try recordScalar1D(&k_scale, push_scale_ylora, util.ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y_lora, &buf_y_lora_scaled });
         // 5. y += y_lora_scaled  (in place into buf_y)
         const push_add_y = runtime.AddInPlacePush{ .n = M_u32 * N_u32 };
-        try recordScalar1D(&k_add, push_add_y, helpers.ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y, &buf_y_lora_scaled });
+        try recordScalar1D(&k_add, push_add_y, util.ceilDiv(M_u32 * N_u32, group_lin), &ctx, &.{ &buf_y, &buf_y_lora_scaled });
 
         // ── BACKWARD chain.
         // 1. dx_base = dy · W                  (shape M×K = M×Nn · Nn×K)
         const push_dx_base = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = K_u32 };
-        try recordLinBackward(&k_lin_dx, &push_dx_base, helpers.ceilDiv(M_u32, group_lwg), helpers.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_w, &buf_dx });
+        try recordLinBackward(&k_lin_dx, &push_dx_base, util.ceilDiv(M_u32, group_lwg), util.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_w, &buf_dx });
         // 2. dy_B = dy · B                     (shape M×r = M×Nn · Nn×r). LinearBatchedPush.K = r.
         const push_dy_B = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = R_u32 };
-        try recordLinBackward(&k_lin_dx, &push_dy_B, helpers.ceilDiv(M_u32, group_lwg), helpers.ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
+        try recordLinBackward(&k_lin_dx, &push_dy_B, util.ceilDiv(M_u32, group_lwg), util.ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
         // 3. dx_lora = dy_B · A                (shape M×K = M×r · r×K). Nn=r in the linear-backward sense.
         const push_dx_lora = runtime.LinearBatchedPush{ .M = M_u32, .N = R_u32, .K = K_u32 };
-        try recordLinBackward(&k_lin_dx, &push_dx_lora, helpers.ceilDiv(M_u32, group_lwg), helpers.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_a, &buf_dx_lora });
+        try recordLinBackward(&k_lin_dx, &push_dx_lora, util.ceilDiv(M_u32, group_lwg), util.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_a, &buf_dx_lora });
         // 4. dx_lora_scaled = dx_lora * (α/r)
         const push_scale_dxlora = aliases.ScalePush{ .n = M_u32 * K_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_dxlora, helpers.ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx_lora, &buf_dx_lora_scaled });
+        try recordScalar1D(&k_scale, push_scale_dxlora, util.ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx_lora, &buf_dx_lora_scaled });
         // 5. dx += dx_lora_scaled
         const push_add_dx = runtime.AddInPlacePush{ .n = M_u32 * K_u32 };
-        try recordScalar1D(&k_add, push_add_dx, helpers.ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx, &buf_dx_lora_scaled });
+        try recordScalar1D(&k_add, push_add_dx, util.ceilDiv(M_u32 * K_u32, group_lin), &ctx, &.{ &buf_dx, &buf_dx_lora_scaled });
         // 6. ∇A_unscaled = dy_Bᵀ · x          (shape r×K). dW[Nn=r, K]
         const push_dA = runtime.LinearBatchedPush{ .M = M_u32, .N = R_u32, .K = K_u32 };
-        try recordLinBackward(&k_lin_dw, &push_dA, helpers.ceilDiv(R_u32, group_lwg), helpers.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
+        try recordLinBackward(&k_lin_dw, &push_dA, util.ceilDiv(R_u32, group_lwg), util.ceilDiv(K_u32, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
         // 7. ∇A = ∇A_unscaled * (α/r)
         const push_scale_dA = aliases.ScalePush{ .n = R_u32 * K_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_dA, helpers.ceilDiv(R_u32 * K_u32, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
+        try recordScalar1D(&k_scale, push_scale_dA, util.ceilDiv(R_u32 * K_u32, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
         // 8. ∇B_unscaled = dyᵀ · intermediate (shape Nn×r). dW[Nn, K=r]
         const push_dB = runtime.LinearBatchedPush{ .M = M_u32, .N = N_u32, .K = R_u32 };
-        try recordLinBackward(&k_lin_dw, &push_dB, helpers.ceilDiv(N_u32, group_lwg), helpers.ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
+        try recordLinBackward(&k_lin_dw, &push_dB, util.ceilDiv(N_u32, group_lwg), util.ceilDiv(R_u32, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
         // 9. ∇B = ∇B_unscaled * (α/r)
         const push_scale_dB = aliases.ScalePush{ .n = N_u32 * R_u32, .scale = cs.aor };
-        try recordScalar1D(&k_scale, push_scale_dB, helpers.ceilDiv(N_u32 * R_u32, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
+        try recordScalar1D(&k_scale, push_scale_dB, util.ceilDiv(N_u32 * R_u32, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
 
         // ── Read back + diff.
         const y_gpu = try allocator.alloc(f32, M * Nn);
@@ -787,8 +788,8 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
             try recM_fn(kmm, pyb, mu * nu, c_ctx, &.{ bx, bw, by });
             try recM_fn(kmm, pin, mu * ru, c_ctx, &.{ bx, ba, bint });
             try recM_fn(kmm, pyl, mu * nu, c_ctx, &.{ bint, bb, bylora });
-            try recS_fn(ksc, psy.*, helpers.ceilDiv(mu * nu, glin), c_ctx, &.{ bylora, byloras });
-            try recS_fn(kad, pay.*, helpers.ceilDiv(mu * nu, glin), c_ctx, &.{ by, byloras });
+            try recS_fn(ksc, psy.*, util.ceilDiv(mu * nu, glin), c_ctx, &.{ bylora, byloras });
+            try recS_fn(kad, pay.*, util.ceilDiv(mu * nu, glin), c_ctx, &.{ by, byloras });
         }
     }.call;
 
@@ -822,21 +823,21 @@ pub fn runGpuLoraTrainDemo(allocator: std.mem.Allocator) !void {
             M_u, N_u, R_u, recordMatmul, recordScalar1D, group_lin,
         );
         // Loss grad: dy = y - target  (shader is half-sum MSE).
-        try recordScalar1D(&k_mse_grad, push_mse, helpers.ceilDiv(M_u * N_u, group_lin), &ctx, &.{ &buf_y, &buf_target_y, &buf_dy });
+        try recordScalar1D(&k_mse_grad, push_mse, util.ceilDiv(M_u * N_u, group_lin), &ctx, &.{ &buf_y, &buf_target_y, &buf_dy });
         // Backward — dx is not computed (no upstream).
         // dy_B = dy · B
-        try recordLinBackward(&k_lin_dx, &push_dy_B, helpers.ceilDiv(M_u, group_lwg), helpers.ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
+        try recordLinBackward(&k_lin_dx, &push_dy_B, util.ceilDiv(M_u, group_lwg), util.ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_b, &buf_dy_B });
         // ∇A_unscaled = dy_Bᵀ · x ; ∇A = (α/r) · ∇A_unscaled
-        try recordLinBackward(&k_lin_dw, &push_dA, helpers.ceilDiv(R_u, group_lwg), helpers.ceilDiv(K_u, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
-        try recordScalar1D(&k_scale, push_scale_dA, helpers.ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
+        try recordLinBackward(&k_lin_dw, &push_dA, util.ceilDiv(R_u, group_lwg), util.ceilDiv(K_u, group_lwg), &ctx, &.{ &buf_dy_B, &buf_x, &buf_dA_unscaled });
+        try recordScalar1D(&k_scale, push_scale_dA, util.ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_dA_unscaled, &buf_dA });
         // ∇B_unscaled = dyᵀ · intermediate ; ∇B = (α/r) · ∇B_unscaled
-        try recordLinBackward(&k_lin_dw, &push_dB, helpers.ceilDiv(N_u, group_lwg), helpers.ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
-        try recordScalar1D(&k_scale, push_scale_dB, helpers.ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
+        try recordLinBackward(&k_lin_dw, &push_dB, util.ceilDiv(N_u, group_lwg), util.ceilDiv(R_u, group_lwg), &ctx, &.{ &buf_dy, &buf_intermediate, &buf_dB_unscaled });
+        try recordScalar1D(&k_scale, push_scale_dB, util.ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_dB_unscaled, &buf_dB });
         // Adam updates on A and B.
         const adam_a = runtime.AdamStepPush{ .n = R_u * K_u, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = step };
         const adam_b = runtime.AdamStepPush{ .n = N_u * R_u, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = step };
-        try recordScalar1D(&k_adam, adam_a, helpers.ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_a, &buf_dA, &buf_m_a, &buf_v_a });
-        try recordScalar1D(&k_adam, adam_b, helpers.ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_b, &buf_dB, &buf_m_b, &buf_v_b });
+        try recordScalar1D(&k_adam, adam_a, util.ceilDiv(R_u * K_u, group_lin), &ctx, &.{ &buf_a, &buf_dA, &buf_m_a, &buf_v_a });
+        try recordScalar1D(&k_adam, adam_b, util.ceilDiv(N_u * R_u, group_lin), &ctx, &.{ &buf_b, &buf_dB, &buf_m_b, &buf_v_b });
 
         if (step % log_every == 0) {
             try buf_y.readBack(&ctx, f32, y_buf);
@@ -1186,8 +1187,8 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
             try recM_fn(kmm, pyb, mu * nu, ctx_ptr, &.{ buf_x_, buf_w_, buf_y_ });
             try recM_fn(kmm, pin, mu * ru, ctx_ptr, &.{ buf_x_, buf_a_, buf_inter_ });
             try recM_fn(kmm, pyl, mu * nu, ctx_ptr, &.{ buf_inter_, buf_b_, buf_yl_ });
-            try recS_fn(ksc, psy.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
-            try recS_fn(kad, pay.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
+            try recS_fn(ksc, psy.*, util.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
+            try recS_fn(kad, pay.*, util.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
             try buf_y_.readBack(ctx_ptr, f32, y_buf_);
             const initial_loss = mse_fn(y_buf_, target_y_);
             result.loss_at_log[log_idx] = initial_loss;
@@ -1199,21 +1200,21 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
                 try recM_fn(kmm, pyb, mu * nu, ctx_ptr, &.{ buf_x_, buf_w_, buf_y_ });
                 try recM_fn(kmm, pin, mu * ru, ctx_ptr, &.{ buf_x_, buf_a_, buf_inter_ });
                 try recM_fn(kmm, pyl, mu * nu, ctx_ptr, &.{ buf_inter_, buf_b_, buf_yl_ });
-                try recS_fn(ksc, psy.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
-                try recS_fn(kad, pay.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
+                try recS_fn(ksc, psy.*, util.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_yl_, buf_yls_ });
+                try recS_fn(kad, pay.*, util.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_yls_ });
                 // Loss grad.
-                try recS_fn(kmse, pms.*, helpers.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_target_, buf_dy_ });
+                try recS_fn(kmse, pms.*, util.ceilDiv(mu * nu, glin), ctx_ptr, &.{ buf_y_, buf_target_, buf_dy_ });
                 // Backward.
-                try recL_fn(klx, pdyB, helpers.ceilDiv(mu, glwg), helpers.ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_b_, buf_dyB_ });
-                try recL_fn(klw, pdA, helpers.ceilDiv(ru, glwg), helpers.ceilDiv(ku, glwg), ctx_ptr, &.{ buf_dyB_, buf_x_, buf_dAu_ });
-                try recS_fn(ksc, psda.*, helpers.ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_dAu_, buf_dA_ });
-                try recL_fn(klw, pdB, helpers.ceilDiv(nu, glwg), helpers.ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_inter_, buf_dBu_ });
-                try recS_fn(ksc, psdb.*, helpers.ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_dBu_, buf_dB_ });
+                try recL_fn(klx, pdyB, util.ceilDiv(mu, glwg), util.ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_b_, buf_dyB_ });
+                try recL_fn(klw, pdA, util.ceilDiv(ru, glwg), util.ceilDiv(ku, glwg), ctx_ptr, &.{ buf_dyB_, buf_x_, buf_dAu_ });
+                try recS_fn(ksc, psda.*, util.ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_dAu_, buf_dA_ });
+                try recL_fn(klw, pdB, util.ceilDiv(nu, glwg), util.ceilDiv(ru, glwg), ctx_ptr, &.{ buf_dy_, buf_inter_, buf_dBu_ });
+                try recS_fn(ksc, psdb.*, util.ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_dBu_, buf_dB_ });
                 // Adam — different lr for A vs B (the LoRA+ knob).
                 const adam_a = runtime.AdamStepPush{ .n = ru * ku, .lr = lr_a, .beta1 = beta1_, .beta2 = beta2_, .eps = eps_, .t = step };
                 const adam_b = runtime.AdamStepPush{ .n = nu * ru, .lr = lr_b, .beta1 = beta1_, .beta2 = beta2_, .eps = eps_, .t = step };
-                try recS_fn(kadam, adam_a, helpers.ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_a_, buf_dA_, buf_m_a_, buf_v_a_ });
-                try recS_fn(kadam, adam_b, helpers.ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_b_, buf_dB_, buf_m_b_, buf_v_b_ });
+                try recS_fn(kadam, adam_a, util.ceilDiv(ru * ku, glin), ctx_ptr, &.{ buf_a_, buf_dA_, buf_m_a_, buf_v_a_ });
+                try recS_fn(kadam, adam_b, util.ceilDiv(nu * ru, glin), ctx_ptr, &.{ buf_b_, buf_dB_, buf_m_b_, buf_v_b_ });
 
                 // Periodic loss readback for the trajectory.
                 if (step % log_every_ == 0) {
