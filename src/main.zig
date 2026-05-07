@@ -5,42 +5,11 @@
 //! success or surfaces an error otherwise.
 
 const std = @import("std");
-const vk = @import("gpu/vk.zig");
-const buffer = @import("gpu/buffer.zig");
-const pipeline = @import("gpu/pipeline.zig");
-const safetensors = @import("safetensors.zig");
-const model_mod = @import("model.zig");
-const dtype = @import("dtype.zig");
-const cpu_math = @import("cpu/math.zig");
 const cpu_forward = @import("cpu/forward.zig");
-const cpu_gated_delta = @import("cpu/gated_delta.zig");
-const cpu_full_attn = @import("cpu/full_attn.zig");
-const turboquant = @import("cpu/turboquant.zig");
-const q4_0 = @import("cpu/q4_0.zig");
-const q4_k = @import("cpu/q4_k.zig");
-const cpu_train = @import("cpu/train.zig");
-const cpu_train_transformer = @import("cpu/train_transformer.zig");
-const cpu_train_decoder = @import("cpu/train_decoder.zig");
-const cpu_cce = @import("cpu/cce.zig");
-const cpu_lora = @import("cpu/lora.zig");
-const train_runner = @import("train/runner.zig");
-const train_runner_n = @import("train/runner_n.zig");
-const train_transformer = @import("train/transformer.zig");
-const train_load_real = @import("train/load_real.zig");
-const train_dataset = @import("train/dataset.zig");
-const tokenizer_mod = @import("tokenizer.zig");
 const config_mod = @import("config.zig");
 const gpu_model = @import("gpu/model.zig");
-const gpu_scratch = @import("gpu/scratch.zig");
-const gpu_recorder = @import("gpu/recorder.zig");
-const runtime = @import("runtime.zig");
-const runtime_hybrid = @import("runtime_hybrid.zig");
-const loader = @import("loader.zig");
 const session_mod = @import("session.zig");
-const chat_template_mod = @import("chat_template.zig");
 const hf_cache = @import("hf_cache.zig");
-const probe = @import("probe.zig");
-const shaders = @import("shaders");
 const commands_inspect = @import("commands/inspect.zig");
 const commands_encode = @import("commands/encode.zig");
 const commands_bench = @import("commands/bench.zig");
@@ -152,7 +121,7 @@ pub fn main() !void {
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--qwen35-layer-test")) {
         // args[2] = model dir, args[3] = path to layer-0 reference
         // dump from scripts/dump_qwen35_layer0.py.
-        try runQwen35LayerTest(allocator, args[2], args[3]);
+        try smoke_layer_tests.runQwen35LayerTest(allocator, args[2], args[3]);
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--dump-embed")) {
@@ -705,96 +674,3 @@ pub fn main() !void {
     try smoke_gpu_kernels.runGpuTq4RoundTripSmoke(allocator);
     try smoke_gpu_kernels.runGpuTq4PackToCacheSmoke(allocator);
 }
-
-fn runQwen35LayerTest(
-    gpa: std.mem.Allocator,
-    dir_path: []const u8,
-    dump_path: []const u8,
-) !void {
-    // ── Load model ──────────────────────────────────────────────────
-    var model = try model_mod.Model.load(gpa, dir_path);
-    defer model.deinit();
-    const cfg = model.config;
-    if (cfg.family != .qwen35) {
-        std.debug.print("expected qwen3.5 model, got {s}\n", .{@tagName(cfg.family)});
-        return error.WrongFamily;
-    }
-
-    // ── Read reference dump ─────────────────────────────────────────
-    // Format: header (4 × i32: magic, hidden_size, layer_idx,
-    // layer_type_kind) followed by hidden_size fp32 (input) and
-    // hidden_size fp32 (expected output). `layer_type_kind` is 0 for
-    // linear_attention, 1 for full_attention — lets the Zig side cross-
-    // check that Python dumped the layer it thinks Zig is testing.
-    const file = try std.fs.cwd().openFile(dump_path, .{ .mode = .read_only });
-    defer file.close();
-    var got_header: [4]i32 = undefined;
-    const hdr_bytes_read = try file.read(std.mem.sliceAsBytes(got_header[0..]));
-    if (hdr_bytes_read != @sizeOf(@TypeOf(got_header))) return error.DumpHeaderTruncated;
-    if (got_header[0] != 0x515E_3503) return error.DumpMagicMismatch;
-    if (got_header[1] != @as(i32, @intCast(cfg.hidden_size))) return error.DumpHiddenSizeMismatch;
-    const layer_idx: usize = @intCast(got_header[2]);
-    if (layer_idx >= cfg.num_hidden_layers) return error.LayerIndexOutOfRange;
-    const want_kind: i32 = switch (model.layers[layer_idx].layer_type) {
-        .linear_attention => 0,
-        .full_attention => 1,
-    };
-    if (got_header[3] != want_kind) return error.DumpLayerTypeMismatch;
-
-    const x = try gpa.alloc(f32, cfg.hidden_size);
-    defer gpa.free(x);
-    const expected = try gpa.alloc(f32, cfg.hidden_size);
-    defer gpa.free(expected);
-    if (try file.read(std.mem.sliceAsBytes(x)) != cfg.hidden_size * @sizeOf(f32)) return error.DumpInputTruncated;
-    if (try file.read(std.mem.sliceAsBytes(expected)) != cfg.hidden_size * @sizeOf(f32)) return error.DumpOutputTruncated;
-
-    // ── Run the Zig CPU layer-N step ────────────────────────────────
-    // Ref Python returns the layer's ATTENTION-PATH output (post
-    // out_proj, pre residual add). We don't add the residual either.
-    const got = try gpa.alloc(f32, cfg.hidden_size);
-    defer gpa.free(got);
-    const layer = model.layers[layer_idx];
-    switch (layer.layer_type) {
-        .linear_attention => {
-            var state = try cpu_gated_delta.State.init(gpa, cfg);
-            defer state.deinit(gpa);
-            try cpu_gated_delta.decodeStep(gpa, cfg, layer, &state, x, got);
-        },
-        .full_attention => {
-            // Single-token decode at pos=0 with empty cache. Cache is
-            // sized for one position — that's all we need.
-            var kv = try cpu_full_attn.KvCache.init(gpa, cfg, 1);
-            defer kv.deinit(gpa);
-            try cpu_full_attn.decodeStep(gpa, cfg, layer, &kv, x, got, 0);
-        },
-    }
-
-    // ── Compare ─────────────────────────────────────────────────────
-    var max_abs: f32 = 0.0;
-    var sum_sq_diff: f64 = 0.0;
-    var sum_sq_ref: f64 = 0.0;
-    for (got, expected) |g, e| {
-        const d = @abs(g - e);
-        if (d > max_abs) max_abs = d;
-        sum_sq_diff += @as(f64, d) * @as(f64, d);
-        sum_sq_ref += @as(f64, e) * @as(f64, e);
-    }
-    const rel = if (sum_sq_ref > 0) @sqrt(sum_sq_diff / sum_sq_ref) else 0.0;
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("layer {d} ({s}) parity:\n", .{ layer_idx, @tagName(layer.layer_type) });
-    try stdout.print("  hidden_size  = {d}\n", .{cfg.hidden_size});
-    try stdout.print("  max |Δ|      = {e}\n", .{max_abs});
-    try stdout.print("  ‖Δ‖ / ‖ref‖ = {e}\n", .{rel});
-    try stdout.print("  first 4 (got vs ref):\n", .{});
-    for (0..@min(4, got.len)) |i| {
-        try stdout.print("    [{d}] {e:.6}  vs  {e:.6}\n", .{ i, got[i], expected[i] });
-    }
-    if (max_abs > 1e-3) {
-        try stdout.print("FAIL: |Δ| > 1e-3\n", .{});
-        return error.ParityFailed;
-    }
-    try stdout.print("PASS qwen35 layer {d} ({s}) — max |Δ| = {e}\n", .{ layer_idx, @tagName(layer.layer_type), max_abs });
-}
-
-
-
