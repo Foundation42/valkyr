@@ -41,6 +41,10 @@ const chat_template_mod = @import("chat_template.zig");
 const hf_cache = @import("hf_cache.zig");
 const probe = @import("probe.zig");
 const shaders = @import("shaders");
+const commands_inspect = @import("commands/inspect.zig");
+const commands_encode = @import("commands/encode.zig");
+const commands_bench = @import("commands/bench.zig");
+const commands_serve = @import("commands/serve.zig");
 
 /// One entry from a `--prompts` TSV: `<label>\t<prompt>` per line.
 /// Both fields are slices into the file's read buffer (LoadedPrompts);
@@ -94,7 +98,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--list")) {
-        try runList(allocator);
+        try commands_inspect.runList(allocator);
         return;
     }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--cce-forward-smoke")) {
@@ -163,19 +167,19 @@ pub fn main() !void {
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--inspect")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
-        try runInspect(allocator, dir);
+        try commands_inspect.runInspect(allocator, dir);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--load")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
-        try runLoad(allocator, dir);
+        try commands_inspect.runLoad(allocator, dir);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--config")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
-        try runConfig(allocator, dir);
+        try commands_inspect.runConfig(allocator, dir);
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--qwen35-layer-test")) {
@@ -186,7 +190,7 @@ pub fn main() !void {
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--dump-embed")) {
         const token_id = try std.fmt.parseInt(u32, args[3], 10);
-        try runDumpEmbed(allocator, args[2], token_id);
+        try commands_inspect.runDumpEmbed(allocator, args[2], token_id);
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--rmsnorm-test")) {
@@ -267,7 +271,7 @@ pub fn main() !void {
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--encode")) {
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
-        try runEncode(allocator, dir, args[3]);
+        try commands_encode.runEncode(allocator, dir, args[3]);
         return;
     }
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--tq4-kv-test")) {
@@ -358,7 +362,7 @@ pub fn main() !void {
         }
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
-        try runBench(allocator, dir, n);
+        try commands_bench.runBench(allocator, dir, n);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--session-smoke")) {
@@ -527,7 +531,7 @@ pub fn main() !void {
             return;
         }
         const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
-        try runServe(allocator, args[2], public_id orelse args[2], bind_addr, port, max_new, precision);
+        try commands_serve.runServe(allocator, args[2], public_id orelse args[2], bind_addr, port, max_new, precision);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--chat")) {
@@ -735,138 +739,6 @@ pub fn main() !void {
     try runGpuTq4PackToCacheSmoke(allocator);
 }
 
-// ── --list: enumerate cached HF models ─────────────────────────────
-//
-// Walks ~/.cache/huggingface/hub (env-overridable via HF_HUB_CACHE /
-// HF_HOME / XDG_CACHE_HOME) and prints one row per cached model with
-// its architecture, on-disk size, and a marker column showing whether
-// valkyr can load it. Designed to pair with `--chat <id>`: if a row
-// shows `[OK]`, you can chat the model directly via its id.
-
-fn runList(gpa: std.mem.Allocator) !void {
-    const stdout = std.io.getStdOut().writer();
-
-    const root = try hf_cache.cacheRoot(gpa);
-    defer gpa.free(root);
-    try stdout.print("HF cache: {s}\n\n", .{root});
-
-    const models = try hf_cache.listModels(gpa);
-    defer {
-        for (models) |entry| {
-            var m = entry;
-            m.deinit(gpa);
-        }
-        gpa.free(models);
-    }
-    if (models.len == 0) {
-        try stdout.print("(no models cached — try `hf download <org/name>`)\n", .{});
-        return;
-    }
-
-    // Sort: supported first, then by id alphabetically. Two-key sort
-    // via std.mem.sort with a stable comparator.
-    std.mem.sort(hf_cache.ModelInfo, @constCast(models), {}, struct {
-        fn lt(_: void, a: hf_cache.ModelInfo, b: hf_cache.ModelInfo) bool {
-            if (a.supported != b.supported) return a.supported;
-            return std.mem.lessThan(u8, a.id, b.id);
-        }
-    }.lt);
-
-    // Width-fit columns for readability.
-    var max_id_w: usize = 5;
-    var max_arch_w: usize = 12;
-    for (models) |m| {
-        if (m.id.len > max_id_w) max_id_w = m.id.len;
-        if (m.architecture.len > max_arch_w) max_arch_w = m.architecture.len;
-    }
-    if (max_id_w > 60) max_id_w = 60;
-    if (max_arch_w > 36) max_arch_w = 36;
-
-    try stdout.print("  {s: <60}  {s: <36}  {s: >9}  {s}\n", .{
-        "model id (`--chat <this>`)",
-        "architecture",
-        "size",
-        "status",
-    });
-    try stdout.print("  {s:->60}  {s:->36}  {s:->9}  {s:->8}\n", .{ "", "", "", "" });
-
-    var size_buf: [32]u8 = undefined;
-    for (models) |m| {
-        const size_str = try hf_cache.formatSize(m.bytes, &size_buf);
-        const status: []const u8 = if (m.supported) "[OK]" else "[?]";
-        try stdout.print("  {s: <60}  {s: <36}  {s: >9}  {s}\n", .{
-            m.id,
-            m.architecture,
-            size_str,
-            status,
-        });
-    }
-
-    var supported_count: usize = 0;
-    for (models) |m| if (m.supported) {
-        supported_count += 1;
-    };
-    try stdout.print("\n{d}/{d} models supported by valkyr's loader.\n", .{ supported_count, models.len });
-}
-
-// ── inspect: dump the tensor inventory of a real .safetensors file ──
-
-fn runInspect(allocator: std.mem.Allocator, path: []const u8) !void {
-    const t0 = std.time.nanoTimestamp();
-    var st = try safetensors.SafeTensors.open(allocator, path);
-    defer st.deinit();
-    const t1 = std.time.nanoTimestamp();
-    const open_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("File: {s}\n", .{path});
-    try stdout.print("Tensors: {d}    Open+parse: {d:.2} ms\n", .{ st.count(), open_ms });
-    try stdout.print("Mapping: {d:.2} GiB\n", .{
-        @as(f64, @floatFromInt(st.mapping.len)) / (1024.0 * 1024.0 * 1024.0),
-    });
-    try stdout.print("\n", .{});
-
-    // Walk in alphabetical order so the output is reproducible across
-    // hashmap iteration orders.
-    var names = std.ArrayList([]const u8).init(allocator);
-    defer names.deinit();
-    var it = st.by_name.keyIterator();
-    while (it.next()) |k| try names.append(k.*);
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lessThan);
-
-    var totals = [_]u64{0} ** @typeInfo(safetensors.Dtype).@"enum".fields.len;
-    for (names.items) |name| {
-        const t = st.get(name).?;
-        totals[@intFromEnum(t.dtype)] += t.bytes.len;
-        try stdout.print("  {s:<10} {s:<55} ", .{ @tagName(t.dtype), name });
-        try stdout.print("[", .{});
-        for (t.shape, 0..) |d, i| {
-            if (i > 0) try stdout.print(", ", .{});
-            try stdout.print("{d}", .{d});
-        }
-        try stdout.print("]  {d:.2} MiB\n", .{
-            @as(f64, @floatFromInt(t.bytes.len)) / (1024.0 * 1024.0),
-        });
-    }
-
-    try stdout.print("\nDtype totals:\n", .{});
-    inline for (@typeInfo(safetensors.Dtype).@"enum".fields) |f| {
-        const idx: usize = f.value;
-        if (totals[idx] > 0) {
-            try stdout.print("  {s:<6} {d:.2} MiB\n", .{
-                f.name,
-                @as(f64, @floatFromInt(totals[idx])) / (1024.0 * 1024.0),
-            });
-        }
-    }
-}
-
-// ── load: parse config + open shards + bind layer weights ────────────
-
 fn runQwen35LayerTest(
     gpa: std.mem.Allocator,
     dir_path: []const u8,
@@ -955,147 +827,6 @@ fn runQwen35LayerTest(
         return error.ParityFailed;
     }
     try stdout.print("PASS qwen35 layer {d} ({s}) — max |Δ| = {e}\n", .{ layer_idx, @tagName(layer.layer_type), max_abs });
-}
-
-fn runConfig(allocator: std.mem.Allocator, dir_path: []const u8) !void {
-    // Parse `config.json` only — no safetensors loader. Useful for
-    // validating new architectures' config plumbing in isolation before
-    // wiring up the rest of the loader.
-    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
-    defer allocator.free(cfg_path);
-    const cfg = try config_mod.Config.loadFromFile(allocator, cfg_path);
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("Parsed {s}\n\n", .{cfg_path});
-    try cfg.print(stdout);
-    try stdout.print("\n[in_proj_qkv conv dim] {d}\n", .{cfg.linearAttnConvDim()});
-    if (cfg.family.isHybrid()) {
-        try stdout.print("[layer_types[0..8]]    ", .{});
-        const n = @min(cfg.num_hidden_layers, 8);
-        for (cfg.layer_types[0..n]) |t| try stdout.print("{s} ", .{@tagName(t)});
-        try stdout.print("\n", .{});
-    }
-}
-
-fn runLoad(allocator: std.mem.Allocator, dir_path: []const u8) !void {
-    const t0 = std.time.nanoTimestamp();
-    var model = try model_mod.Model.load(allocator, dir_path);
-    defer model.deinit();
-    const t1 = std.time.nanoTimestamp();
-    const load_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("Loaded {s}\n", .{dir_path});
-    try stdout.print("Load time: {d:.2} ms ({d} shard(s), {d} tensors)\n\n", .{
-        load_ms, model.shards.shards.len, model.shards.count(),
-    });
-    try model.config.print(stdout);
-    try stdout.print("\nLM head: {s}\n", .{
-        if (model.isLmHeadTied()) "tied (shares embed_tokens)" else "separate (lm_head.weight)",
-    });
-
-    // Sanity: walk every layer once and confirm we can read the first
-    // and last byte of each weight from the mmap. If a shard's offset
-    // table is wrong, that page-faults; if it's right, this is free.
-    // For hybrid models the per-layer fields differ between full and
-    // linear-attention blocks — touch whichever is present.
-    var bytes_touched: usize = 0;
-    for (model.layers) |layer| {
-        // FFN trio + the two LayerNorms are always present.
-        inline for (.{
-            "input_layernorm",          "post_attention_layernorm",
-            "gate_proj",                "up_proj",                  "down_proj",
-        }) |fname| {
-            const t = @field(layer, fname);
-            if (t.bytes.len > 0) {
-                bytes_touched +%= @intCast(t.bytes[0]);
-                bytes_touched +%= @intCast(t.bytes[t.bytes.len - 1]);
-            }
-        }
-        // Optional per-flavor tensors. `inline for` on a tuple of field
-        // names lets us walk them uniformly, dereference the optional,
-        // and skip nulls.
-        inline for (.{
-            "q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm",
-            "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
-            "conv1d_weight", "A_log", "dt_bias", "ssm_norm_weight", "out_proj",
-        }) |fname| {
-            if (@field(layer, fname)) |t| {
-                if (t.bytes.len > 0) {
-                    bytes_touched +%= @intCast(t.bytes[0]);
-                    bytes_touched +%= @intCast(t.bytes[t.bytes.len - 1]);
-                }
-            }
-        }
-    }
-    bytes_touched +%= @intCast(model.embed_tokens.bytes[0]);
-    bytes_touched +%= @intCast(model.final_norm.bytes[0]);
-    bytes_touched +%= @intCast(model.lm_head.bytes[0]);
-    // The xor folds the first/last byte of every weight into one word —
-    // a cheap way to force the OS to actually touch each tensor page.
-    // Print it so the optimizer can't elide the loop.
-    try stdout.print("\nPASS load (touch checksum: 0x{x})\n", .{bytes_touched});
-}
-
-// ── dump-embed: pull a token's row from embed_tokens, bf16 → fp32 ────
-
-fn runDumpEmbed(allocator: std.mem.Allocator, dir_path: []const u8, token_id: u32) !void {
-    var model = try model_mod.Model.load(allocator, dir_path);
-    defer model.deinit();
-
-    const cfg = model.config;
-    if (token_id >= cfg.vocab_size) {
-        std.debug.print("token id {d} out of range (vocab_size={d})\n", .{ token_id, cfg.vocab_size });
-        return error.OutOfRange;
-    }
-
-    if (model.embed_tokens.dtype != .bf16) {
-        std.debug.print("expected bf16 embed_tokens; got {s}\n", .{@tagName(model.embed_tokens.dtype)});
-        return error.UnexpectedDtype;
-    }
-
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("token {d}, hidden_size={d} — first values + stats\n", .{ token_id, cfg.hidden_size });
-
-    // Slice the row for this token. embed_tokens is [vocab_size, hidden_size]
-    // row-major, so row `token_id` starts at `token_id * hidden_size *
-    // bytes_per_elem` from the tensor's byte base.
-    const elem_bytes = model.embed_tokens.dtype.elemSize();
-    const row_bytes = cfg.hidden_size * elem_bytes;
-    const row_start = @as(usize, token_id) * row_bytes;
-    const row_bf16 = dtype.asU16(model.embed_tokens.bytes[row_start .. row_start + row_bytes]);
-
-    // Convert into a heap-allocated fp32 buffer.
-    const row_f32 = try allocator.alloc(f32, cfg.hidden_size);
-    defer allocator.free(row_f32);
-    dtype.bf16SliceToF32(row_bf16, row_f32);
-
-    // First N for inspection.
-    const n_show: usize = @min(16, row_f32.len);
-    for (row_f32[0..n_show], 0..) |v, i| try stdout.print("  [{d:>4}] {d:.6}\n", .{ i, v });
-
-    // Stats over the whole row.
-    var min_v: f32 = std.math.inf(f32);
-    var max_v: f32 = -std.math.inf(f32);
-    var sum: f64 = 0;
-    var nan_count: usize = 0;
-    var inf_count: usize = 0;
-    for (row_f32) |v| {
-        if (std.math.isNan(v)) {
-            nan_count += 1;
-            continue;
-        }
-        if (std.math.isInf(v)) {
-            inf_count += 1;
-            continue;
-        }
-        if (v < min_v) min_v = v;
-        if (v > max_v) max_v = v;
-        sum += v;
-    }
-    const mean = sum / @as(f64, @floatFromInt(row_f32.len - nan_count - inf_count));
-    try stdout.print("\nstats: min={d:.6} max={d:.6} mean={d:.6} nan={d} inf={d}\n", .{
-        min_v, max_v, mean, nan_count, inf_count,
-    });
 }
 
 // ── matmul smoke: synthetic A·B^T, hand-checked oracle ──────────────
@@ -12965,189 +12696,6 @@ fn runRunnerSmoke(
     if (threaded) runner.shutdown();
 }
 
-// ── serve: OpenAI-compatible HTTP endpoint ─────────────────────────
-
-const server_mod = @import("server/server.zig");
-
-fn runServe(
-    gpa: std.mem.Allocator,
-    model_arg: []const u8,
-    public_id: []const u8,
-    bind_addr: []const u8,
-    port: u16,
-    max_new: u32,
-    precision: gpu_model.Precision,
-) !void {
-    const stdout = std.io.getStdOut().writer();
-    var ctx = try vk.Context.init(gpa);
-    defer ctx.deinit();
-
-    try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    try stdout.print("loading model {s}...\n", .{model_arg});
-
-    const t0 = std.time.nanoTimestamp();
-    var loaded = try loader.loadGpuModel(gpa, &ctx, model_arg, .{ .precision = precision });
-    defer loaded.deinit(ctx.device);
-    const t1 = std.time.nanoTimestamp();
-    const cfg = loaded.config();
-    try stdout.print(
-        "loaded in {d:.1} s — family={s} layers={d} hybrid={}\n",
-        .{ @as(f64, @floatFromInt(t1 - t0)) / 1e9, @tagName(cfg.family), cfg.num_hidden_layers, cfg.family.isHybrid() },
-    );
-
-    var sess = try session_mod.Session.init(gpa, &ctx, &loaded.gpu_model, &loaded.tokenizer, .{
-        .max_pos = 4096,
-    });
-    defer sess.deinit();
-
-    // Recorder sized for serve's likely usage: pure-µs budget mode
-    // (default for runner) + worst-case big-model layer counts. The
-    // runner default is `.either{layers=8, µs=5000}` so the layer
-    // cap keeps us inside 4096 sets / 16384 descriptors.
-    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
-    defer rec.deinit();
-
-    var runner = try inference_runner.InferenceRunner.initBorrow(gpa, &sess, &rec, .{
-        .default_max_tokens = max_new,
-    });
-    defer runner.deinit();
-    try runner.start();
-
-    var srv = try server_mod.Server.init(gpa, &runner, .{
-        .bind_address = bind_addr,
-        .port = port,
-        .model_id = public_id,
-        .default_max_tokens = max_new,
-    });
-    defer srv.deinit();
-    try srv.start();
-
-    try stdout.print(
-        "server ready: POST http://{s}:{d}/v1/chat/completions  •  GET /v1/models\n" ++
-            "model id (validate against request.model): {s}\n" ++
-            "Ctrl-C to stop.\n",
-        .{ bind_addr, port, public_id },
-    );
-
-    // Park forever — Ctrl-C kills the process. We don't install a
-    // signal handler; the OS reaping is fine for v0.
-    while (true) {
-        std.time.sleep(std.time.ns_per_s);
-    }
-}
-
-// ── bench: cold / warm forward timing on Gemma 2B IT ───────────────
-
-fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void {
-    var cpu = try model_mod.Model.load(gpa, dir_path);
-    defer cpu.deinit();
-    const cfg = cpu.config;
-
-    var ctx = try vk.Context.init(gpa);
-    defer ctx.deinit();
-
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    try stdout.print("model: {s}    layers={d}  hidden={d}  vocab={d}\n", .{
-        @tagName(cfg.family), cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size,
-    });
-
-    const t_up0 = std.time.nanoTimestamp();
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, .bf16_matmul);
-    defer gm.deinit(ctx.device);
-    const t_up1 = std.time.nanoTimestamp();
-    const upload_ms = @as(f64, @floatFromInt(t_up1 - t_up0)) / 1_000_000.0;
-    try stdout.print("upload (bf16 matmul): {d:.0} ms\n\n", .{upload_ms});
-
-    const max_pos: usize = @max(n_steps + 16, 128);
-    var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, max_pos);
-    defer sc.deinit(ctx.device);
-    var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
-    defer kv.deinit(ctx.device);
-
-    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
-    defer k.deinit();
-
-    var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
-    defer rec.deinit();
-
-    const logits = try gpa.alloc(f32, cfg.vocab_size);
-    defer gpa.free(logits);
-
-    const bos = tok_bos: {
-        // Use BOS token id from config when set; otherwise fall back to 2
-        // (Gemma's bos id) so the bench works without a tokenizer load.
-        if (cfg.bos_token_id) |b| break :tok_bos b;
-        break :tok_bos 2;
-    };
-
-    // Time each forward, advancing position each step. Position 0 uses
-    // bos; subsequent steps feed back the argmax (a real autoregressive
-    // greedy run, not a microbenchmark on a fixed input).
-    const samples = try gpa.alloc(f64, n_steps);
-    defer gpa.free(samples);
-    var current: u32 = bos;
-
-    for (0..n_steps) |step| {
-        if (step > 0) try rec.reset();
-        try rec.begin();
-        try recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, step, current, null, true);
-        const t0 = std.time.nanoTimestamp();
-        try rec.endAndSubmit();
-        const t1 = std.time.nanoTimestamp();
-        samples[step] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-
-        try sc.logits.readBack(&ctx, f32, logits);
-        current = @intCast(cpu_forward.argmax(logits));
-    }
-
-    // Stats. The first sample is the cold one (pipeline compile + cold
-    // caches). Steady-state stats use samples[1..].
-    const cold = samples[0];
-    var warm_sum: f64 = 0;
-    var warm_min: f64 = std.math.inf(f64);
-    var warm_max: f64 = 0;
-    for (samples[1..]) |s| {
-        warm_sum += s;
-        if (s < warm_min) warm_min = s;
-        if (s > warm_max) warm_max = s;
-    }
-    const warm_mean = warm_sum / @as(f64, @floatFromInt(samples.len - 1));
-
-    // p50 and p99 via a sorted copy (cheap at n_steps ≤ a few hundred).
-    const sorted = try gpa.alloc(f64, samples.len - 1);
-    defer gpa.free(sorted);
-    @memcpy(sorted, samples[1..]);
-    std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
-    const p50 = sorted[sorted.len / 2];
-    const p99_idx: usize = @min(sorted.len - 1, (sorted.len * 99) / 100);
-    const p99 = sorted[p99_idx];
-
-    try stdout.print("forwards: {d} steps (positions 0..{d})\n", .{ n_steps, n_steps - 1 });
-    try stdout.print("  cold (step 0)   : {d:.2} ms\n", .{cold});
-    try stdout.print("  warm mean       : {d:.2} ms\n", .{warm_mean});
-    try stdout.print("  warm median     : {d:.2} ms\n", .{p50});
-    try stdout.print("  warm min/max    : {d:.2} / {d:.2} ms\n", .{ warm_min, warm_max });
-    try stdout.print("  warm p99        : {d:.2} ms\n", .{p99});
-    try stdout.print("  throughput      : {d:.1} tok/s (warm mean)\n", .{1000.0 / warm_mean});
-
-    // Position-dependent cost: attention scoring grows linearly with
-    // n_pos. Print early-vs-late timings to make it visible.
-    if (n_steps >= 32) {
-        var early: f64 = 0;
-        for (samples[1..16]) |s| early += s;
-        var late: f64 = 0;
-        const start = samples.len - 16;
-        for (samples[start..]) |s| late += s;
-        try stdout.print("\n  pos-dependent cost (15-step rolling means):\n", .{});
-        try stdout.print("    early (pos 1..15)         : {d:.2} ms/tok\n", .{early / 15.0});
-        try stdout.print("    late  (pos {d}..{d}) : {d:.2} ms/tok\n", .{
-            start, n_steps - 1, late / 16.0,
-        });
-    }
-}
-
-
 // ── chat: prompt prefill + generation, single-turn or REPL ─────────
 
 fn runChat(
@@ -13713,47 +13261,6 @@ fn hexDigit(c: u8) ?u8 {
         'A'...'F' => c - 'A' + 10,
         else => null,
     };
-}
-
-// ── encode: BPE round-trip smoke ───────────────────────────────────
-
-fn runEncode(gpa: std.mem.Allocator, dir_path: []const u8, text: []const u8) !void {
-    const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{dir_path});
-    defer gpa.free(tok_path);
-
-    const t0 = std.time.nanoTimestamp();
-    var tok = try tokenizer_mod.Tokenizer.loadFromFile(gpa, tok_path);
-    defer tok.deinit();
-    const t1 = std.time.nanoTimestamp();
-    const load_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("tokenizer load: {d:.0} ms ({d} ids, {d} merges)\n\n", .{
-        load_ms, tok.vocabSize(), tok.merges.count(),
-    });
-    try stdout.print("input: {s}\n\n", .{text});
-
-    const t2 = std.time.nanoTimestamp();
-    const ids = try tok.encode(gpa, text);
-    defer gpa.free(ids);
-    const t3 = std.time.nanoTimestamp();
-    const enc_ms = @as(f64, @floatFromInt(t3 - t2)) / 1_000_000.0;
-
-    try stdout.print("{d} tokens, encode {d:.2} ms:\n", .{ ids.len, enc_ms });
-    for (ids) |id| {
-        const s = tok.decode(id) orelse "<unknown>";
-        try stdout.print("  id={d:>6}  {s}\n", .{ id, s });
-    }
-
-    // Reconstruct: concat decoded strings (no normalization reversal
-    // here — we just print what each id yields on decode). This is a
-    // sanity check that the encoded stream is sensible, not a true
-    // round-trip (true round-trip would also undo the ▁→' ' decoder).
-    try stdout.print("\nconcat of decoded ids: \"", .{});
-    for (ids) |id| {
-        if (tok.decode(id)) |s| try stdout.print("{s}", .{s});
-    }
-    try stdout.print("\"\n", .{});
 }
 
 // ── Forward-step helper used by both gen-many and chat ─────────────
