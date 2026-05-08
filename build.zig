@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
     const cce_backward_dw_spv = compileShader(b, "cce_backward_dw");
     const qk_rope_partial_batched_spv = compileShader(b, "qk_rope_partial_batched");
     const qk_rope_backward_batched_spv = compileShader(b, "qk_rope_backward_batched");
+    const fa_forward_spv = compileShader(b, "fa_forward");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -179,6 +180,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(cce_backward_dw_spv, "cce_backward_dw.spv");
     _ = wf.addCopyFile(qk_rope_partial_batched_spv, "qk_rope_partial_batched.spv");
     _ = wf.addCopyFile(qk_rope_backward_batched_spv, "qk_rope_backward_batched.spv");
+    _ = wf.addCopyFile(fa_forward_spv, "fa_forward.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -262,6 +264,7 @@ pub fn build(b: *std.Build) void {
         \\pub const cce_backward_dw align(4) = @embedFile("cce_backward_dw.spv").*;
         \\pub const qk_rope_partial_batched align(4) = @embedFile("qk_rope_partial_batched.spv").*;
         \\pub const qk_rope_backward_batched align(4) = @embedFile("qk_rope_backward_batched.spv").*;
+        \\pub const fa_forward align(4) = @embedFile("fa_forward.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──

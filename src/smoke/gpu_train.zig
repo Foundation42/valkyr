@@ -15,6 +15,7 @@ const cpu_math = @import("../cpu/math.zig");
 const cpu_train_transformer = @import("../cpu/train_transformer.zig");
 const cpu_cce = @import("../cpu/cce.zig");
 const cpu_lora = @import("../cpu/lora.zig");
+const cpu_flash_attn = @import("../cpu/flash_attn.zig");
 const train_lora = @import("../train/lora.zig");
 const train_transformer = @import("../train/transformer.zig");
 const config_mod = @import("../config.zig");
@@ -2181,6 +2182,183 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
             "  ×28 layers = total/L extrapolated to Qwen3-0.6B's full attention stack.\n" ++
             "  These are the totals FlashAttention has to beat at the same shapes.\n",
         .{},
+    );
+}
+
+// ── F3: FlashAttention forward GPU parity vs CPU oracle ───────────────
+//
+// Drives `shaders/fa_forward.comp` against
+// `cpu/flash_attn.zig:flashAttentionForward` on the same 5 shape
+// cases the F2 CPU smoke gates: decode + prefill-causal + GQA +
+// non-aligned blocks + Qwen3-0.6B per-layer dims. Tolerance 1e-4
+// rel-err — both paths compute online softmax in fp32, but the
+// reduction order on the GPU (subgroup-cooperative dot product +
+// row reductions) differs from the CPU's serial accumulation.
+//
+// One workgroup per (q, h) — gx = n_q × n_heads. Two SSBO bindings
+// per (Q, K, V, O, LSE) slot; `write_lse=0` still binds the LSE
+// buffer (Vulkan needs the descriptor populated) but the kernel
+// writes nothing into it.
+
+pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const FaCase = struct {
+        name: []const u8,
+        n_q: u32,
+        n_kv: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        causal: bool,
+        check_lse: bool,
+    };
+    const cases = [_]FaCase{
+        .{ .name = "decode-tiny       (n_q=1 n_kv=8 GQA 4:2 d=16)", .n_q = 1, .n_kv = 8, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = false, .check_lse = false },
+        .{ .name = "decode-medium     (n_q=1 n_kv=128 GQA 4:2 d=32)", .n_q = 1, .n_kv = 128, .n_heads = 4, .n_kv_heads = 2, .head_dim = 32, .causal = false, .check_lse = false },
+        .{ .name = "prefill-causal    (n_q=4 n_kv=4 GQA 4:2 d=16)", .n_q = 4, .n_kv = 4, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = true },
+        .{ .name = "prefill-qwen3     (n_q=16 n_kv=16 GQA 16:8 d=128)", .n_q = 16, .n_kv = 16, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true, .check_lse = false },
+        .{ .name = "non-aligned-kv    (n_q=10 n_kv=37 GQA 4:2 d=16)", .n_q = 10, .n_kv = 37, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = false },
+    };
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
+    defer kern.deinit();
+
+    var max_rel_seen: f32 = 0.0;
+    var max_lse_rel_seen: f32 = 0.0;
+
+    for (cases) |cs| {
+        const heads_per_kv = cs.n_heads / cs.n_kv_heads;
+        const q_elems = cs.n_q * cs.n_heads * cs.head_dim;
+        const kv_elems = cs.n_kv * cs.n_kv_heads * cs.head_dim;
+        const out_elems = q_elems;
+        const lse_elems = cs.n_q * cs.n_heads;
+
+        const Q = try allocator.alloc(f32, q_elems);
+        defer allocator.free(Q);
+        const K = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(K);
+        const V = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(V);
+        const out_ref = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_ref);
+        const lse_ref = try allocator.alloc(f32, lse_elems);
+        defer allocator.free(lse_ref);
+        const out_gpu = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_gpu);
+        const lse_gpu = try allocator.alloc(f32, lse_elems);
+        defer allocator.free(lse_gpu);
+
+        // CPU oracle scratch (Br = 1 — caller-allocated tile state).
+        const Br: usize = 1;
+        const Bc: usize = 16; // matches the shader's compile-time BC.
+        const s_tile = try allocator.alloc(f32, Br * Bc);
+        defer allocator.free(s_tile);
+        const p_tile = try allocator.alloc(f32, Br * Bc);
+        defer allocator.free(p_tile);
+        const o_acc = try allocator.alloc(f32, Br * cs.head_dim);
+        defer allocator.free(o_acc);
+        const m_acc = try allocator.alloc(f32, Br);
+        defer allocator.free(m_acc);
+        const l_acc = try allocator.alloc(f32, Br);
+        defer allocator.free(l_acc);
+
+        var prng = std.Random.DefaultPrng.init(0xFA_60_F0);
+        const rng = prng.random();
+        for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (V) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+        cpu_flash_attn.flashAttentionForward(
+            Q, K, V, cs.n_q, cs.n_kv, cs.n_heads, cs.n_kv_heads, cs.head_dim,
+            cs.causal, Br, Bc,
+            out_ref, lse_ref,
+            s_tile, p_tile, o_acc, m_acc, l_acc,
+        );
+
+        // GPU dispatch.
+        var buf_q = try buffer.Buffer.initStatic(&ctx, f32, Q);
+        defer buf_q.deinit(ctx.device);
+        var buf_k = try buffer.Buffer.initStatic(&ctx, f32, K);
+        defer buf_k.deinit(ctx.device);
+        var buf_v = try buffer.Buffer.initStatic(&ctx, f32, V);
+        defer buf_v.deinit(ctx.device);
+        var buf_o = try buffer.Buffer.initDeviceOnly(&ctx, out_elems * @sizeOf(f32));
+        defer buf_o.deinit(ctx.device);
+        var buf_lse = try buffer.Buffer.initDeviceOnly(&ctx, lse_elems * @sizeOf(f32));
+        defer buf_lse.deinit(ctx.device);
+
+        try kern.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o, &buf_lse });
+
+        const push = runtime.FaForwardPush{
+            .n_q = cs.n_q,
+            .n_heads = cs.n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cs.head_dim,
+            .n_kv = cs.n_kv,
+            .kv_stride = cs.n_kv_heads * cs.head_dim,
+            .causal = if (cs.causal) 1 else 0,
+            .write_lse = if (cs.check_lse) 1 else 0,
+            .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.head_dim))),
+        };
+        const gx: u32 = cs.n_q * cs.n_heads;
+
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaForwardPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &kern, .push = &push, .gx = gx });
+
+        try buf_o.readBack(&ctx, f32, out_gpu);
+        if (cs.check_lse) try buf_lse.readBack(&ctx, f32, lse_gpu);
+
+        // Output parity.
+        var max_abs: f32 = 0;
+        var max_ref: f32 = 0;
+        for (out_ref, out_gpu) |r, g| {
+            const d = @abs(r - g);
+            if (d > max_abs) max_abs = d;
+            if (@abs(r) > max_ref) max_ref = @abs(r);
+        }
+        const rel = if (max_ref > 0) max_abs / max_ref else max_abs;
+        if (rel > 1e-4) {
+            std.debug.print(
+                "FA GPU parity FAIL ({s}): max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+                .{ cs.name, max_abs, max_ref, rel },
+            );
+            return error.ParityFailed;
+        }
+        if (rel > max_rel_seen) max_rel_seen = rel;
+
+        // LSE parity (only on cases that exercised it).
+        if (cs.check_lse) {
+            var lse_max_abs: f32 = 0;
+            var lse_max_ref: f32 = 0;
+            for (lse_ref, lse_gpu) |r, g| {
+                if (std.math.isInf(r) and std.math.isInf(g)) continue;
+                const d = @abs(r - g);
+                if (d > lse_max_abs) lse_max_abs = d;
+                if (@abs(r) > lse_max_ref) lse_max_ref = @abs(r);
+            }
+            const lse_rel = if (lse_max_ref > 0) lse_max_abs / lse_max_ref else lse_max_abs;
+            if (lse_rel > 1e-4) {
+                std.debug.print(
+                    "FA GPU lse FAIL ({s}): max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+                    .{ cs.name, lse_max_abs, lse_max_ref, lse_rel },
+                );
+                return error.ParityFailed;
+            }
+            if (lse_rel > max_lse_rel_seen) max_lse_rel_seen = lse_rel;
+        }
+    }
+
+    std.debug.print(
+        "PASS GPU fa_forward parity ({d} cases incl. GQA + causal + non-aligned, max rel={e:.2}, lse rel={e:.2}) on {s}\n",
+        .{ cases.len, max_rel_seen, max_lse_rel_seen, ctx.deviceName() },
     );
 }
 

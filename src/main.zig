@@ -123,6 +123,16 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-forward-smoke")) {
+        // F3 of the FlashAttention arc: GPU SPIR-V kernel parity vs
+        // the F2 CPU oracle. Drives `shaders/fa_forward.comp` (one
+        // workgroup per (q, h), tile-on-K with online softmax in
+        // shared mem) on the same 5 shape cases as F2; tolerance
+        // 1e-4 rel-err (reduction-order divergence between cooperative
+        // subgroup ops and serial CPU accumulation).
+        try smoke_gpu_train.runFlashAttentionGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-sampling-smoke")) {
         // β-6c sampled-text-shift validation. Greedy-samples N tokens
         // from a probe prompt before and after fine-tuning on a single
@@ -916,6 +926,7 @@ pub fn main() !void {
     try smoke_cpu.runRmsNormBackwardCpuSmoke(allocator);
     try smoke_cpu.runLoraMergeMathSmoke(allocator);
     try smoke_cpu.runFlashAttentionParitySmoke(allocator);
+    try smoke_gpu_train.runFlashAttentionGpuSmoke(allocator);
     try smoke_gpu_train.runLayerNormBackwardCpuSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulSmoke(allocator);
     try smoke_training.runGpuMlpForwardSmoke(allocator);

@@ -1,0 +1,212 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_vote       : require
+
+// FlashAttention forward (Dao et al. 2022, Algorithm 1; FA-2-style
+// outer-Q loop). One workgroup per (q, h) pair. Streams K/V tiles of
+// `BC` keys through shared memory while maintaining running rowmax
+// (m), rowsum (l), and accumulated output (O) per query — never
+// materialises [n_q × n_heads × n_kv] scores or attn buffers.
+//
+// Mathematical identity (matches cpu/flash_attn.zig:flashAttentionForward):
+//
+//     m_new = max(m_old, rowmax(S_tile))
+//     P_tile = exp(S_tile - m_new)
+//     scale_old = exp(m_old - m_new)               (or 0 when m_old = -inf)
+//     l_new = scale_old · l_old + rowsum(P_tile)
+//     O_new = scale_old · O_old + P_tile · V_tile
+//     out = O_final / l_final
+//
+// Compile-time tile + dim caps (driver-portable, conservative):
+//     BC          = 16          keys per K/V tile
+//     HEAD_DIM    = 128         max supported head_dim
+//
+// Shared memory: ~25 KB at HEAD_DIM=128 (K_tile + V_tile dominate).
+// That fits AMD RDNA's 32 KB/WG ceiling and NVIDIA Ampere's 48 KB
+// default. Larger head_dim or BC needs a separate shader variant.
+//
+// Causal mask: when `causal != 0`, masked keys (k > q + n_kv − n_q)
+// receive −inf so the online softmax produces 0 there. Matches the
+// CPU oracle in cpu/flash_attn.zig.
+//
+// Optional LSE output: when `write_lse != 0`, writes
+// `lse[q, h] = m_final + log(l_final)` for each (q, h) — the
+// quantity FlashAttention backward needs to recompute the softmax
+// without saving the full attn matrix.
+
+layout(local_size_x = 256) in;
+
+#define BC            16u
+#define HEAD_DIM_MAX  128u
+
+layout(set = 0, binding = 0, std430) readonly  buffer Q   { float q_buf[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer K   { float k_buf[];   };
+layout(set = 0, binding = 2, std430) readonly  buffer V   { float v_buf[];   };
+layout(set = 0, binding = 3, std430) writeonly buffer O   { float o_buf[];   };
+layout(set = 0, binding = 4, std430) writeonly buffer LSE { float lse_buf[]; };
+
+layout(push_constant) uniform Pc {
+    uint  n_q;
+    uint  n_heads;
+    uint  heads_per_kv;
+    uint  head_dim;
+    uint  n_kv;
+    uint  kv_stride;       // n_kv_heads * head_dim
+    uint  causal;
+    uint  write_lse;
+    float inv_sqrt_dim;
+} pc;
+
+shared float Q_row [HEAD_DIM_MAX];
+shared float O_state[HEAD_DIM_MAX];
+shared float K_tile[BC * HEAD_DIM_MAX];
+shared float V_tile[BC * HEAD_DIM_MAX];
+shared float S_row [BC];
+shared float P_row [BC];
+shared float sg_partials[32];
+
+shared float m_state;
+shared float l_state;
+shared float m_tile_shared;
+shared float l_tile_shared;
+
+void main() {
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+
+    uint cell = gl_WorkGroupID.x;
+    uint h = cell / pc.n_q;
+    uint q = cell - h * pc.n_q;
+    if (h >= pc.n_heads) return;
+
+    uint kv_h = h / pc.heads_per_kv;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd  = pc.head_dim;
+
+    // ── Load Q row + init online-softmax state.
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        Q_row[d]   = q_buf[q * pc.n_heads * hd + h * hd + d];
+        O_state[d] = 0.0;
+    }
+    if (tid == 0u) {
+        m_state = NEG_INF;
+        l_state = 0.0;
+    }
+    barrier();
+
+    // Causal key cutoff (inclusive). For non-causal we just use n_kv − 1.
+    int k_limit = (pc.causal != 0u)
+        ? int(q) + int(pc.n_kv) - int(pc.n_q)
+        : int(pc.n_kv) - 1;
+
+    for (uint k_block_start = 0u; k_block_start < pc.n_kv; k_block_start += BC) {
+        uint k_block_len = min(BC, pc.n_kv - k_block_start);
+
+        // ── Cooperatively load K_tile and V_tile.
+        uint kv_total = k_block_len * hd;
+        for (uint i = tid; i < kv_total; i += gl_WorkGroupSize.x) {
+            uint kj = i / hd;
+            uint d  = i - kj * hd;
+            uint kv_off = (k_block_start + kj) * pc.kv_stride + kv_h * hd + d;
+            K_tile[kj * hd + d] = k_buf[kv_off];
+            V_tile[kj * hd + d] = v_buf[kv_off];
+        }
+        barrier();
+
+        // ── Compute S_row[kj] = inv_sqrt_d · Σ_d Q_row[d] · K_tile[kj, d].
+        // Each subgroup of 32 threads handles one (kj) cell via dot product
+        // + subgroup reduction; gl_NumSubgroups subgroups in flight per round.
+        uint sg       = gl_SubgroupID;
+        uint sg_count = gl_NumSubgroups;
+        uint rounds   = (k_block_len + sg_count - 1u) / sg_count;
+        for (uint r = 0u; r < rounds; r += 1u) {
+            uint kj = r * sg_count + sg;
+            // All threads in this subgroup take the same branch (kj is
+            // sg-uniform), so subgroupAdd has uniform participation.
+            if (kj < k_block_len) {
+                float partial = 0.0;
+                for (uint d = gl_SubgroupInvocationID; d < hd; d += gl_SubgroupSize) {
+                    partial += Q_row[d] * K_tile[kj * hd + d];
+                }
+                float total = subgroupAdd(partial);
+                if (subgroupElect()) {
+                    int  k_abs  = int(k_block_start + kj);
+                    bool masked = (pc.causal != 0u) && (k_abs > k_limit);
+                    S_row[kj] = masked ? NEG_INF : total * pc.inv_sqrt_dim;
+                }
+            }
+        }
+        barrier();
+
+        // ── Cooperative rowmax of S_row[0..k_block_len].
+        float local_max = NEG_INF;
+        for (uint kj = tid; kj < k_block_len; kj += gl_WorkGroupSize.x) {
+            local_max = max(local_max, S_row[kj]);
+        }
+        float sg_max = subgroupMax(local_max);
+        if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_max;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? sg_partials[gl_SubgroupInvocationID]
+                        : NEG_INF;
+            float total = subgroupMax(v);
+            if (subgroupElect()) m_tile_shared = total;
+        }
+        barrier();
+
+        float m_old = m_state;
+        float m_new = max(m_old, m_tile_shared);
+
+        // ── Compute P_row[kj] = exp(S_row[kj] − m_new); cooperative rowsum.
+        float local_sum = 0.0;
+        for (uint kj = tid; kj < k_block_len; kj += gl_WorkGroupSize.x) {
+            float s = S_row[kj];
+            float p = (s == NEG_INF) ? 0.0 : exp(s - m_new);
+            P_row[kj] = p;
+            local_sum += p;
+        }
+        float sg_sum = subgroupAdd(local_sum);
+        if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? sg_partials[gl_SubgroupInvocationID]
+                        : 0.0;
+            float total = subgroupAdd(v);
+            if (subgroupElect()) l_tile_shared = total;
+        }
+        barrier();
+
+        float scale_old = (m_old == NEG_INF) ? 0.0 : exp(m_old - m_new);
+        float l_tile    = l_tile_shared;
+
+        // ── Update O: O = scale_old · O + Σ_kj P_row[kj] · V_tile[kj, :].
+        for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+            float o = O_state[d] * scale_old;
+            for (uint kj = 0u; kj < k_block_len; kj += 1u) {
+                o += P_row[kj] * V_tile[kj * hd + d];
+            }
+            O_state[d] = o;
+        }
+
+        // Single thread updates the running scalars; the barrier below
+        // sync's everyone for the next iteration's S_row writes.
+        if (tid == 0u) {
+            m_state = m_new;
+            l_state = scale_old * l_state + l_tile;
+        }
+        barrier();
+    }
+
+    // ── Final normalise + write out. Last barrier already sync'd O_state.
+    float inv_l = (l_state > 0.0) ? 1.0 / l_state : 0.0;
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        o_buf[q * pc.n_heads * hd + h * hd + d] = O_state[d] * inv_l;
+    }
+    if (pc.write_lse != 0u && tid == 0u) {
+        lse_buf[q * pc.n_heads + h] = (l_state > 0.0)
+            ? m_state + log(l_state)
+            : NEG_INF;
+    }
+}

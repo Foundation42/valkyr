@@ -250,6 +250,31 @@ pub const AttnOutputTrainPush = extern struct {
     attn_stride: u32,
 };
 
+/// FlashAttention forward (Dao Algorithm 1; FA-2-style outer-Q loop).
+/// One workgroup per (q, h) pair — gx = n_q × n_heads. Subsumes both
+/// decode (n_q=1, no mask) and prefill (n_q ≥ 1, optional causal) by
+/// runtime parameters; no n_q-specific shader variant required.
+///
+/// `write_lse != 0` writes `lse[q, h] = m_final + log(l_final)` into
+/// the LSE binding for FA backward to recompute softmax later. When
+/// `write_lse == 0`, the LSE binding is unused but must still resolve
+/// (callers can bind the same buffer as Q to keep descriptors happy).
+///
+/// Compile-time caps in `shaders/fa_forward.comp`: BC=16 keys per
+/// tile, HEAD_DIM ≤ 128. Larger head_dim or BC needs a separate
+/// shader variant.
+pub const FaForwardPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_kv: u32,
+    kv_stride: u32,
+    causal: u32,
+    write_lse: u32,
+    inv_sqrt_dim: f32,
+};
+
 pub const Mlp2ForwardBatchedPush = extern struct {
     dim_in: u32,
     dim_hidden: u32,
