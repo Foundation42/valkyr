@@ -28,9 +28,19 @@ The two big arcs:
      deployments.
    - **Symmetric K=TQ / V=TQ** (with care — the softmax variance story
      means K-side needs eyes on PPL, not just argmax).
-   - **Fused FlashAttention-style kernel** that consumes packed TQ4 K
-     and V in the inner loop, where the bandwidth savings actually pay
-     for themselves at long context.
+   - **Fused FlashAttention-style kernel.** **Forward shipped 2026-05-08
+     across the F1-F5b arc.** `shaders/fa_forward.comp` (single fused
+     kernel, BC=16, HEAD_DIM ≤ 128) wired into `Runner.forwardLogits`
+     for **4-4.8× prefill speedup**; `shaders/fa_decode_split.comp` +
+     `fa_decode_merge.comp` (Tri Dao FlashDecoding split-K) wired into
+     `runtime.recordOneLayer` for chat decode at **7× speedup at
+     ctx=32768** (per-layer attention 5.0 ms → 0.7 ms). TQ4-V-cache
+     composes via the existing `dequant_v` buffer; hybrid Qwen3.5
+     (head_dim=256) auto-falls-back to the 3-pass chain. Outstanding:
+     **F6 (FA backward)** for the training-step swap, and a fused
+     kernel that consumes packed TQ4 K/V directly in the inner loop
+     (skipping the `dequant_v` materialisation) for the bandwidth
+     savings to land at long context.
    - **bf16 LM head + bf16 embedding** kernels — currently fp32, the
      LM head matmul is the single biggest dispatch we do.
    - **GPU-side compute quantize.** Q4_K_M upload is currently 4–6×

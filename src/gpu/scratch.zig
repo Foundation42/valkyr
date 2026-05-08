@@ -50,11 +50,35 @@ pub const GpuScratch = struct {
     fused: buffer.Buffer,
     ffn_out: buffer.Buffer,
 
+    /// FlashDecoding phase-1 partials. Sized for the worst-case
+    /// `n_splits` produced by `runtime.chooseFaDecodeSplit(max_pos)`,
+    /// which mirrors the per-step heuristic in `computeForwardPushes`.
+    /// Always allocated (a few MiB at long max_pos); attention falls
+    /// back to the 3-pass chain for head_dim > FA_HEAD_DIM_MAX so
+    /// these go unused there.
+    fa_o_partial: buffer.Buffer,
+    fa_m_partial: buffer.Buffer,
+    fa_l_partial: buffer.Buffer,
+
     pub fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: usize) !GpuScratch {
         const hidden = cfg.hidden_size;
         const inter = cfg.intermediate_size;
         const q_dim = cfg.num_attention_heads * cfg.head_dim;
         const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+
+        // Worst-case n_splits the FlashDecoding heuristic can produce
+        // at any decode step. Mirrors `runtime.chooseFaDecodeSplit`
+        // applied to `max_pos`. Inlined to avoid the gpu/scratch ↔
+        // runtime import cycle.
+        const max_pos_u32: u32 = @intCast(max_pos);
+        const max_n_splits: u32 = if (max_pos_u32 <= 4)
+            1
+        else if (max_pos_u32 < 1024)
+            4
+        else
+            (max_pos_u32 + 255) / 256;
+        const o_partial_elems: usize = cfg.num_attention_heads * @as(usize, max_n_splits) * cfg.head_dim;
+        const ml_partial_elems: usize = cfg.num_attention_heads * @as(usize, max_n_splits);
 
         const f = @sizeOf(f32);
         return .{
@@ -76,6 +100,9 @@ pub const GpuScratch = struct {
             .up             = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
             .fused          = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
             .ffn_out        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .fa_o_partial   = try buffer.Buffer.initDeviceOnly(ctx, o_partial_elems * f),
+            .fa_m_partial   = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),
+            .fa_l_partial   = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),
         };
     }
 
@@ -97,6 +124,9 @@ pub const GpuScratch = struct {
         self.up.deinit(device);
         self.fused.deinit(device);
         self.ffn_out.deinit(device);
+        self.fa_o_partial.deinit(device);
+        self.fa_m_partial.deinit(device);
+        self.fa_l_partial.deinit(device);
     }
 };
 

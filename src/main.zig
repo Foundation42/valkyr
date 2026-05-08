@@ -154,6 +154,17 @@ pub fn main() !void {
         try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-decode-chat-smoke")) {
+        // F5b of the FlashAttention arc: end-to-end parity gate that
+        // the FlashDecoding swap-in inside `recordOneLayer` (chat decode
+        // path) produces the same attention output as the original
+        // 3-pass chain it replaces. Drives both paths off the production
+        // `chooseFaDecodeSplit` heuristic + the same push shapes
+        // `computeForwardPushes` builds, at Qwen3-0.6B per-layer dims
+        // (n_heads=16 GQA 16:8 head_dim=128); 1e-4 rel-err tolerance.
+        try smoke_gpu_train.runFaDecodeChatPathSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-sampling-smoke")) {
         // β-6c sampled-text-shift validation. Greedy-samples N tokens
         // from a probe prompt before and after fine-tuning on a single
@@ -950,6 +961,7 @@ pub fn main() !void {
     try smoke_gpu_train.runFlashAttentionGpuSmoke(allocator);
     try smoke_gpu_train.runFaRunnerSmoke(allocator);
     try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
+    try smoke_gpu_train.runFaDecodeChatPathSmoke(allocator);
     try smoke_gpu_train.runLayerNormBackwardCpuSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulSmoke(allocator);
     try smoke_training.runGpuMlpForwardSmoke(allocator);

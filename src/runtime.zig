@@ -309,6 +309,38 @@ pub const FaDecodeMergePush = extern struct {
     n_splits: u32,
 };
 
+/// Pick (n_splits, split_size) for FlashDecoding given the current
+/// decode `n_kv`. Targets ≥ 4 splits for typical chat lengths so
+/// `n_heads × n_splits` saturates a modern GPU's SM count, and caps
+/// `split_size` at 256 (the shape `runFlashDecodingGpuSmoke` exercises).
+///
+///   n_kv ≤ 4         → 1 split × split_size = max(n_kv, 1)
+///   4  < n_kv < 1024 → 4 splits × ceilDiv(n_kv, 4) (≤ 256)
+///   n_kv ≥ 1024      → split_size = 256, n_splits = ceilDiv(n_kv, 256)
+///
+/// The returned `n_splits × split_size ≥ n_kv` always; the kernel's
+/// per-WG bounds check handles the partial tail when split_size doesn't
+/// divide n_kv. Buffer sizing in `GpuScratch` mirrors this heuristic
+/// applied to `max_pos`.
+pub fn chooseFaDecodeSplit(n_kv: u32) struct { n_splits: u32, split_size: u32 } {
+    if (n_kv <= 4) {
+        return .{ .n_splits = 1, .split_size = if (n_kv == 0) 1 else n_kv };
+    }
+    if (n_kv < 1024) {
+        const split_size: u32 = (n_kv + 3) / 4;
+        return .{ .n_splits = 4, .split_size = split_size };
+    }
+    const split_size: u32 = 256;
+    const n_splits: u32 = (n_kv + split_size - 1) / split_size;
+    return .{ .n_splits = n_splits, .split_size = split_size };
+}
+
+/// Maximum head_dim the FlashAttention / FlashDecoding shaders accept.
+/// Compile-time cap in `shaders/fa_forward.comp`,
+/// `shaders/fa_decode_split.comp`. Larger heads (Qwen3.5 d=256) take
+/// the 3-pass fallback automatically.
+pub const FA_HEAD_DIM_MAX: u32 = 128;
+
 pub const Mlp2ForwardBatchedPush = extern struct {
     dim_in: u32,
     dim_hidden: u32,
@@ -428,6 +460,13 @@ pub const ChatKernels = struct {
     scores: pipeline.Kernel,
     softmax: pipeline.Kernel,
     attn_out: pipeline.Kernel,
+    /// FlashDecoding phase 1 — split-K decode kernel. Replaces the
+    /// `scores → softmax → attn_out` trio when `cfg.head_dim ≤ 128`
+    /// (see `FA_HEAD_DIM_MAX`); falls through to 3-pass otherwise.
+    fa_decode_split: pipeline.Kernel,
+    /// FlashDecoding phase 2 — merge per-split (O, m, l) partials into
+    /// final attention output. Paired with `fa_decode_split`.
+    fa_decode_merge: pipeline.Kernel,
     add: pipeline.Kernel,
     geglu: pipeline.Kernel,
 
@@ -468,6 +507,8 @@ pub const ChatKernels = struct {
             .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
             .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
             .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
+            .fa_decode_split = try pipeline.Kernel.init(ctx, &shaders.fa_decode_split, 6, @sizeOf(FaDecodeSplitPush)),
+            .fa_decode_merge = try pipeline.Kernel.init(ctx, &shaders.fa_decode_merge, 4, @sizeOf(FaDecodeMergePush)),
             .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
             .geglu = try pipeline.Kernel.init(ctx, ffn_spv, 3, @sizeOf(GegluPush)),
         };
@@ -484,6 +525,8 @@ pub const ChatKernels = struct {
         self.scores.deinit();
         self.softmax.deinit();
         self.attn_out.deinit();
+        self.fa_decode_split.deinit();
+        self.fa_decode_merge.deinit();
         self.add.deinit();
         self.geglu.deinit();
     }
@@ -504,6 +547,12 @@ pub const ForwardPushes = struct {
     scores_push: AttnScoresPush,
     softmax_push: SoftmaxPush,
     attn_out_push: AttnOutputPush,
+    /// Set when `cfg.head_dim ≤ FA_HEAD_DIM_MAX`. `recordOneLayer`
+    /// then dispatches the FlashDecoding split + merge pair instead
+    /// of the 3-pass `scores → softmax → attn_out` chain.
+    attn_use_fa: bool,
+    fa_decode_split_push: FaDecodeSplitPush,
+    fa_decode_merge_push: FaDecodeMergePush,
     geglu_push: GegluPush,
     n_pos: u32,
 };
@@ -574,6 +623,28 @@ pub fn computeForwardPushes(
             .n_pos = n_pos,
             .kv_stride = kv_dim,
             .scores_stride = max_pos_u32,
+        },
+        .attn_use_fa = head_dim_u32 <= FA_HEAD_DIM_MAX,
+        .fa_decode_split_push = blk: {
+            const ch = chooseFaDecodeSplit(n_pos);
+            break :blk .{
+                .n_heads = @intCast(cfg.num_attention_heads),
+                .heads_per_kv = heads_per_kv,
+                .head_dim = head_dim_u32,
+                .n_kv = n_pos,
+                .kv_stride = kv_dim,
+                .n_splits = ch.n_splits,
+                .split_size = ch.split_size,
+                .inv_sqrt_dim = inv_sqrt_dim,
+            };
+        },
+        .fa_decode_merge_push = blk: {
+            const ch = chooseFaDecodeSplit(n_pos);
+            break :blk .{
+                .n_heads = @intCast(cfg.num_attention_heads),
+                .head_dim = head_dim_u32,
+                .n_splits = ch.n_splits,
+            };
         },
         .geglu_push = .{ .n = inter },
         .n_pos = n_pos,
@@ -694,16 +765,11 @@ pub fn recordOneLayer(
         try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &p.kv_write_push, kv_dim);
     }
 
-    try rec.dispatch(
-        &k.scores,
-        &.{ &sc.q_rot, &kv_layer.k_cache, &sc.scores },
-        &p.scores_push,
-        @as(u32, @intCast(cfg.num_attention_heads)) * p.n_pos,
-        1,
-        1,
-    );
-    try recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, @intCast(cfg.num_attention_heads));
-
+    // V cache for attention. With `--tq4v` we unpack the whole V cache
+    // into `dequant_v` first; the attention kernel(s) below see the
+    // same fp32 layout `[n_pos, n_kv_heads, head_dim]` either way.
+    // Lifted above the attention dispatch so the FA-decode path can
+    // read it as a single binding.
     const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
         const tq_layer = &t.cache.layers[layer_idx];
         const total_blocks: u32 = p.n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
@@ -711,14 +777,51 @@ pub fn recordOneLayer(
         break :blk &t.cache.dequant_v;
     } else &kv_layer.v_cache;
 
-    try rec.dispatch(
-        &k.attn_out,
-        &.{ &sc.scores, v_for_attn, &sc.head_out },
-        &p.attn_out_push,
-        @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
-        1,
-        1,
-    );
+    if (p.attn_use_fa) {
+        // FlashDecoding (split-K + merge). `head_dim ≤ FA_HEAD_DIM_MAX`
+        // is enforced at `computeForwardPushes` time. Phase 1 emits
+        // unnormalised (O, m, l) partials for each (head, split) pair;
+        // phase 2 combines them into `head_out` with running-max +
+        // rescaled-sum.
+        const split = p.fa_decode_split_push;
+        try rec.dispatch(
+            &k.fa_decode_split,
+            &.{ &sc.q_rot, &kv_layer.k_cache, v_for_attn, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
+            &split,
+            @as(u32, @intCast(cfg.num_attention_heads)) * split.n_splits,
+            1,
+            1,
+        );
+        try rec.dispatch(
+            &k.fa_decode_merge,
+            &.{ &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial, &sc.head_out },
+            &p.fa_decode_merge_push,
+            @as(u32, @intCast(cfg.num_attention_heads)),
+            1,
+            1,
+        );
+    } else {
+        // 3-pass fallback: materialises the [n_heads × n_pos] scores
+        // tensor in HBM. Used when head_dim > FA_HEAD_DIM_MAX
+        // (e.g. Qwen3.5 d=256).
+        try rec.dispatch(
+            &k.scores,
+            &.{ &sc.q_rot, &kv_layer.k_cache, &sc.scores },
+            &p.scores_push,
+            @as(u32, @intCast(cfg.num_attention_heads)) * p.n_pos,
+            1,
+            1,
+        );
+        try recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, @intCast(cfg.num_attention_heads));
+        try rec.dispatch(
+            &k.attn_out,
+            &.{ &sc.scores, v_for_attn, &sc.head_out },
+            &p.attn_out_push,
+            @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
+            1,
+            1,
+        );
+    }
 
     try recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
     try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);

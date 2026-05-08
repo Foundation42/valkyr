@@ -2642,6 +2642,215 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── F5b: chat-decode FA wiring matches the 3-pass chain ───────────────
+//
+// End-to-end gate that the FlashDecoding swap-in inside `recordOneLayer`
+// produces the same attention output as the original 3-pass chain at
+// Qwen3-0.6B per-layer shape. Drives both paths off `chooseFaDecodeSplit`
+// and the same `AttnScoresPush` / `SoftmaxPush` / `AttnOutputPush` /
+// `FaDecodeSplitPush` / `FaDecodeMergePush` shapes the production
+// `computeForwardPushes` builds — so it catches stride / heuristic /
+// dispatch-arity bugs in the wiring, not just kernel correctness
+// (which `runFlashDecodingGpuSmoke` already gates).
+//
+// Cases sweep n_kv ∈ {16, 64, 256, 1024} at Qwen3-0.6B shape
+// (n_heads=16 GQA 16:8 head_dim=128). The first three exercise
+// the heuristic's small-n_kv branches (n_splits=1 or 4); the last
+// crosses into the n_splits = ceilDiv(n_kv, 256) regime.
+pub fn runFaDecodeChatPathSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const Case = struct { name: []const u8, n_kv: u32 };
+    const cases = [_]Case{
+        .{ .name = "n_kv=16   (1 split, sz=16)",   .n_kv = 16 },
+        .{ .name = "n_kv=64   (4 splits, sz=16)",  .n_kv = 64 },
+        .{ .name = "n_kv=256  (4 splits, sz=64)",  .n_kv = 256 },
+        .{ .name = "n_kv=1024 (4 splits, sz=256)", .n_kv = 1024 },
+    };
+    const n_heads: u32 = 16;
+    const n_kv_heads: u32 = 8;
+    const head_dim: u32 = 128;
+    const heads_per_kv: u32 = n_heads / n_kv_heads;
+    const kv_stride: u32 = n_kv_heads * head_dim;
+    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    var k_scores = try pipeline.Kernel.init(&ctx, &shaders.attn_scores, 3, @sizeOf(runtime.AttnScoresPush));
+    defer k_scores.deinit();
+    var k_softmax = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(runtime.SoftmaxPush));
+    defer k_softmax.deinit();
+    var k_attn_out = try pipeline.Kernel.init(&ctx, &shaders.attn_output, 3, @sizeOf(runtime.AttnOutputPush));
+    defer k_attn_out.deinit();
+    var k_split = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_split, 6, @sizeOf(runtime.FaDecodeSplitPush));
+    defer k_split.deinit();
+    var k_merge = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush));
+    defer k_merge.deinit();
+
+    var max_rel_seen: f32 = 0;
+
+    for (cases) |cs| {
+        const n_kv = cs.n_kv;
+        const ch = runtime.chooseFaDecodeSplit(n_kv);
+        // Sanity: heuristic must cover all keys.
+        std.debug.assert(ch.n_splits * ch.split_size >= n_kv);
+
+        const q_elems = n_heads * head_dim;
+        const kv_elems = n_kv * n_kv_heads * head_dim;
+        const scores_elems = n_heads * n_kv;
+        const out_elems = n_heads * head_dim;
+        const o_partial_elems = n_heads * ch.n_splits * head_dim;
+        const ml_partial_elems = n_heads * ch.n_splits;
+
+        const Q = try allocator.alloc(f32, q_elems);
+        defer allocator.free(Q);
+        const K = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(K);
+        const V = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(V);
+        const out_3pass = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_3pass);
+        const out_fa = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_fa);
+
+        var prng = std.Random.DefaultPrng.init(0xF5b_C0DE);
+        const rng = prng.random();
+        for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (V) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+        var buf_q = try buffer.Buffer.initStatic(&ctx, f32, Q);
+        defer buf_q.deinit(ctx.device);
+        var buf_k = try buffer.Buffer.initStatic(&ctx, f32, K);
+        defer buf_k.deinit(ctx.device);
+        var buf_v = try buffer.Buffer.initStatic(&ctx, f32, V);
+        defer buf_v.deinit(ctx.device);
+        var buf_scores = try buffer.Buffer.initDeviceOnly(&ctx, scores_elems * @sizeOf(f32));
+        defer buf_scores.deinit(ctx.device);
+        var buf_out_3pass = try buffer.Buffer.initDeviceOnly(&ctx, out_elems * @sizeOf(f32));
+        defer buf_out_3pass.deinit(ctx.device);
+        var buf_o_partial = try buffer.Buffer.initDeviceOnly(&ctx, o_partial_elems * @sizeOf(f32));
+        defer buf_o_partial.deinit(ctx.device);
+        var buf_m_partial = try buffer.Buffer.initDeviceOnly(&ctx, ml_partial_elems * @sizeOf(f32));
+        defer buf_m_partial.deinit(ctx.device);
+        var buf_l_partial = try buffer.Buffer.initDeviceOnly(&ctx, ml_partial_elems * @sizeOf(f32));
+        defer buf_l_partial.deinit(ctx.device);
+        var buf_out_fa = try buffer.Buffer.initDeviceOnly(&ctx, out_elems * @sizeOf(f32));
+        defer buf_out_fa.deinit(ctx.device);
+
+        // ─ 3-pass reference (matches `recordOneLayer` else-branch) ─
+        // Decode is n_q=1 with no causal mask so scores_stride = n_pos.
+        const scores_push = runtime.AttnScoresPush{
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_pos = n_kv,
+            .kv_stride = kv_stride,
+            .scores_stride = n_kv,
+            .inv_sqrt_dim = inv_sqrt_dim,
+        };
+        const softmax_push = runtime.SoftmaxPush{ .dim = n_kv, .stride = n_kv };
+        const attn_out_push = runtime.AttnOutputPush{
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_pos = n_kv,
+            .kv_stride = kv_stride,
+            .scores_stride = n_kv,
+        };
+
+        try k_scores.bind(&.{ &buf_q, &buf_k, &buf_scores });
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.AttnScoresPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_scores, .push = &scores_push, .gx = n_heads * n_kv });
+
+        try k_softmax.bind(&.{ &buf_scores, &buf_scores });
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.SoftmaxPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_softmax, .push = &softmax_push, .gx = n_heads });
+
+        try k_attn_out.bind(&.{ &buf_scores, &buf_v, &buf_out_3pass });
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.AttnOutputPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_attn_out, .push = &attn_out_push, .gx = n_heads * head_dim });
+        try buf_out_3pass.readBack(&ctx, f32, out_3pass);
+
+        // ─ FA-decode swap-in (matches `recordOneLayer` if-branch) ─
+        const split_push = runtime.FaDecodeSplitPush{
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_kv = n_kv,
+            .kv_stride = kv_stride,
+            .n_splits = ch.n_splits,
+            .split_size = ch.split_size,
+            .inv_sqrt_dim = inv_sqrt_dim,
+        };
+        const merge_push = runtime.FaDecodeMergePush{
+            .n_heads = n_heads,
+            .head_dim = head_dim,
+            .n_splits = ch.n_splits,
+        };
+
+        try k_split.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o_partial, &buf_m_partial, &buf_l_partial });
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaDecodeSplitPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_split, .push = &split_push, .gx = n_heads * ch.n_splits });
+
+        try k_merge.bind(&.{ &buf_o_partial, &buf_m_partial, &buf_l_partial, &buf_out_fa });
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaDecodeMergePush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_merge, .push = &merge_push, .gx = n_heads });
+        try buf_out_fa.readBack(&ctx, f32, out_fa);
+
+        var max_abs: f32 = 0;
+        var max_ref: f32 = 0;
+        for (out_3pass, out_fa) |r, g| {
+            const d = @abs(r - g);
+            if (d > max_abs) max_abs = d;
+            if (@abs(r) > max_ref) max_ref = @abs(r);
+        }
+        const rel = if (max_ref > 0) max_abs / max_ref else max_abs;
+        if (rel > 1e-4) {
+            std.debug.print(
+                "FA-decode chat-path parity FAIL ({s}): n_splits={d} sz={d} max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+                .{ cs.name, ch.n_splits, ch.split_size, max_abs, max_ref, rel },
+            );
+            return error.ParityFailed;
+        }
+        if (rel > max_rel_seen) max_rel_seen = rel;
+    }
+
+    std.debug.print(
+        "PASS GPU fa_decode chat-path parity vs 3-pass ({d} cases at Qwen3-0.6B shape n_heads=16 GQA 16:8 d=128, max rel={e:.2}) on {s}\n",
+        .{ cases.len, max_rel_seen, ctx.deviceName() },
+    );
+}
+
 // ── F4: Runner.forwardLogits with FA matches the 3-pass chain ─────────
 //
 // End-to-end gate that the FA path inside `recordLayerForward`

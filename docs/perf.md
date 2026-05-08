@@ -110,7 +110,15 @@ layer, which extrapolates to attention costing 19.7 ms/token instead
 of the F1 baseline's 146 ms/token at the full Qwen3-0.6B 28-layer
 stack.
 
-The split-K kernels still need to be wired into `--chat`'s decode
-path before the win is user-visible (currently chat decode lives
-in `model.zig` / `runtime.zig`, separate from the training Runner).
-Tier-2 follow-up.
+**Wired into `--chat` (F5b, 2026-05-08).** `runtime.recordOneLayer`
+now branches between FlashDecoding (`fa_decode_split` +
+`fa_decode_merge`) and the 3-pass chain on `cfg.head_dim ≤ 128` (=
+`FA_HEAD_DIM_MAX`). The per-step `(n_splits, split_size)` heuristic
+in `chooseFaDecodeSplit` mirrors the bench shapes: ≤ 4 keys → 1
+split, &lt; 1024 → 4 splits, ≥ 1024 → `split_size = 256`. TQ4-V
+composes cleanly — the same `dequant_v` buffer feeds either path.
+Hybrid Qwen3.5 (`head_dim = 256`) auto-falls-back to 3-pass via
+the same gate. End-to-end parity gate `runFaDecodeChatPathSmoke`
+runs both paths through the production push values at Qwen3-0.6B
+shape and compares to **4.42e-7 max rel-err** across n_kv ∈
+{16, 64, 256, 1024} — five orders below the 1e-4 tolerance.
