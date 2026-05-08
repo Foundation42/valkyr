@@ -16,6 +16,7 @@ const cpu_train_transformer = @import("../cpu/train_transformer.zig");
 const cpu_cce = @import("../cpu/cce.zig");
 const cpu_lora = @import("../cpu/lora.zig");
 const train_lora = @import("../train/lora.zig");
+const train_transformer = @import("../train/transformer.zig");
 const config_mod = @import("../config.zig");
 const safetensors = @import("../safetensors.zig");
 const q4_0 = @import("../cpu/q4_0.zig");
@@ -1523,6 +1524,238 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
         "PASS GPU LoRA+ — λ=16 vs λ=1 on rank-{d} delta recovery: {d:.2}× lower final loss, {d:.2}× lower at step {d}\n",
         .{ r, final_ratio, early_ratio, log_every },
     );
+}
+
+// ── A4-2: Runner-side LoRA-Q smoke ────────────────────────────────────
+//
+// Wire test for LoRA-Q integration into `train_transformer.Runner`.
+// Earlier --lora-rec-smoke proved the dispatch chain at the per-kernel
+// level; this one drives the *real* Runner.step end-to-end with
+// `cfg.lora_q_enabled = true` and asserts three things:
+//
+//   1. Forward parity at init. Because A is N(0,σ) but B = 0, the
+//      LoRA delta `(α/r)·B·A·x` is identically zero at step 0, so
+//      forwardLogits with lora_q_enabled = true must be bit-equal to
+//      the lora_q_enabled = false runner over the same weights.
+//      This is the safety net: if wiring is wrong, this fails before
+//      we even take a gradient step.
+//
+//   2. W_q is frozen across training. After N Adam steps the LoRA
+//      runner's per-layer W_q must equal its initial value byte-for-byte.
+//      If recordAdamAll's branch is wrong, this catches it.
+//
+//   3. Loss decreases. With B initialised to zero, ∇A is zero on
+//      step 1 (∇A = (α/r)·dy_Bᵀ·x and dy_B = dy·B = 0) but ∇B is not
+//      (∇B = (α/r)·dyᵀ·intermediate, intermediate = x·Aᵀ ≠ 0). Step 1
+//      moves B; step 2 onward moves both. The standalone --lora-train-demo
+//      already proves this asymmetry trains; here we just gate that
+//      the loss drops vs. the initial loss across n_steps.
+//
+// Synthetic micro-shape (≪ Qwen3-0.6B): keeps init/step under a second
+// each so this can land in the default smoke pass without slowing it down.
+
+pub fn runGpuTransformerLoraQSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // ── Toy decoder shape. Just big enough for the LoRA chain to have
+    //    something to do (rank-4 adapter on a 32×32 W_q).
+    const dim: u32 = 32;
+    const n_heads: u32 = 4;
+    const n_kv_heads: u32 = 2;
+    const head_dim: u32 = 8; // n_heads * head_dim = dim
+    const ff_dim: u32 = 64;
+    const n_pos: u32 = 8;
+    const n_layers: u32 = 2;
+    const vocab: u32 = 64;
+    const lora_rank: u32 = 4;
+    const lora_alpha: f32 = 8.0;
+    const n_steps: u32 = 30;
+
+    // ── Random init weights. Deterministic seed → stable parity.
+    var prng = std.Random.DefaultPrng.init(0xC10_5550);
+    const rng = prng.random();
+
+    const w_embed = try allocator.alloc(f32, vocab * dim);
+    defer allocator.free(w_embed);
+    const w_final_norm = try allocator.alloc(f32, dim);
+    defer allocator.free(w_final_norm);
+    const w_lm_head = try allocator.alloc(f32, vocab * dim);
+    defer allocator.free(w_lm_head);
+    for (w_embed) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+    for (w_final_norm) |*v| v.* = 1.0;
+    for (w_lm_head) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+
+    const q_dim: u32 = n_heads * head_dim;
+    const kv_dim: u32 = n_kv_heads * head_dim;
+    const layers = try allocator.alloc(train_transformer.LayerWeights, n_layers);
+    defer allocator.free(layers);
+
+    // Backing storage for each layer's weights — kept alive for the
+    // duration of the Runner.init call (Runner uploads into its own
+    // device buffers and copies, so we can free after init returns).
+    var layer_storage = std.ArrayList([]f32).init(allocator);
+    defer {
+        for (layer_storage.items) |s| allocator.free(s);
+        layer_storage.deinit();
+    }
+    const allocLayerSlice = struct {
+        fn f(al: std.mem.Allocator, store: *std.ArrayList([]f32), n: usize, r: std.Random, scale: f32, fill_with: ?f32) ![]f32 {
+            const s = try al.alloc(f32, n);
+            if (fill_with) |c| {
+                for (s) |*v| v.* = c;
+            } else {
+                for (s) |*v| v.* = (r.float(f32) - 0.5) * scale;
+            }
+            try store.append(s);
+            return s;
+        }
+    }.f;
+
+    for (0..n_layers) |li| {
+        layers[li] = .{
+            // RMSNorm gains: identity (1.0) so the norm is well-conditioned.
+            .w_n1 = try allocLayerSlice(allocator, &layer_storage, dim, rng, 0, 1.0),
+            .w_q = try allocLayerSlice(allocator, &layer_storage, q_dim * dim, rng, 0.2, null),
+            .w_k = try allocLayerSlice(allocator, &layer_storage, kv_dim * dim, rng, 0.2, null),
+            .w_v = try allocLayerSlice(allocator, &layer_storage, kv_dim * dim, rng, 0.2, null),
+            .w_o = try allocLayerSlice(allocator, &layer_storage, dim * q_dim, rng, 0.2, null),
+            .w_n2 = try allocLayerSlice(allocator, &layer_storage, dim, rng, 0, 1.0),
+            .w_gate = try allocLayerSlice(allocator, &layer_storage, ff_dim * dim, rng, 0.2, null),
+            .w_up = try allocLayerSlice(allocator, &layer_storage, ff_dim * dim, rng, 0.2, null),
+            .w_down = try allocLayerSlice(allocator, &layer_storage, dim * ff_dim, rng, 0.2, null),
+        };
+    }
+
+    // ── Token + target ids.
+    const token_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(token_ids);
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    for (token_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, vocab);
+    for (target_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, vocab);
+
+    const cfg_base: train_transformer.Config = .{
+        .dim = dim,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .ff_dim = ff_dim,
+        .n_pos = n_pos,
+        .n_layers = n_layers,
+        .vocab_size = vocab,
+        .lr = 1e-2,
+    };
+    var cfg_lora = cfg_base;
+    cfg_lora.lora_q_enabled = true;
+    cfg_lora.lora_q_rank = lora_rank;
+    cfg_lora.lora_q_alpha = lora_alpha;
+
+    const init_weights: train_transformer.InitWeights = .{
+        .embed = w_embed,
+        .final_norm = w_final_norm,
+        .lm_head = w_lm_head,
+        .layers = layers,
+    };
+
+    // ── Runner #1: lora_q_enabled = true, default-init A,B.
+    var runner_lora = try train_transformer.Runner.init(allocator, &ctx, cfg_lora, init_weights);
+    defer runner_lora.deinit();
+
+    // ── Runner #2: lora_q_enabled = false, same weights.
+    var runner_plain = try train_transformer.Runner.init(allocator, &ctx, cfg_base, init_weights);
+    defer runner_plain.deinit();
+
+    // ── Step-0 forward parity. B = 0 ⇒ LoRA delta = 0 ⇒ identical logits.
+    const logits_lora = try allocator.alloc(f32, n_pos * vocab);
+    defer allocator.free(logits_lora);
+    const logits_plain = try allocator.alloc(f32, n_pos * vocab);
+    defer allocator.free(logits_plain);
+    try runner_lora.forwardLogits(token_ids, logits_lora);
+    try runner_plain.forwardLogits(token_ids, logits_plain);
+
+    var max_diff: f32 = 0;
+    for (logits_lora, logits_plain) |a, b| {
+        const d = @abs(a - b);
+        if (d > max_diff) max_diff = d;
+    }
+    if (max_diff > 1e-5) {
+        std.debug.print(
+            "FAIL LoRA-Q step-0 forward parity: max|logits_lora - logits_plain| = {e} (expected ≤ 1e-5)\n",
+            .{max_diff},
+        );
+        return error.LoraQForwardParityFailed;
+    }
+    std.debug.print("  step-0 fwd parity   max|Δ| = {e:.2}\n", .{max_diff});
+
+    // ── Snapshot W_q for layer 0 from the LoRA runner — must remain
+    //    bit-equal across all training steps.
+    const w_q_numel: usize = q_dim * dim;
+    const w_q_snapshot = try allocator.alloc(f32, w_q_numel);
+    defer allocator.free(w_q_snapshot);
+    try runner_lora.buf_w_q[0].readBack(&ctx, f32, w_q_snapshot);
+
+    // ── Initial loss. forwardLogits has already run once, so we can
+    //    reuse logits_lora to compute it manually with cpu_math's
+    //    softmaxCe-style summation, but the simplest signal is to take
+    //    pre-step and post-step logits and compare.
+    const initial_loss = computeCeLoss(logits_lora, target_ids, n_pos, vocab);
+
+    // ── Train.
+    var step_t: u32 = 0;
+    while (step_t < n_steps) : (step_t += 1) {
+        try runner_lora.step(token_ids, target_ids);
+    }
+
+    // ── Verify W_q is unchanged.
+    const w_q_after = try allocator.alloc(f32, w_q_numel);
+    defer allocator.free(w_q_after);
+    try runner_lora.buf_w_q[0].readBack(&ctx, f32, w_q_after);
+    var w_q_max_diff: f32 = 0;
+    for (w_q_snapshot, w_q_after) |a, b| {
+        const d = @abs(a - b);
+        if (d > w_q_max_diff) w_q_max_diff = d;
+    }
+    if (w_q_max_diff != 0.0) {
+        std.debug.print(
+            "FAIL LoRA-Q W_q frozen: max|W_q_after - W_q_before| = {e} (expected exactly 0)\n",
+            .{w_q_max_diff},
+        );
+        return error.LoraQWqNotFrozen;
+    }
+    std.debug.print("  W_q frozen          max|Δ| = 0 (over {d} steps)\n", .{n_steps});
+
+    // ── Verify loss decreased.
+    try runner_lora.forwardLogits(token_ids, logits_lora);
+    const final_loss = computeCeLoss(logits_lora, target_ids, n_pos, vocab);
+    if (!(final_loss < initial_loss)) {
+        std.debug.print(
+            "FAIL LoRA-Q loss: initial={d:.6} final={d:.6} (expected final < initial)\n",
+            .{ initial_loss, final_loss },
+        );
+        return error.LoraQLossDidNotDecrease;
+    }
+
+    std.debug.print(
+        "PASS GPU train_transformer LoRA-Q via Runner — rank={d} α={d:.1} α/r={d:.2}, CE {d:.4} → {d:.4} ({d:.2}× drop) over {d} steps\n",
+        .{ lora_rank, lora_alpha, lora_alpha / @as(f32, @floatFromInt(lora_rank)), initial_loss, final_loss, initial_loss / final_loss, n_steps },
+    );
+}
+
+fn computeCeLoss(logits: []const f32, target_ids: []const u32, n_pos: u32, vocab: u32) f32 {
+    var total: f32 = 0;
+    for (0..n_pos) |row| {
+        const off = row * vocab;
+        var m: f32 = -std.math.inf(f32);
+        for (0..vocab) |v| {
+            if (logits[off + v] > m) m = logits[off + v];
+        }
+        var lse_sum: f32 = 0;
+        for (0..vocab) |v| lse_sum += @exp(logits[off + v] - m);
+        const lse = m + @log(lse_sum);
+        total += lse - logits[off + target_ids[row]];
+    }
+    return total / @as(f32, @floatFromInt(n_pos));
 }
 
 // ── CCE bench: time each kernel in isolation at Qwen3-0.6B shape ──────

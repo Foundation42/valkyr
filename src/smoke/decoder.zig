@@ -2196,6 +2196,110 @@ pub fn runRealModelTrainStepSmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── A4-2: real Qwen3-0.6B β-5 with LoRA-Q wired in ───────────────────
+//
+// Same shape and dataset as `runRealModelTrainStepSmoke` but with
+// `cfg.lora_q_enabled = true` (rank-16, α=32 ⇒ α/r=2). Validates the
+// LoRA-Q wiring at production scale (28 Qwen3-0.6B layers × 1024-dim
+// W_q each) and reports ms/step so we can compare against the
+// no-LoRA baseline (saved in memory: 265 ms post-fused-QK-RoPE).
+//
+// Pass criteria match β-5: CE_before / CE_after finite + CE_after <
+// CE_before. With B = 0 init and only A,B trainable, ∇A = 0 on step 1
+// — but ∇B is non-zero, so step 1 still moves B and tilts the LoRA
+// delta. CE should still drop visibly even at lr=1e-5 (typical fine-
+// tune scale).
+
+pub fn runRealModelTrainStepLoraQSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3-0.6B";
+    const jsonl_path = "data/train/tiny_facts.jsonl";
+    const n_pos: u32 = 16;
+    const eos_id: u32 = 151_645;
+    const lr: f32 = 1e-5;
+    const lora_rank: u32 = 16;
+    const lora_alpha: f32 = 32.0;
+
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.HfModelNotInCache => {
+            std.debug.print("SKIP runRealModelTrainStepLoraQSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    var weights = try train_load_real.loadTrainWeights(allocator, &cpu, n_pos);
+    defer weights.deinit();
+    var cfg = weights.cfg;
+    cfg.lr = lr;
+    cfg.lora_q_enabled = true;
+    cfg.lora_q_rank = lora_rank;
+    cfg.lora_q_alpha = lora_alpha;
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    var ds = try train_dataset.buildFromJsonl(allocator, &tok, jsonl_path, n_pos, eos_id);
+    defer ds.deinit();
+    if (ds.numBatches() == 0) return error.DatasetTooShort;
+
+    const input_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(input_ids);
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    try ds.batch(0, input_ids, target_ids);
+
+    const vocab: usize = cfg.vocab_size;
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var runner = try train_transformer.Runner.init(allocator, &ctx, cfg, weights.view());
+    defer runner.deinit();
+
+    const logits = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(logits);
+
+    try runner.forwardLogits(input_ids, logits);
+    const ce_before = computeMeanCe(logits, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_before)) {
+        std.debug.print("LoRA-Q train-step smoke: CE_before not finite ({d})\n", .{ce_before});
+        return error.CeBeforeNotFinite;
+    }
+
+    const t_step_start = std.time.nanoTimestamp();
+    try runner.step(input_ids, target_ids);
+    const t_step_end = std.time.nanoTimestamp();
+    const step_ms: f64 = @as(f64, @floatFromInt(t_step_end - t_step_start)) / 1.0e6;
+
+    try runner.forwardLogits(input_ids, logits);
+    const ce_after = computeMeanCe(logits, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_after)) {
+        std.debug.print("LoRA-Q train-step smoke: CE_after not finite ({d}) after CE_before={d:.6}\n", .{ ce_after, ce_before });
+        return error.CeAfterNotFinite;
+    }
+
+    if (ce_after >= ce_before) {
+        std.debug.print(
+            "LoRA-Q train-step smoke: CE did not decrease (before={d:.6} after={d:.6} delta={d:.6}) at lr={e}\n",
+            .{ ce_before, ce_after, ce_after - ce_before, lr },
+        );
+        return error.CeDidNotDecrease;
+    }
+
+    const delta = ce_before - ce_after;
+    const rel_pct: f64 = 100.0 * @as(f64, delta) / @as(f64, ce_before);
+    std.debug.print(
+        "PASS real Qwen3-0.6B LoRA-Q one-step train (n_pos={d} lr={e} rank={d} α={d:.0} α/r={d:.2}; CE {d:.6} → {d:.6}, Δ={d:.6} ({d:.3}%); step={d:.1} ms)\n",
+        .{ n_pos, lr, lora_rank, lora_alpha, lora_alpha / @as(f32, @floatFromInt(lora_rank)), ce_before, ce_after, delta, rel_pct, step_ms },
+    );
+}
+
 // ── chunk 8c-β-6b: checkpoint save/load round-trip ──────────────────
 //
 // Trains a toy 8c-α-3-shape Runner for K steps, saves a checkpoint,

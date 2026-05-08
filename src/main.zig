@@ -64,6 +64,14 @@ pub fn main() !void {
         try smoke_decoder.runRealModelTrainStepSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-lora-q-step-smoke")) {
+        // A4-2 perf gate: same as --real-train-step-smoke but with
+        // LoRA-Q enabled (rank-16, α=32). Validates the LoRA-Q wiring
+        // at production scale (28 layers × 1024-dim W_q) and reports
+        // ms/step for the perf snapshot.
+        try smoke_decoder.runRealModelTrainStepLoraQSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-multi-step-smoke")) {
         // β-6a multi-step training loop. Same setup as β-5 but runs 30
         // Adam steps on the same batch, asserts CE drops ≥90%. Validates
@@ -219,6 +227,16 @@ pub fn main() !void {
         // instead of 14 separate submitOneShot calls. This is the
         // path the in-Runner LoRA integration will use.
         try smoke_gpu_train.runGpuLoraRecorderSmoke(allocator);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-q-runner-smoke")) {
+        // A4-2 wire test. Drives `train_transformer.Runner.step` with
+        // `cfg.lora_q_enabled = true` end-to-end and asserts (1) step-0
+        // forward parity vs the same Runner with LoRA off (B=0 ⇒ delta
+        // = 0), (2) W_q is unchanged after N Adam steps (LoRA freezes
+        // W_q), (3) loss decreases. The smallest end-to-end gate that
+        // the LoRA helpers compose into Runner.step correctly.
+        try smoke_gpu_train.runGpuTransformerLoraQSmoke(allocator);
         return;
     }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-train-demo")) {
@@ -764,6 +782,7 @@ pub fn main() !void {
     try smoke_gpu_train.runGpuCceBackwardDwSmoke(allocator);
     try smoke_gpu_train.runGpuLoraSmoke(allocator);
     try smoke_gpu_train.runGpuLoraRecorderSmoke(allocator);
+    try smoke_gpu_train.runGpuTransformerLoraQSmoke(allocator);
     try smoke_gpu_train.runEmbeddedAttachSmoke(allocator);
     try smoke_gpu_train.runEmbeddedRecorderSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulQ4_0Smoke(allocator);
