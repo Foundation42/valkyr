@@ -114,6 +114,15 @@ pub fn main() !void {
         try smoke_cpu.runLoraMergeMathSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--flash-attention-smoke")) {
+        // F2 of the FlashAttention arc: CPU oracle parity vs the
+        // standard 3-pass attention forward. Gates the tile-on-Q
+        // online-softmax algorithm at decode + prefill-causal + GQA
+        // + non-aligned-block shapes, plus an LSE-output check that
+        // the per-row log-sum-exp matches log Σ exp(scores).
+        try smoke_cpu.runFlashAttentionParitySmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-sampling-smoke")) {
         // β-6c sampled-text-shift validation. Greedy-samples N tokens
         // from a probe prompt before and after fine-tuning on a single
@@ -906,6 +915,7 @@ pub fn main() !void {
     try smoke_cpu.runTrainCpuMultiLayerSmoke(allocator);
     try smoke_cpu.runRmsNormBackwardCpuSmoke(allocator);
     try smoke_cpu.runLoraMergeMathSmoke(allocator);
+    try smoke_cpu.runFlashAttentionParitySmoke(allocator);
     try smoke_gpu_train.runLayerNormBackwardCpuSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulSmoke(allocator);
     try smoke_training.runGpuMlpForwardSmoke(allocator);

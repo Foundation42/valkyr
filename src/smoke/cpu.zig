@@ -7,6 +7,7 @@ const cpu_math = @import("../cpu/math.zig");
 const cpu_train = @import("../cpu/train.zig");
 const cpu_train_transformer = @import("../cpu/train_transformer.zig");
 const cpu_lora = @import("../cpu/lora.zig");
+const cpu_flash_attn = @import("../cpu/flash_attn.zig");
 const dtype = @import("../dtype.zig");
 const lora_merge = @import("../commands/lora_merge.zig");
 const safetensors = @import("../safetensors.zig");
@@ -613,6 +614,152 @@ pub fn runLoraMergeMathSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS lora-merge math (M=4 N=8 K=16 r=4 α=8: fp32 rel-err {e}, bf16 round-trip rel-err {e})\n",
         .{ rel_fp32, rel_bf16 },
+    );
+}
+
+// ── F2: FlashAttention forward CPU oracle parity ──────────────────────
+//
+// Gates `cpu/flash_attn.zig:flashAttentionForward` against
+// `cpu/train_transformer.zig:attentionForward`. Five shape cases
+// covering decode (n_q=1, no mask), prefill causal (n_q == n_kv),
+// non-aligned blocks (n_q not divisible by Br), GQA (heads_per_kv > 1),
+// and Qwen3-0.6B per-layer dims. One LSE-only case checks the
+// log-sum-exp output that FA backward will need to recompute the
+// softmax. Tolerance: 1e-5 rel-err — reduction order differs between
+// the two paths so bit-equality is not expected.
+
+const FlashCase = struct {
+    name: []const u8,
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    Br: usize,
+    Bc: usize,
+};
+
+fn runOneFlashCase(allocator: std.mem.Allocator, case: FlashCase, check_lse: bool) !void {
+    const Q = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(Q);
+    const K = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(K);
+    const V = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(V);
+    const out_ref = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(out_ref);
+    const out_fa = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(out_fa);
+    const scores = try allocator.alloc(f32, case.n_q * case.n_heads * case.n_kv);
+    defer allocator.free(scores);
+    const attn = try allocator.alloc(f32, case.n_q * case.n_heads * case.n_kv);
+    defer allocator.free(attn);
+    const lse = try allocator.alloc(f32, case.n_q * case.n_heads);
+    defer allocator.free(lse);
+
+    const s_tile = try allocator.alloc(f32, case.Br * case.Bc);
+    defer allocator.free(s_tile);
+    const p_tile = try allocator.alloc(f32, case.Br * case.Bc);
+    defer allocator.free(p_tile);
+    const o_acc = try allocator.alloc(f32, case.Br * case.head_dim);
+    defer allocator.free(o_acc);
+    const m_acc = try allocator.alloc(f32, case.Br);
+    defer allocator.free(m_acc);
+    const l_acc = try allocator.alloc(f32, case.Br);
+    defer allocator.free(l_acc);
+
+    var prng = std.Random.DefaultPrng.init(0xFA_CE_AB);
+    const rng = prng.random();
+    for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+    for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+    for (V) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+    cpu_train_transformer.attentionForward(
+        Q, K, V, case.n_q, case.n_kv, case.n_heads, case.n_kv_heads, case.head_dim,
+        case.causal, scores, attn, out_ref,
+    );
+    cpu_flash_attn.flashAttentionForward(
+        Q, K, V, case.n_q, case.n_kv, case.n_heads, case.n_kv_heads, case.head_dim,
+        case.causal, case.Br, case.Bc,
+        out_fa, lse,
+        s_tile, p_tile, o_acc, m_acc, l_acc,
+    );
+
+    var max_abs: f32 = 0;
+    var max_ref: f32 = 0;
+    for (out_ref, out_fa) |r, f| {
+        const d = @abs(r - f);
+        if (d > max_abs) max_abs = d;
+        if (@abs(r) > max_ref) max_ref = @abs(r);
+    }
+    const rel = if (max_ref > 0) max_abs / max_ref else max_abs;
+    if (rel > 1e-5) {
+        std.debug.print(
+            "FA parity FAIL ({s}): max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+            .{ case.name, max_abs, max_ref, rel },
+        );
+        return error.ParityFailed;
+    }
+
+    // Optional: cross-check the LSE output against log Σ exp(scores).
+    if (check_lse) {
+        const NEG_INF: f32 = -std.math.inf(f32);
+        for (0..case.n_q) |q| {
+            for (0..case.n_heads) |h| {
+                const row_off = q * case.n_heads * case.n_kv + h * case.n_kv;
+                var max_s: f32 = NEG_INF;
+                for (0..case.n_kv) |k| {
+                    const v = scores[row_off + k];
+                    if (v > max_s) max_s = v;
+                }
+                var sum: f64 = 0;
+                for (0..case.n_kv) |k| {
+                    const v = scores[row_off + k];
+                    if (!std.math.isInf(v)) sum += @exp(v - max_s);
+                }
+                const lse_ref: f32 = if (sum > 0)
+                    max_s + @as(f32, @floatCast(@log(sum)))
+                else
+                    NEG_INF;
+                const lse_fa = lse[q * case.n_heads + h];
+                if (std.math.isInf(lse_ref) and std.math.isInf(lse_fa)) continue;
+                const d = @abs(lse_ref - lse_fa);
+                const lse_rel = if (@abs(lse_ref) > 1e-6) d / @abs(lse_ref) else d;
+                if (lse_rel > 1e-5) {
+                    std.debug.print(
+                        "FA lse FAIL ({s}) q={d} h={d}: ref={e:.6} fa={e:.6} rel={e:.3}\n",
+                        .{ case.name, q, h, lse_ref, lse_fa, lse_rel },
+                    );
+                    return error.ParityFailed;
+                }
+            }
+        }
+    }
+}
+
+pub fn runFlashAttentionParitySmoke(allocator: std.mem.Allocator) !void {
+    const cases = [_]FlashCase{
+        .{ .name = "decode-tiny (n_q=1 n_kv=8 GQA 4:2 d=16)", .n_q = 1, .n_kv = 8, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = false, .Br = 1, .Bc = 4 },
+        .{ .name = "decode-medium (n_q=1 n_kv=128 GQA 4:2 d=32)", .n_q = 1, .n_kv = 128, .n_heads = 4, .n_kv_heads = 2, .head_dim = 32, .causal = false, .Br = 1, .Bc = 32 },
+        .{ .name = "prefill-causal (n_q=4 n_kv=4 GQA 4:2 d=16)", .n_q = 4, .n_kv = 4, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .Br = 2, .Bc = 2 },
+        .{ .name = "prefill-qwen3 (n_q=16 n_kv=16 GQA 16:8 d=128)", .n_q = 16, .n_kv = 16, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true, .Br = 4, .Bc = 4 },
+        .{ .name = "non-aligned blocks (n_q=10 n_kv=12 Br=4 Bc=5)", .n_q = 10, .n_kv = 12, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .Br = 4, .Bc = 5 },
+    };
+
+    for (cases) |c| try runOneFlashCase(allocator, c, false);
+
+    // Dedicated LSE-checked case so the per-row log-sum-exp output is
+    // gated independently of the bulk parity sweep.
+    try runOneFlashCase(allocator, .{
+        .name = "lse-output (n_q=4 n_kv=4 d=8)",
+        .n_q = 4, .n_kv = 4, .n_heads = 2, .n_kv_heads = 1, .head_dim = 8,
+        .causal = true, .Br = 2, .Bc = 2,
+    }, true);
+
+    std.debug.print(
+        "PASS flash-attention forward parity ({d} cases incl. GQA + causal + non-aligned blocks + LSE)\n",
+        .{cases.len + 1},
     );
 }
 
