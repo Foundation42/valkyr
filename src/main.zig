@@ -16,6 +16,7 @@ const commands_bench = @import("commands/bench.zig");
 const commands_serve = @import("commands/serve.zig");
 const commands_chat = @import("commands/chat.zig");
 const commands_finetune = @import("commands/finetune.zig");
+const commands_gen_from_ckpt = @import("commands/gen_from_ckpt.zig");
 const smoke_gpu_gen = @import("smoke/gpu_gen.zig");
 const smoke_session = @import("smoke/session.zig");
 const smoke_misc = @import("smoke/misc.zig");
@@ -142,6 +143,49 @@ pub fn main() !void {
             return error.MissingDataArg;
         }
         try commands_finetune.run(allocator, opts);
+        return;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--gen-from-ckpt")) {
+        // Generate text from a `.vkpt` checkpoint produced by --fine-tune.
+        // Uses the training Runner's forwardLogits + greedyDecode (slow,
+        // ~150 ms/tok at Qwen3-0.6B Debug; complete loop without needing
+        // .vkpt support in the inference Session).
+        // Format:
+        //   --gen-from-ckpt <model> --ckpt <path> --prompt TEXT
+        //                                          [--n-gen N] [--n-pos N]
+        var opts = commands_gen_from_ckpt.Options{
+            .model = args[2],
+            .ckpt_path = "",
+            .prompt = "",
+        };
+        var i: usize = 3;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--ckpt") and i + 1 < args.len) {
+                opts.ckpt_path = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--prompt") and i + 1 < args.len) {
+                opts.prompt = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--n-gen") and i + 1 < args.len) {
+                opts.n_gen = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--n-pos") and i + 1 < args.len) {
+                opts.n_pos = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if (opts.ckpt_path.len == 0) {
+            std.debug.print("--gen-from-ckpt: --ckpt <path> is required\n", .{});
+            return error.MissingCkptArg;
+        }
+        if (opts.prompt.len == 0) {
+            std.debug.print("--gen-from-ckpt: --prompt TEXT is required\n", .{});
+            return error.MissingPromptArg;
+        }
+        try commands_gen_from_ckpt.run(allocator, opts);
         return;
     }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--decoder-stack-train-smoke")) {

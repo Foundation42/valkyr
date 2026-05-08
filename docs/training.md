@@ -145,11 +145,36 @@ Qwen3-0.6B is **~8.4 GiB** (params + Adam m/v + Adam v all fp32).
 buffers each fenced via `vkQueueWaitIdle` — ~46 s on the test rig);
 batched-readback is a future perf chunk.
 
-> **Current limitation:** `--fine-tune --out` writes a `.vkpt` but the
-> inference path (`--chat`, `--gen`, `--serve`) doesn't yet load `.vkpt`
-> directly — it reads safetensors. Use the `--probe` flag during
-> training to see model output shift; reloading a fine-tuned checkpoint
-> for inference is the natural next chunk after this doc lands.
+### Generate from a saved checkpoint
+
+```sh
+./zig-out/bin/valkyr --gen-from-ckpt Qwen/Qwen3-0.6B \
+    --ckpt fine-tuned.vkpt \
+    --prompt "The capital of France is" \
+    --n-gen 20
+```
+
+Loads the base model (for tokenizer + architecture), reads the `.vkpt`
+into a fresh training Runner (overwrites params + Adam state), and
+greedy-decodes N tokens via the same `forwardLogits` + autoregressive
+loop the `--probe` flag uses. Output for a checkpoint trained 30 steps
+on `tiny_facts.jsonl` batch 0 with the example above:
+
+```
+[gen-from-ckpt] loaded checkpoint in 9629 ms
+[gen-from-ckpt] 20 tokens in 2139 ms (106.9 ms/tok)
+
+The capital of France is Paris. Paris sits on the river Seine and is famous for being famous for being famous for being
+```
+
+**Slow path.** Each generated token costs a full training-shape forward
+pass over `n_pos` (~107 ms/tok at Qwen3-0.6B Debug) — there's no
+incremental KV cache. The fast inference path (`--chat <model>`) doesn't
+yet load `.vkpt` directly because the format is fp32 and positionally
+keyed while the inference loader expects bf16 / safetensors-named
+tensors. fp32→bf16 conversion + tensor-name mapping is the natural next
+chunk; once it lands, `--chat <model> --ckpt <path>` will give
+production-speed generation off a fine-tune.
 
 ## Performance
 

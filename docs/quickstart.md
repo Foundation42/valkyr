@@ -111,6 +111,12 @@ zig build run
     --probe "The capital of France is" \
     --out fine-tuned.vkpt
 
+# Generate text from a `.vkpt` checkpoint produced above.
+./zig-out/bin/valkyr --gen-from-ckpt Qwen/Qwen3-0.6B \
+    --ckpt fine-tuned.vkpt \
+    --prompt "The capital of France is" \
+    --n-gen 20
+
 # OpenAI-compatible HTTP server (POST /v1/chat/completions, GET /v1/models)
 # See docs/server.md for the full surface — streaming, multi-turn,
 # error envelope, openai-python compatibility.
