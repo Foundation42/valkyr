@@ -192,6 +192,7 @@ The detail lives in `docs/`. Each page is self-contained.
 | | |
 |---|---|
 | [docs/quickstart.md](docs/quickstart.md) | Build deps + every CLI mode (`--list`, `--inspect`, `--gen`, `--gpu-gen`, `--chat`, `--bench`, `--serve`, headless validators). |
+| [docs/windows.md](docs/windows.md) | Windows 11 build + run (Zig 0.14.1, LunarG Vulkan SDK), the source patches that get the POSIX path running on Win32, AMD Strix Point iGPU perf, known issues. |
 | [docs/models.md](docs/models.md) | The six supported model families end-to-end and the rest of "what works today" (forward pass, chat, weight precisions, sampling, tokenizer). |
 | [docs/quantization.md](docs/quantization.md) | TurboQuant TQ4 V-cache (`--tq4v`), Q4_0 (`--q4`), Q4_K_M (`--q4k`) — algorithmic rationale + try-it. |
 | [docs/parity.md](docs/parity.md) | Four-tier parity (HF → CPU → GPU → GPU+TQ4) with the Qwen3 / Qwen3.5 numerical-drift figures + greedy-determinism note. |

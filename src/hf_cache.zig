@@ -16,6 +16,10 @@
 //! as `$HF_HOME/hub`), then `XDG_CACHE_HOME` (treated as
 //! `$XDG_CACHE_HOME/huggingface/hub`), then the default. We follow the
 //! same priority order huggingface_hub itself uses.
+//!
+//! For the home-directory fallback we try `HOME` first (POSIX) then
+//! `USERPROFILE` (Windows) — matches Python's `os.path.expanduser("~")`
+//! cross-platform behaviour, which is what huggingface_hub uses.
 
 const std = @import("std");
 
@@ -53,7 +57,11 @@ pub fn cacheRoot(gpa: std.mem.Allocator) ![]u8 {
         defer gpa.free(v);
         return std.fs.path.join(gpa, &.{ v, "huggingface", "hub" });
     } else |_| {}
-    const home = std.process.getEnvVarOwned(gpa, "HOME") catch return error.NoHome;
+    const home = blk: {
+        if (std.process.getEnvVarOwned(gpa, "HOME")) |v| break :blk v else |_| {}
+        if (std.process.getEnvVarOwned(gpa, "USERPROFILE")) |v| break :blk v else |_| {}
+        return error.NoHome;
+    };
     defer gpa.free(home);
     return std.fs.path.join(gpa, &.{ home, ".cache", "huggingface", "hub" });
 }
@@ -67,6 +75,10 @@ pub fn cacheRoot(gpa: std.mem.Allocator) ![]u8 {
 pub fn looksLikeModelId(arg: []const u8) bool {
     if (arg.len == 0) return false;
     if (arg[0] == '/' or arg[0] == '.') return false;
+    // Windows drive-letter paths like `C:\foo` or `C:/foo` — second char
+    // is always `:`. HF ids never contain `:`, so this is a clean rule
+    // that lets `--chat C:/dev/model` work even if the path doesn't exist.
+    if (arg.len >= 2 and arg[1] == ':') return false;
     if (std.mem.indexOfScalar(u8, arg, '/') == null) return false;
     // If it's an existing path on disk, treat as path (let the user win
     // any unintended ambiguity).

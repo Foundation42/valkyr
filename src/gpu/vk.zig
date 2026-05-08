@@ -47,6 +47,16 @@ fn makeApiVersion(variant: u32, major: u32, minor: u32, patch: u32) u32 {
     return (variant << 29) | (major << 22) | (minor << 12) | patch;
 }
 
+fn deviceTypeStr(t: c.VkPhysicalDeviceType) []const u8 {
+    return switch (t) {
+        c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => "discrete",
+        c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => "integrated",
+        c.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => "virtual",
+        c.VK_PHYSICAL_DEVICE_TYPE_CPU => "cpu",
+        else => "other",
+    };
+}
+
 const enable_validation = switch (builtin.mode) {
     .Debug, .ReleaseSafe => true,
     .ReleaseFast, .ReleaseSmall => false,
@@ -81,6 +91,12 @@ pub const Context = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Context {
         _ = allocator; // reserved — extension/layer enumeration may need it
+
+        // Diagnostic print toggle. Off by default; set `VALKYR_VK_VERBOSE`
+        // (any value) to dump the enumerated physical devices, the device
+        // we picked, and the queue-family table. Useful for first-run
+        // bring-up on a new platform / GPU.
+        const verbose = std.process.hasEnvVarConstant("VALKYR_VK_VERBOSE");
 
         // ── Instance ────────────────────────────────────────────────
         var app_info = std.mem.zeroes(c.VkApplicationInfo);
@@ -123,17 +139,50 @@ pub const Context = struct {
         dev_count = cap;
         try check(c.vkEnumeratePhysicalDevices(instance, &dev_count, &devs));
 
+        // Rank by deviceType. Windows often enumerates a software/virtual
+        // adapter (e.g. Microsoft's D3D12-on-Vulkan layer) ahead of the
+        // real GPU, so we explicitly score and pick the highest-scoring
+        // candidate rather than falling through to devs[0]. iGPUs (Strix
+        // Point, Apple, etc.) win when no discrete card is present.
+        const rank = struct {
+            fn score(t: c.VkPhysicalDeviceType) u32 {
+                return switch (t) {
+                    c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => 4,
+                    c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => 3,
+                    c.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => 2,
+                    c.VK_PHYSICAL_DEVICE_TYPE_CPU => 1,
+                    else => 0,
+                };
+            }
+        };
         var picked: c.VkPhysicalDevice = devs[0];
         var picked_props: c.VkPhysicalDeviceProperties = undefined;
         c.vkGetPhysicalDeviceProperties(picked, &picked_props);
+        var best_score: u32 = rank.score(picked_props.deviceType);
+        if (verbose) std.debug.print("vk: enumerated {d} physical device(s):\n", .{dev_count});
         for (devs[0..dev_count]) |pd| {
             var p: c.VkPhysicalDeviceProperties = undefined;
             c.vkGetPhysicalDeviceProperties(pd, &p);
-            if (p.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            if (verbose) {
+                const name_slice = std.mem.sliceTo(&p.deviceName, 0);
+                std.debug.print("vk:   - [{s}] {s} (api {d}.{d}.{d})\n", .{
+                    deviceTypeStr(p.deviceType),
+                    name_slice,
+                    c.VK_VERSION_MAJOR(p.apiVersion),
+                    c.VK_VERSION_MINOR(p.apiVersion),
+                    c.VK_VERSION_PATCH(p.apiVersion),
+                });
+            }
+            const s = rank.score(p.deviceType);
+            if (s > best_score) {
                 picked = pd;
                 picked_props = p;
-                break;
+                best_score = s;
             }
+        }
+        if (verbose) {
+            const picked_name = std.mem.sliceTo(&picked_props.deviceName, 0);
+            std.debug.print("vk: picked [{s}] {s}\n", .{ deviceTypeStr(picked_props.deviceType), picked_name });
         }
 
         // ── Queue family pick ───────────────────────────────────────
@@ -169,6 +218,20 @@ pub const Context = struct {
             }
         }
         const qf_index = queue_family orelse return error.NoComputeQueue;
+        if (verbose) {
+            std.debug.print("vk: queue families ({d}):\n", .{qf_count});
+            for (qfs[0..qf_count], 0..) |qf, i| {
+                std.debug.print("vk:   - family {d}: count={d} flags=0x{x}{s}{s}{s}{s}\n", .{
+                    i,
+                    qf.queueCount,
+                    qf.queueFlags,
+                    if ((qf.queueFlags & c.VK_QUEUE_GRAPHICS_BIT) != 0) " GRAPHICS" else "",
+                    if ((qf.queueFlags & c.VK_QUEUE_COMPUTE_BIT) != 0) " COMPUTE" else "",
+                    if ((qf.queueFlags & c.VK_QUEUE_TRANSFER_BIT) != 0) " TRANSFER" else "",
+                    if (i == qf_index) " [picked]" else "",
+                });
+            }
+        }
 
         // ── Logical device + queue ──────────────────────────────────
         const queue_priority: f32 = 1.0;

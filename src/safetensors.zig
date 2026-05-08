@@ -18,6 +18,35 @@
 //! into a host-allocated buffer.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Windows file-mapping APIs. Zig 0.14.1's std.os.windows.kernel32 doesn't
+// expose CreateFileMappingW / MapViewOfFile / UnmapViewOfFile yet, so we
+// declare them ourselves. Gated by `os.tag == .windows` so the POSIX build
+// never sees the kernel32 link request.
+const win = if (builtin.os.tag == .windows) struct {
+    const w = std.os.windows;
+    pub const PAGE_READONLY: w.DWORD = 0x02;
+    pub const FILE_MAP_READ: w.DWORD = 0x04;
+    pub extern "kernel32" fn CreateFileMappingW(
+        hFile: w.HANDLE,
+        lpAttributes: ?*anyopaque,
+        flProtect: w.DWORD,
+        dwMaximumSizeHigh: w.DWORD,
+        dwMaximumSizeLow: w.DWORD,
+        lpName: ?w.LPCWSTR,
+    ) callconv(w.WINAPI) ?w.HANDLE;
+    pub extern "kernel32" fn MapViewOfFile(
+        hFileMappingObject: w.HANDLE,
+        dwDesiredAccess: w.DWORD,
+        dwFileOffsetHigh: w.DWORD,
+        dwFileOffsetLow: w.DWORD,
+        dwNumberOfBytesToMap: w.SIZE_T,
+    ) callconv(w.WINAPI) ?w.LPVOID;
+    pub extern "kernel32" fn UnmapViewOfFile(
+        lpBaseAddress: w.LPCVOID,
+    ) callconv(w.WINAPI) w.BOOL;
+} else struct {};
 
 pub const Dtype = enum {
     f32,
@@ -85,7 +114,7 @@ pub const SafeTensors = struct {
     file: std.fs.File,
     /// The full file mapped read-only. Slice covers the entire file
     /// (header_len_field + header_json + tensor_data).
-    mapping: []align(std.mem.page_size) const u8,
+    mapping: []align(std.heap.page_size_min) const u8,
     /// Owns parsed shape arrays and tensor-name strings. Freed wholesale
     /// on deinit — no per-entry cleanup.
     arena: std.heap.ArenaAllocator,
@@ -100,7 +129,32 @@ pub const SafeTensors = struct {
         if (stat.size < 8) return error.FileTooSmall;
         const file_size: usize = @intCast(stat.size);
 
-        const mapping = try std.posix.mmap(
+        const mapping: []align(std.heap.page_size_min) const u8 = if (builtin.os.tag == .windows) blk: {
+            // CreateFileMappingW with size 0/0 means "use the file's size".
+            // We close the mapping handle immediately after MapViewOfFile —
+            // the view keeps an internal ref so the section stays alive
+            // until UnmapViewOfFile.
+            const map_handle = win.CreateFileMappingW(
+                file.handle,
+                null,
+                win.PAGE_READONLY,
+                0,
+                0,
+                null,
+            ) orelse return error.CreateFileMappingFailed;
+            defer std.os.windows.CloseHandle(map_handle);
+            const view = win.MapViewOfFile(
+                map_handle,
+                win.FILE_MAP_READ,
+                0,
+                0,
+                file_size,
+            ) orelse return error.MapViewOfFileFailed;
+            // MapViewOfFile returns a 64 KiB-aligned address; claiming
+            // page_size alignment is conservative and safe.
+            const ptr: [*]align(std.heap.page_size_min) const u8 = @ptrCast(@alignCast(view));
+            break :blk ptr[0..file_size];
+        } else try std.posix.mmap(
             null,
             file_size,
             std.posix.PROT.READ,
@@ -108,7 +162,9 @@ pub const SafeTensors = struct {
             file.handle,
             0,
         );
-        errdefer std.posix.munmap(mapping);
+        errdefer if (builtin.os.tag == .windows) {
+            _ = win.UnmapViewOfFile(mapping.ptr);
+        } else std.posix.munmap(mapping);
 
         // Header: u64 LE header length, then JSON, then tensor data.
         const header_len = std.mem.readInt(u64, mapping[0..8], .little);
@@ -188,7 +244,11 @@ pub const SafeTensors = struct {
     pub fn deinit(self: *SafeTensors) void {
         self.by_name.deinit();
         self.arena.deinit();
-        std.posix.munmap(self.mapping);
+        if (builtin.os.tag == .windows) {
+            _ = win.UnmapViewOfFile(self.mapping.ptr);
+        } else {
+            std.posix.munmap(self.mapping);
+        }
         self.file.close();
     }
 

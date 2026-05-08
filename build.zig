@@ -295,7 +295,20 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("shaders", .{
         .root_source_file = shader_mod,
     });
-    exe.linkSystemLibrary("vulkan");
+    // Vulkan loader: `vulkan-1.lib` on Windows, `libvulkan.so` (linked as
+    // `vulkan`) elsewhere. On Windows the LunarG SDK installer sets
+    // `VULKAN_SDK`; we use it to add the headers + import-lib paths so
+    // `@cInclude("vulkan/vulkan.h")` and the `-lvulkan-1` link both
+    // resolve without the user having to copy files into Zig's libc dir.
+    if (target.result.os.tag == .windows) {
+        if (std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK")) |sdk| {
+            exe.addIncludePath(.{ .cwd_relative = b.fmt("{s}/Include", .{sdk}) });
+            exe.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/Lib", .{sdk}) });
+        } else |_| {}
+        exe.linkSystemLibrary("vulkan-1");
+    } else {
+        exe.linkSystemLibrary("vulkan");
+    }
     exe.linkLibC();
 
     b.installArtifact(exe);

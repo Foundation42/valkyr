@@ -20,6 +20,10 @@ sudo pacman -S vulkan-headers vulkan-tools shaderc \
 On Debian / Ubuntu the equivalent is `libvulkan-dev vulkan-tools
 glslang-tools`. On macOS install the [Vulkan SDK from
 LunarG](https://vulkan.lunarg.com/sdk/home) (which bundles MoltenVK).
+On Windows install the same LunarG SDK plus the prebuilt Zig 0.14.1
+zip from [ziglang.org](https://ziglang.org/download/) — see
+[windows.md](windows.md) for the full walkthrough including AMD
+Strix Point iGPU perf numbers and known-issue notes.
 
 Then:
 
