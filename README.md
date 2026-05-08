@@ -138,6 +138,23 @@ CCE + checkpoint round-trip — composed first-try as real weights and
 real data flowed through. Full walkthrough in
 [docs/training.md](docs/training.md).
 
+**LoRA fine-tuning** is the same backend with a bitmask flag flipped:
+
+```sh
+./zig-out/bin/valkyr --lora-finetune Qwen/Qwen3-0.6B \
+    --data data/train/tiny_facts.jsonl \
+    --steps 30 --lora-targets all_attn --lora-rank 16 \
+    --out lora.lvkpt
+```
+
+Frozen base + trainable A,B for every projection in `--lora-targets`
+(any subset of `q,k,v,o,gate,up,down`, plus `all_attn`/`all_ffn`/`all`
+shorthands). Saves a **52.5 MiB `.lvkpt`** instead of an 8.4 GiB
+`.vkpt` (~170× shrink). LoRA-Q runs at **256 ms/step**, actually
+faster than full fine-tune, because the freeze skips Adam on the
+huge embed + lm_head buffers — full breakdown + perf table in
+[docs/training.md § LoRA fine-tuning](docs/training.md#lora-fine-tuning).
+
 **Honest framing.** valkyr is younger and smaller than llama.cpp. On
 raw decode tok/s on a single CUDA card, llama.cpp's CUDA path is
 faster than ours today (~1.5× on Qwen3.6 27B with `--q4k` last we
@@ -162,7 +179,7 @@ The detail lives in `docs/`. Each page is self-contained.
 | [docs/perf.md](docs/perf.md) | Decode tok/s table on RTX 3090 across the model + precision matrix, plus the bf16 vectorized-read win and what `--tq4v` is (and isn't) for. |
 | [docs/hardware.md](docs/hardware.md) | Vulkan 1.3 GPU requirements + what fits on 24 GiB across the matrix. |
 | [docs/architecture.md](docs/architecture.md) | `src/` and `shaders/` layout + convention notes (RoPE pair convention, Gemma quirks, TurboQuant Algorithm 1, numerical drift). |
-| [docs/training.md](docs/training.md) | Fine-tune your own model — `--fine-tune` CLI, dataset format, `.vkpt` checkpoint format, performance ballpark, smoke-gate primitives. |
+| [docs/training.md](docs/training.md) | Fine-tune your own model — `--fine-tune` (full-weight) and `--lora-finetune` (LoRA / LoRA+) CLIs, dataset format, `.vkpt` and `.lvkpt` checkpoint formats, performance ballpark, smoke-gate primitives. |
 | [docs/embedding.md](docs/embedding.md) | Full guide for embedding valkyr in a Vulkan host — three integration tiers, frame-budget mechanics, lifetime rules. |
 | [docs/server.md](docs/server.md) | OpenAI-compatible HTTP server (`--serve`) — endpoints, streaming, multi-turn, error envelope, openai-python compatibility. |
 | [docs/limitations.md](docs/limitations.md) | What valkyr can't do today + experiments that got reverted (tiled-N matmul, Q4_0 split layout, SwiGLU sparsity skipping). |

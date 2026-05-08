@@ -30,6 +30,13 @@ for the cooperative in-frame training surface,
 - **Checkpointing.** Custom `.vkpt` format — header + `Config` snapshot
   + raw fp32 blocks for every param + Adam m/v + step counter. Round-
   trip preserves training state bit-for-bit at toy scale.
+- **LoRA / PEFT.** `cfg.lora_targets` bitmask selects any subset of
+  the seven dense projections (Q / K / V / O / gate / up / down) for
+  rank-r adapter training. Frozen base + trainable A,B per target,
+  with optional LoRA+ differential lr for B (Chronicals Theorem 1).
+  Saves to a separate `.lvkpt` format that's ~170× smaller than the
+  full `.vkpt` (52.5 MiB vs ~9 GiB on Qwen3-0.6B). See
+  [§ LoRA fine-tuning](#lora-fine-tuning) below.
 
 ## Quick start
 
@@ -94,8 +101,12 @@ valkyr --fine-tune <model> --data <jsonl> [options]
 | `--rotate` | off | Cycle `dataset.batch(step + IDX) mod N` each step |
 | `--probe TEXT` | off | Sample N tokens from this prompt before & after training |
 | `--n-gen N` | `20` | Tokens generated per probe sample |
-| `--out PATH` | off | Save a `.vkpt` checkpoint at the end |
+| `--out PATH` | off | Save a checkpoint at the end (`.vkpt` for full-FT, `.lvkpt` when LoRA is on) |
 | `--print-every K` | `5` | Per-step timing print cadence; `0` to suppress |
+| `--lora-targets SPEC` | off | Comma-separated projection list — `q,k,v,o,gate,up,down` or shorthands `all_attn`, `all_ffn`, `all`. Switches to LoRA mode. |
+| `--lora-rank N` | `16` | LoRA adapter rank (when `--lora-targets` is set) |
+| `--lora-alpha A` | `32.0` | LoRA scaling — effective per-projection scale is α/r |
+| `--lora-lr-b-scale L` | `1.0` | LoRA+ multiplier on B's lr (Chronicals Theorem 1; ~16 typical) |
 
 ## Dataset format
 
@@ -147,6 +158,147 @@ appeared in every one of the 671 training rows — the model has absorbed
 the dataset's most-common boilerplate. This is generalization across
 batches (not single-batch memorization like the `tiny_facts` demo).
 1,247 ms/step at n_pos=128 Debug on an RTX 3090.
+
+## LoRA fine-tuning
+
+Pass `--lora-targets` (and optionally `--lora-rank`, `--lora-alpha`,
+`--lora-lr-b-scale`) to switch into LoRA mode. The `--lora-finetune`
+alias is the discoverable shortcut — same backend, but requires
+`--lora-targets` and bumps the lr default to `5e-4` (typical LoRA
+fine-tune rate is 10–50× full-FT lr because there's a much smaller
+trainable surface).
+
+```sh
+./zig-out/bin/valkyr --lora-finetune Qwen/Qwen3-0.6B \
+    --data data/train/tiny_facts.jsonl \
+    --steps 30 \
+    --lora-targets all_attn \
+    --lora-rank 16 \
+    --lora-alpha 32 \
+    --probe "The capital of France is" \
+    --out /tmp/qwen3-lora.lvkpt
+```
+
+In LoRA mode every dense matmul named in `--lora-targets` is replaced
+by `y = x · Wᵀ + (α/r) · (x · Aᵀ) · Bᵀ` with W frozen and A,B trained.
+**Every other parameter is also frozen** — embedding, RMSNorm gains,
+final norm, lm_head, and the dense W's not named in the bitmask. This
+is the standard LoRA semantics. The `.lvkpt` format only persists A,B
+(plus their Adam state); base W stays in the source safetensors and is
+re-loaded on resume.
+
+### Target bitmask
+
+| Spec | Bit | What it covers |
+|---|---|---|
+| `q` | 1 | W_q (queries) |
+| `k` | 2 | W_k (keys) |
+| `v` | 4 | W_v (values) |
+| `o` | 8 | W_o (output projection) |
+| `gate` | 16 | W_gate (FFN gate) |
+| `up` | 32 | W_up (FFN up) |
+| `down` | 64 | W_down (FFN down) |
+| `all_attn` | 15 | `q | k | v | o` (most common LoRA setup) |
+| `all_ffn` | 112 | `gate | up | down` |
+| `all` | 127 | every dense projection |
+
+Combine freely: `--lora-targets q,v` is the original
+`Hu et al. 2021` LoRA setup; `--lora-targets all` is the maximal
+coverage at higher per-step cost.
+
+### `.lvkpt` size + load time
+
+LoRA-only checkpoints are ~170× smaller than full `.vkpt` because
+they skip the base weights. On Qwen3-0.6B (28 layers, dim=1024,
+GQA 16/8, ff_dim=3072, vocab=151936):
+
+| Targets | Rank | `.lvkpt` size | Load time |
+|---|---|---|---|
+| `all_attn` | 16 | **52.5 MiB** | ~370 ms |
+| `q` | 16 | ~16 MiB | <200 ms |
+| `all` | 16 | ~125 MiB | ~700 ms |
+| (full `.vkpt` reference) | — | ~9 GiB | ~46–52 s |
+
+### LoRA performance
+
+On an RTX 3090, real-shape Qwen3-0.6B at `n_pos=16`, ReleaseFast:
+
+| Mode | Targets | ms/step | Δ vs full-FT |
+|---|---|---|---|
+| Full fine-tune | — | 268 | baseline |
+| LoRA | `q` rank-16 | **256** | **−12 ms / −4.7%** (faster!) |
+| LoRA | `all_attn` rank-16 | ~310 | +42 ms / +15.7% |
+| LoRA | `all` rank-16 | 399 | +131 ms / +48.8% |
+
+LoRA-Q is **faster** than full-FT because the freeze skips Adam on
+the huge `embed` and `lm_head` buffers (vocab × dim each is ~600 MiB
+of fp32 + Adam m/v at Qwen3-0.6B), which costs more HBM bandwidth
+than the +14 LoRA dispatches per layer add. Past ~3 enabled targets,
+the LoRA chain overhead crosses back over and the all-projection
+case is slower.
+
+### Resume from `.lvkpt`
+
+`--gen-from-ckpt` autodetects `.vkpt` vs `.lvkpt` by sniffing the
+4-byte magic at the file head. For `.lvkpt`, pass the same
+`--lora-targets` / `--lora-rank` the checkpoint was saved with so
+the Runner allocates matching adapter slots before load overwrites
+them; `cfgShapeMatches` rejects mismatches with
+`error.LoraCheckpointConfigMismatch`.
+
+```sh
+./zig-out/bin/valkyr --gen-from-ckpt Qwen/Qwen3-0.6B \
+    --ckpt /tmp/qwen3-lora.lvkpt \
+    --lora-targets all_attn \
+    --lora-rank 16 \
+    --lora-alpha 32 \
+    --prompt "The capital of France is" \
+    --n-gen 20
+```
+
+A 10-step `--lora-finetune` on `tiny_facts.jsonl` with
+`--lora-targets all_attn --lora-rank 16` produces this:
+
+```
+[gen-from-ckpt] loaded LoRA checkpoint in 367 ms
+[gen-from-ckpt] 8 tokens in 746 ms (93.3 ms/tok)
+
+The capital of France is Paris. Paris sits on the river Se
+```
+
+The post-train continuation is verbatim from `tiny_facts.jsonl` line 1
+(same memorization signal as the full-FT demo), achieved with a
+**52.5 MiB** delta on disk instead of an 8.4 GiB checkpoint.
+
+### `.lvkpt` format
+
+Same buffered-IO shape as `.vkpt` but a different magic + body:
+
+```
+[16 bytes — CheckpointHeader]
+  magic    : "VLKP"
+  version  : u32 = 1
+  step_t   : u32  (Adam timestep counter)
+  cfg_size : u32  (sanity check)
+
+[Config struct as raw bytes — std.mem.asBytes(&cfg)]
+
+[body — raw fp32 in this canonical order]
+  for each Proj in [.q, .k, .v, .o, .gate, .up, .down]:
+    if (cfg.lora_targets & projBit(Proj)) != 0:
+      for each layer i in 0..n_layers:
+        A bytes      ([r, K_proj] fp32)
+        m_A bytes
+        v_A bytes
+        B bytes      ([N_proj, r] fp32)
+        m_B bytes
+        v_B bytes
+```
+
+Disabled projections contribute zero bytes. `cfgShapeMatches` enforces
+matching `lora_targets` and `lora_rank` between save and load — a
+checkpoint trained with `all_attn` cannot be loaded into a Runner
+configured for `all`.
 
 ## Checkpoint format (`.vkpt`)
 
@@ -229,11 +381,17 @@ The same primitives the user-facing `--fine-tune` uses are exposed as
 flag-gated smokes for development:
 
 ```sh
-./zig-out/bin/valkyr --real-train-step-smoke   # β-5: one Adam step
-./zig-out/bin/valkyr --real-multi-step-smoke   # β-6a: 30-step overfit
-./zig-out/bin/valkyr --checkpoint-smoke        # β-6b: toy save/load round-trip
-./zig-out/bin/valkyr --real-sampling-smoke     # β-6c: pre/post text shift
+./zig-out/bin/valkyr --real-train-step-smoke      # β-5: one Adam step
+./zig-out/bin/valkyr --real-multi-step-smoke      # β-6a: 30-step overfit
+./zig-out/bin/valkyr --checkpoint-smoke           # β-6b: toy .vkpt round-trip
+./zig-out/bin/valkyr --real-sampling-smoke        # β-6c: pre/post text shift
 ./zig-out/bin/valkyr --decoder-stack-train-smoke  # toy 8c-α-3 (200-step convergence)
+./zig-out/bin/valkyr --lora-rec-smoke             # A4-1: helper-level LoRA parity
+./zig-out/bin/valkyr --lora-q-runner-smoke        # A4-2: LoRA on Q-projection
+./zig-out/bin/valkyr --lora-all-runner-smoke      # A4-3: LoRA on all 7 projections
+./zig-out/bin/valkyr --lora-checkpoint-smoke      # A4-4: toy .lvkpt round-trip
+./zig-out/bin/valkyr --real-lora-q-step-smoke     # β-5 + LoRA-Q (real Qwen3-0.6B)
+./zig-out/bin/valkyr --real-lora-all-step-smoke   # β-5 + LoRA-all (real Qwen3-0.6B)
 ```
 
 Each smoke gates a specific property and prints a `PASS …` line on
@@ -246,9 +404,10 @@ particular piece of the fine-tune flow is exercised in isolation.
   not on the roadmap before the single-GPU surface stabilises.
 - **Mixed precision.** fp32 throughout. bf16 / fp16 forward + master-
   fp32 weights is a future depth chunk.
-- **LoRA / PEFT for fine-tuning.** The `cpu/lora.zig` + LoRA GPU smokes
-  prove the kernel inventory works; wiring LoRA adapters into
-  `Runner.step` is a separate chunk.
+- **Per-projection LoRA rank.** A single `lora_rank` applies to every
+  enabled projection. Per-target rank (e.g. rank-16 on Q+V, rank-4 on
+  K+O) would be a small additive change to `LoraState.allocAndInit`
+  but isn't on yet.
 - **Sliding-window attention (Gemma 2/3).** The trainer uses standard
   causal attention. Gemma's per-layer alternating sliding-window mask
   is a model-family chunk.
@@ -273,10 +432,20 @@ CLI, the building blocks are in `src/train/`:
   → `runner.step(input_ids, target_ids)` (one Adam step) →
   `runner.forwardLogits(token_ids, out_logits)` (eval) →
   `runner.saveCheckpoint(allocator, path)` /
-  `runner.loadCheckpoint(allocator, path)`.
+  `runner.loadCheckpoint(allocator, path)` (full state, `.vkpt`) /
+  `runner.saveLoraCheckpoint(allocator, path)` /
+  `runner.loadLoraCheckpoint(allocator, path)` (LoRA-only, `.lvkpt`).
+- `train_transformer.LoraTarget` — bitmask constants
+  (`q | k | v | o | gate | up | down | all_attn | all_ffn | all`).
+  Set on `Config.lora_targets` to enable LoRA on those projections.
+- `train_lora.recordLoraForward` /
+  `train_lora.recordLoraBackward` — the underlying dispatch helpers
+  that compose existing kernels (matmul / linear-backward / scale /
+  add-in-place) into the LoRA chain. Useful if you need LoRA on a
+  custom dispatch path outside the Runner.
 - `train_sampling.greedyDecode(...)` — autoregressive greedy decode
   wrapping `forwardLogits`, used by the `--probe` flag.
 
 The CLI driver in `src/commands/finetune.zig` is the worked example —
-about 200 lines composing the four modules above into the shape the
-flag exposes.
+about 280 lines composing the modules above into the shape the
+`--fine-tune` / `--lora-finetune` flags expose.

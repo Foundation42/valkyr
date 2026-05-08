@@ -111,7 +111,16 @@ zig build run
     --probe "The capital of France is" \
     --out fine-tuned.vkpt
 
-# Generate text from a `.vkpt` checkpoint produced above.
+# LoRA fine-tune — frozen base + trainable A,B per projection. Saves
+# a `.lvkpt` (~170× smaller than `.vkpt`). --lora-targets accepts
+# any subset of q,k,v,o,gate,up,down (or all_attn/all_ffn/all).
+./zig-out/bin/valkyr --lora-finetune Qwen/Qwen3-0.6B \
+    --data data/train/tiny_facts.jsonl \
+    --steps 30 --lora-targets all_attn --lora-rank 16 \
+    --out lora.lvkpt
+
+# Generate text from a `.vkpt` or `.lvkpt` checkpoint produced above.
+# Magic-sniffed at load — pass --lora-targets / --lora-rank for `.lvkpt`.
 ./zig-out/bin/valkyr --gen-from-ckpt Qwen/Qwen3-0.6B \
     --ckpt fine-tuned.vkpt \
     --prompt "The capital of France is" \

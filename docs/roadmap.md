@@ -76,11 +76,23 @@ The two big arcs:
      smoke shows the post-train model literally regurgitating
      `tiny_facts.jsonl` batch 0 ("*Paris. Paris sits on the river Seine
      and is famous for...*") where the pre-train base model gives a
-     generic capital-listing. **Next tier:** Tier-4 = multi-batch
-     training loop (rotate batches across dataset), real-model checkpoint
-     stress (7.4 GB at Qwen3-0.6B fp32), and an Unsloth-equivalent
-     fine-tune driver. See
-     [embedding.md § Embedding training](embedding.md#embedding-training).
+     generic capital-listing. **A-series (LoRA) shipped 2026-05-08:**
+     Chronicals-paper-aligned LoRA + LoRA+ wired into `Runner.step`
+     with a `lora_targets: u32` bitmask + `LoraTarget` constants
+     (`q | k | v | o | gate | up | down | all_attn | all_ffn | all`),
+     standard freeze semantics (every non-LoRA param frozen when LoRA
+     is on), and a `.lvkpt` checkpoint format that drops the on-disk
+     payload from ~9 GiB (`.vkpt`) to ~52.5 MiB on Qwen3-0.6B at
+     `all_attn` rank-16 — a ~170× shrink. `--lora-finetune <model>
+     --data <jsonl> --lora-targets <spec>` is the user-facing CLI;
+     `--gen-from-ckpt` magic-sniffs `.vkpt` vs `.lvkpt`. LoRA-Q is
+     actually faster than full-FT (256 vs 268 ms/step) because the
+     freeze skips Adam on the huge embed + lm_head buffers.
+     **Next tier:** Tier-4 = multi-batch training loop (rotate batches
+     across dataset), real-model checkpoint stress, and an Unsloth-
+     equivalent fine-tune driver. See
+     [training.md § LoRA fine-tuning](training.md#lora-fine-tuning)
+     and [embedding.md § Embedding training](embedding.md#embedding-training).
    - **Architectural blueprints (ONNX / JSON-spec).** Once the
      primitive set has stabilised through the transformer-training
      deepening above, a declarative graph → instantiated valkyr
