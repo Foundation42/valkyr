@@ -91,6 +91,11 @@ pub const InitWeights = struct {
 
 const checkpoint_magic: [4]u8 = .{ 'V', 'K', 'P', 'T' };
 const checkpoint_version: u32 = 1;
+/// Buffered-IO chunk size for checkpoint save/load. 4 MiB is large
+/// enough to amortise syscall overhead across the many small per-layer
+/// blobs and small enough that the staging-side memcpy still fits in
+/// L2 on most CPUs.
+const checkpoint_io_buf_bytes: comptime_int = 4 * 1024 * 1024;
 
 const CheckpointHeader = extern struct {
     magic: [4]u8,
@@ -1101,6 +1106,27 @@ pub const Runner = struct {
     // pipelines, and the recorder — all rebuilt from params + the next
     // forward/backward pass.
 
+    // PERF NOTE — checkpoint save floor (measured 2026-05-08):
+    // Save at Qwen3-0.6B (8.40 GiB fp32) takes ~46-52 s on an RTX 3090.
+    // The bottleneck is reading from HOST_VISIBLE staging memory back
+    // to host RAM during the per-blob copy: on systems without ReBAR /
+    // SAM enabled, NVIDIA host-visible mappings above ~256 MiB fall
+    // into a slow PCIe-BAR fallback path. We tried pooling all
+    // transfers through one 622 MiB persistent staging buffer (which
+    // would amortise allocation cost) but it specifically *hits* the
+    // slow path and got a wash. The current per-blob `readBack` /
+    // `uploadFromHost` shape keeps individual allocations small enough
+    // to stay in the fast BAR1 window for most blobs. A buffered
+    // writer/reader wraps the file to coalesce per-blob writes into
+    // 4 MiB-aligned sequential I/O, which is a small unambiguous win
+    // (~3-5 s shaved across the 933 blobs).
+    //
+    // Real fixes would be: (a) async overlap of GPU copy and file
+    // write; (b) save in bf16 / quantized form (changes the format);
+    // (c) chunked staging pool tuned to fit in BAR1. Defer until a
+    // real workflow makes save time hurt — single-checkpoint cost is
+    // currently a one-time tax per fine-tune session.
+
     pub fn saveCheckpoint(self: *Runner, allocator: std.mem.Allocator, path: []const u8) !void {
         const blobs = try self.collectBlobs(allocator);
         defer allocator.free(blobs);
@@ -1108,14 +1134,18 @@ pub const Runner = struct {
         const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
 
+        const SaveWriter = std.io.BufferedWriter(checkpoint_io_buf_bytes, std.fs.File.Writer);
+        var bw = SaveWriter{ .unbuffered_writer = file.writer() };
+        const w = bw.writer();
+
         const header = CheckpointHeader{
             .magic = checkpoint_magic,
             .version = checkpoint_version,
             .step_t = self.step_t,
             .cfg_size = @sizeOf(Config),
         };
-        try file.writeAll(std.mem.asBytes(&header));
-        try file.writeAll(std.mem.asBytes(&self.cfg));
+        try w.writeAll(std.mem.asBytes(&header));
+        try w.writeAll(std.mem.asBytes(&self.cfg));
 
         var scratch = std.ArrayList(f32).init(allocator);
         defer scratch.deinit();
@@ -1123,8 +1153,9 @@ pub const Runner = struct {
         for (blobs) |b| {
             try scratch.resize(b.numel);
             try b.buf.readBack(self.ctx, f32, scratch.items);
-            try file.writeAll(std.mem.sliceAsBytes(scratch.items));
+            try w.writeAll(std.mem.sliceAsBytes(scratch.items));
         }
+        try bw.flush();
     }
 
     pub fn loadCheckpoint(self: *Runner, allocator: std.mem.Allocator, path: []const u8) !void {
@@ -1134,14 +1165,18 @@ pub const Runner = struct {
         const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
         defer file.close();
 
+        const LoadReader = std.io.BufferedReader(checkpoint_io_buf_bytes, std.fs.File.Reader);
+        var br = LoadReader{ .unbuffered_reader = file.reader() };
+        const r = br.reader();
+
         var header: CheckpointHeader = undefined;
-        try file.reader().readNoEof(std.mem.asBytes(&header));
+        try r.readNoEof(std.mem.asBytes(&header));
         if (!std.mem.eql(u8, &header.magic, &checkpoint_magic)) return error.InvalidCheckpointMagic;
         if (header.version != checkpoint_version) return error.UnsupportedCheckpointVersion;
         if (header.cfg_size != @sizeOf(Config)) return error.CheckpointConfigSizeMismatch;
 
         var saved_cfg: Config = undefined;
-        try file.reader().readNoEof(std.mem.asBytes(&saved_cfg));
+        try r.readNoEof(std.mem.asBytes(&saved_cfg));
         if (!cfgShapeMatches(saved_cfg, self.cfg)) return error.CheckpointConfigMismatch;
 
         // Restore optimizer state. The saved cfg's lr/beta/eps_adam are
@@ -1157,7 +1192,7 @@ pub const Runner = struct {
 
         for (blobs) |b| {
             try scratch.resize(b.numel);
-            try file.reader().readNoEof(std.mem.sliceAsBytes(scratch.items));
+            try r.readNoEof(std.mem.sliceAsBytes(scratch.items));
             try b.buf.uploadFromHost(self.ctx, f32, scratch.items);
         }
     }
