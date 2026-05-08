@@ -198,3 +198,150 @@ pub fn flashAttentionForward(
     }
 }
 
+/// FlashAttention backward (Dao et al. 2023, Algorithm 4 — the
+/// FlashAttention-2 backward). Recomputes the softmax inline from the
+/// saved `O` and `lse` buffers, never materialising the full
+/// [n_q × n_heads × n_kv] attention matrix that
+/// `cpu_train_transformer.attentionBackward` consumes.
+///
+/// Math identity (exact modulo fp32 rounding from a different reduction
+/// order). Given the saved forward results `O = attn · V` (where
+/// `attn = softmax(Q · Kᵀ · inv_sqrt_d)`) and `lse = log(Σ_k exp(S))`:
+///
+///     D[q, h] = Σ_d O[q, h, d] · dO[q, h, d]
+///             = Σ_k attn[q, h, k] · (Σ_d dO[q, h, d] · V[k, kv_h, d])
+///             = Σ_k attn[q, h, k] · d_attn[q, h, k]                  (eq. ★)
+///
+///     P[q, h, k] = exp(S[q, h, k] − lse[q, h])    (= attn[q, h, k])
+///     dP[q, h, k] = Σ_d dO[q, h, d] · V[k, kv_h, d]
+///     dS[q, h, k] = P[q, h, k] · (dP[q, h, k] − D[q, h])
+///
+/// where the substitution at (★) is what lets the FA-2 backward replace
+/// the [n_q × n_heads × n_kv] `Σ_k(attn · d_attn)` term in `softmax_backward`
+/// with a [n_q × n_heads] rowwise reduction over `head_dim`. The final
+/// gradients are unchanged:
+///
+///     dV[k, kv_h, d] = Σ_h_in_kv Σ_q P[q, h, k] · dO[q, h, d]
+///     dQ[q, h, d]    = Σ_k dS[q, h, k] · K[k, kv_h, d] / √d
+///     dK[k, kv_h, d] = Σ_h_in_kv Σ_q dS[q, h, k] · Q[q, h, d] / √d
+///
+/// Writes (overwrites; does not accumulate) into `dQ`, `dK`, `dV` —
+/// matches `attentionBackward`'s contract.
+///
+/// Causal mask follows the same `k_limit = q + (n_kv − n_q)` convention
+/// as the forward; entries beyond `k_limit` are skipped (P stays zero,
+/// no contribution to gradients).
+///
+/// Heap-free: D[q, h] is computed inline once per (q, h) row before
+/// the k loop, replacing the [n_q × n_heads × n_kv] `d_scores` scratch
+/// that the 3-pass oracle requires.
+///
+/// Shapes:
+///   Q   [n_q,  n_heads,    head_dim]
+///   K   [n_kv, n_kv_heads, head_dim]
+///   V   [n_kv, n_kv_heads, head_dim]
+///   O   [n_q,  n_heads,    head_dim]    saved forward output
+///   dO  [n_q,  n_heads,    head_dim]    incoming gradient
+///   lse [n_q,  n_heads]                 saved log-sum-exp from forward
+///   dQ  [n_q,  n_heads,    head_dim]    output (overwritten)
+///   dK  [n_kv, n_kv_heads, head_dim]    output (overwritten)
+///   dV  [n_kv, n_kv_heads, head_dim]    output (overwritten)
+pub fn flashAttentionBackward(
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    O: []const f32,
+    dO: []const f32,
+    lse: []const f32,
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    dQ: []f32,
+    dK: []f32,
+    dV: []f32,
+) void {
+    std.debug.assert(n_heads % n_kv_heads == 0);
+    const heads_per_kv = n_heads / n_kv_heads;
+    std.debug.assert(Q.len == n_q * n_heads * head_dim);
+    std.debug.assert(K.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(V.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(O.len == n_q * n_heads * head_dim);
+    std.debug.assert(dO.len == n_q * n_heads * head_dim);
+    std.debug.assert(lse.len == n_q * n_heads);
+    std.debug.assert(dQ.len == n_q * n_heads * head_dim);
+    std.debug.assert(dK.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(dV.len == n_kv * n_kv_heads * head_dim);
+    if (causal) std.debug.assert(n_q <= n_kv);
+
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    @memset(dQ, 0.0);
+    @memset(dK, 0.0);
+    @memset(dV, 0.0);
+
+    for (0..n_q) |q| {
+        for (0..n_heads) |h| {
+            const kv_h = h / heads_per_kv;
+            const o_off = q * n_heads * head_dim + h * head_dim;
+            // dQ[q, h, :] / dO[q, h, :] / Q[q, h, :] / O[q, h, :] all
+            // share this offset (q-major heads-second head_dim-last).
+            const lse_qh = lse[q * n_heads + h];
+
+            // If the entire row was masked at forward time, no gradient
+            // flows through this (q, h). Skips the recompute and zero
+            // contribution to dQ/dK/dV (already memset).
+            if (lse_qh == NEG_INF) continue;
+
+            // D[q, h] = Σ_d O[q, h, d] · dO[q, h, d] — fp64 to match
+            // `attentionBackward`'s d-axis reduction precision. This
+            // is the FA-2 simplification of `Σ_k attn · d_attn`.
+            var D: f64 = 0;
+            for (0..head_dim) |d| {
+                D += @as(f64, O[o_off + d]) * @as(f64, dO[o_off + d]);
+            }
+            const D_f32: f32 = @floatCast(D);
+
+            const k_limit: usize = if (causal) causalKeyLimit(q, n_q, n_kv) else n_kv - 1;
+
+            for (0..n_kv) |k| {
+                if (causal and k > k_limit) continue;
+
+                const k_off = k * n_kv_heads * head_dim + kv_h * head_dim;
+
+                // Recompute S = Q · Kᵀ · inv_sqrt_d, then P = exp(S − LSE).
+                var s: f64 = 0;
+                for (0..head_dim) |d| {
+                    s += @as(f64, Q[o_off + d]) * @as(f64, K[k_off + d]);
+                }
+                const S: f32 = @as(f32, @floatCast(s)) * inv_sqrt_d;
+                const P: f32 = @exp(S - lse_qh);
+                if (P == 0.0) continue;
+
+                // dV[k, kv_h, d] += P · dO[q, h, d]
+                for (0..head_dim) |d| {
+                    dV[k_off + d] += P * dO[o_off + d];
+                }
+
+                // dP = Σ_d dO[q, h, d] · V[k, kv_h, d] — fp64 reduction.
+                var dP: f64 = 0;
+                for (0..head_dim) |d| {
+                    dP += @as(f64, dO[o_off + d]) * @as(f64, V[k_off + d]);
+                }
+
+                // dS = P · (dP − D); scale by inv_sqrt_d once for the
+                // dQ / dK chain rule.
+                const dS_scaled: f32 = P * (@as(f32, @floatCast(dP)) - D_f32) * inv_sqrt_d;
+
+                // dQ[q, h, d] += dS_scaled · K[k, kv_h, d]
+                // dK[k, kv_h, d] += dS_scaled · Q[q, h, d]
+                for (0..head_dim) |d| {
+                    dQ[o_off + d] += dS_scaled * K[k_off + d];
+                    dK[k_off + d] += dS_scaled * Q[o_off + d];
+                }
+            }
+        }
+    }
+}

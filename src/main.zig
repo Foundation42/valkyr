@@ -123,6 +123,17 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--flash-attention-bw-smoke")) {
+        // F6a of the FlashAttention arc: CPU oracle parity for the
+        // FA-2 backward (Dao 2023, Algorithm 4). Recomputes softmax
+        // inline from saved O + LSE — replaces the [n_q × n_heads ×
+        // n_kv] attn-matrix consumption of the 3-pass `attentionBackward`
+        // with a per-row D = Σ_d O · dO reduction, then accumulates
+        // dQ/dK/dV the same way. Five shape cases mirror the F2 forward
+        // smoke; tolerance 1e-4 rel-err.
+        try smoke_cpu.runFlashAttentionBackwardParitySmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-forward-smoke")) {
         // F3 of the FlashAttention arc: GPU SPIR-V kernel parity vs
         // the F2 CPU oracle. Drives `shaders/fa_forward.comp` (one
@@ -958,6 +969,7 @@ pub fn main() !void {
     try smoke_cpu.runRmsNormBackwardCpuSmoke(allocator);
     try smoke_cpu.runLoraMergeMathSmoke(allocator);
     try smoke_cpu.runFlashAttentionParitySmoke(allocator);
+    try smoke_cpu.runFlashAttentionBackwardParitySmoke(allocator);
     try smoke_gpu_train.runFlashAttentionGpuSmoke(allocator);
     try smoke_gpu_train.runFaRunnerSmoke(allocator);
     try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);

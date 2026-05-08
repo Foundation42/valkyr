@@ -763,6 +763,168 @@ pub fn runFlashAttentionParitySmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── F6a: FlashAttention backward CPU oracle parity ────────────────────
+//
+// Gates `cpu/flash_attn.zig:flashAttentionBackward` against
+// `cpu/train_transformer.zig:attentionBackward`. The two paths consume
+// different forward-saved tensors — the 3-pass oracle takes `attn`
+// (full softmax matrix), the FA-2 oracle takes `O` + `lse` and
+// recomputes P inline — so this smoke runs both forwards on the same
+// inputs and confirms dQ/dK/dV match. Reduction order differs, so
+// bit-equality is not expected; tolerance: 1e-4 rel-err.
+//
+// Shapes mirror the forward parity smoke's training-relevant cases
+// (n_q == n_kv, causal, GQA), plus a heads_per_kv=4 case to exercise
+// the kv_h fold and a non-aligned causal case so masked-out rows are
+// covered.
+
+const FlashBackwardCase = struct {
+    name: []const u8,
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+};
+
+fn runOneFlashBackwardCase(allocator: std.mem.Allocator, case: FlashBackwardCase) !struct { dq: f32, dk: f32, dv: f32 } {
+    const Q = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(Q);
+    const K = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(K);
+    const V = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(V);
+    const dO = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(dO);
+
+    // 3-pass forward: produces `attn` (consumed by 3-pass backward) and
+    // `O_ref` (used as the saved `O` input to FA backward — equivalent
+    // to FA forward's output to ~1e-6 per the F2 forward smoke).
+    const scores = try allocator.alloc(f32, case.n_q * case.n_heads * case.n_kv);
+    defer allocator.free(scores);
+    const attn = try allocator.alloc(f32, case.n_q * case.n_heads * case.n_kv);
+    defer allocator.free(attn);
+    const O_ref = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(O_ref);
+
+    // FA forward: produces `lse` (consumed by FA backward) and `O_fa`.
+    const O_fa = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(O_fa);
+    const lse = try allocator.alloc(f32, case.n_q * case.n_heads);
+    defer allocator.free(lse);
+
+    // FA forward tile scratch.
+    const Br: usize = @min(case.n_q, 4);
+    const Bc: usize = @min(case.n_kv, 4);
+    const s_tile = try allocator.alloc(f32, Br * Bc);
+    defer allocator.free(s_tile);
+    const p_tile = try allocator.alloc(f32, Br * Bc);
+    defer allocator.free(p_tile);
+    const o_acc = try allocator.alloc(f32, Br * case.head_dim);
+    defer allocator.free(o_acc);
+    const m_acc = try allocator.alloc(f32, Br);
+    defer allocator.free(m_acc);
+    const l_acc = try allocator.alloc(f32, Br);
+    defer allocator.free(l_acc);
+
+    // Backward outputs.
+    const d_scores = try allocator.alloc(f32, case.n_q * case.n_heads * case.n_kv);
+    defer allocator.free(d_scores);
+    const dQ_ref = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(dQ_ref);
+    const dK_ref = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(dK_ref);
+    const dV_ref = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(dV_ref);
+    const dQ_fa = try allocator.alloc(f32, case.n_q * case.n_heads * case.head_dim);
+    defer allocator.free(dQ_fa);
+    const dK_fa = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(dK_fa);
+    const dV_fa = try allocator.alloc(f32, case.n_kv * case.n_kv_heads * case.head_dim);
+    defer allocator.free(dV_fa);
+
+    var prng = std.Random.DefaultPrng.init(0xF6_BACE);
+    const rng = prng.random();
+    for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+    for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+    for (V) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+    for (dO) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+    cpu_train_transformer.attentionForward(
+        Q, K, V, case.n_q, case.n_kv, case.n_heads, case.n_kv_heads, case.head_dim,
+        case.causal, scores, attn, O_ref,
+    );
+    cpu_flash_attn.flashAttentionForward(
+        Q, K, V, case.n_q, case.n_kv, case.n_heads, case.n_kv_heads, case.head_dim,
+        case.causal, Br, Bc,
+        O_fa, lse,
+        s_tile, p_tile, o_acc, m_acc, l_acc,
+    );
+
+    cpu_train_transformer.attentionBackward(
+        dO, Q, K, V, attn, case.n_q, case.n_kv, case.n_heads, case.n_kv_heads, case.head_dim,
+        case.causal, d_scores, dQ_ref, dK_ref, dV_ref,
+    );
+    cpu_flash_attn.flashAttentionBackward(
+        Q, K, V, O_fa, dO, lse, case.n_q, case.n_kv, case.n_heads, case.n_kv_heads, case.head_dim,
+        case.causal, dQ_fa, dK_fa, dV_fa,
+    );
+
+    const checkRel = struct {
+        fn rel(ref: []const f32, got: []const f32) f32 {
+            var max_abs: f32 = 0;
+            var max_ref: f32 = 0;
+            for (ref, got) |r, g| {
+                const d = @abs(r - g);
+                if (d > max_abs) max_abs = d;
+                if (@abs(r) > max_ref) max_ref = @abs(r);
+            }
+            return if (max_ref > 0) max_abs / max_ref else max_abs;
+        }
+    }.rel;
+
+    const rel_dq = checkRel(dQ_ref, dQ_fa);
+    const rel_dk = checkRel(dK_ref, dK_fa);
+    const rel_dv = checkRel(dV_ref, dV_fa);
+
+    const tol: f32 = 1e-4;
+    if (rel_dq > tol or rel_dk > tol or rel_dv > tol) {
+        std.debug.print(
+            "FA backward parity FAIL ({s}): rel(dQ/dK/dV)=({e:.3},{e:.3},{e:.3})\n",
+            .{ case.name, rel_dq, rel_dk, rel_dv },
+        );
+        return error.ParityFailed;
+    }
+
+    return .{ .dq = rel_dq, .dk = rel_dk, .dv = rel_dv };
+}
+
+pub fn runFlashAttentionBackwardParitySmoke(allocator: std.mem.Allocator) !void {
+    const cases = [_]FlashBackwardCase{
+        .{ .name = "prefill-tiny (n_q=4 n_kv=4 GQA 4:2 d=16)",        .n_q = 4,  .n_kv = 4,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = true  },
+        .{ .name = "prefill-qwen3 (n_q=16 n_kv=16 GQA 16:8 d=128)",   .n_q = 16, .n_kv = 16, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true  },
+        .{ .name = "non-aligned (n_q=10 n_kv=12 GQA 4:2 d=16 causal)", .n_q = 10, .n_kv = 12, .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = true  },
+        .{ .name = "gqa-4to1 (n_q=8 n_kv=8 heads_per_kv=4 d=16)",     .n_q = 8,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 1, .head_dim = 16,  .causal = true  },
+        .{ .name = "non-causal (n_q=4 n_kv=8 GQA 4:2 d=16)",          .n_q = 4,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = false },
+    };
+
+    var max_dq: f32 = 0;
+    var max_dk: f32 = 0;
+    var max_dv: f32 = 0;
+    for (cases) |c| {
+        const r = try runOneFlashBackwardCase(allocator, c);
+        if (r.dq > max_dq) max_dq = r.dq;
+        if (r.dk > max_dk) max_dk = r.dk;
+        if (r.dv > max_dv) max_dv = r.dv;
+    }
+
+    std.debug.print(
+        "PASS flash-attention backward parity ({d} cases incl. GQA + causal + non-aligned + d=128, max rel(dQ/dK/dV)=({e:.2},{e:.2},{e:.2}))\n",
+        .{ cases.len, max_dq, max_dk, max_dv },
+    );
+}
+
 /// Naive `y[m, n] = Σ_k x[m, k] · w[n, k]` — the matmul-nt convention.
 /// Used only by smokes; production kernels live in src/runtime.zig.
 fn matmulNt(x: []const f32, w: []const f32, y: []f32, M: usize, N: usize, K: usize) void {
