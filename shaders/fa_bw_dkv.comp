@@ -1,0 +1,201 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_vote       : require
+
+// FlashAttention-2 backward, phase 3 — per-(k, kv_h) dK + dV accumulation.
+// Symmetric to fa_bw_dq.comp: tile-on-Q outer loop, recompute softmax
+// inline from saved LSE, and fold every q-head sharing this kv-head
+// (heads_per_kv) into the same dK/dV row.
+//
+// Math (Dao 2023, Algorithm 4). For each (k, kv_h), iterate
+// h_offset ∈ [0, heads_per_kv) (GQA fold), then iterate Q tiles of `BR`
+// queries:
+//
+//     S[qi]  = inv_sqrt_d · Σ_d Q_tile[qi, d] · K_row[d]      (or -inf if causal-masked)
+//     P[qi]  = exp(S[qi] − lse[q_abs, h])
+//     dP[qi] = Σ_d dO_tile[qi, d] · V_row[d]
+//     dS[qi] = P[qi] · (dP[qi] − D[q_abs, h])
+//     dV_acc[d] += Σ_qi P[qi]  · dO_tile[qi, d]
+//     dK_acc[d] += inv_sqrt_d · Σ_qi dS[qi] · Q_tile[qi, d]
+//
+// Final: dK[k, kv_h, :] = dK_acc, dV[k, kv_h, :] = dV_acc.
+//
+// Dispatch: n_kv × n_kv_heads workgroups (cell = kv_h * n_kv + k). One
+// WG per output K/V row → no cross-WG accumulation needed. The GQA
+// fold happens inside the WG via the h_offset loop.
+//
+// Causal mask: for fixed k, only q ≥ q_min contribute, where
+// q_min = max(0, k − (n_kv − n_q)) (when n_q ≤ n_kv). Past that floor
+// the per-position cutoff `k > k_limit(q)` is automatically false.
+//
+// Compile-time tile + dim caps (matches fa_forward.comp):
+//     BR          = 16          queries per Q/dO tile
+//     HEAD_DIM    = 128         max supported head_dim
+//
+// Shared memory ≈ 18.5 KB at HEAD_DIM=128 (Q_tile + dO_tile dominate).
+
+layout(local_size_x = 256) in;
+
+#define BR            16u
+#define HEAD_DIM_MAX  128u
+
+layout(set = 0, binding = 0, std430) readonly  buffer Q   { float q_buf[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer K   { float k_buf[];   };
+layout(set = 0, binding = 2, std430) readonly  buffer V   { float v_buf[];   };
+layout(set = 0, binding = 3, std430) readonly  buffer DO  { float do_buf[];  };
+layout(set = 0, binding = 4, std430) readonly  buffer LSE { float lse_buf[]; };
+layout(set = 0, binding = 5, std430) readonly  buffer D   { float d_buf[];   };
+layout(set = 0, binding = 6, std430) writeonly buffer DK  { float dk_buf[];  };
+layout(set = 0, binding = 7, std430) writeonly buffer DV  { float dv_buf[];  };
+
+layout(push_constant) uniform Pc {
+    uint  n_q;
+    uint  n_kv;
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  heads_per_kv;
+    uint  head_dim;
+    uint  kv_stride;       // n_kv_heads * head_dim
+    uint  causal;
+    float inv_sqrt_dim;
+} pc;
+
+shared float K_row [HEAD_DIM_MAX];
+shared float V_row [HEAD_DIM_MAX];
+shared float dK_acc[HEAD_DIM_MAX];
+shared float dV_acc[HEAD_DIM_MAX];
+shared float Q_tile [BR * HEAD_DIM_MAX];
+shared float dO_tile[BR * HEAD_DIM_MAX];
+shared float lse_tile[BR];
+shared float D_tile  [BR];
+shared float S_row [BR];
+shared float P_row [BR];
+shared float dP_row[BR];
+
+void main() {
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+
+    uint cell = gl_WorkGroupID.x;
+    uint kv_h = cell / pc.n_kv;
+    uint k    = cell - kv_h * pc.n_kv;
+    if (kv_h >= pc.n_kv_heads) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint hd  = pc.head_dim;
+    uint heads_per_kv = pc.heads_per_kv;
+    uint k_off = k * pc.kv_stride + kv_h * hd;
+
+    // Load K_row, V_row; init dK_acc, dV_acc.
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        K_row [d] = k_buf[k_off + d];
+        V_row [d] = v_buf[k_off + d];
+        dK_acc[d] = 0.0;
+        dV_acc[d] = 0.0;
+    }
+    barrier();
+
+    // Causal q-floor: q_min = max(0, k − (n_kv − n_q)) when causal.
+    int q_min = 0;
+    if (pc.causal != 0u) {
+        int delta = int(pc.n_kv) - int(pc.n_q);
+        q_min = max(0, int(k) - delta);
+    }
+
+    // GQA fold: every q-head h ∈ [kv_h · heads_per_kv, (kv_h+1) · heads_per_kv)
+    // contributes to dK[k, kv_h, :] and dV[k, kv_h, :].
+    for (uint h_offset = 0u; h_offset < heads_per_kv; h_offset += 1u) {
+        uint h = kv_h * heads_per_kv + h_offset;
+
+        for (uint q_block_start = uint(q_min); q_block_start < pc.n_q; q_block_start += BR) {
+            uint q_block_len = min(BR, pc.n_q - q_block_start);
+
+            // ── Cooperatively load Q_tile, dO_tile.
+            uint q_total = q_block_len * hd;
+            for (uint i = tid; i < q_total; i += gl_WorkGroupSize.x) {
+                uint qi = i / hd;
+                uint d  = i - qi * hd;
+                uint q_off = (q_block_start + qi) * pc.n_heads * hd + h * hd + d;
+                Q_tile [qi * hd + d] = q_buf [q_off];
+                dO_tile[qi * hd + d] = do_buf[q_off];
+            }
+            // Load lse_tile, D_tile per q in this block.
+            for (uint qi = tid; qi < q_block_len; qi += gl_WorkGroupSize.x) {
+                lse_tile[qi] = lse_buf[(q_block_start + qi) * pc.n_heads + h];
+                D_tile  [qi] = d_buf  [(q_block_start + qi) * pc.n_heads + h];
+            }
+            barrier();
+
+            // ── S_row[qi] = inv_sqrt_d · Σ_d Q_tile[qi, d] · K_row[d];
+            //    per-q causal check vs current k.
+            uint sg = gl_SubgroupID;
+            uint sg_count = gl_NumSubgroups;
+            uint rounds = (q_block_len + sg_count - 1u) / sg_count;
+            for (uint r = 0u; r < rounds; r += 1u) {
+                uint qi = r * sg_count + sg;
+                if (qi < q_block_len) {
+                    float partial = 0.0;
+                    for (uint d = gl_SubgroupInvocationID; d < hd; d += gl_SubgroupSize) {
+                        partial += Q_tile[qi * hd + d] * K_row[d];
+                    }
+                    float total = subgroupAdd(partial);
+                    if (subgroupElect()) {
+                        int q_abs = int(q_block_start + qi);
+                        int k_limit = (pc.causal != 0u)
+                            ? q_abs + int(pc.n_kv) - int(pc.n_q)
+                            : int(pc.n_kv) - 1;
+                        bool masked = (pc.causal != 0u) && (int(k) > k_limit);
+                        S_row[qi] = masked ? NEG_INF : total * pc.inv_sqrt_dim;
+                    }
+                }
+            }
+            barrier();
+
+            // ── dP_row[qi] = Σ_d dO_tile[qi, d] · V_row[d].
+            for (uint r = 0u; r < rounds; r += 1u) {
+                uint qi = r * sg_count + sg;
+                if (qi < q_block_len) {
+                    float partial = 0.0;
+                    for (uint d = gl_SubgroupInvocationID; d < hd; d += gl_SubgroupSize) {
+                        partial += dO_tile[qi * hd + d] * V_row[d];
+                    }
+                    float total = subgroupAdd(partial);
+                    if (subgroupElect()) {
+                        dP_row[qi] = total;
+                    }
+                }
+            }
+            barrier();
+
+            // ── P_row[qi] = exp(S_row[qi] − lse_tile[qi]).
+            if (tid < q_block_len) {
+                float s = S_row[tid];
+                P_row[tid] = (s == NEG_INF) ? 0.0 : exp(s - lse_tile[tid]);
+            }
+            barrier();
+
+            // ── dV_acc[d] += Σ_qi P[qi] · dO_tile[qi, d]
+            //    dK_acc[d] += inv_sqrt_d · Σ_qi P[qi] · (dP[qi] − D_tile[qi]) · Q_tile[qi, d]
+            for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+                float dk_add = 0.0;
+                float dv_add = 0.0;
+                for (uint qi = 0u; qi < q_block_len; qi += 1u) {
+                    float P = P_row[qi];
+                    if (P == 0.0) continue;
+                    float dS = P * (dP_row[qi] - D_tile[qi]);
+                    dk_add += dS * Q_tile [qi * hd + d];
+                    dv_add += P  * dO_tile[qi * hd + d];
+                }
+                dK_acc[d] += dk_add * pc.inv_sqrt_dim;
+                dV_acc[d] += dv_add;
+            }
+            barrier();
+        }
+    }
+
+    // Write final dK_row and dV_row.
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        dk_buf[k_off + d] = dK_acc[d];
+        dv_buf[k_off + d] = dV_acc[d];
+    }
+}

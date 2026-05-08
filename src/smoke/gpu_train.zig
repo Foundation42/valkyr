@@ -2851,6 +2851,242 @@ pub fn runFaDecodeChatPathSmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── F6b: GPU FlashAttention-2 backward parity ─────────────────────────
+//
+// End-to-end gate for the 3-kernel FA-2 backward chain
+// (`fa_bw_d → fa_bw_dq → fa_bw_dkv`) vs the CPU oracle in
+// `cpu/flash_attn.zig:flashAttentionBackward`. Random Q/K/V/dO inputs
+// are generated, the CPU `flashAttentionForward` produces O + LSE
+// (which the backward consumes), then both backward paths run and
+// dQ/dK/dV are compared.
+//
+// Cases mirror F6a's CPU smoke (training-relevant prefill shapes,
+// causal + GQA + non-aligned + d=128 Qwen3-class), tolerance 1e-4
+// rel-err — reduction-order divergence between cooperative subgroup
+// reductions and serial CPU accumulation puts us several orders below
+// the gate in practice.
+pub fn runFlashAttentionBackwardGpuSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const Case = struct {
+        name: []const u8,
+        n_q: u32,
+        n_kv: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        causal: bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "prefill-tiny (n_q=4 n_kv=4 GQA 4:2 d=16)",        .n_q = 4,  .n_kv = 4,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = true  },
+        .{ .name = "prefill-qwen3 (n_q=16 n_kv=16 GQA 16:8 d=128)",   .n_q = 16, .n_kv = 16, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true  },
+        .{ .name = "non-aligned (n_q=10 n_kv=12 GQA 4:2 d=16 causal)", .n_q = 10, .n_kv = 12, .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = true  },
+        .{ .name = "gqa-4to1 (n_q=8 n_kv=8 heads_per_kv=4 d=16)",     .n_q = 8,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 1, .head_dim = 16,  .causal = true  },
+        .{ .name = "non-causal (n_q=4 n_kv=8 GQA 4:2 d=16)",          .n_q = 4,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = false },
+    };
+
+    var k_d = try pipeline.Kernel.init(&ctx, &shaders.fa_bw_d, 3, @sizeOf(runtime.FaBwDPush));
+    defer k_d.deinit();
+    var k_dq = try pipeline.Kernel.init(&ctx, &shaders.fa_bw_dq, 7, @sizeOf(runtime.FaBwDqPush));
+    defer k_dq.deinit();
+    var k_dkv = try pipeline.Kernel.init(&ctx, &shaders.fa_bw_dkv, 8, @sizeOf(runtime.FaBwDkvPush));
+    defer k_dkv.deinit();
+
+    var max_dq_seen: f32 = 0;
+    var max_dk_seen: f32 = 0;
+    var max_dv_seen: f32 = 0;
+
+    for (cases) |cs| {
+        const heads_per_kv: u32 = cs.n_heads / cs.n_kv_heads;
+        const kv_stride: u32 = cs.n_kv_heads * cs.head_dim;
+        const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.head_dim)));
+        const q_elems: usize = cs.n_q * cs.n_heads * cs.head_dim;
+        const kv_elems: usize = cs.n_kv * cs.n_kv_heads * cs.head_dim;
+        const lse_elems: usize = cs.n_q * cs.n_heads;
+
+        const Q = try allocator.alloc(f32, q_elems);
+        defer allocator.free(Q);
+        const K = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(K);
+        const V = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(V);
+        const dO = try allocator.alloc(f32, q_elems);
+        defer allocator.free(dO);
+        const O_host = try allocator.alloc(f32, q_elems);
+        defer allocator.free(O_host);
+        const lse_host = try allocator.alloc(f32, lse_elems);
+        defer allocator.free(lse_host);
+
+        var prng = std.Random.DefaultPrng.init(0xF6B_BACE);
+        const rng = prng.random();
+        for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (V) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (dO) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+        // Run CPU FA forward to get the saved O + LSE the backward consumes.
+        const Br: usize = @min(@as(usize, cs.n_q), 4);
+        const Bc: usize = @min(@as(usize, cs.n_kv), 4);
+        const s_tile = try allocator.alloc(f32, Br * Bc);
+        defer allocator.free(s_tile);
+        const p_tile = try allocator.alloc(f32, Br * Bc);
+        defer allocator.free(p_tile);
+        const o_acc = try allocator.alloc(f32, Br * cs.head_dim);
+        defer allocator.free(o_acc);
+        const m_acc = try allocator.alloc(f32, Br);
+        defer allocator.free(m_acc);
+        const l_acc = try allocator.alloc(f32, Br);
+        defer allocator.free(l_acc);
+        cpu_flash_attn.flashAttentionForward(
+            Q, K, V,
+            cs.n_q, cs.n_kv, cs.n_heads, cs.n_kv_heads, cs.head_dim,
+            cs.causal, Br, Bc,
+            O_host, lse_host,
+            s_tile, p_tile, o_acc, m_acc, l_acc,
+        );
+
+        // CPU oracle (F6a).
+        const dQ_ref = try allocator.alloc(f32, q_elems);
+        defer allocator.free(dQ_ref);
+        const dK_ref = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(dK_ref);
+        const dV_ref = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(dV_ref);
+        cpu_flash_attn.flashAttentionBackward(
+            Q, K, V, O_host, dO, lse_host,
+            cs.n_q, cs.n_kv, cs.n_heads, cs.n_kv_heads, cs.head_dim,
+            cs.causal,
+            dQ_ref, dK_ref, dV_ref,
+        );
+
+        // GPU buffers (inputs static, outputs device-only).
+        var buf_q = try buffer.Buffer.initStatic(&ctx, f32, Q);
+        defer buf_q.deinit(ctx.device);
+        var buf_k = try buffer.Buffer.initStatic(&ctx, f32, K);
+        defer buf_k.deinit(ctx.device);
+        var buf_v = try buffer.Buffer.initStatic(&ctx, f32, V);
+        defer buf_v.deinit(ctx.device);
+        var buf_do = try buffer.Buffer.initStatic(&ctx, f32, dO);
+        defer buf_do.deinit(ctx.device);
+        var buf_o = try buffer.Buffer.initStatic(&ctx, f32, O_host);
+        defer buf_o.deinit(ctx.device);
+        var buf_lse = try buffer.Buffer.initStatic(&ctx, f32, lse_host);
+        defer buf_lse.deinit(ctx.device);
+        var buf_d = try buffer.Buffer.initDeviceOnly(&ctx, lse_elems * @sizeOf(f32));
+        defer buf_d.deinit(ctx.device);
+        var buf_dq = try buffer.Buffer.initDeviceOnly(&ctx, q_elems * @sizeOf(f32));
+        defer buf_dq.deinit(ctx.device);
+        var buf_dk = try buffer.Buffer.initDeviceOnly(&ctx, kv_elems * @sizeOf(f32));
+        defer buf_dk.deinit(ctx.device);
+        var buf_dv = try buffer.Buffer.initDeviceOnly(&ctx, kv_elems * @sizeOf(f32));
+        defer buf_dv.deinit(ctx.device);
+
+        // Phase 1: D[q, h] = Σ_d O · dO.
+        try k_d.bind(&.{ &buf_o, &buf_do, &buf_d });
+        const push_d = runtime.FaBwDPush{
+            .n_q = cs.n_q,
+            .n_heads = cs.n_heads,
+            .head_dim = cs.head_dim,
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaBwDPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_d, .push = &push_d, .gx = cs.n_q * cs.n_heads });
+
+        // Phase 2: dQ accumulation.
+        try k_dq.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_do, &buf_lse, &buf_d, &buf_dq });
+        const push_dq = runtime.FaBwDqPush{
+            .n_q = cs.n_q,
+            .n_heads = cs.n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cs.head_dim,
+            .n_kv = cs.n_kv,
+            .kv_stride = kv_stride,
+            .causal = if (cs.causal) 1 else 0,
+            .inv_sqrt_dim = inv_sqrt_dim,
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaBwDqPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_dq, .push = &push_dq, .gx = cs.n_q * cs.n_heads });
+
+        // Phase 3: dK + dV accumulation.
+        try k_dkv.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_do, &buf_lse, &buf_d, &buf_dk, &buf_dv });
+        const push_dkv = runtime.FaBwDkvPush{
+            .n_q = cs.n_q,
+            .n_kv = cs.n_kv,
+            .n_heads = cs.n_heads,
+            .n_kv_heads = cs.n_kv_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cs.head_dim,
+            .kv_stride = kv_stride,
+            .causal = if (cs.causal) 1 else 0,
+            .inv_sqrt_dim = inv_sqrt_dim,
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaBwDkvPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_dkv, .push = &push_dkv, .gx = cs.n_kv * cs.n_kv_heads });
+
+        const dQ_gpu = try allocator.alloc(f32, q_elems);
+        defer allocator.free(dQ_gpu);
+        const dK_gpu = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(dK_gpu);
+        const dV_gpu = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(dV_gpu);
+        try buf_dq.readBack(&ctx, f32, dQ_gpu);
+        try buf_dk.readBack(&ctx, f32, dK_gpu);
+        try buf_dv.readBack(&ctx, f32, dV_gpu);
+
+        const checkRel = struct {
+            fn rel(ref: []const f32, got: []const f32) f32 {
+                var max_abs: f32 = 0;
+                var max_ref: f32 = 0;
+                for (ref, got) |r, g| {
+                    const d = @abs(r - g);
+                    if (d > max_abs) max_abs = d;
+                    if (@abs(r) > max_ref) max_ref = @abs(r);
+                }
+                return if (max_ref > 0) max_abs / max_ref else max_abs;
+            }
+        }.rel;
+
+        const rel_dq = checkRel(dQ_ref, dQ_gpu);
+        const rel_dk = checkRel(dK_ref, dK_gpu);
+        const rel_dv = checkRel(dV_ref, dV_gpu);
+
+        const tol: f32 = 1e-4;
+        if (rel_dq > tol or rel_dk > tol or rel_dv > tol) {
+            std.debug.print(
+                "GPU FA backward parity FAIL ({s}): rel(dQ/dK/dV)=({e:.3},{e:.3},{e:.3})\n",
+                .{ cs.name, rel_dq, rel_dk, rel_dv },
+            );
+            return error.ParityFailed;
+        }
+        if (rel_dq > max_dq_seen) max_dq_seen = rel_dq;
+        if (rel_dk > max_dk_seen) max_dk_seen = rel_dk;
+        if (rel_dv > max_dv_seen) max_dv_seen = rel_dv;
+    }
+
+    std.debug.print(
+        "PASS GPU fa_bw (D + dQ + dKV) parity vs CPU FA-2 oracle ({d} cases incl. GQA + causal + non-aligned + d=128, max rel(dQ/dK/dV)=({e:.2},{e:.2},{e:.2})) on {s}\n",
+        .{ cases.len, max_dq_seen, max_dk_seen, max_dv_seen, ctx.deviceName() },
+    );
+}
+
 // ── F4: Runner.forwardLogits with FA matches the 3-pass chain ─────────
 //
 // End-to-end gate that the FA path inside `recordLayerForward`

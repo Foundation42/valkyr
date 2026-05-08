@@ -1,0 +1,63 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_vote       : require
+
+// FlashAttention-2 backward, phase 1 — per-row D reduction.
+// Computes D[q, h] = Σ_d O[q, h, d] · dO[q, h, d] over `head_dim`.
+//
+// This is the FA-2 substitution that lets backward avoid materialising
+// the full softmax matrix: the 3-pass `softmax_backward` term
+// `Σ_k attn[q, h, k] · d_attn[q, h, k]` is exactly this row reduction
+// over `head_dim` because the saved O is the attn-weighted V sum
+// (see cpu/flash_attn.zig:flashAttentionBackward header for the proof).
+//
+// Dispatch: n_q × n_heads workgroups, one per (q, h) pair (cell =
+// h * n_q + q). Each WG cooperatively reduces `head_dim` products via
+// subgroup arithmetic + sg_partials cross-subgroup combine.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer O   { float o_buf[];  };
+layout(set = 0, binding = 1, std430) readonly  buffer DO  { float do_buf[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer D   { float d_buf[];  };
+
+layout(push_constant) uniform Pc {
+    uint n_q;
+    uint n_heads;
+    uint head_dim;
+} pc;
+
+shared float sg_partials[32];
+
+void main() {
+    uint cell = gl_WorkGroupID.x;
+    uint h = cell / pc.n_q;
+    uint q = cell - h * pc.n_q;
+    if (h >= pc.n_heads) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint hd  = pc.head_dim;
+    uint base = q * pc.n_heads * hd + h * hd;
+
+    // Per-thread slice of head_dim, accumulated into one fp32 partial.
+    float partial = 0.0;
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        partial += o_buf[base + d] * do_buf[base + d];
+    }
+
+    // Subgroup reduction → cross-subgroup reduction via shared sg_partials.
+    float sg_sum = subgroupAdd(partial);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID]
+                    : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) {
+            d_buf[q * pc.n_heads + h] = total;
+        }
+    }
+}

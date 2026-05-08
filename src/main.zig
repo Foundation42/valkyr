@@ -165,6 +165,15 @@ pub fn main() !void {
         try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-bw-smoke")) {
+        // F6b of the FlashAttention arc: GPU SPIR-V parity for the
+        // 3-kernel FA-2 backward chain (`fa_bw_d → fa_bw_dq → fa_bw_dkv`)
+        // vs the F6a CPU oracle. Cooperative subgroup reductions diverge
+        // from serial CPU accumulation in fp32 rounding order, so
+        // tolerance is 1e-4 rel-err (in practice ~1e-6 to 1e-7).
+        try smoke_gpu_train.runFlashAttentionBackwardGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-decode-chat-smoke")) {
         // F5b of the FlashAttention arc: end-to-end parity gate that
         // the FlashDecoding swap-in inside `recordOneLayer` (chat decode
@@ -974,6 +983,7 @@ pub fn main() !void {
     try smoke_gpu_train.runFaRunnerSmoke(allocator);
     try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
     try smoke_gpu_train.runFaDecodeChatPathSmoke(allocator);
+    try smoke_gpu_train.runFlashAttentionBackwardGpuSmoke(allocator);
     try smoke_gpu_train.runLayerNormBackwardCpuSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulSmoke(allocator);
     try smoke_training.runGpuMlpForwardSmoke(allocator);

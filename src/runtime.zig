@@ -341,6 +341,53 @@ pub fn chooseFaDecodeSplit(n_kv: u32) struct { n_splits: u32, split_size: u32 } 
 /// the 3-pass fallback automatically.
 pub const FA_HEAD_DIM_MAX: u32 = 128;
 
+/// FlashAttention-2 backward, phase 1 — per-row D reduction
+/// (`shaders/fa_bw_d.comp`). Computes `D[q, h] = Σ_d O · dO`. Dispatch
+/// `n_q × n_heads` workgroups; each cooperatively reduces `head_dim`
+/// products via subgroup ops.
+///
+/// Bindings (3 readonly+writeable): O, dO, D.
+pub const FaBwDPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    head_dim: u32,
+};
+
+/// FlashAttention-2 backward, phase 2 — per-(q, h) dQ accumulation
+/// (`shaders/fa_bw_dq.comp`). Recomputes the softmax inline from saved
+/// LSE; never materialises the [n_q × n_heads × n_kv] attn matrix.
+/// Dispatch `n_q × n_heads` workgroups; each owns its dQ row.
+///
+/// Bindings (7): Q, K, V, dO, LSE, D, dQ.
+pub const FaBwDqPush = extern struct {
+    n_q: u32,
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_kv: u32,
+    kv_stride: u32,        // n_kv_heads * head_dim
+    causal: u32,
+    inv_sqrt_dim: f32,
+};
+
+/// FlashAttention-2 backward, phase 3 — per-(k, kv_h) dK + dV
+/// accumulation (`shaders/fa_bw_dkv.comp`). Symmetric to phase 2:
+/// tile-on-Q outer loop, GQA fold over heads_per_kv inside the WG.
+/// Dispatch `n_kv × n_kv_heads` workgroups; each owns its dK + dV row.
+///
+/// Bindings (8): Q, K, V, dO, LSE, D, dK, dV.
+pub const FaBwDkvPush = extern struct {
+    n_q: u32,
+    n_kv: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    kv_stride: u32,        // n_kv_heads * head_dim
+    causal: u32,
+    inv_sqrt_dim: f32,
+};
+
 pub const Mlp2ForwardBatchedPush = extern struct {
     dim_in: u32,
     dim_hidden: u32,

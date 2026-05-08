@@ -94,6 +94,9 @@ pub fn build(b: *std.Build) void {
     const fa_forward_spv = compileShader(b, "fa_forward");
     const fa_decode_split_spv = compileShader(b, "fa_decode_split");
     const fa_decode_merge_spv = compileShader(b, "fa_decode_merge");
+    const fa_bw_d_spv = compileShader(b, "fa_bw_d");
+    const fa_bw_dq_spv = compileShader(b, "fa_bw_dq");
+    const fa_bw_dkv_spv = compileShader(b, "fa_bw_dkv");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -185,6 +188,9 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(fa_forward_spv, "fa_forward.spv");
     _ = wf.addCopyFile(fa_decode_split_spv, "fa_decode_split.spv");
     _ = wf.addCopyFile(fa_decode_merge_spv, "fa_decode_merge.spv");
+    _ = wf.addCopyFile(fa_bw_d_spv, "fa_bw_d.spv");
+    _ = wf.addCopyFile(fa_bw_dq_spv, "fa_bw_dq.spv");
+    _ = wf.addCopyFile(fa_bw_dkv_spv, "fa_bw_dkv.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -271,6 +277,9 @@ pub fn build(b: *std.Build) void {
         \\pub const fa_forward align(4) = @embedFile("fa_forward.spv").*;
         \\pub const fa_decode_split align(4) = @embedFile("fa_decode_split.spv").*;
         \\pub const fa_decode_merge align(4) = @embedFile("fa_decode_merge.spv").*;
+        \\pub const fa_bw_d align(4) = @embedFile("fa_bw_d.spv").*;
+        \\pub const fa_bw_dq align(4) = @embedFile("fa_bw_dq.spv").*;
+        \\pub const fa_bw_dkv align(4) = @embedFile("fa_bw_dkv.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──
