@@ -270,6 +270,50 @@ The post-train continuation is verbatim from `tiny_facts.jsonl` line 1
 (same memorization signal as the full-FT demo), achieved with a
 **52.5 MiB** delta on disk instead of an 8.4 GiB checkpoint.
 
+### Production-speed inference: `--chat --lora-ckpt`
+
+`--gen-from-ckpt` reuses the *training* `forwardLogits` (one full
+n_pos-shape pass per token, no KV cache) — fine for sanity checks at
+~107 ms/tok but slow for actually using a fine-tune. The fast path
+folds the LoRA delta into the base weights at load time and runs the
+unmodified inference matmul:
+
+    W' = W + (α/r) · B · A      (one-time merge per projection)
+    y  = x · W'ᵀ                (every token afterwards, KV-cached)
+
+So `--chat --lora-ckpt` pays a one-time merge cost (~4 s for
+`all_attn` rank-16 on Qwen3-0.6B, host-side fp32 then back to bf16)
+and zero per-token LoRA overhead afterwards.
+
+```sh
+./zig-out/bin/valkyr --chat Qwen/Qwen3-0.6B \
+    --lora-ckpt /tmp/qwen3-lora.lvkpt \
+    --lora-targets all_attn \
+    --lora-rank 16 \
+    --lora-alpha 32 \
+    --max-new 30 \
+    --temp 0 \
+    "The capital of France is"
+```
+
+| Path | Tokens / s | ms / tok | Notes |
+|---|---|---|---|
+| `--gen-from-ckpt` (training Runner) | ~9 | ~107 | n_pos-shape forward per token |
+| `--chat --lora-ckpt` (merged, KV-cached) | **~145** | **~7** | same as base — zero LoRA overhead |
+| `--chat` (base, no LoRA) | ~143 | ~7 | reference |
+
+**~15× faster** than the slow path. The merge supports `bf16_matmul`
+(default `--chat` precision) and `fp32_all`. Q4_0 / Q4_K need a
+re-quantisation pass after the merge (changes the per-block scale
+grids) — that's a future chunk; pass `--lora-ckpt` without `--q4` /
+`--q4k` for now.
+
+`--gen-from-ckpt` remains the only path for full-FT `.vkpt`
+checkpoints — the inference loader needs a positional-blob → safetensors-
+tensor-name mapping that's a separate chunk from the LoRA-merge work.
+With LoRA being the modern fine-tune workflow it covers the common
+case for now.
+
 ### `.lvkpt` format
 
 Same buffered-IO shape as `.vkpt` but a different magic + body:
@@ -354,8 +398,13 @@ incremental KV cache. The fast inference path (`--chat <model>`) doesn't
 yet load `.vkpt` directly because the format is fp32 and positionally
 keyed while the inference loader expects bf16 / safetensors-named
 tensors. fp32→bf16 conversion + tensor-name mapping is the natural next
-chunk; once it lands, `--chat <model> --ckpt <path>` will give
-production-speed generation off a fine-tune.
+chunk for full-weight fine-tunes.
+
+The LoRA equivalent (`.lvkpt` → `--chat`) **is** wired up — see
+[§ Production-speed inference: `--chat --lora-ckpt`](#production-speed-inference---chat---lora-ckpt)
+above. The merge math `W' = W + (α/r)·B·A` doesn't need the
+positional → name mapping because it operates on the bf16 weights
+already in the inference path.
 
 ## Performance
 
@@ -390,6 +439,7 @@ flag-gated smokes for development:
 ./zig-out/bin/valkyr --lora-q-runner-smoke        # A4-2: LoRA on Q-projection
 ./zig-out/bin/valkyr --lora-all-runner-smoke      # A4-3: LoRA on all 7 projections
 ./zig-out/bin/valkyr --lora-checkpoint-smoke      # A4-4: toy .lvkpt round-trip
+./zig-out/bin/valkyr --lora-merge-smoke           # chat-path LoRA fold-in math identity
 ./zig-out/bin/valkyr --real-lora-q-step-smoke     # β-5 + LoRA-Q (real Qwen3-0.6B)
 ./zig-out/bin/valkyr --real-lora-all-step-smoke   # β-5 + LoRA-all (real Qwen3-0.6B)
 ```
@@ -411,8 +461,16 @@ particular piece of the fine-tune flow is exercised in isolation.
 - **Sliding-window attention (Gemma 2/3).** The trainer uses standard
   causal attention. Gemma's per-layer alternating sliding-window mask
   is a model-family chunk.
-- **Resume-from-checkpoint into inference.** `--fine-tune --out`
-  writes a `.vkpt`; `--chat <ckpt.vkpt>` doesn't load it yet.
+- **Resume full-FT checkpoint into inference.** `--fine-tune --out`
+  writes a `.vkpt`; `--chat <ckpt.vkpt>` doesn't load it yet
+  (positional-blob → safetensors-tensor-name mapping is a separate
+  chunk). The LoRA path **is** wired: `--chat --lora-ckpt foo.lvkpt`
+  folds the delta into the base bf16 weights at load time.
+- **`--lora-ckpt` with `--q4` / `--q4k`.** The merge supports
+  `bf16_matmul` (default `--chat`) and `fp32_all`. Q4 paths would need
+  a per-block re-quantisation after the fp32 merge — non-trivial
+  because the scale grids are recomputed per super-block. Future
+  chunk; reject with a clear error today.
 - **HuggingFace bit-parity.** We don't aim for byte-exact agreement
   with `transformers.Trainer.train()`; our convergence gate is "loss
   drops" not "loss matches PyTorch's logits".
@@ -445,6 +503,16 @@ CLI, the building blocks are in `src/train/`:
   custom dispatch path outside the Runner.
 - `train_sampling.greedyDecode(...)` — autoregressive greedy decode
   wrapping `forwardLogits`, used by the `--probe` flag.
+- `lora_merge.run(allocator, ctx, &gpu_model, cpu_cfg, opts)` — folds
+  a `.lvkpt` into the bf16 / fp32 projection weights of an inference
+  `GpuModel` in place. The CLI hook for `--chat --lora-ckpt`; embed
+  callers can drive it directly to attach a LoRA at session bring-up
+  without going through the chat command.
+- `lora_merge.applyLoraDeltaFp32(w, a, b, N, K, r, alpha_over_r)` —
+  the pure-CPU inner loop, exposed so callers that already have the
+  delta in host memory (e.g. a probe loop or a custom format) can
+  fold it into a fp32 weight slice without touching the GPU buffer
+  round-trip.
 
 The CLI driver in `src/commands/finetune.zig` is the worked example —
 about 280 lines composing the modules above into the shape the

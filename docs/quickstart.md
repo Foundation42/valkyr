@@ -121,10 +121,24 @@ zig build run
 
 # Generate text from a `.vkpt` or `.lvkpt` checkpoint produced above.
 # Magic-sniffed at load — pass --lora-targets / --lora-rank for `.lvkpt`.
+# Slow (~107 ms/tok at Qwen3-0.6B): runs the training-Runner forward,
+# no KV cache. Use this for parity sanity-checks against the trainer.
 ./zig-out/bin/valkyr --gen-from-ckpt Qwen/Qwen3-0.6B \
     --ckpt fine-tuned.vkpt \
     --prompt "The capital of France is" \
     --n-gen 20
+
+# Production-speed LoRA inference — `.lvkpt` deltas fold into the bf16
+# base weights at load time, then the unmodified `--chat` path runs
+# (~7 ms/tok ≈ 145 tok/s, ~15× faster than --gen-from-ckpt). Pass the
+# same --lora-targets / --lora-rank / --lora-alpha the .lvkpt was
+# saved with. Currently bf16 / fp32 only — Q4 paths land in a future
+# chunk.
+./zig-out/bin/valkyr --chat Qwen/Qwen3-0.6B \
+    --lora-ckpt lora.lvkpt \
+    --lora-targets all_attn --lora-rank 16 --lora-alpha 32 \
+    --max-new 30 --temp 0 \
+    "The capital of France is"
 
 # OpenAI-compatible HTTP server (POST /v1/chat/completions, GET /v1/models)
 # See docs/server.md for the full surface — streaming, multi-turn,

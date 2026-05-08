@@ -105,6 +105,15 @@ pub fn main() !void {
         try smoke_decoder.runDecoderStackLoraCheckpointSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-merge-smoke")) {
+        // Math identity gate for `--chat --lora-ckpt`. Verifies that
+        // `forward(W + (α/r)·B·A)` matches the explicit LoRA forward
+        // at fp32 (1e-5 rel-err) and within bf16 round-trip noise
+        // (1e-2 rel-err) — so the chat-path merge will produce the
+        // same logits as the slow `--gen-from-ckpt` training path.
+        try smoke_cpu.runLoraMergeMathSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-sampling-smoke")) {
         // β-6c sampled-text-shift validation. Greedy-samples N tokens
         // from a probe prompt before and after fine-tuning on a single
@@ -732,6 +741,12 @@ pub fn main() !void {
         var prompts_tsv: ?[]const u8 = null;
         var probe_prefix: ?[]const u8 = null;
         var max_new: usize = 256;
+        // ── --lora-ckpt fold-in. All four required together; the
+        //    .lvkpt's cfg is checked against (targets, rank) at merge.
+        var lora_path: ?[]const u8 = null;
+        var lora_targets: u32 = 0;
+        var lora_rank: u32 = 0;
+        var lora_alpha: f32 = 0.0;
         var i: usize = 3;
         while (i < args.len) {
             const a = args[i];
@@ -768,6 +783,21 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--max-new") and i + 1 < args.len) {
                 max_new = try std.fmt.parseInt(usize, args[i + 1], 10);
                 i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-ckpt") and i + 1 < args.len) {
+                lora_path = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-targets") and i + 1 < args.len) {
+                lora_targets = commands_finetune.parseLoraTargets(args[i + 1]) catch |err| {
+                    std.debug.print("invalid --lora-targets spec '{s}': {s}\n", .{ args[i + 1], @errorName(err) });
+                    return;
+                };
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-rank") and i + 1 < args.len) {
+                lora_rank = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-alpha") and i + 1 < args.len) {
+                lora_alpha = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
             } else {
                 user_msg = a;
                 i += 1;
@@ -797,6 +827,25 @@ pub fn main() !void {
             std.debug.print("--q4 and --q4k are mutually exclusive\n", .{});
             return;
         }
+        // --lora-ckpt requires the three companion flags so the merge layout
+        // is unambiguous and so cfgShapeMatches gates a wrong-shape reload.
+        var lora_ckpt: ?commands_chat.LoraCkpt = null;
+        if (lora_path != null or lora_targets != 0 or lora_rank != 0) {
+            if (lora_path == null or lora_targets == 0 or lora_rank == 0) {
+                std.debug.print("--lora-ckpt requires --lora-targets, --lora-rank, and --lora-alpha (the values --lora-finetune was run with)\n", .{});
+                return;
+            }
+            if (q4 or q4k) {
+                std.debug.print("--lora-ckpt is not yet supported with --q4 / --q4k (Q4 requantisation after merge is a future chunk)\n", .{});
+                return;
+            }
+            lora_ckpt = .{
+                .path = lora_path.?,
+                .targets = lora_targets,
+                .rank = lora_rank,
+                .alpha = lora_alpha,
+            };
+        }
         const precision: gpu_model.Precision = if (q4k) .q4_k_matmul else if (q4) .q4_0_matmul else .bf16_matmul;
         // Resolve `args[2]` from a possibly-HF-id form ("org/name") to an
         // on-disk snapshot path so chat works with `--chat
@@ -824,9 +873,13 @@ pub fn main() !void {
         }
 
         if (cfg.family.isHybrid()) {
+            if (lora_ckpt != null) {
+                std.debug.print("--lora-ckpt is not yet supported on Qwen3.5-style hybrid models (q_proj is widened by attn_output_gate)\n", .{});
+                return;
+            }
             try commands_chat.runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new);
         } else {
-            try commands_chat.runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new);
+            try commands_chat.runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, lora_ckpt);
         }
         return;
     }
@@ -843,6 +896,7 @@ pub fn main() !void {
     try smoke_cpu.runTrainCpuSmoke(allocator);
     try smoke_cpu.runTrainCpuMultiLayerSmoke(allocator);
     try smoke_cpu.runRmsNormBackwardCpuSmoke(allocator);
+    try smoke_cpu.runLoraMergeMathSmoke(allocator);
     try smoke_gpu_train.runLayerNormBackwardCpuSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulSmoke(allocator);
     try smoke_training.runGpuMlpForwardSmoke(allocator);

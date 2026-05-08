@@ -20,6 +20,7 @@ const probe = @import("../probe.zig");
 const shaders = @import("shaders");
 
 const aliases = @import("../runtime_aliases.zig");
+const lora_merge = @import("lora_merge.zig");
 
 /// One entry from a `--prompts` TSV: `<label>\t<prompt>` per line.
 /// Both fields are slices into the file's read buffer (LoadedPrompts);
@@ -27,6 +28,16 @@ const aliases = @import("../runtime_aliases.zig");
 pub const PromptEntry = struct {
     label: []const u8,
     text: []const u8,
+};
+
+/// `.lvkpt` LoRA fold-in spec for `--chat --lora-ckpt`. When non-null,
+/// after `GpuModel.upload` we merge the adapter deltas into the base
+/// projection weights in place — zero per-token overhead afterwards.
+pub const LoraCkpt = struct {
+    path: []const u8,
+    targets: u32,
+    rank: u32,
+    alpha: f32,
 };
 
 /// Output of `loadPromptsTsv`: the heap-allocated file content and an
@@ -78,6 +89,7 @@ pub fn runChat(
     batch_prompts: ?[]const PromptEntry,
     probe_prefix: ?[]const u8,
     max_new: usize,
+    lora_ckpt: ?LoraCkpt,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -104,6 +116,19 @@ pub fn runChat(
     defer gm.deinit(ctx.device);
     const t_up1_g = std.time.nanoTimestamp();
     try stdout.print("  upload took {d:.0} ms\n", .{@as(f64, @floatFromInt(t_up1_g - t_up0_g)) / 1_000_000.0});
+
+    if (lora_ckpt) |lc| {
+        try stdout.print("merging LoRA checkpoint: {s}\n", .{lc.path});
+        const t_merge_start = std.time.nanoTimestamp();
+        try lora_merge.run(gpa, &ctx, &gm, cfg, .{
+            .lvkpt_path = lc.path,
+            .lora_targets = lc.targets,
+            .lora_rank = lc.rank,
+            .lora_alpha = lc.alpha,
+        });
+        const t_merge_end = std.time.nanoTimestamp();
+        try stdout.print("  merge took {d:.0} ms\n", .{@as(f64, @floatFromInt(t_merge_end - t_merge_start)) / 1_000_000.0});
+    }
 
     // KV cache sized for a generous chat. 2048 positions ≈ 18 layers ×
     // 2 (K + V) × 2048 × 256 × 4 bytes ≈ 72 MiB on disk space — fine.

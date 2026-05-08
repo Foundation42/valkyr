@@ -88,6 +88,16 @@ The two big arcs:
      `--gen-from-ckpt` magic-sniffs `.vkpt` vs `.lvkpt`. LoRA-Q is
      actually faster than full-FT (256 vs 268 ms/step) because the
      freeze skips Adam on the huge embed + lm_head buffers.
+     **`.lvkpt` into the chat path shipped same day:**
+     `--chat <model> --lora-ckpt foo.lvkpt --lora-targets <spec>
+     --lora-rank N --lora-alpha A` folds the LoRA delta into the
+     base bf16 weights at load (`W' = W + (α/r)·B·A`, ~4 s one-time
+     for `all_attn` rank-16 on Qwen3-0.6B), then runs the unmodified
+     fast inference path. **~145 tok/s** vs `--gen-from-ckpt`'s
+     ~9 tok/s — ~15× speedup, with bit-identical token throughput
+     to the base model afterwards. The `.vkpt` (full-FT) equivalent
+     still needs the positional-blob → safetensors-tensor-name
+     mapping; LoRA covers the modern fine-tune workflow today.
      **Next tier:** Tier-4 = multi-batch training loop (rotate batches
      across dataset), real-model checkpoint stress, and an Unsloth-
      equivalent fine-tune driver. See

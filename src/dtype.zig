@@ -86,3 +86,20 @@ pub fn asU16(bytes: []const u8) []align(1) const u16 {
     std.debug.assert(bytes.len % 2 == 0);
     return @as([*]align(1) const u16, @ptrCast(bytes.ptr))[0 .. bytes.len / 2];
 }
+
+/// f32 → bf16 with round-to-nearest-even (the convention PyTorch /
+/// TensorFlow use). Pure bit-level: bias the lower 16 mantissa bits by
+/// `0x7FFF + LSB_of_upper_half` and truncate. NaN survives (the operation
+/// preserves any non-zero mantissa nibble in the upper 16 bits).
+pub inline fn f32ToBf16(value: f32) u16 {
+    const u: u32 = @bitCast(value);
+    const lsb: u32 = (u >> 16) & 1;
+    const rounding_bias: u32 = 0x7FFF +% lsb;
+    const rounded: u32 = u +% rounding_bias;
+    return @truncate(rounded >> 16);
+}
+
+pub fn f32SliceToBf16(src: []const f32, dst: []u16) void {
+    std.debug.assert(src.len == dst.len);
+    for (src, dst) |s, *d| d.* = f32ToBf16(s);
+}

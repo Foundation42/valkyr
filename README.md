@@ -155,15 +155,35 @@ faster than full fine-tune, because the freeze skips Adam on the
 huge embed + lm_head buffers — full breakdown + perf table in
 [docs/training.md § LoRA fine-tuning](docs/training.md#lora-fine-tuning).
 
-**Honest framing.** valkyr is younger and smaller than llama.cpp. On
-raw decode tok/s on a single CUDA card, llama.cpp's CUDA path is
-faster than ours today (~1.5× on Qwen3.6 27B with `--q4k` last we
-measured). What valkyr offers is **reach** (every Vulkan GPU),
-**cleanliness** (CPU oracles for every kernel), and **composability**
-(lives inside your existing Vulkan app). If you need maximum
-throughput on a single NVIDIA box, llama.cpp is the right tool. If you
-want one inference engine that runs everywhere your game or app
-already runs, valkyr is.
+Once trained, fold the `.lvkpt` into the bf16 base weights at load
+time and chat at production speed:
+
+```sh
+./zig-out/bin/valkyr --chat Qwen/Qwen3-0.6B \
+    --lora-ckpt lora.lvkpt \
+    --lora-targets all_attn --lora-rank 16 --lora-alpha 32 \
+    --temp 0 "The capital of France is"
+```
+
+`W' = W + (α/r)·B·A` once at load (~4 s for `all_attn` rank-16 on
+Qwen3-0.6B), then **~145 tok/s** — same speed as the un-fine-tuned
+base, ~15× faster than `--gen-from-ckpt`'s training-path replay
+(~9 tok/s).
+
+**Where valkyr stands.** valkyr is younger and smaller than llama.cpp,
+and on raw decode tok/s on a single CUDA card llama.cpp's CUDA path
+is still faster (~1.5× on Qwen3.6 27B with `--q4k` last we measured).
+What valkyr offers in return is a different shape: **reach** (every
+Vulkan GPU — not just NVIDIA), **fine-tuning built in**
+(`--fine-tune` and `--lora-finetune` ship today, with `--chat
+--lora-ckpt` for production-speed use of the result —
+[docs/training.md](docs/training.md)), **composability** (designed to
+live inside your existing Vulkan app, not just a standalone binary),
+and **cleanliness** (every kernel has a CPU oracle, every change has
+a parity smoke). If you want maximum decode throughput on a single
+NVIDIA box, llama.cpp is the right tool. If you want one engine that
+runs everywhere your game or app already runs *and* lets you train
+the model that runs in it, valkyr is.
 
 ## Documentation
 

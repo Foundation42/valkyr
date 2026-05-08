@@ -6,6 +6,9 @@ const std = @import("std");
 const cpu_math = @import("../cpu/math.zig");
 const cpu_train = @import("../cpu/train.zig");
 const cpu_train_transformer = @import("../cpu/train_transformer.zig");
+const cpu_lora = @import("../cpu/lora.zig");
+const dtype = @import("../dtype.zig");
+const lora_merge = @import("../commands/lora_merge.zig");
 const safetensors = @import("../safetensors.zig");
 
 // ── matmul smoke: synthetic A·B^T, hand-checked oracle ──────────────
@@ -519,4 +522,111 @@ pub fn runRmsNormBackwardCpuSmoke(allocator: std.mem.Allocator) !void {
         "PASS rmsnorm backward CPU oracle (numeric-grad parity ≤ {e} on dx + dw, gemma_quirk on/off; multi-row dw accum bit-exact)\n",
         .{max_rel_err_overall},
     );
+}
+
+// ── lora-merge math: pre-fold W' = W + (α/r)·B·A vs explicit LoRA ────
+//
+// The chat-path `--lora-ckpt` route folds the LoRA delta into the base
+// weight at load time, then runs the unmodified inference matmul. That
+// only works if `forward(merged_W) ≡ forward_lora(W, A, B)` to the
+// kernel-noise floor. This smoke gates the math identity — both at
+// fp32 (exact algebra modulo reduction order) and after the bf16
+// round-trip the chat path actually does on `bf16_matmul` precision.
+pub fn runLoraMergeMathSmoke(allocator: std.mem.Allocator) !void {
+    const M: usize = 4;
+    const N: usize = 8;
+    const K: usize = 16;
+    const r: usize = 4;
+    const alpha: f32 = 8.0;
+    const aor: f32 = alpha / @as(f32, @floatFromInt(r));
+
+    var rng = std.Random.DefaultPrng.init(0xCAFE_F00D_BABE_C0DE);
+    const rand = rng.random();
+
+    const x = try allocator.alloc(f32, M * K);
+    defer allocator.free(x);
+    const w_base = try allocator.alloc(f32, N * K);
+    defer allocator.free(w_base);
+    const a_lora = try allocator.alloc(f32, r * K);
+    defer allocator.free(a_lora);
+    const b_lora = try allocator.alloc(f32, N * r);
+    defer allocator.free(b_lora);
+    for (x) |*v| v.* = rand.floatNorm(f32) * 0.5;
+    for (w_base) |*v| v.* = rand.floatNorm(f32) * 0.1;
+    for (a_lora) |*v| v.* = rand.floatNorm(f32) * 0.5;
+    for (b_lora) |*v| v.* = rand.floatNorm(f32) * 0.5;
+
+    // ── Path A: explicit LoRA forward (the trainer's math, the truth).
+    const y_oracle = try allocator.alloc(f32, M * N);
+    defer allocator.free(y_oracle);
+    const intermediate = try allocator.alloc(f32, M * r);
+    defer allocator.free(intermediate);
+    cpu_lora.loraForward(x, w_base, a_lora, b_lora, M, N, K, r, aor, y_oracle, intermediate);
+
+    // ── Path B: merge the delta into W, then plain matmul_nt.
+    const w_merged = try allocator.alloc(f32, N * K);
+    defer allocator.free(w_merged);
+    @memcpy(w_merged, w_base);
+    _ = lora_merge.applyLoraDeltaFp32(w_merged, a_lora, b_lora, N, K, r, aor);
+
+    const y_merged = try allocator.alloc(f32, M * N);
+    defer allocator.free(y_merged);
+    matmulNt(x, w_merged, y_merged, M, N, K);
+
+    var max_abs_fp32: f32 = 0.0;
+    var max_y: f32 = 0.0;
+    for (y_oracle, y_merged) |a, b| {
+        max_abs_fp32 = @max(max_abs_fp32, @abs(a - b));
+        max_y = @max(max_y, @abs(a));
+    }
+    const rel_fp32 = max_abs_fp32 / @max(max_y, 1.0e-9);
+    if (rel_fp32 > 1.0e-5) {
+        std.debug.print("lora-merge fp32 parity: rel-err {e} > 1e-5\n", .{rel_fp32});
+        return error.ParityFailed;
+    }
+
+    // ── Path C: bf16 round-trip on the merged weights, then matmul.
+    const w_bf16 = try allocator.alloc(u16, N * K);
+    defer allocator.free(w_bf16);
+    const w_round = try allocator.alloc(f32, N * K);
+    defer allocator.free(w_round);
+    dtype.f32SliceToBf16(w_merged, w_bf16);
+    for (w_bf16, w_round) |s, *d| d.* = dtype.bf16ToF32(s);
+
+    const y_bf16 = try allocator.alloc(f32, M * N);
+    defer allocator.free(y_bf16);
+    matmulNt(x, w_round, y_bf16, M, N, K);
+
+    var max_abs_bf16: f32 = 0.0;
+    for (y_oracle, y_bf16) |a, b| {
+        max_abs_bf16 = @max(max_abs_bf16, @abs(a - b));
+    }
+    const rel_bf16 = max_abs_bf16 / @max(max_y, 1.0e-9);
+    // bf16 has ~3 decimal digits / ~1/256 relative precision; a tight
+    // gate at 1% catches rounding regressions while leaving head-room
+    // for the K=16 reduction noise.
+    if (rel_bf16 > 1.0e-2) {
+        std.debug.print("lora-merge bf16 round-trip: rel-err {e} > 1e-2\n", .{rel_bf16});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS lora-merge math (M=4 N=8 K=16 r=4 α=8: fp32 rel-err {e}, bf16 round-trip rel-err {e})\n",
+        .{ rel_fp32, rel_bf16 },
+    );
+}
+
+/// Naive `y[m, n] = Σ_k x[m, k] · w[n, k]` — the matmul-nt convention.
+/// Used only by smokes; production kernels live in src/runtime.zig.
+fn matmulNt(x: []const f32, w: []const f32, y: []f32, M: usize, N: usize, K: usize) void {
+    std.debug.assert(x.len == M * K);
+    std.debug.assert(w.len == N * K);
+    std.debug.assert(y.len == M * N);
+    for (0..M) |m| {
+        for (0..N) |n| {
+            var s: f64 = 0.0;
+            for (0..K) |k| s += @as(f64, x[m * K + k]) * @as(f64, w[n * K + k]);
+            y[m * N + n] = @floatCast(s);
+        }
+    }
 }
