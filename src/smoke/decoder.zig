@@ -2527,6 +2527,222 @@ pub fn runDecoderStackCheckpointSmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── A4-4: `.lvkpt` (LoRA-only) round-trip smoke ──────────────────────
+//
+// Mirror of runDecoderStackCheckpointSmoke but with LoRA enabled on
+// the attention block (Q+K+V+O, rank-4). Saves a `.lvkpt`; reloads
+// into a fresh Runner with identical Config; asserts both
+//   1. round-trip CE match (Runner B post-load == Runner A at save),
+//   2. trajectory match (Runner B post-load + M more steps == Runner
+//      A's continuous K+M endpoint).
+// Gate 2 specifically validates that Adam m/v + step_t round-trip too:
+// without them, the M-step trajectory after load would diverge by
+// 0.1-1.0 in CE since momentum resets to zero at the wrong step.
+//
+// Fixed seed + same toy shape as the `.vkpt` smoke so the two can run
+// side-by-side in CI without parameter drift.
+
+pub fn runDecoderStackLoraCheckpointSmoke(allocator: std.mem.Allocator) !void {
+    const cfg_static = cpu_train_decoder.StackConfig{
+        .base = .{
+            .dim = 16,
+            .n_heads = 2,
+            .n_kv_heads = 2,
+            .head_dim = 8,
+            .ff_dim = 32,
+            .n_pos = 4,
+            .rms_eps = 1e-5,
+            .causal = true,
+            .rotary_dim = 8,
+            .qk_norm = true,
+        },
+        .n_layers = 2,
+        .vocab_size = 8,
+    };
+    const dim = cfg_static.base.dim;
+    const n_pos = cfg_static.base.n_pos;
+    const n_heads = cfg_static.base.n_heads;
+    const n_kv_heads = cfg_static.base.n_kv_heads;
+    const head_dim = cfg_static.base.head_dim;
+    const ff_dim = cfg_static.base.ff_dim;
+    const vocab = cfg_static.vocab_size;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv_heads * head_dim;
+
+    const seed: u64 = 0xC0_DE_CC_07;
+    const init_scale: f32 = 0.1;
+    const lora_rank: u32 = 4;
+    const lora_alpha: f32 = 8.0;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const w_embed = try aa.alloc(f32, vocab * dim);
+    const w_final_norm = try aa.alloc(f32, dim);
+    const w_lm_head = try aa.alloc(f32, vocab * dim);
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rng = prng.random();
+    for (w_embed) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+    for (w_final_norm) |*v| v.* = 1.0;
+    for (w_lm_head) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+
+    const layer_weights = try aa.alloc(train_transformer.LayerWeights, cfg_static.n_layers);
+    for (layer_weights) |*lw| {
+        const w_n1 = try aa.alloc(f32, dim);
+        const w_q = try aa.alloc(f32, q_dim * dim);
+        const w_k = try aa.alloc(f32, kv_dim * dim);
+        const w_v = try aa.alloc(f32, kv_dim * dim);
+        const w_o = try aa.alloc(f32, dim * q_dim);
+        const w_n2 = try aa.alloc(f32, dim);
+        const w_gate = try aa.alloc(f32, ff_dim * dim);
+        const w_up = try aa.alloc(f32, ff_dim * dim);
+        const w_down = try aa.alloc(f32, dim * ff_dim);
+        const w_q_norm = try aa.alloc(f32, head_dim);
+        const w_k_norm = try aa.alloc(f32, head_dim);
+        for (w_n1) |*v| v.* = 1.0;
+        for (w_n2) |*v| v.* = 1.0;
+        for (w_q_norm) |*v| v.* = 1.0;
+        for (w_k_norm) |*v| v.* = 1.0;
+        for (w_q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_k) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_v) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_o) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_gate) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_up) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_down) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        lw.* = .{
+            .w_n1 = w_n1,
+            .w_q = w_q,
+            .w_k = w_k,
+            .w_v = w_v,
+            .w_o = w_o,
+            .w_n2 = w_n2,
+            .w_gate = w_gate,
+            .w_up = w_up,
+            .w_down = w_down,
+            .w_q_norm = w_q_norm,
+            .w_k_norm = w_k_norm,
+        };
+    }
+
+    const token_ids = try aa.alloc(u32, n_pos);
+    const target_ids = try aa.alloc(u32, n_pos);
+    for (token_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, @intCast(vocab));
+    for (target_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, @intCast(vocab));
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const runner_cfg = train_transformer.Config{
+        .dim = @intCast(dim),
+        .n_heads = @intCast(n_heads),
+        .n_kv_heads = @intCast(n_kv_heads),
+        .head_dim = @intCast(head_dim),
+        .ff_dim = @intCast(ff_dim),
+        .n_pos = @intCast(n_pos),
+        .n_layers = @intCast(cfg_static.n_layers),
+        .vocab_size = @intCast(vocab),
+        .rms_eps = cfg_static.base.rms_eps,
+        .causal = cfg_static.base.causal,
+        .rotary_dim = @intCast(cfg_static.base.rotary_dim),
+        .rope_theta = cfg_static.base.rope_theta,
+        .qk_norm = cfg_static.base.qk_norm,
+        .lr = 1e-2,
+        .lora_targets = train_transformer.LoraTarget.all_attn,
+        .lora_rank = lora_rank,
+        .lora_alpha = lora_alpha,
+    };
+    const init_weights = train_transformer.InitWeights{
+        .embed = w_embed,
+        .final_norm = w_final_norm,
+        .lm_head = w_lm_head,
+        .layers = layer_weights,
+    };
+
+    const k_steps: u32 = 10;
+    const m_steps: u32 = 10;
+    const ckpt_path = "/tmp/valkyr_lora_ckpt_smoke.lvkpt";
+    defer std.fs.cwd().deleteFile(ckpt_path) catch {};
+
+    const logits_buf = try allocator.alloc(f32, n_pos * vocab);
+    defer allocator.free(logits_buf);
+
+    // ── Runner A: train K, save, train M more.
+    var runner_a = try train_transformer.Runner.init(allocator, &ctx, runner_cfg, init_weights);
+    defer runner_a.deinit();
+
+    var i: u32 = 0;
+    while (i < k_steps) : (i += 1) try runner_a.step(token_ids, target_ids);
+
+    try runner_a.forwardLogits(token_ids, logits_buf);
+    const ce_at_save = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_at_save)) return error.CeAtSaveNotFinite;
+
+    try runner_a.saveLoraCheckpoint(allocator, ckpt_path);
+
+    i = 0;
+    while (i < m_steps) : (i += 1) try runner_a.step(token_ids, target_ids);
+
+    try runner_a.forwardLogits(token_ids, logits_buf);
+    const ce_continuous = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_continuous)) return error.CeContinuousNotFinite;
+
+    // ── Runner B: fresh init (same base weights, default LoRA init),
+    //    load `.lvkpt`, train M more, compare to continuous endpoint.
+    var runner_b = try train_transformer.Runner.init(allocator, &ctx, runner_cfg, init_weights);
+    defer runner_b.deinit();
+    try runner_b.loadLoraCheckpoint(allocator, ckpt_path);
+
+    // Gate 1: round-trip integrity. CE on Runner B post-load should
+    // match Runner A's CE at save modulo small fp non-determinism on
+    // the LoRA chain (5 dispatches per projection per layer = many
+    // adds and the rounding mode of the GPU's fma may differ from
+    // run to run within ~1e-3).
+    try runner_b.forwardLogits(token_ids, logits_buf);
+    const ce_after_load = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    const roundtrip_delta = @abs(ce_after_load - ce_at_save);
+    if (roundtrip_delta > 1e-3) {
+        std.debug.print(
+            "LoRA checkpoint round-trip FAIL: ce_at_save={d:.6} ce_after_load={d:.6} delta={e:.3}\n",
+            .{ ce_at_save, ce_after_load, roundtrip_delta },
+        );
+        return error.LoraCheckpointRoundTripFailed;
+    }
+
+    // Gate 2: trajectory continuity. Runner B trained M steps post-
+    // load should land near Runner A's K+M endpoint. If Adam m/v /
+    // step_t weren't restored, the M-step trajectory diverges visibly.
+    i = 0;
+    while (i < m_steps) : (i += 1) try runner_b.step(token_ids, target_ids);
+
+    try runner_b.forwardLogits(token_ids, logits_buf);
+    const ce_after_resume = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_after_resume)) return error.CeAfterResumeNotFinite;
+
+    const trajectory_delta = @abs(ce_after_resume - ce_continuous);
+    if (trajectory_delta > 1e-2) {
+        std.debug.print(
+            "LoRA checkpoint trajectory FAIL: ce_continuous={d:.6} ce_after_resume={d:.6} delta={e:.3}\n",
+            .{ ce_continuous, ce_after_resume, trajectory_delta },
+        );
+        return error.LoraCheckpointTrajectoryDivergent;
+    }
+
+    // Report the on-disk size — the marquee number for the LoRA
+    // checkpoint story (kilobytes-ish, vs ~0.6 MiB on the toy
+    // for the full `.vkpt` save and ~9 GiB on Qwen3-0.6B).
+    const file = try std.fs.cwd().openFile(ckpt_path, .{ .mode = .read_only });
+    defer file.close();
+    const stat = try file.stat();
+
+    std.debug.print(
+        "PASS Runner LoRA checkpoint round-trip ({d}-layer toy stack qk_norm+RoPE; LoRA all_attn rank={d}; K={d}+M={d} steps; CE save={d:.6} load={d:.6} (Δ={e:.2}); resume {d:.6} vs continuous {d:.6} (Δ={e:.2}); .lvkpt {d:.1} KiB)\n",
+        .{ cfg_static.n_layers, lora_rank, k_steps, m_steps, ce_at_save, ce_after_load, roundtrip_delta, ce_after_resume, ce_continuous, trajectory_delta, @as(f64, @floatFromInt(stat.size)) / 1024.0 },
+    );
+}
+
 // ── chunk 8c-β-6c: sampled-text-shift validation ────────────────────
 //
 // Closes the "did this actually do anything observable" loop. Samples

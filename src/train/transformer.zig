@@ -165,6 +165,13 @@ pub const LoraInitWeights = struct {
 
 const checkpoint_magic: [4]u8 = .{ 'V', 'K', 'P', 'T' };
 const checkpoint_version: u32 = 1;
+/// `.lvkpt` (A4-4) — LoRA-only checkpoint. Stores per-projection-per-
+/// layer A / B / Adam m/v for every enabled target plus the cfg
+/// snapshot + step_t. Tiny compared to `.vkpt` (kilobytes-megabytes vs
+/// gigabytes) — base W stays in safetensors. Magic intentionally
+/// distinct from `.vkpt`'s "VKPT" so the loader fails fast on swap.
+const lora_checkpoint_magic: [4]u8 = .{ 'V', 'L', 'K', 'P' };
+const lora_checkpoint_version: u32 = 1;
 /// Buffered-IO chunk size for checkpoint save/load. 4 MiB is large
 /// enough to amortise syscall overhead across the many small per-layer
 /// blobs and small enough that the staging-side memcpy still fits in
@@ -1304,6 +1311,129 @@ pub const Runner = struct {
         }
     }
 
+    // ── LoRA-only checkpoint (chunk A4-4) ─────────────────────────────
+    //
+    // Persists per-projection-per-layer A / B / Adam m/v for every
+    // enabled target. Skips base W's (still on disk in the source
+    // safetensors) and skips RMSNorm gains, embed, lm_head, final_norm
+    // (not LoRA targets — those are full-weight params even in LoRA
+    // mode, so saving them would defeat the LoRA-checkpoint-is-tiny
+    // story; if a workload wants them too, use the full `.vkpt` save).
+    //
+    // Body order is identical to the in-memory iteration order: outer
+    // loop over Proj.q / .k / .v / .o / .gate / .up / .down (matches
+    // `LoraTarget`'s bit layout), inner loop over layers 0..n_layers,
+    // each inner step writes (A, m_A, v_A, B, m_B, v_B). Disabled
+    // projections contribute zero bytes and are skipped on both ends.
+    //
+    // Returns error.LoraCheckpointEmpty if the Runner has no LoRA
+    // state (cfg.lora_targets = 0); calling save here is meaningless
+    // and almost certainly a caller bug.
+
+    pub fn saveLoraCheckpoint(self: *Runner, allocator: std.mem.Allocator, path: []const u8) !void {
+        if (self.lora == null) return error.LoraCheckpointEmpty;
+
+        const blobs = try self.collectLoraBlobs(allocator);
+        defer allocator.free(blobs);
+
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+
+        const SaveWriter = std.io.BufferedWriter(checkpoint_io_buf_bytes, std.fs.File.Writer);
+        var bw = SaveWriter{ .unbuffered_writer = file.writer() };
+        const w = bw.writer();
+
+        const header = CheckpointHeader{
+            .magic = lora_checkpoint_magic,
+            .version = lora_checkpoint_version,
+            .step_t = self.step_t,
+            .cfg_size = @sizeOf(Config),
+        };
+        try w.writeAll(std.mem.asBytes(&header));
+        try w.writeAll(std.mem.asBytes(&self.cfg));
+
+        var scratch = std.ArrayList(f32).init(allocator);
+        defer scratch.deinit();
+
+        for (blobs) |b| {
+            try scratch.resize(b.numel);
+            try b.buf.readBack(self.ctx, f32, scratch.items);
+            try w.writeAll(std.mem.sliceAsBytes(scratch.items));
+        }
+        try bw.flush();
+    }
+
+    pub fn loadLoraCheckpoint(self: *Runner, allocator: std.mem.Allocator, path: []const u8) !void {
+        if (self.lora == null) return error.LoraCheckpointEmpty;
+
+        const blobs = try self.collectLoraBlobs(allocator);
+        defer allocator.free(blobs);
+
+        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        const LoadReader = std.io.BufferedReader(checkpoint_io_buf_bytes, std.fs.File.Reader);
+        var br = LoadReader{ .unbuffered_reader = file.reader() };
+        const r = br.reader();
+
+        var header: CheckpointHeader = undefined;
+        try r.readNoEof(std.mem.asBytes(&header));
+        if (!std.mem.eql(u8, &header.magic, &lora_checkpoint_magic)) return error.InvalidLoraCheckpointMagic;
+        if (header.version != lora_checkpoint_version) return error.UnsupportedLoraCheckpointVersion;
+        if (header.cfg_size != @sizeOf(Config)) return error.LoraCheckpointConfigSizeMismatch;
+
+        var saved_cfg: Config = undefined;
+        try r.readNoEof(std.mem.asBytes(&saved_cfg));
+        if (!cfgShapeMatches(saved_cfg, self.cfg)) return error.LoraCheckpointConfigMismatch;
+
+        // step_t + Adam hyperparameters round-trip from the snapshot;
+        // base-arch lr/beta/eps already match cfgShapeMatches's
+        // structural fields. Caller can override lr post-load.
+        self.step_t = header.step_t;
+        self.cfg.lr = saved_cfg.lr;
+        self.cfg.beta1 = saved_cfg.beta1;
+        self.cfg.beta2 = saved_cfg.beta2;
+        self.cfg.eps_adam = saved_cfg.eps_adam;
+        self.cfg.lora_alpha = saved_cfg.lora_alpha;
+        self.cfg.lora_lr_b_scale = saved_cfg.lora_lr_b_scale;
+
+        var scratch = std.ArrayList(f32).init(allocator);
+        defer scratch.deinit();
+
+        for (blobs) |b| {
+            try scratch.resize(b.numel);
+            try r.readNoEof(std.mem.sliceAsBytes(scratch.items));
+            try b.buf.uploadFromHost(self.ctx, f32, scratch.items);
+        }
+    }
+
+    fn collectLoraBlobs(self: *Runner, allocator: std.mem.Allocator) ![]Blob {
+        var out = std.ArrayList(Blob).init(allocator);
+        errdefer out.deinit();
+
+        if (self.lora) |*ls| {
+            inline for (@typeInfo(Proj).@"enum".fields) |f| {
+                const p: Proj = @enumFromInt(f.value);
+                if (ls.slots[@intFromEnum(p)]) |*slot| {
+                    const a_numel: usize = @as(usize, slot.shape.r) * @as(usize, slot.shape.K);
+                    const b_numel: usize = @as(usize, slot.shape.N) * @as(usize, slot.shape.r);
+                    for (0..self.cfg.n_layers) |i| {
+                        try out.appendSlice(&[_]Blob{
+                            .{ .buf = &slot.a[i], .numel = a_numel },
+                            .{ .buf = &slot.m_a[i], .numel = a_numel },
+                            .{ .buf = &slot.v_a[i], .numel = a_numel },
+                            .{ .buf = &slot.b[i], .numel = b_numel },
+                            .{ .buf = &slot.m_b[i], .numel = b_numel },
+                            .{ .buf = &slot.v_b[i], .numel = b_numel },
+                        });
+                    }
+                }
+            }
+        }
+
+        return try out.toOwnedSlice();
+    }
+
     /// Build the canonical (param, m, v) ordered list of every device
     /// buffer that needs to round-trip through a checkpoint. Both save
     /// and load walk this list in the same order.
@@ -1488,6 +1618,12 @@ pub const Runner = struct {
                 try self.rec.dispatch(&self.k_adam, &.{ &slot.b[i], &slot.dw_b[i], &slot.m_b[i], &slot.v_b[i] }, &adam_b, util.ceilDiv(n_b, group_lin), 1, 1);
                 return;
             }
+            // LoRA is globally active but this projection isn't in
+            // `lora_targets`. Skip Adam entirely — `.lvkpt` doesn't
+            // persist this W's state, so any drift wouldn't survive
+            // a checkpoint round-trip. Net behaviour: every dense W
+            // stays at its safetensors value across the LoRA fine-tune.
+            return;
         }
         try self.rec.dispatch(&self.k_adam, &.{ w, dw, m, v }, push, util.ceilDiv(push.n, group_lin), 1, 1);
     }
@@ -1766,8 +1902,19 @@ pub const Runner = struct {
         const n_up_w: u32 = cfg.ff_dim * cfg.dim;
         const n_down_w: u32 = cfg.dim * cfg.ff_dim;
 
-        const adam_embed = runtime.AdamStepPush{ .n = n_embed, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_embed, &self.buf_dE_embed, &self.buf_m_embed, &self.buf_v_embed }, &adam_embed, util.ceilDiv(n_embed, group_lin), 1, 1);
+        // ── In LoRA mode (`lora_targets != 0`), the standard semantics
+        //    is to freeze every non-LoRA parameter — only A,B for each
+        //    enabled projection move. Without this, .lvkpt round-trip
+        //    breaks: a fresh Runner loads only LoRA params, so any
+        //    drift in the non-LoRA params (embed, lm_head, RMSNorm
+        //    gains) doesn't survive the load. Skipping the Adam
+        //    dispatches here also saves a chunk of compute per step.
+        const lora_active: bool = (cfg.lora_targets != 0);
+
+        if (!lora_active) {
+            const adam_embed = runtime.AdamStepPush{ .n = n_embed, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_embed, &self.buf_dE_embed, &self.buf_m_embed, &self.buf_v_embed }, &adam_embed, util.ceilDiv(n_embed, group_lin), 1, 1);
+        }
 
         for (0..cfg.n_layers) |i| {
             const adam_n1 = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
@@ -1780,32 +1927,39 @@ pub const Runner = struct {
             const adam_up = runtime.AdamStepPush{ .n = n_up_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
             const adam_down = runtime.AdamStepPush{ .n = n_down_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
 
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n1[i], &self.buf_dw_n1[i], &self.buf_m_n1[i], &self.buf_v_n1[i] }, &adam_n1, util.ceilDiv(dim_n, group_lin), 1, 1);
+            if (!lora_active) {
+                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n1[i], &self.buf_dw_n1[i], &self.buf_m_n1[i], &self.buf_v_n1[i] }, &adam_n1, util.ceilDiv(dim_n, group_lin), 1, 1);
+            }
             // For each of the 7 dense projections: when LoRA is on for
             // that target, recordProjAdam skips the frozen W's Adam and
             // runs Adam on A and B (with B's lr scaled by lora_lr_b_scale,
-            // i.e. LoRA+ Theorem 1). Otherwise it runs the plain W Adam
-            // step. The other 4 per-layer params (n1, n2, q_norm,
-            // k_norm) are never LoRA'd — RMSNorm gains aren't matmuls.
+            // i.e. LoRA+ Theorem 1). Otherwise — and only when not in
+            // LoRA-active mode — it runs the plain W Adam step. The
+            // RMSNorm gains (n1, n2, q_norm, k_norm) are never LoRA'd
+            // and are frozen along with everything else when LoRA is on.
             try self.recordProjAdam(.q, @intCast(i), &self.buf_w_q[i], &self.buf_dw_q[i], &self.buf_m_q[i], &self.buf_v_q[i], &adam_q);
             try self.recordProjAdam(.k, @intCast(i), &self.buf_w_k[i], &self.buf_dw_k[i], &self.buf_m_k[i], &self.buf_v_k[i], &adam_k);
             try self.recordProjAdam(.v, @intCast(i), &self.buf_w_v[i], &self.buf_dw_v[i], &self.buf_m_v[i], &self.buf_v_v[i], &adam_v);
             try self.recordProjAdam(.o, @intCast(i), &self.buf_w_o[i], &self.buf_dw_o[i], &self.buf_m_o[i], &self.buf_v_o[i], &adam_o);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n2[i], &self.buf_dw_n2[i], &self.buf_m_n2[i], &self.buf_v_n2[i] }, &adam_n2, util.ceilDiv(dim_n, group_lin), 1, 1);
+            if (!lora_active) {
+                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n2[i], &self.buf_dw_n2[i], &self.buf_m_n2[i], &self.buf_v_n2[i] }, &adam_n2, util.ceilDiv(dim_n, group_lin), 1, 1);
+            }
             try self.recordProjAdam(.gate, @intCast(i), &self.buf_w_gate[i], &self.buf_dw_gate[i], &self.buf_m_gate[i], &self.buf_v_gate[i], &adam_gate);
             try self.recordProjAdam(.up, @intCast(i), &self.buf_w_up[i], &self.buf_dw_up[i], &self.buf_m_up[i], &self.buf_v_up[i], &adam_up);
             try self.recordProjAdam(.down, @intCast(i), &self.buf_w_down[i], &self.buf_dw_down[i], &self.buf_m_down[i], &self.buf_v_down[i], &adam_down);
-            if (cfg.qk_norm) {
+            if (cfg.qk_norm and !lora_active) {
                 const adam_qn = runtime.AdamStepPush{ .n = cfg.head_dim, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
                 try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q_norm[i], &self.buf_dw_q_norm[i], &self.buf_m_q_norm[i], &self.buf_v_q_norm[i] }, &adam_qn, util.ceilDiv(cfg.head_dim, group_lin), 1, 1);
                 try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_k_norm[i], &self.buf_dw_k_norm[i], &self.buf_m_k_norm[i], &self.buf_v_k_norm[i] }, &adam_qn, util.ceilDiv(cfg.head_dim, group_lin), 1, 1);
             }
         }
 
-        const adam_final_norm = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-        const adam_lm_head = runtime.AdamStepPush{ .n = n_lm_head, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_final_norm, &self.buf_dw_final_norm, &self.buf_m_final_norm, &self.buf_v_final_norm }, &adam_final_norm, util.ceilDiv(dim_n, group_lin), 1, 1);
-        try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_lm_head, &self.buf_dw_lm_head, &self.buf_m_lm_head, &self.buf_v_lm_head }, &adam_lm_head, util.ceilDiv(n_lm_head, group_lin), 1, 1);
+        if (!lora_active) {
+            const adam_final_norm = runtime.AdamStepPush{ .n = dim_n, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
+            const adam_lm_head = runtime.AdamStepPush{ .n = n_lm_head, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_final_norm, &self.buf_dw_final_norm, &self.buf_m_final_norm, &self.buf_v_final_norm }, &adam_final_norm, util.ceilDiv(dim_n, group_lin), 1, 1);
+            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_lm_head, &self.buf_dw_lm_head, &self.buf_m_lm_head, &self.buf_v_lm_head }, &adam_lm_head, util.ceilDiv(n_lm_head, group_lin), 1, 1);
+        }
     }
 
     fn reduceDwPartial(self: *Runner, partial: *const buffer.Buffer, dst_dynamic: *buffer.Buffer) !void {

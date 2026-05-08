@@ -96,6 +96,15 @@ pub fn main() !void {
         try smoke_decoder.runDecoderStackCheckpointSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-checkpoint-smoke")) {
+        // A4-4 .lvkpt round-trip. Same pattern as --checkpoint-smoke
+        // but the Runner has LoRA on all_attn (rank-4) and saves to
+        // the LoRA-only `.lvkpt` format. Gates that A/B + Adam m/v
+        // for every enabled projection round-trip cleanly + that the
+        // saved-and-resumed trajectory matches the continuous one.
+        try smoke_decoder.runDecoderStackLoraCheckpointSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-sampling-smoke")) {
         // β-6c sampled-text-shift validation. Greedy-samples N tokens
         // from a probe prompt before and after fine-tuning on a single
@@ -104,19 +113,34 @@ pub fn main() !void {
         try smoke_decoder.runRealModelSamplingSmoke(allocator);
         return;
     }
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "--fine-tune")) {
+    if (args.len >= 3 and (std.mem.eql(u8, args[1], "--fine-tune") or std.mem.eql(u8, args[1], "--lora-finetune"))) {
         // User-facing fine-tune driver: load real Qwen3-class weights,
         // train N Adam steps on a JSONL dataset, optionally save a
-        // .vkpt checkpoint, optionally show a probe sample before/after.
+        // checkpoint, optionally show a probe sample before/after.
+        //
+        // `--fine-tune` defaults to full-weight training (every param
+        // trained, .vkpt save format). Pass `--lora-targets` (and
+        // optionally `--lora-rank` / `--lora-alpha` / `--lora-lr-b-scale`)
+        // to switch into LoRA mode (only A,B per enabled projection
+        // trained; .lvkpt save format).
+        //
+        // `--lora-finetune` is the discoverable alias — same backend,
+        // but requires `--lora-targets` and bumps the lr default to
+        // 5e-4 (typical LoRA fine-tune rate is 10-50× full-FT lr).
         // Format:
         //   --fine-tune <model> --data <jsonl> [--steps N] [--lr LR]
         //                                       [--n-pos N] [--batch IDX]
         //                                       [--rotate] [--probe TEXT]
         //                                       [--n-gen N] [--out PATH]
         //                                       [--print-every K]
+        //                                       [--lora-targets q,k,v,o,gate,up,down,all_attn,all_ffn,all]
+        //                                       [--lora-rank N] [--lora-alpha A]
+        //                                       [--lora-lr-b-scale L]
+        const is_lora_alias = std.mem.eql(u8, args[1], "--lora-finetune");
         var opts = commands_finetune.Options{
             .model = args[2],
             .data_path = "",
+            .lr = if (is_lora_alias) 5e-4 else 1e-5,
         };
         var i: usize = 3;
         while (i < args.len) {
@@ -151,25 +175,54 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--print-every") and i + 1 < args.len) {
                 opts.print_every = try std.fmt.parseInt(u32, args[i + 1], 10);
                 i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-targets") and i + 1 < args.len) {
+                opts.lora_targets = commands_finetune.parseLoraTargets(args[i + 1]) catch |err| {
+                    std.debug.print("--lora-targets: invalid spec \"{s}\" ({s}). Valid names: q, k, v, o, gate, up, down, all_attn, all_ffn, all (comma-separated).\n", .{ args[i + 1], @errorName(err) });
+                    return err;
+                };
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-rank") and i + 1 < args.len) {
+                opts.lora_rank = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-alpha") and i + 1 < args.len) {
+                opts.lora_alpha = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-lr-b-scale") and i + 1 < args.len) {
+                opts.lora_lr_b_scale = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
             } else {
                 i += 1;
             }
         }
         if (opts.data_path.len == 0) {
-            std.debug.print("--fine-tune: --data <jsonl> is required\n", .{});
+            std.debug.print("{s}: --data <jsonl> is required\n", .{args[1]});
             return error.MissingDataArg;
+        }
+        if (is_lora_alias and opts.lora_targets == 0) {
+            std.debug.print("--lora-finetune: --lora-targets <spec> is required (e.g. q,k,v,o or all_attn or all)\n", .{});
+            return error.MissingLoraTargets;
         }
         try commands_finetune.run(allocator, opts);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--gen-from-ckpt")) {
-        // Generate text from a `.vkpt` checkpoint produced by --fine-tune.
-        // Uses the training Runner's forwardLogits + greedyDecode (slow,
-        // ~150 ms/tok at Qwen3-0.6B Debug; complete loop without needing
-        // .vkpt support in the inference Session).
+        // Generate text from a `.vkpt` or `.lvkpt` checkpoint produced
+        // by --fine-tune / --lora-finetune. Uses the training Runner's
+        // forwardLogits + greedyDecode (slow, ~150 ms/tok at Qwen3-0.6B
+        // Debug; complete loop without needing .vkpt support in the
+        // inference Session). Magic-sniffed at load time, so the same
+        // command handles both formats.
+        //
+        // For `.lvkpt`: pass the same `--lora-targets` / `--lora-rank`
+        // the checkpoint was saved with so the Runner allocates
+        // matching adapter slots before loadLoraCheckpoint overwrites
+        // them. Mismatches return error.LoraCheckpointConfigMismatch.
+        //
         // Format:
         //   --gen-from-ckpt <model> --ckpt <path> --prompt TEXT
         //                                          [--n-gen N] [--n-pos N]
+        //                                          [--lora-targets ...] [--lora-rank N]
+        //                                          [--lora-alpha A] [--lora-lr-b-scale L]
         var opts = commands_gen_from_ckpt.Options{
             .model = args[2],
             .ckpt_path = "",
@@ -189,6 +242,21 @@ pub fn main() !void {
                 i += 2;
             } else if (std.mem.eql(u8, a, "--n-pos") and i + 1 < args.len) {
                 opts.n_pos = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-targets") and i + 1 < args.len) {
+                opts.lora_targets = commands_finetune.parseLoraTargets(args[i + 1]) catch |err| {
+                    std.debug.print("--lora-targets: invalid spec \"{s}\" ({s})\n", .{ args[i + 1], @errorName(err) });
+                    return err;
+                };
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-rank") and i + 1 < args.len) {
+                opts.lora_rank = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-alpha") and i + 1 < args.len) {
+                opts.lora_alpha = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lora-lr-b-scale") and i + 1 < args.len) {
+                opts.lora_lr_b_scale = try std.fmt.parseFloat(f32, args[i + 1]);
                 i += 2;
             } else {
                 i += 1;
@@ -825,6 +893,7 @@ pub fn main() !void {
     try smoke_decoder.runRealModelTrainStepSmoke(allocator);
     try smoke_decoder.runRealModelMultiStepSmoke(allocator);
     try smoke_decoder.runDecoderStackCheckpointSmoke(allocator);
+    try smoke_decoder.runDecoderStackLoraCheckpointSmoke(allocator);
     try smoke_decoder.runRealModelSamplingSmoke(allocator);
     try smoke_decoder.runDecoderBackwardGpuParitySmoke(allocator);
     try smoke_decoder.runDecoderTrainGpuSmoke(allocator);

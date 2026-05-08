@@ -35,7 +35,53 @@ pub const Options = struct {
     n_gen: u32 = 20,
     print_every: u32 = 5,
     eos_id: u32 = 151_645, // Qwen3 <|im_end|>
+
+    // ── LoRA fine-tune options (A4-4). When `lora_targets != 0` the
+    //    Runner enables LoRA on the named projections and saves a
+    //    `.lvkpt` (LoRA-only) checkpoint instead of the full `.vkpt`.
+    //    Base weights stay in the source safetensors.
+    lora_targets: u32 = 0,
+    lora_rank: u32 = 16,
+    lora_alpha: f32 = 32.0,
+    lora_lr_b_scale: f32 = 1.0,
 };
+
+/// Parse a comma-separated `--lora-targets` value into the bitmask
+/// `Config.lora_targets` consumes. Recognises individual projection
+/// names ("q","k","v","o","gate","up","down") plus the three group
+/// shorthands ("all_attn","all_ffn","all"). Whitespace around commas
+/// is tolerated. Returns error.UnknownLoraTarget on an unrecognised
+/// name.
+pub fn parseLoraTargets(spec: []const u8) !u32 {
+    var mask: u32 = 0;
+    var it = std.mem.tokenizeAny(u8, spec, ", \t");
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "q")) {
+            mask |= train_transformer.LoraTarget.q;
+        } else if (std.mem.eql(u8, tok, "k")) {
+            mask |= train_transformer.LoraTarget.k;
+        } else if (std.mem.eql(u8, tok, "v")) {
+            mask |= train_transformer.LoraTarget.v;
+        } else if (std.mem.eql(u8, tok, "o")) {
+            mask |= train_transformer.LoraTarget.o;
+        } else if (std.mem.eql(u8, tok, "gate")) {
+            mask |= train_transformer.LoraTarget.gate;
+        } else if (std.mem.eql(u8, tok, "up")) {
+            mask |= train_transformer.LoraTarget.up;
+        } else if (std.mem.eql(u8, tok, "down")) {
+            mask |= train_transformer.LoraTarget.down;
+        } else if (std.mem.eql(u8, tok, "all_attn") or std.mem.eql(u8, tok, "all-attn")) {
+            mask |= train_transformer.LoraTarget.all_attn;
+        } else if (std.mem.eql(u8, tok, "all_ffn") or std.mem.eql(u8, tok, "all-ffn")) {
+            mask |= train_transformer.LoraTarget.all_ffn;
+        } else if (std.mem.eql(u8, tok, "all")) {
+            mask |= train_transformer.LoraTarget.all;
+        } else {
+            return error.UnknownLoraTarget;
+        }
+    }
+    return mask;
+}
 
 pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
     const stdout = std.io.getStdOut().writer();
@@ -53,11 +99,23 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
     defer weights.deinit();
     var cfg = weights.cfg;
     cfg.lr = opts.lr;
+    cfg.lora_targets = opts.lora_targets;
+    cfg.lora_rank = opts.lora_rank;
+    cfg.lora_alpha = opts.lora_alpha;
+    cfg.lora_lr_b_scale = opts.lora_lr_b_scale;
 
     try stdout.print(
         "[fine-tune] arch: {d} layers, dim={d}, GQA {d}/{d}, head_dim={d}, ff_dim={d}, vocab={d}\n",
         .{ cfg.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.ff_dim, cfg.vocab_size },
     );
+    if (cfg.lora_targets != 0) {
+        try stdout.print(
+            "[fine-tune] mode: LoRA — targets bitmask=0x{x} ({d}/7 projections) rank={d} α={d:.2} α/r={d:.2} lr_b_scale={d:.2}\n",
+            .{ cfg.lora_targets, @popCount(cfg.lora_targets), cfg.lora_rank, cfg.lora_alpha, cfg.lora_alpha / @as(f32, @floatFromInt(cfg.lora_rank)), cfg.lora_lr_b_scale },
+        );
+    } else {
+        try stdout.print("[fine-tune] mode: full-weight (every param trained, .vkpt save format)\n", .{});
+    }
 
     // ── Tokenizer.
     const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
@@ -160,19 +218,35 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
         try stdout.print("[probe after]  {s}\n", .{post_text});
     }
 
-    // ── Optional checkpoint save.
+    // ── Optional checkpoint save. LoRA mode → `.lvkpt` (small,
+    //    LoRA-only); full-weight mode → `.vkpt`.
     if (opts.out_path) |out| {
         const t_save_start = std.time.nanoTimestamp();
-        try runner.saveCheckpoint(allocator, out);
+        if (cfg.lora_targets != 0) {
+            try runner.saveLoraCheckpoint(allocator, out);
+        } else {
+            try runner.saveCheckpoint(allocator, out);
+        }
         const t_save_end = std.time.nanoTimestamp();
         const save_ms: f64 = @as(f64, @floatFromInt(t_save_end - t_save_start)) / 1.0e6;
         const file = try std.fs.cwd().openFile(out, .{ .mode = .read_only });
         defer file.close();
         const stat = try file.stat();
-        try stdout.print(
-            "[fine-tune] saved checkpoint: {s} ({d:.2} GiB, {d:.1} ms)\n",
-            .{ out, @as(f64, @floatFromInt(stat.size)) / (1024.0 * 1024.0 * 1024.0), save_ms },
-        );
+        const size_bytes: f64 = @floatFromInt(stat.size);
+        // `.lvkpt` is typically MiB-scale at most; report MiB to keep
+        // the output readable.
+        const fmt_kind: []const u8 = if (cfg.lora_targets != 0) "lora-checkpoint" else "checkpoint";
+        if (size_bytes >= 256.0 * 1024.0 * 1024.0) {
+            try stdout.print(
+                "[fine-tune] saved {s}: {s} ({d:.2} GiB, {d:.1} ms)\n",
+                .{ fmt_kind, out, size_bytes / (1024.0 * 1024.0 * 1024.0), save_ms },
+            );
+        } else {
+            try stdout.print(
+                "[fine-tune] saved {s}: {s} ({d:.2} MiB, {d:.1} ms)\n",
+                .{ fmt_kind, out, size_bytes / (1024.0 * 1024.0), save_ms },
+            );
+        }
     }
 }
 

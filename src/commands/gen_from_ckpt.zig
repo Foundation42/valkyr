@@ -20,11 +20,21 @@ const train_sampling = @import("../train/sampling.zig");
 
 pub const Options = struct {
     model: []const u8, // HF model id or local dir — provides architecture + tokenizer
-    ckpt_path: []const u8, // .vkpt produced by --fine-tune --out
+    ckpt_path: []const u8, // .vkpt or .lvkpt produced by --fine-tune --out
     prompt: []const u8,
     n_gen: u32 = 30,
     n_pos: u32 = 16, // must match the n_pos the checkpoint was saved at
     eos_id: u32 = 151_645, // Qwen3 <|im_end|>
+
+    // ── For `.lvkpt`, the loader needs the same `lora_targets` /
+    //    `lora_rank` the checkpoint was saved with so the Runner
+    //    allocates matching adapter slots before loadLoraCheckpoint
+    //    overwrites them. cfgShapeMatches enforces the match at load
+    //    time. Leave at defaults (0 / 0) for `.vkpt` checkpoints.
+    lora_targets: u32 = 0,
+    lora_rank: u32 = 0,
+    lora_alpha: f32 = 0.0,
+    lora_lr_b_scale: f32 = 1.0,
 };
 
 pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
@@ -47,7 +57,11 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
     // to a checkpoint-only init path.
     var weights = try train_load_real.loadTrainWeights(allocator, &cpu, opts.n_pos);
     defer weights.deinit();
-    const cfg = weights.cfg;
+    var cfg = weights.cfg;
+    cfg.lora_targets = opts.lora_targets;
+    cfg.lora_rank = opts.lora_rank;
+    cfg.lora_alpha = opts.lora_alpha;
+    cfg.lora_lr_b_scale = opts.lora_lr_b_scale;
 
     // ── Tokenizer.
     const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
@@ -66,15 +80,32 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
     var runner = try train_transformer.Runner.init(allocator, &ctx, cfg, weights.view());
     defer runner.deinit();
 
-    // ── Load the checkpoint (overwrites params + Adam state).
+    // ── Load the checkpoint (overwrites params + Adam state). We
+    //    autodetect `.vkpt` vs `.lvkpt` by sniffing the 4-byte magic
+    //    at the file head — same routine handles both since the user
+    //    might point either kind of file via `--ckpt`.
     const t_load_start = std.time.nanoTimestamp();
-    runner.loadCheckpoint(allocator, opts.ckpt_path) catch |err| {
-        try stdout.print("[gen-from-ckpt] checkpoint load failed: {s}\n", .{@errorName(err)});
-        return err;
-    };
+    var magic_buf: [4]u8 = undefined;
+    {
+        const f = try std.fs.cwd().openFile(opts.ckpt_path, .{ .mode = .read_only });
+        defer f.close();
+        try f.reader().readNoEof(&magic_buf);
+    }
+    const is_lora = std.mem.eql(u8, &magic_buf, "VLKP");
+    if (is_lora) {
+        runner.loadLoraCheckpoint(allocator, opts.ckpt_path) catch |err| {
+            try stdout.print("[gen-from-ckpt] LoRA checkpoint load failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+    } else {
+        runner.loadCheckpoint(allocator, opts.ckpt_path) catch |err| {
+            try stdout.print("[gen-from-ckpt] checkpoint load failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+    }
     const t_load_end = std.time.nanoTimestamp();
     const load_ms: f64 = @as(f64, @floatFromInt(t_load_end - t_load_start)) / 1.0e6;
-    try stdout.print("[gen-from-ckpt] loaded checkpoint in {d:.0} ms\n", .{load_ms});
+    try stdout.print("[gen-from-ckpt] loaded {s} checkpoint in {d:.0} ms\n", .{ if (is_lora) "LoRA" else "full-weight", load_ms });
 
     // ── Generate.
     const vocab: usize = cfg.vocab_size;
