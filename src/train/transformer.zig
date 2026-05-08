@@ -58,23 +58,57 @@ pub const Config = struct {
     beta2: f32 = 0.999,
     eps_adam: f32 = 1e-8,
 
-    /// LoRA on Q-projection (A4-2 v0). When true, every layer's W_q is
-    /// frozen (no Adam step) and supplemented by trainable rank-r
-    /// factors A ([r, dim]) and B ([n_q, r]):
-    ///     y_q = x · W_qᵀ + (α/r) · (x · Aᵀ) · Bᵀ
-    /// B is zero-initialised so a freshly-init Runner with lora_q_enabled
-    /// = true produces forward outputs bit-equal to the no-LoRA path —
-    /// a useful parity gate that A4-2's smoke leans on. Default false
-    /// keeps the existing wired-in path unchanged.
-    lora_q_enabled: bool = false,
-    lora_q_rank: u32 = 0,
-    lora_q_alpha: f32 = 0.0,
+    /// LoRA target bitmask (A4-3). Each bit selects one projection
+    /// to be replaced by `y = x·Wᵀ + (α/r)·(x·Aᵀ)·Bᵀ` with W frozen
+    /// and (A, B) trained. Use `LoraTarget.q | LoraTarget.k | ...` to
+    /// build, or `LoraTarget.all` / `LoraTarget.all_attn` shortcuts.
+    /// 0 ⇒ no LoRA (default), every dense matmul stays in the plain
+    /// path. The same `lora_rank` / `lora_alpha` / `lora_lr_b_scale`
+    /// apply to every enabled projection (per-projection rank is on
+    /// the A4-3+ board if a workload needs it).
+    lora_targets: u32 = 0,
+    lora_rank: u32 = 0,
+    lora_alpha: f32 = 0.0,
     /// LoRA+ differential learning rate for B (Chronicals Theorem 1).
-    /// Effective Adam lr for B is `lr · lora_q_lr_b_scale`; 1.0 is
+    /// Effective Adam lr for B is `lr · lora_lr_b_scale`; 1.0 is
     /// classical LoRA, ~16 is the Chronicals default. Untouched when
-    /// `lora_q_enabled = false`.
-    lora_q_lr_b_scale: f32 = 1.0,
+    /// `lora_targets = 0`.
+    lora_lr_b_scale: f32 = 1.0,
 };
+
+/// Bitmask constants for `Config.lora_targets`. Use bitwise-or to
+/// compose multiple projections; e.g. `LoraTarget.q | LoraTarget.v`
+/// for "LoRA on Q + V only".
+pub const LoraTarget = struct {
+    pub const q: u32 = 1 << 0;
+    pub const k: u32 = 1 << 1;
+    pub const v: u32 = 1 << 2;
+    pub const o: u32 = 1 << 3;
+    pub const gate: u32 = 1 << 4;
+    pub const up: u32 = 1 << 5;
+    pub const down: u32 = 1 << 6;
+    /// All four attention projections (Q + K + V + O). The most common
+    /// LoRA config in the literature.
+    pub const all_attn: u32 = q | k | v | o;
+    /// FFN-only LoRA: gate + up + down.
+    pub const all_ffn: u32 = gate | up | down;
+    /// Full LoRA on every dense matmul in the layer (max optimizer-state
+    /// reduction; ~30-40% step-time penalty on Qwen3-0.6B).
+    pub const all: u32 = all_attn | all_ffn;
+};
+
+/// Internal enum mirroring `LoraTarget` bits, used for indexing into
+/// `LoraState.slots`. The bit layout `1 << @intFromEnum(p)` matches
+/// the public `LoraTarget` constants exactly.
+const Proj = enum(u3) { q = 0, k, v, o, gate, up, down };
+const proj_count: comptime_int = 7;
+
+fn projBit(p: Proj) u32 {
+    return @as(u32, 1) << @intFromEnum(p);
+}
+fn projEnabled(targets: u32, p: Proj) bool {
+    return (targets & projBit(p)) != 0;
+}
 
 pub const LayerWeights = struct {
     w_n1: []const f32, // [dim]
@@ -98,17 +132,26 @@ pub const InitWeights = struct {
     lm_head: []const f32, // [vocab, dim]
     layers: []const LayerWeights, // length cfg.n_layers
 
-    /// Per-layer LoRA-Q initial weights. When empty *and*
-    /// `cfg.lora_q_enabled = true`, the Runner default-initialises A
-    /// from a fixed-seed scaled normal (σ = 1/sqrt(rank)) and B from
-    /// zeros. When non-empty, length must equal cfg.n_layers; each
-    /// entry's shapes must match `[r, dim]` and `[n_q, r]`.
+    /// Per-layer LoRA initial weights, one slice per target projection.
+    /// When empty for an enabled projection, the Runner default-init's
+    /// A from a fixed-seed scaled normal (σ = 1/sqrt(rank)) and B from
+    /// zeros. When non-empty, length must equal cfg.n_layers and each
+    /// entry's shapes must match `[r, K_proj]` for A and `[N_proj, r]`
+    /// for B. Disabled projections (per `cfg.lora_targets`) ignore the
+    /// corresponding slice entirely — leaving it empty is fine even
+    /// when `cfg.lora_targets = 0`.
     lora_q: []const LoraInitWeights = &.{},
+    lora_k: []const LoraInitWeights = &.{},
+    lora_v: []const LoraInitWeights = &.{},
+    lora_o: []const LoraInitWeights = &.{},
+    lora_gate: []const LoraInitWeights = &.{},
+    lora_up: []const LoraInitWeights = &.{},
+    lora_down: []const LoraInitWeights = &.{},
 };
 
 pub const LoraInitWeights = struct {
-    a: []const f32, // [r, dim]
-    b: []const f32, // [n_q, r]
+    a: []const f32, // [r, K_proj]
+    b: []const f32, // [N_proj, r]
 };
 
 // ── Checkpoint format (chunk 8c-β-6b) ────────────────────────────────
@@ -151,7 +194,7 @@ fn cfgShapeMatches(a: Config, b: Config) bool {
         a.rms_eps == b.rms_eps and a.causal == b.causal and
         a.rotary_dim == b.rotary_dim and a.rope_theta == b.rope_theta and
         a.qk_norm == b.qk_norm and
-        a.lora_q_enabled == b.lora_q_enabled and a.lora_q_rank == b.lora_q_rank;
+        a.lora_targets == b.lora_targets and a.lora_rank == b.lora_rank;
 }
 
 pub const Runner = struct {
@@ -379,13 +422,14 @@ pub const Runner = struct {
     push_dk: runtime.AttnBackwardDkPush,
     push_embed_bw: runtime.EmbeddingBackwardPush,
 
-    /// Optional LoRA-Q state (A4-2). Populated iff `cfg.lora_q_enabled`.
-    /// Owns the only LoRA-specific kernel (k_scale), the per-layer A/B
-    /// adapters + Adam m/v + dW, the [n_pos, r] intermediate cache that
-    /// bridges LoRA forward → backward, and the shared scratch buffers.
-    /// All other kernels (matmul, lin_dx, lin_dw, add_in_place) are
-    /// reused from the Runner.
-    lora_q: ?LoraQState,
+    /// Optional LoRA state (A4-2 → A4-3). Populated iff
+    /// `cfg.lora_targets != 0`. Owns the only LoRA-specific kernel
+    /// (k_scale), per-projection A/B adapters + Adam m/v + dW, the
+    /// per-projection [n_pos, r] intermediate cache that bridges LoRA
+    /// forward → backward, and the shared scratch buffers (sized to
+    /// the largest enabled projection). All other kernels (matmul,
+    /// lin_dx, lin_dw, add_in_place) are reused from the Runner.
+    lora: ?LoraState,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -493,13 +537,14 @@ pub const Runner = struct {
         //   + backward 27 (+2 RoPE, +2 qk_norm) = 42 to 50 per layer.
         // Plus 9 stack-level (embed + final_norm + lm_head + ce + lm_dx +
         // lm_dw + final_norm_bw + 2 spare).
-        // LoRA-Q (when enabled): forward Q matmul (1) → recordLoraForward
-        // (5) net +4; backward Q lin_dx+lin_dw (2) → recordLoraBackward
-        // (9) net +7. Total +11 per layer when lora_q_enabled. Bump
-        // 50 → 65 to absorb that without spilling, and add +1 per
-        // layer of headroom in the Adam phase (skip W_q +1 / add A +1
-        // / add B +1 = +1 net).
-        const per_layer_max: u32 = if (cfg.lora_q_enabled) 65 else 50;
+        // LoRA: per enabled projection, forward matmul (1) →
+        // recordLoraForward (5) net +4; backward lin_dx+lin_dw (2) →
+        // recordLoraBackward (9) net +7. Total +11 per layer per
+        // enabled projection. Adam phase goes +1 per enabled projection
+        // (skip frozen W's Adam, add A and B). Bump per-layer cap by
+        // 12 × popcount(targets) to absorb both phases with headroom.
+        const lora_count: u32 = @popCount(cfg.lora_targets);
+        const per_layer_max: u32 = 50 + 12 * lora_count;
         const phase1_dispatches: u32 = 32 + per_layer_max * cfg.n_layers;
         var rec = try recorder_mod.Recorder.init(ctx, phase1_dispatches, 8 * phase1_dispatches);
         errdefer rec.deinit();
@@ -569,14 +614,15 @@ pub const Runner = struct {
             try per_layer.populateLayer(ctx, li, cfg, lw);
         }
 
-        // ── LoRA-Q state (A4-2). Allocated only when cfg.lora_q_enabled;
-        //    the shaders + per-layer arrays are LoRA-specific so we
-        //    don't pay any allocation cost in the no-LoRA path.
-        var lora_q_state: ?LoraQState = if (cfg.lora_q_enabled)
-            try LoraQState.allocAndInit(allocator, ctx, cfg, weights.lora_q)
+        // ── LoRA state (A4-2 → A4-3). Allocated only when
+        //    cfg.lora_targets != 0; the shaders + per-projection slots
+        //    are LoRA-specific so we don't pay any allocation cost in
+        //    the no-LoRA path.
+        var lora_state: ?LoraState = if (cfg.lora_targets != 0)
+            try LoraState.allocAndInit(allocator, ctx, cfg, weights)
         else
             null;
-        errdefer if (lora_q_state) |*ls| ls.deinit(ctx.device, allocator);
+        errdefer if (lora_state) |*ls| ls.deinit(ctx.device, allocator);
 
         // ── Shared scratch.
         const sc_scores = try buffer.Buffer.initDeviceOnly(ctx, scores_total * f32sz);
@@ -932,7 +978,7 @@ pub const Runner = struct {
             .push_dq = push_dq,
             .push_dk = push_dk,
             .push_embed_bw = push_embed_bw,
-            .lora_q = lora_q_state,
+            .lora = lora_state,
         };
     }
 
@@ -1023,8 +1069,9 @@ pub const Runner = struct {
         alloc.free(self.dw_partial_host);
         alloc.free(self.dw_reduced);
 
-        // LoRA-Q state (its k_scale + per-layer + scratches), if present.
-        if (self.lora_q) |*ls| ls.deinit(dev, alloc);
+        // LoRA state (its k_scale + per-projection slots + scratches),
+        // if present.
+        if (self.lora) |*ls| ls.deinit(dev, alloc);
 
         // Pipelines + recorder.
         self.k_embed.deinit();
@@ -1333,6 +1380,118 @@ pub const Runner = struct {
 
     // ── Internal recording helpers ────────────────────────────────────
 
+    // ── Per-projection record helpers (A4-3) ──────────────────────────
+    //
+    // A projection's path is one of two shapes: plain dense matmul +
+    // backward (as the wired-in path always was), or LoRA-augmented
+    // (W frozen, A/B trained — see `LoraState.allocAndInit` for the
+    // shape derivation). These three helpers decide per call.
+    //
+    // The plain branches mirror the original inline dispatches exactly,
+    // so when `cfg.lora_targets = 0` the recorded cmdbuf is bit-equal
+    // to the pre-A4-2 path. The LoRA branches consume the matching
+    // `LoraState.slots[Proj]` and the shared scratches.
+
+    fn recordProjForward(
+        self: *Runner,
+        proj: Proj,
+        li: u32,
+        x: *const buffer.Buffer,
+        w: *const buffer.Buffer,
+        y: *const buffer.Buffer,
+        push: *const runtime.MatmulPush,
+    ) !void {
+        const i: usize = @intCast(li);
+        if (self.lora) |*ls| {
+            if (ls.slots[@intFromEnum(proj)]) |*slot| {
+                try lora_helpers.recordLoraForward(
+                    &self.rec,
+                    ls.kernels(self),
+                    .{
+                        .x = x,
+                        .w = w,
+                        .a = &slot.a[i],
+                        .b = &slot.b[i],
+                        .y = y,
+                        .intermediate_out = &slot.intermediate[i],
+                        .sc_y_lora = &ls.sc_y_lora,
+                        .sc_y_lora_scaled = &ls.sc_y_lora_scaled,
+                    },
+                    slot.shape,
+                );
+                return;
+            }
+        }
+        try self.rec.dispatch(&self.k_matmul, &.{ x, w, y }, push, self.cfg.n_pos * push.n, 1, 1);
+    }
+
+    fn recordProjBackward(
+        self: *Runner,
+        proj: Proj,
+        li: u32,
+        dy: *const buffer.Buffer,
+        x: *const buffer.Buffer,
+        w: *const buffer.Buffer,
+        dx: *const buffer.Buffer,
+        dw: *const buffer.Buffer,
+        push: *const runtime.LinearBatchedPush,
+    ) !void {
+        const i: usize = @intCast(li);
+        if (self.lora) |*ls| {
+            if (ls.slots[@intFromEnum(proj)]) |*slot| {
+                try lora_helpers.recordLoraBackward(
+                    &self.rec,
+                    ls.kernels(self),
+                    .{
+                        .dy = dy,
+                        .x = x,
+                        .w = w,
+                        .a = &slot.a[i],
+                        .b = &slot.b[i],
+                        .intermediate = &slot.intermediate[i],
+                        .dx = dx,
+                        .dA = &slot.dw_a[i],
+                        .dB = &slot.dw_b[i],
+                        .sc_dy_B = &ls.sc_dy_B,
+                        .sc_dx_lora = &ls.sc_dx_lora,
+                        .sc_dx_lora_scaled = &ls.sc_dx_lora_scaled,
+                        .sc_dA_unscaled = &ls.sc_dA_unscaled,
+                        .sc_dB_unscaled = &ls.sc_dB_unscaled,
+                    },
+                    slot.shape,
+                );
+                return;
+            }
+        }
+        try self.rec.dispatch(&self.k_lin_dx, &.{ dy, w, dx }, push, util.ceilDiv(push.M, group_lwg), util.ceilDiv(push.K, group_lwg), 1);
+        try self.rec.dispatch(&self.k_lin_dw, &.{ dy, x, dw }, push, util.ceilDiv(push.N, group_lwg), util.ceilDiv(push.K, group_lwg), 1);
+    }
+
+    fn recordProjAdam(
+        self: *Runner,
+        proj: Proj,
+        li: u32,
+        w: *const buffer.Buffer,
+        dw: *const buffer.Buffer,
+        m: *const buffer.Buffer,
+        v: *const buffer.Buffer,
+        push: *const runtime.AdamStepPush,
+    ) !void {
+        const i: usize = @intCast(li);
+        if (self.lora) |*ls| {
+            if (ls.slots[@intFromEnum(proj)]) |*slot| {
+                const n_a: u32 = @intCast(slot.a[i].bytes / @sizeOf(f32));
+                const n_b: u32 = @intCast(slot.b[i].bytes / @sizeOf(f32));
+                const adam_a = runtime.AdamStepPush{ .n = n_a, .lr = push.lr, .beta1 = push.beta1, .beta2 = push.beta2, .eps = push.eps, .t = push.t };
+                const adam_b = runtime.AdamStepPush{ .n = n_b, .lr = push.lr * self.cfg.lora_lr_b_scale, .beta1 = push.beta1, .beta2 = push.beta2, .eps = push.eps, .t = push.t };
+                try self.rec.dispatch(&self.k_adam, &.{ &slot.a[i], &slot.dw_a[i], &slot.m_a[i], &slot.v_a[i] }, &adam_a, util.ceilDiv(n_a, group_lin), 1, 1);
+                try self.rec.dispatch(&self.k_adam, &.{ &slot.b[i], &slot.dw_b[i], &slot.m_b[i], &slot.v_b[i] }, &adam_b, util.ceilDiv(n_b, group_lin), 1, 1);
+                return;
+            }
+        }
+        try self.rec.dispatch(&self.k_adam, &.{ w, dw, m, v }, push, util.ceilDiv(push.n, group_lin), 1, 1);
+    }
+
     fn recordEmbedLookup(self: *Runner) !void {
         const total: u32 = self.cfg.n_pos * self.cfg.dim;
         try self.rec.dispatch(
@@ -1370,31 +1529,15 @@ pub const Runner = struct {
             &self.sc_k_pre
         else
             &self.buf_k[i];
-        // Q matmul: plain `x · W_qᵀ`, or LoRA-augmented when lora_q is on.
-        // The LoRA chain writes the same `q_matmul_dst` so downstream
-        // (qk_norm, RoPE, attention) sees an identical buffer layout —
-        // it's the per-element value that picks up the (α/r)·B·A·x term.
-        if (self.lora_q) |*ls| {
-            try lora_helpers.recordLoraForward(
-                &self.rec,
-                ls.kernels(self),
-                .{
-                    .x = &self.buf_n1[i],
-                    .w = &self.buf_w_q[i],
-                    .a = &ls.a[i],
-                    .b = &ls.b[i],
-                    .y = q_matmul_dst,
-                    .intermediate_out = &ls.intermediate[i],
-                    .sc_y_lora = &ls.sc_y_lora,
-                    .sc_y_lora_scaled = &ls.sc_y_lora_scaled,
-                },
-                ls.shape,
-            );
-        } else {
-            try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_q[i], q_matmul_dst }, &self.push_mm_q, cfg.n_pos * self.push_mm_q.n, 1, 1);
-        }
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_k[i], k_matmul_dst }, &self.push_mm_k, cfg.n_pos * self.push_mm_k.n, 1, 1);
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n1[i], &self.buf_w_v[i], &self.buf_v[i] }, &self.push_mm_v, cfg.n_pos * self.push_mm_v.n, 1, 1);
+        // Each of Q/K/V/O/gate/up/down may be LoRA-augmented or plain
+        // dense matmul depending on `cfg.lora_targets`. The LoRA chain
+        // writes the same destination buffer so downstream paths
+        // (qk_norm, RoPE, attention, swiglu, etc.) see an identical
+        // buffer layout — only the per-element value picks up the
+        // `(α/r)·B·A·x` term when LoRA is on.
+        try self.recordProjForward(.q, li, &self.buf_n1[i], &self.buf_w_q[i], q_matmul_dst, &self.push_mm_q);
+        try self.recordProjForward(.k, li, &self.buf_n1[i], &self.buf_w_k[i], k_matmul_dst, &self.push_mm_k);
+        try self.recordProjForward(.v, li, &self.buf_n1[i], &self.buf_w_v[i], &self.buf_v[i], &self.push_mm_v);
         if (cfg.qk_norm) {
             // rmsnorm dispatches: one workgroup per row, n_rows = n_pos * n_heads
             // (Q) or n_pos * n_kv_heads (K), dim = head_dim. The rmsnorm
@@ -1415,22 +1558,22 @@ pub const Runner = struct {
         try self.rec.dispatch(&self.k_softmax, &.{ &self.sc_scores, &self.buf_attn[i] }, &self.push_softmax, cfg.n_pos * cfg.n_heads, 1, 1);
         // 7. attention output.
         try self.rec.dispatch(&self.k_attn_output, &.{ &self.buf_attn[i], &self.buf_v[i], &self.buf_attn_out[i] }, &self.push_attn_output, cfg.n_pos * cfg.n_heads * cfg.head_dim, 1, 1);
-        // 8. O projection.
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_attn_out[i], &self.buf_w_o[i], &self.sc_o }, &self.push_mm_o, cfg.n_pos * self.push_mm_o.n, 1, 1);
+        // 8. O projection (LoRA-aware).
+        try self.recordProjForward(.o, li, &self.buf_attn_out[i], &self.buf_w_o[i], &self.sc_o, &self.push_mm_o);
         // 9. mid = x_in + o (residual).
         const add_groups: u32 = util.ceilDiv(self.push_n_pos_dim.n, group_lin);
         try self.rec.dispatch(&self.k_vec_add, &.{ x_in_buf, &self.sc_o, &self.buf_mid[i] }, &self.push_n_pos_dim, add_groups, 1, 1);
         // 10. RMSNorm n2.
         try self.rec.dispatch(&self.k_rms, &.{ &self.buf_mid[i], &self.buf_w_n2[i], &self.buf_n2[i] }, &self.push_rms, cfg.n_pos, 1, 1);
-        // 11. W_gate matmul.
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n2[i], &self.buf_w_gate[i], &self.buf_pre_gate[i] }, &self.push_mm_gate, cfg.n_pos * self.push_mm_gate.n, 1, 1);
-        // 12. W_up matmul.
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_n2[i], &self.buf_w_up[i], &self.buf_up[i] }, &self.push_mm_up, cfg.n_pos * self.push_mm_up.n, 1, 1);
+        // 11. W_gate matmul (LoRA-aware).
+        try self.recordProjForward(.gate, li, &self.buf_n2[i], &self.buf_w_gate[i], &self.buf_pre_gate[i], &self.push_mm_gate);
+        // 12. W_up matmul (LoRA-aware).
+        try self.recordProjForward(.up, li, &self.buf_n2[i], &self.buf_w_up[i], &self.buf_up[i], &self.push_mm_up);
         // 13. SwiGLU fwd: gated = silu(pre_gate) · up.
         const swiglu_groups: u32 = util.ceilDiv(self.push_swiglu.n, group_lin);
         try self.rec.dispatch(&self.k_swiglu_fwd, &.{ &self.buf_pre_gate[i], &self.buf_up[i], &self.buf_gated[i] }, &self.push_swiglu, swiglu_groups, 1, 1);
-        // 14. W_down matmul → ff_out.
-        try self.rec.dispatch(&self.k_matmul, &.{ &self.buf_gated[i], &self.buf_w_down[i], &self.sc_ff_out }, &self.push_mm_down, cfg.n_pos * self.push_mm_down.n, 1, 1);
+        // 14. W_down matmul → ff_out (LoRA-aware).
+        try self.recordProjForward(.down, li, &self.buf_gated[i], &self.buf_w_down[i], &self.sc_ff_out, &self.push_mm_down);
         // 15. y = mid + ff_out.
         try self.rec.dispatch(&self.k_vec_add, &.{ &self.buf_mid[i], &self.sc_ff_out, &self.buf_y[i] }, &self.push_n_pos_dim, add_groups, 1, 1);
     }
@@ -1526,25 +1669,23 @@ pub const Runner = struct {
         const add_groups: u32 = util.ceilDiv(self.push_n_pos_dim.n, group_lin);
         const swiglu_groups: u32 = util.ceilDiv(self.push_swiglu.n, group_lin);
 
-        // W_down dx + dW (treats d_y_in as d_ff_out).
-        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_down[i], &self.sc_d_gated }, &self.push_lin_down, util.ceilDiv(self.push_lin_down.M, group_lwg), util.ceilDiv(self.push_lin_down.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_gated[i], &self.buf_dw_down[i] }, &self.push_lin_down, util.ceilDiv(self.push_lin_down.N, group_lwg), util.ceilDiv(self.push_lin_down.K, group_lwg), 1);
+        // W_down backward (LoRA-aware: when LoRA is on .down, dW_down
+        // is replaced by ∇A_down / ∇B_down and dx still flows through
+        // the (α/r)·dy_B·A path).
+        try self.recordProjBackward(.down, li, d_y_in, &self.buf_gated[i], &self.buf_w_down[i], &self.sc_d_gated, &self.buf_dw_down[i], &self.push_lin_down);
         // SwiGLU bw: (d_gated, pre_gate, up) → (d_pre_gate, d_up).
         try self.rec.dispatch(&self.k_swiglu_bw, &.{ &self.sc_d_gated, &self.buf_pre_gate[i], &self.buf_up[i], &self.sc_d_pre_gate, &self.sc_d_up_grad }, &self.push_swiglu, swiglu_groups, 1, 1);
-        // W_gate dx + dW (writes d_n2).
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_pre_gate, &self.buf_w_gate[i], &self.sc_d_n2 }, &self.push_lin_gate, util.ceilDiv(self.push_lin_gate.M, group_lwg), util.ceilDiv(self.push_lin_gate.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_pre_gate, &self.buf_n2[i], &self.buf_dw_gate[i] }, &self.push_lin_gate, util.ceilDiv(self.push_lin_gate.N, group_lwg), util.ceilDiv(self.push_lin_gate.K, group_lwg), 1);
-        // W_up dx + dW + accumulate into d_n2.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_d_up_grad, &self.buf_w_up[i], &self.sc_d_n2_up }, &self.push_lin_up, util.ceilDiv(self.push_lin_up.M, group_lwg), util.ceilDiv(self.push_lin_up.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_d_up_grad, &self.buf_n2[i], &self.buf_dw_up[i] }, &self.push_lin_up, util.ceilDiv(self.push_lin_up.N, group_lwg), util.ceilDiv(self.push_lin_up.K, group_lwg), 1);
+        // W_gate backward (writes d_n2).
+        try self.recordProjBackward(.gate, li, &self.sc_d_pre_gate, &self.buf_n2[i], &self.buf_w_gate[i], &self.sc_d_n2, &self.buf_dw_gate[i], &self.push_lin_gate);
+        // W_up backward + accumulate into d_n2.
+        try self.recordProjBackward(.up, li, &self.sc_d_up_grad, &self.buf_n2[i], &self.buf_w_up[i], &self.sc_d_n2_up, &self.buf_dw_up[i], &self.push_lin_up);
         try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n2, &self.sc_d_n2_up }, &self.push_n_pos_dim, add_groups, 1, 1);
         // RMSNorm n2 bw → d_mid_norm + dw_n2_partial.
         try self.rec.dispatch(&self.k_rms_bw, &.{ &self.sc_d_n2, &self.buf_mid[i], &self.buf_w_n2[i], &self.sc_d_mid_norm, &self.buf_dw_n2_partial[i] }, &self.push_rms, cfg.n_pos, 1, 1);
         // d_y_in += d_mid_norm. From here, d_y_in holds d_mid_total.
         try self.rec.dispatch(&self.k_add, &.{ d_y_in, &self.sc_d_mid_norm }, &self.push_n_pos_dim, add_groups, 1, 1);
-        // O projection dx + dW.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ d_y_in, &self.buf_w_o[i], &self.sc_d_attn_out }, &self.push_lin_o, util.ceilDiv(self.push_lin_o.M, group_lwg), util.ceilDiv(self.push_lin_o.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ d_y_in, &self.buf_attn_out[i], &self.buf_dw_o[i] }, &self.push_lin_o, util.ceilDiv(self.push_lin_o.N, group_lwg), util.ceilDiv(self.push_lin_o.K, group_lwg), 1);
+        // O projection backward (LoRA-aware).
+        try self.recordProjBackward(.o, li, d_y_in, &self.buf_attn_out[i], &self.buf_w_o[i], &self.sc_d_attn_out, &self.buf_dw_o[i], &self.push_lin_o);
         // SDPA backward.
         try self.rec.dispatch(&self.k_attn_dattn, &.{ &self.sc_d_attn_out, &self.buf_v[i], &self.sc_d_attn }, &self.push_dattn, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
         try self.rec.dispatch(&self.k_attn_dv, &.{ &self.buf_attn[i], &self.sc_d_attn_out, &self.sc_dV }, &self.push_dv, cfg.n_pos * cfg.n_kv_heads * cfg.head_dim, 1, 1);
@@ -1592,44 +1733,13 @@ pub const Runner = struct {
         else
             &self.sc_dK;
 
-        // Q proj backward. Plain path writes lin_dx into sc_d_n1 +
-        // lin_dw into buf_dw_q (an Adam target). LoRA path: W_q is
-        // frozen, so we replace the lin_dw on W_q with ∇A / ∇B writes
-        // and let recordLoraBackward also handle dx (which now picks
-        // up the (α/r)·dy_B·A contribution).
-        if (self.lora_q) |*ls| {
-            try lora_helpers.recordLoraBackward(
-                &self.rec,
-                ls.kernels(self),
-                .{
-                    .dy = dQ_lin,
-                    .x = &self.buf_n1[i],
-                    .w = &self.buf_w_q[i],
-                    .a = &ls.a[i],
-                    .b = &ls.b[i],
-                    .intermediate = &ls.intermediate[i],
-                    .dx = &self.sc_d_n1,
-                    .dA = &ls.dw_a[i],
-                    .dB = &ls.dw_b[i],
-                    .sc_dy_B = &ls.sc_dy_B,
-                    .sc_dx_lora = &ls.sc_dx_lora,
-                    .sc_dx_lora_scaled = &ls.sc_dx_lora_scaled,
-                    .sc_dA_unscaled = &ls.sc_dA_unscaled,
-                    .sc_dB_unscaled = &ls.sc_dB_unscaled,
-                },
-                ls.shape,
-            );
-        } else {
-            try self.rec.dispatch(&self.k_lin_dx, &.{ dQ_lin, &self.buf_w_q[i], &self.sc_d_n1 }, &self.push_lin_q, util.ceilDiv(self.push_lin_q.M, group_lwg), util.ceilDiv(self.push_lin_q.K, group_lwg), 1);
-            try self.rec.dispatch(&self.k_lin_dw, &.{ dQ_lin, &self.buf_n1[i], &self.buf_dw_q[i] }, &self.push_lin_q, util.ceilDiv(self.push_lin_q.N, group_lwg), util.ceilDiv(self.push_lin_q.K, group_lwg), 1);
-        }
-        // K proj + accumulate into d_n1.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ dK_lin, &self.buf_w_k[i], &self.sc_d_n1_k }, &self.push_lin_k, util.ceilDiv(self.push_lin_k.M, group_lwg), util.ceilDiv(self.push_lin_k.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ dK_lin, &self.buf_n1[i], &self.buf_dw_k[i] }, &self.push_lin_k, util.ceilDiv(self.push_lin_k.N, group_lwg), util.ceilDiv(self.push_lin_k.K, group_lwg), 1);
+        // Q/K/V backward (LoRA-aware). Q writes directly into sc_d_n1
+        // (saves an add_in_place); K/V write to scratch and add into
+        // sc_d_n1.
+        try self.recordProjBackward(.q, li, dQ_lin, &self.buf_n1[i], &self.buf_w_q[i], &self.sc_d_n1, &self.buf_dw_q[i], &self.push_lin_q);
+        try self.recordProjBackward(.k, li, dK_lin, &self.buf_n1[i], &self.buf_w_k[i], &self.sc_d_n1_k, &self.buf_dw_k[i], &self.push_lin_k);
         try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n1, &self.sc_d_n1_k }, &self.push_n_pos_dim, add_groups, 1, 1);
-        // V proj + accumulate into d_n1.
-        try self.rec.dispatch(&self.k_lin_dx, &.{ &self.sc_dV, &self.buf_w_v[i], &self.sc_d_n1_v }, &self.push_lin_v, util.ceilDiv(self.push_lin_v.M, group_lwg), util.ceilDiv(self.push_lin_v.K, group_lwg), 1);
-        try self.rec.dispatch(&self.k_lin_dw, &.{ &self.sc_dV, &self.buf_n1[i], &self.buf_dw_v[i] }, &self.push_lin_v, util.ceilDiv(self.push_lin_v.N, group_lwg), util.ceilDiv(self.push_lin_v.K, group_lwg), 1);
+        try self.recordProjBackward(.v, li, &self.sc_dV, &self.buf_n1[i], &self.buf_w_v[i], &self.sc_d_n1_v, &self.buf_dw_v[i], &self.push_lin_v);
         try self.rec.dispatch(&self.k_add, &.{ &self.sc_d_n1, &self.sc_d_n1_v }, &self.push_n_pos_dim, add_groups, 1, 1);
         // RMSNorm n1 bw → writes the rmsnorm.dx contribution to d_x_in_out.
         try self.rec.dispatch(&self.k_rms_bw, &.{ &self.sc_d_n1, x_in_buf, &self.buf_w_n1[i], d_x_in_out, &self.buf_dw_n1_partial[i] }, &self.push_rms, cfg.n_pos, 1, 1);
@@ -1671,27 +1781,20 @@ pub const Runner = struct {
             const adam_down = runtime.AdamStepPush{ .n = n_down_w, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
 
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n1[i], &self.buf_dw_n1[i], &self.buf_m_n1[i], &self.buf_v_n1[i] }, &adam_n1, util.ceilDiv(dim_n, group_lin), 1, 1);
-            // W_q is frozen under LoRA-Q; A/B receive Adam updates
-            // instead. LoRA+ applies a multiplicative scale to lr for B
-            // (Chronicals Theorem 1, λ_B ≈ 16). When LoRA-Q is off, the
-            // plain W_q Adam step runs unchanged.
-            if (self.lora_q) |*ls| {
-                const n_a: u32 = @intCast(ls.a[i].bytes / @sizeOf(f32));
-                const n_b: u32 = @intCast(ls.b[i].bytes / @sizeOf(f32));
-                const adam_la = runtime.AdamStepPush{ .n = n_a, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-                const adam_lb = runtime.AdamStepPush{ .n = n_b, .lr = lr * cfg.lora_q_lr_b_scale, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
-                try self.rec.dispatch(&self.k_adam, &.{ &ls.a[i], &ls.dw_a[i], &ls.m_a[i], &ls.v_a[i] }, &adam_la, util.ceilDiv(n_a, group_lin), 1, 1);
-                try self.rec.dispatch(&self.k_adam, &.{ &ls.b[i], &ls.dw_b[i], &ls.m_b[i], &ls.v_b[i] }, &adam_lb, util.ceilDiv(n_b, group_lin), 1, 1);
-            } else {
-                try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q[i], &self.buf_dw_q[i], &self.buf_m_q[i], &self.buf_v_q[i] }, &adam_q, util.ceilDiv(n_q_w, group_lin), 1, 1);
-            }
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_k[i], &self.buf_dw_k[i], &self.buf_m_k[i], &self.buf_v_k[i] }, &adam_k, util.ceilDiv(n_k_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_v[i], &self.buf_dw_v[i], &self.buf_m_v[i], &self.buf_v_v[i] }, &adam_v, util.ceilDiv(n_v_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_o[i], &self.buf_dw_o[i], &self.buf_m_o[i], &self.buf_v_o[i] }, &adam_o, util.ceilDiv(n_o_w, group_lin), 1, 1);
+            // For each of the 7 dense projections: when LoRA is on for
+            // that target, recordProjAdam skips the frozen W's Adam and
+            // runs Adam on A and B (with B's lr scaled by lora_lr_b_scale,
+            // i.e. LoRA+ Theorem 1). Otherwise it runs the plain W Adam
+            // step. The other 4 per-layer params (n1, n2, q_norm,
+            // k_norm) are never LoRA'd — RMSNorm gains aren't matmuls.
+            try self.recordProjAdam(.q, @intCast(i), &self.buf_w_q[i], &self.buf_dw_q[i], &self.buf_m_q[i], &self.buf_v_q[i], &adam_q);
+            try self.recordProjAdam(.k, @intCast(i), &self.buf_w_k[i], &self.buf_dw_k[i], &self.buf_m_k[i], &self.buf_v_k[i], &adam_k);
+            try self.recordProjAdam(.v, @intCast(i), &self.buf_w_v[i], &self.buf_dw_v[i], &self.buf_m_v[i], &self.buf_v_v[i], &adam_v);
+            try self.recordProjAdam(.o, @intCast(i), &self.buf_w_o[i], &self.buf_dw_o[i], &self.buf_m_o[i], &self.buf_v_o[i], &adam_o);
             try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_n2[i], &self.buf_dw_n2[i], &self.buf_m_n2[i], &self.buf_v_n2[i] }, &adam_n2, util.ceilDiv(dim_n, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_gate[i], &self.buf_dw_gate[i], &self.buf_m_gate[i], &self.buf_v_gate[i] }, &adam_gate, util.ceilDiv(n_gate_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_up[i], &self.buf_dw_up[i], &self.buf_m_up[i], &self.buf_v_up[i] }, &adam_up, util.ceilDiv(n_up_w, group_lin), 1, 1);
-            try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_down[i], &self.buf_dw_down[i], &self.buf_m_down[i], &self.buf_v_down[i] }, &adam_down, util.ceilDiv(n_down_w, group_lin), 1, 1);
+            try self.recordProjAdam(.gate, @intCast(i), &self.buf_w_gate[i], &self.buf_dw_gate[i], &self.buf_m_gate[i], &self.buf_v_gate[i], &adam_gate);
+            try self.recordProjAdam(.up, @intCast(i), &self.buf_w_up[i], &self.buf_dw_up[i], &self.buf_m_up[i], &self.buf_v_up[i], &adam_up);
+            try self.recordProjAdam(.down, @intCast(i), &self.buf_w_down[i], &self.buf_dw_down[i], &self.buf_m_down[i], &self.buf_v_down[i], &adam_down);
             if (cfg.qk_norm) {
                 const adam_qn = runtime.AdamStepPush{ .n = cfg.head_dim, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = eps, .t = t };
                 try self.rec.dispatch(&self.k_adam, &.{ &self.buf_w_q_norm[i], &self.buf_dw_q_norm[i], &self.buf_m_q_norm[i], &self.buf_v_q_norm[i] }, &adam_qn, util.ceilDiv(cfg.head_dim, group_lin), 1, 1);
@@ -2021,33 +2124,26 @@ const PerLayerArrays = struct {
     }
 };
 
-// ── LoRA-Q state (A4-2) ──────────────────────────────────────────────
+// ── LoRA state (A4-2 → A4-3) ─────────────────────────────────────────
 //
-// Lives on the Runner as `lora_q: ?LoraQState` and is populated only
-// when `cfg.lora_q_enabled = true`. Owns:
+// Lives on the Runner as `lora: ?LoraState` and is populated only when
+// `cfg.lora_targets != 0`. One `ProjLoraSlot` per enabled projection
+// (Q / K / V / O / gate / up / down) holds that projection's per-layer
+// adapters + Adam state; disabled projections sit at `null` in the
+// `slots` array and pay no allocation cost. Shared scratches are sized
+// to the largest enabled projection along each axis (max N for the
+// y-side scratches, max K for the dx-side, both for ∇A/∇B).
 //
-//   - k_scale: the only LoRA-specific kernel (the rest reuse Runner's
-//     k_matmul / k_lin_dx / k_lin_dw / k_add).
-//   - per-layer A [r, dim], B [n_q, r], plus their dW + Adam m/v slots.
-//   - per-layer intermediate buffer [n_pos, r] — cached during forward
-//     for re-use in backward (computes ∇B = (α/r)·dyᵀ·intermediate).
-//   - a single set of shared scratch buffers (re-used across layers
-//     since recordLayerForward / recordLayerBackward fire layer-by-layer
-//     and never overlap dispatches that would need separate scratches).
-//
-// Default init (when InitWeights.lora_q is empty):
-//   A ~ N(0, 1/sqrt(rank))  — Hu et al. LoRA paper, σ = 1/sqrt(r) for
-//                             order-1-magnitude post-Aᵀ activations.
+// Default init (when InitWeights.lora_<proj> is empty):
+//   A ~ N(0, 1/sqrt(rank))  — Hu et al. LoRA paper.
 //   B = 0                   — guarantees the LoRA delta is zero on the
 //                             first forward, so loss(LoRA on, B=0) ==
-//                             loss(LoRA off). Once the first backward
-//                             updates B (∇B is non-zero since it's
-//                             driven by `intermediate = x·Aᵀ`), the
-//                             paths diverge.
-const LoraQState = struct {
-    k_scale: pipeline.Kernel,
+//                             loss(LoRA off). The first backward kicks
+//                             B into motion (∇B is driven by `inter
+//                             = x·Aᵀ` which is non-zero); ∇A starts
+//                             non-zero from step 2 once B has moved.
 
-    // Per-layer slices.
+const ProjLoraSlot = struct {
     a: []buffer.Buffer,
     b: []buffer.Buffer,
     intermediate: []buffer.Buffer,
@@ -2057,167 +2153,9 @@ const LoraQState = struct {
     v_a: []buffer.Buffer,
     m_b: []buffer.Buffer,
     v_b: []buffer.Buffer,
-
-    // Shared scratch.
-    sc_y_lora: buffer.Buffer,
-    sc_y_lora_scaled: buffer.Buffer,
-    sc_dy_B: buffer.Buffer,
-    sc_dx_lora: buffer.Buffer,
-    sc_dx_lora_scaled: buffer.Buffer,
-    sc_dA_unscaled: buffer.Buffer,
-    sc_dB_unscaled: buffer.Buffer,
-
     shape: lora_helpers.LoraShape,
 
-    fn allocAndInit(
-        allocator: std.mem.Allocator,
-        ctx: *const vk.Context,
-        cfg: Config,
-        provided: []const LoraInitWeights,
-    ) !LoraQState {
-        std.debug.assert(cfg.lora_q_enabled);
-        if (cfg.lora_q_rank == 0) return error.LoraQRankZero;
-        if (provided.len != 0 and provided.len != cfg.n_layers) return error.LoraQInitLen;
-
-        const n_layers: usize = @intCast(cfg.n_layers);
-        const dim: usize = @intCast(cfg.dim);
-        const r: usize = @intCast(cfg.lora_q_rank);
-        const n_q: usize = @as(usize, @intCast(cfg.n_heads)) * @as(usize, @intCast(cfg.head_dim));
-        const n_pos: usize = @intCast(cfg.n_pos);
-        const f32sz = @sizeOf(f32);
-        const a_numel: usize = r * dim;
-        const b_numel: usize = n_q * r;
-        const inter_numel: usize = n_pos * r;
-
-        var k_scale = try pipeline.Kernel.init(ctx, &shaders.scale, 2, @sizeOf(runtime_hybrid.ScalePush));
-        errdefer k_scale.deinit();
-
-        // ── Default-init A from N(0, 1/sqrt(r)). Fixed seed so smokes
-        //    are deterministic; A4-4 will hand the loaded weights in
-        //    via `provided` for resume-from-checkpoint.
-        var prng = std.Random.DefaultPrng.init(0x10AAFADE);
-        const rng = prng.random();
-        const sigma: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(r)));
-
-        const a_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(a_slice);
-        const b_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(b_slice);
-        const intermediate_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(intermediate_slice);
-        const dw_a_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(dw_a_slice);
-        const dw_b_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(dw_b_slice);
-        const m_a_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(m_a_slice);
-        const v_a_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(v_a_slice);
-        const m_b_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(m_b_slice);
-        const v_b_slice = try allocator.alloc(buffer.Buffer, n_layers);
-        errdefer allocator.free(v_b_slice);
-
-        // Host-side staging for default init (A normal, B zeros). Reused
-        // across layers since each layer gets its own random A draw.
-        const a_host = try allocator.alloc(f32, a_numel);
-        defer allocator.free(a_host);
-        const b_host = try allocator.alloc(f32, b_numel);
-        defer allocator.free(b_host);
-        @memset(b_host, 0);
-
-        var populated: usize = 0;
-        errdefer {
-            for (0..populated) |i| {
-                a_slice[i].deinit(ctx.device);
-                b_slice[i].deinit(ctx.device);
-                intermediate_slice[i].deinit(ctx.device);
-                dw_a_slice[i].deinit(ctx.device);
-                dw_b_slice[i].deinit(ctx.device);
-                m_a_slice[i].deinit(ctx.device);
-                v_a_slice[i].deinit(ctx.device);
-                m_b_slice[i].deinit(ctx.device);
-                v_b_slice[i].deinit(ctx.device);
-            }
-        }
-
-        for (0..n_layers) |li| {
-            // ── Per-layer A / B initial values.
-            const a_src: []const f32 = blk: {
-                if (provided.len != 0) {
-                    if (provided[li].a.len != a_numel) return error.LoraQAShape;
-                    break :blk provided[li].a;
-                }
-                for (a_host) |*v| v.* = rng.floatNorm(f32) * sigma;
-                break :blk a_host;
-            };
-            const b_src: []const f32 = blk: {
-                if (provided.len != 0) {
-                    if (provided[li].b.len != b_numel) return error.LoraQBShape;
-                    break :blk provided[li].b;
-                }
-                break :blk b_host;
-            };
-
-            a_slice[li] = try buffer.Buffer.initStatic(ctx, f32, a_src);
-            b_slice[li] = try buffer.Buffer.initStatic(ctx, f32, b_src);
-            intermediate_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, inter_numel * f32sz);
-            dw_a_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, a_numel * f32sz);
-            dw_b_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, b_numel * f32sz);
-            m_a_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, a_numel * f32sz);
-            v_a_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, a_numel * f32sz);
-            m_b_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, b_numel * f32sz);
-            v_b_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, b_numel * f32sz);
-            populated = li + 1;
-        }
-
-        // ── Shared scratches.
-        const sc_y_lora = try buffer.Buffer.initDeviceOnly(ctx, n_pos * n_q * f32sz);
-        errdefer @constCast(&sc_y_lora).deinit(ctx.device);
-        const sc_y_lora_scaled = try buffer.Buffer.initDeviceOnly(ctx, n_pos * n_q * f32sz);
-        errdefer @constCast(&sc_y_lora_scaled).deinit(ctx.device);
-        const sc_dy_B = try buffer.Buffer.initDeviceOnly(ctx, n_pos * r * f32sz);
-        errdefer @constCast(&sc_dy_B).deinit(ctx.device);
-        const sc_dx_lora = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
-        errdefer @constCast(&sc_dx_lora).deinit(ctx.device);
-        const sc_dx_lora_scaled = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
-        errdefer @constCast(&sc_dx_lora_scaled).deinit(ctx.device);
-        const sc_dA_unscaled = try buffer.Buffer.initDeviceOnly(ctx, a_numel * f32sz);
-        errdefer @constCast(&sc_dA_unscaled).deinit(ctx.device);
-        const sc_dB_unscaled = try buffer.Buffer.initDeviceOnly(ctx, b_numel * f32sz);
-        errdefer @constCast(&sc_dB_unscaled).deinit(ctx.device);
-
-        const aor: f32 = cfg.lora_q_alpha / @as(f32, @floatFromInt(cfg.lora_q_rank));
-        return LoraQState{
-            .k_scale = k_scale,
-            .a = a_slice,
-            .b = b_slice,
-            .intermediate = intermediate_slice,
-            .dw_a = dw_a_slice,
-            .dw_b = dw_b_slice,
-            .m_a = m_a_slice,
-            .v_a = v_a_slice,
-            .m_b = m_b_slice,
-            .v_b = v_b_slice,
-            .sc_y_lora = sc_y_lora,
-            .sc_y_lora_scaled = sc_y_lora_scaled,
-            .sc_dy_B = sc_dy_B,
-            .sc_dx_lora = sc_dx_lora,
-            .sc_dx_lora_scaled = sc_dx_lora_scaled,
-            .sc_dA_unscaled = sc_dA_unscaled,
-            .sc_dB_unscaled = sc_dB_unscaled,
-            .shape = .{
-                .M = cfg.n_pos,
-                .N = @intCast(n_q),
-                .K = cfg.dim,
-                .r = cfg.lora_q_rank,
-                .alpha_over_r = aor,
-            },
-        };
-    }
-
-    fn deinit(self: *LoraQState, dev: anytype, allocator: std.mem.Allocator) void {
-        self.k_scale.deinit();
+    fn deinit(self: *ProjLoraSlot, dev: anytype, allocator: std.mem.Allocator) void {
         const arrs = [_][]buffer.Buffer{
             self.a, self.b, self.intermediate, self.dw_a, self.dw_b,
             self.m_a, self.v_a, self.m_b, self.v_b,
@@ -2226,6 +2164,221 @@ const LoraQState = struct {
             for (arr) |*buf| buf.deinit(dev);
             allocator.free(arr);
         }
+    }
+};
+
+const LoraState = struct {
+    k_scale: pipeline.Kernel,
+    targets: u32,
+    slots: [proj_count]?ProjLoraSlot,
+
+    sc_y_lora: buffer.Buffer,
+    sc_y_lora_scaled: buffer.Buffer,
+    sc_dy_B: buffer.Buffer,
+    sc_dx_lora: buffer.Buffer,
+    sc_dx_lora_scaled: buffer.Buffer,
+    sc_dA_unscaled: buffer.Buffer,
+    sc_dB_unscaled: buffer.Buffer,
+
+    fn projShape(p: Proj, cfg: Config) lora_helpers.LoraShape {
+        const r = cfg.lora_rank;
+        const aor: f32 = cfg.lora_alpha / @as(f32, @floatFromInt(r));
+        const q_dim: u32 = cfg.n_heads * cfg.head_dim;
+        const kv_dim: u32 = cfg.n_kv_heads * cfg.head_dim;
+        return switch (p) {
+            .q => .{ .M = cfg.n_pos, .N = q_dim, .K = cfg.dim, .r = r, .alpha_over_r = aor },
+            .k => .{ .M = cfg.n_pos, .N = kv_dim, .K = cfg.dim, .r = r, .alpha_over_r = aor },
+            .v => .{ .M = cfg.n_pos, .N = kv_dim, .K = cfg.dim, .r = r, .alpha_over_r = aor },
+            .o => .{ .M = cfg.n_pos, .N = cfg.dim, .K = q_dim, .r = r, .alpha_over_r = aor },
+            .gate => .{ .M = cfg.n_pos, .N = cfg.ff_dim, .K = cfg.dim, .r = r, .alpha_over_r = aor },
+            .up => .{ .M = cfg.n_pos, .N = cfg.ff_dim, .K = cfg.dim, .r = r, .alpha_over_r = aor },
+            .down => .{ .M = cfg.n_pos, .N = cfg.dim, .K = cfg.ff_dim, .r = r, .alpha_over_r = aor },
+        };
+    }
+
+    fn projInitSlice(p: Proj, weights: InitWeights) []const LoraInitWeights {
+        return switch (p) {
+            .q => weights.lora_q,
+            .k => weights.lora_k,
+            .v => weights.lora_v,
+            .o => weights.lora_o,
+            .gate => weights.lora_gate,
+            .up => weights.lora_up,
+            .down => weights.lora_down,
+        };
+    }
+
+    fn allocAndInit(
+        allocator: std.mem.Allocator,
+        ctx: *const vk.Context,
+        cfg: Config,
+        weights: InitWeights,
+    ) !LoraState {
+        std.debug.assert(cfg.lora_targets != 0);
+        if (cfg.lora_rank == 0) return error.LoraRankZero;
+
+        const n_layers: usize = @intCast(cfg.n_layers);
+        const n_pos: usize = @intCast(cfg.n_pos);
+        const r: usize = @intCast(cfg.lora_rank);
+        const f32sz = @sizeOf(f32);
+
+        var k_scale = try pipeline.Kernel.init(ctx, &shaders.scale, 2, @sizeOf(runtime_hybrid.ScalePush));
+        errdefer k_scale.deinit();
+
+        // ── Default-init RNG (fixed seed so smokes are deterministic).
+        //    σ = 1/sqrt(r) is the same scale Hu et al. use in the LoRA
+        //    paper; the seed is shared across projections so tests can
+        //    re-derive A from the seed if needed.
+        var prng = std.Random.DefaultPrng.init(0x10AAFADE);
+        const rng = prng.random();
+        const sigma: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(r)));
+
+        // ── Track maxima for scratch sizing.
+        var max_n: u32 = 0;
+        var max_k: u32 = 0;
+
+        var slots: [proj_count]?ProjLoraSlot = .{null} ** proj_count;
+        errdefer {
+            for (&slots) |*opt| if (opt.*) |*s| s.deinit(ctx.device, allocator);
+        }
+
+        // ── Allocate one slot per enabled projection.
+        inline for (@typeInfo(Proj).@"enum".fields) |f| {
+            const p: Proj = @enumFromInt(f.value);
+            if (projEnabled(cfg.lora_targets, p)) {
+                const shape = projShape(p, cfg);
+                const provided = projInitSlice(p, weights);
+                if (provided.len != 0 and provided.len != cfg.n_layers) return error.LoraInitLen;
+                if (shape.N > max_n) max_n = shape.N;
+                if (shape.K > max_k) max_k = shape.K;
+
+                const a_numel: usize = @as(usize, shape.r) * @as(usize, shape.K);
+                const b_numel: usize = @as(usize, shape.N) * @as(usize, shape.r);
+                const inter_numel: usize = n_pos * @as(usize, shape.r);
+
+                const a_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(a_slice);
+                const b_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(b_slice);
+                const intermediate_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(intermediate_slice);
+                const dw_a_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(dw_a_slice);
+                const dw_b_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(dw_b_slice);
+                const m_a_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(m_a_slice);
+                const v_a_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(v_a_slice);
+                const m_b_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(m_b_slice);
+                const v_b_slice = try allocator.alloc(buffer.Buffer, n_layers);
+                errdefer allocator.free(v_b_slice);
+
+                // Per-projection host staging — reused across layers.
+                const a_host = try allocator.alloc(f32, a_numel);
+                defer allocator.free(a_host);
+                const b_host = try allocator.alloc(f32, b_numel);
+                defer allocator.free(b_host);
+                @memset(b_host, 0);
+
+                var populated: usize = 0;
+                errdefer {
+                    for (0..populated) |i| {
+                        a_slice[i].deinit(ctx.device);
+                        b_slice[i].deinit(ctx.device);
+                        intermediate_slice[i].deinit(ctx.device);
+                        dw_a_slice[i].deinit(ctx.device);
+                        dw_b_slice[i].deinit(ctx.device);
+                        m_a_slice[i].deinit(ctx.device);
+                        v_a_slice[i].deinit(ctx.device);
+                        m_b_slice[i].deinit(ctx.device);
+                        v_b_slice[i].deinit(ctx.device);
+                    }
+                }
+
+                for (0..n_layers) |li| {
+                    const a_src: []const f32 = blk: {
+                        if (provided.len != 0) {
+                            if (provided[li].a.len != a_numel) return error.LoraAShape;
+                            break :blk provided[li].a;
+                        }
+                        for (a_host) |*v| v.* = rng.floatNorm(f32) * sigma;
+                        break :blk a_host;
+                    };
+                    const b_src: []const f32 = blk: {
+                        if (provided.len != 0) {
+                            if (provided[li].b.len != b_numel) return error.LoraBShape;
+                            break :blk provided[li].b;
+                        }
+                        break :blk b_host;
+                    };
+                    a_slice[li] = try buffer.Buffer.initStatic(ctx, f32, a_src);
+                    b_slice[li] = try buffer.Buffer.initStatic(ctx, f32, b_src);
+                    intermediate_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, inter_numel * f32sz);
+                    dw_a_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, a_numel * f32sz);
+                    dw_b_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, b_numel * f32sz);
+                    m_a_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, a_numel * f32sz);
+                    v_a_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, a_numel * f32sz);
+                    m_b_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, b_numel * f32sz);
+                    v_b_slice[li] = try buffer.Buffer.initDeviceOnly(ctx, b_numel * f32sz);
+                    populated = li + 1;
+                }
+
+                slots[@intFromEnum(p)] = ProjLoraSlot{
+                    .a = a_slice,
+                    .b = b_slice,
+                    .intermediate = intermediate_slice,
+                    .dw_a = dw_a_slice,
+                    .dw_b = dw_b_slice,
+                    .m_a = m_a_slice,
+                    .v_a = v_a_slice,
+                    .m_b = m_b_slice,
+                    .v_b = v_b_slice,
+                    .shape = shape,
+                };
+            }
+        }
+
+        // ── Shared scratches sized to the largest enabled projection
+        //    along each axis. The Recorder issues a global memory
+        //    barrier between every dispatch (see gpu/recorder.zig), so
+        //    reusing a scratch across consecutive LoRA chains within
+        //    the same layer (and across layers) is safe.
+        const max_n_us: usize = max_n;
+        const max_k_us: usize = max_k;
+        const sc_y_lora = try buffer.Buffer.initDeviceOnly(ctx, n_pos * max_n_us * f32sz);
+        errdefer @constCast(&sc_y_lora).deinit(ctx.device);
+        const sc_y_lora_scaled = try buffer.Buffer.initDeviceOnly(ctx, n_pos * max_n_us * f32sz);
+        errdefer @constCast(&sc_y_lora_scaled).deinit(ctx.device);
+        const sc_dy_B = try buffer.Buffer.initDeviceOnly(ctx, n_pos * r * f32sz);
+        errdefer @constCast(&sc_dy_B).deinit(ctx.device);
+        const sc_dx_lora = try buffer.Buffer.initDeviceOnly(ctx, n_pos * max_k_us * f32sz);
+        errdefer @constCast(&sc_dx_lora).deinit(ctx.device);
+        const sc_dx_lora_scaled = try buffer.Buffer.initDeviceOnly(ctx, n_pos * max_k_us * f32sz);
+        errdefer @constCast(&sc_dx_lora_scaled).deinit(ctx.device);
+        const sc_dA_unscaled = try buffer.Buffer.initDeviceOnly(ctx, r * max_k_us * f32sz);
+        errdefer @constCast(&sc_dA_unscaled).deinit(ctx.device);
+        const sc_dB_unscaled = try buffer.Buffer.initDeviceOnly(ctx, max_n_us * r * f32sz);
+        errdefer @constCast(&sc_dB_unscaled).deinit(ctx.device);
+
+        return LoraState{
+            .k_scale = k_scale,
+            .targets = cfg.lora_targets,
+            .slots = slots,
+            .sc_y_lora = sc_y_lora,
+            .sc_y_lora_scaled = sc_y_lora_scaled,
+            .sc_dy_B = sc_dy_B,
+            .sc_dx_lora = sc_dx_lora,
+            .sc_dx_lora_scaled = sc_dx_lora_scaled,
+            .sc_dA_unscaled = sc_dA_unscaled,
+            .sc_dB_unscaled = sc_dB_unscaled,
+        };
+    }
+
+    fn deinit(self: *LoraState, dev: anytype, allocator: std.mem.Allocator) void {
+        self.k_scale.deinit();
+        for (&self.slots) |*opt| if (opt.*) |*s| s.deinit(dev, allocator);
         self.sc_y_lora.deinit(dev);
         self.sc_y_lora_scaled.deinit(dev);
         self.sc_dy_B.deinit(dev);
@@ -2235,7 +2388,7 @@ const LoraQState = struct {
         self.sc_dB_unscaled.deinit(dev);
     }
 
-    fn kernels(self: *const LoraQState, runner: *const Runner) lora_helpers.LoraKernels {
+    fn kernels(self: *const LoraState, runner: *const Runner) lora_helpers.LoraKernels {
         return .{
             .matmul = &runner.k_matmul,
             .lin_dx = &runner.k_lin_dx,

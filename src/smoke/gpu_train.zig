@@ -1555,11 +1555,25 @@ pub fn runGpuLoraPlusDemo(allocator: std.mem.Allocator) !void {
 // each so this can land in the default smoke pass without slowing it down.
 
 pub fn runGpuTransformerLoraQSmoke(allocator: std.mem.Allocator) !void {
+    try runGpuTransformerLoraTargetsSmoke(allocator, train_transformer.LoraTarget.q, "Q-only");
+}
+
+pub fn runGpuTransformerLoraAllSmoke(allocator: std.mem.Allocator) !void {
+    try runGpuTransformerLoraTargetsSmoke(allocator, train_transformer.LoraTarget.all, "all-7");
+}
+
+fn runGpuTransformerLoraTargetsSmoke(
+    allocator: std.mem.Allocator,
+    targets: u32,
+    label: []const u8,
+) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
 
-    // ── Toy decoder shape. Just big enough for the LoRA chain to have
-    //    something to do (rank-4 adapter on a 32×32 W_q).
+    // ── Toy decoder shape. Just big enough for every projection's LoRA
+    //    chain to have something to do (rank-4 adapter on each of the
+    //    7 candidate W's). Same shape as the Q-only smoke so the
+    //    runtime stays well under a second per case.
     const dim: u32 = 32;
     const n_heads: u32 = 4;
     const n_kv_heads: u32 = 2;
@@ -1647,9 +1661,9 @@ pub fn runGpuTransformerLoraQSmoke(allocator: std.mem.Allocator) !void {
         .lr = 1e-2,
     };
     var cfg_lora = cfg_base;
-    cfg_lora.lora_q_enabled = true;
-    cfg_lora.lora_q_rank = lora_rank;
-    cfg_lora.lora_q_alpha = lora_alpha;
+    cfg_lora.lora_targets = targets;
+    cfg_lora.lora_rank = lora_rank;
+    cfg_lora.lora_alpha = lora_alpha;
 
     const init_weights: train_transformer.InitWeights = .{
         .embed = w_embed,
@@ -1658,15 +1672,17 @@ pub fn runGpuTransformerLoraQSmoke(allocator: std.mem.Allocator) !void {
         .layers = layers,
     };
 
-    // ── Runner #1: lora_q_enabled = true, default-init A,B.
+    // ── Runner #1: LoRA on, default-init A,B for every enabled target.
     var runner_lora = try train_transformer.Runner.init(allocator, &ctx, cfg_lora, init_weights);
     defer runner_lora.deinit();
 
-    // ── Runner #2: lora_q_enabled = false, same weights.
+    // ── Runner #2: LoRA off, same weights — control for parity.
     var runner_plain = try train_transformer.Runner.init(allocator, &ctx, cfg_base, init_weights);
     defer runner_plain.deinit();
 
-    // ── Step-0 forward parity. B = 0 ⇒ LoRA delta = 0 ⇒ identical logits.
+    // ── Step-0 forward parity. B = 0 for every enabled projection ⇒
+    //    the LoRA delta is zero on every chain ⇒ logits are bit-equal
+    //    to the no-LoRA Runner.
     const logits_lora = try allocator.alloc(f32, n_pos * vocab);
     defer allocator.free(logits_lora);
     const logits_plain = try allocator.alloc(f32, n_pos * vocab);
@@ -1681,24 +1697,42 @@ pub fn runGpuTransformerLoraQSmoke(allocator: std.mem.Allocator) !void {
     }
     if (max_diff > 1e-5) {
         std.debug.print(
-            "FAIL LoRA-Q step-0 forward parity: max|logits_lora - logits_plain| = {e} (expected ≤ 1e-5)\n",
-            .{max_diff},
+            "FAIL LoRA ({s}) step-0 forward parity: max|Δ| = {e} (expected ≤ 1e-5)\n",
+            .{ label, max_diff },
         );
-        return error.LoraQForwardParityFailed;
+        return error.LoraForwardParityFailed;
     }
     std.debug.print("  step-0 fwd parity   max|Δ| = {e:.2}\n", .{max_diff});
 
-    // ── Snapshot W_q for layer 0 from the LoRA runner — must remain
-    //    bit-equal across all training steps.
-    const w_q_numel: usize = q_dim * dim;
-    const w_q_snapshot = try allocator.alloc(f32, w_q_numel);
-    defer allocator.free(w_q_snapshot);
-    try runner_lora.buf_w_q[0].readBack(&ctx, f32, w_q_snapshot);
+    // ── Snapshot every LoRA-target's W on layer 0 — must remain bit-
+    //    equal across all training steps.
+    const Probe = struct {
+        name: []const u8,
+        bit: u32,
+        bufs: []buffer.Buffer,
+        numel: usize,
+    };
+    const probes = [_]Probe{
+        .{ .name = "W_q", .bit = train_transformer.LoraTarget.q, .bufs = runner_lora.buf_w_q, .numel = q_dim * dim },
+        .{ .name = "W_k", .bit = train_transformer.LoraTarget.k, .bufs = runner_lora.buf_w_k, .numel = kv_dim * dim },
+        .{ .name = "W_v", .bit = train_transformer.LoraTarget.v, .bufs = runner_lora.buf_w_v, .numel = kv_dim * dim },
+        .{ .name = "W_o", .bit = train_transformer.LoraTarget.o, .bufs = runner_lora.buf_w_o, .numel = dim * q_dim },
+        .{ .name = "W_gate", .bit = train_transformer.LoraTarget.gate, .bufs = runner_lora.buf_w_gate, .numel = ff_dim * dim },
+        .{ .name = "W_up", .bit = train_transformer.LoraTarget.up, .bufs = runner_lora.buf_w_up, .numel = ff_dim * dim },
+        .{ .name = "W_down", .bit = train_transformer.LoraTarget.down, .bufs = runner_lora.buf_w_down, .numel = dim * ff_dim },
+    };
+    var snapshots: [probes.len][]f32 = undefined;
+    for (probes, 0..) |p, i| {
+        if ((targets & p.bit) == 0) continue;
+        snapshots[i] = try allocator.alloc(f32, p.numel);
+        try p.bufs[0].readBack(&ctx, f32, snapshots[i]);
+    }
+    defer for (probes, 0..) |p, i| {
+        if ((targets & p.bit) == 0) continue;
+        allocator.free(snapshots[i]);
+    };
 
-    // ── Initial loss. forwardLogits has already run once, so we can
-    //    reuse logits_lora to compute it manually with cpu_math's
-    //    softmaxCe-style summation, but the simplest signal is to take
-    //    pre-step and post-step logits and compare.
+    // ── Initial loss before any step.
     const initial_loss = computeCeLoss(logits_lora, target_ids, n_pos, vocab);
 
     // ── Train.
@@ -1707,38 +1741,44 @@ pub fn runGpuTransformerLoraQSmoke(allocator: std.mem.Allocator) !void {
         try runner_lora.step(token_ids, target_ids);
     }
 
-    // ── Verify W_q is unchanged.
-    const w_q_after = try allocator.alloc(f32, w_q_numel);
-    defer allocator.free(w_q_after);
-    try runner_lora.buf_w_q[0].readBack(&ctx, f32, w_q_after);
-    var w_q_max_diff: f32 = 0;
-    for (w_q_snapshot, w_q_after) |a, b| {
-        const d = @abs(a - b);
-        if (d > w_q_max_diff) w_q_max_diff = d;
+    // ── Verify every snapshotted W is unchanged byte-for-byte.
+    var after_buf: [4096]f32 = undefined;
+    for (probes, 0..) |p, i| {
+        if ((targets & p.bit) == 0) continue;
+        if (p.numel > after_buf.len) {
+            std.debug.print("INTERNAL: probe {s} numel={d} > scratch {d} — bump after_buf\n", .{ p.name, p.numel, after_buf.len });
+            return error.ProbeScratchTooSmall;
+        }
+        try p.bufs[0].readBack(&ctx, f32, after_buf[0..p.numel]);
+        var w_max_diff: f32 = 0;
+        for (snapshots[i], after_buf[0..p.numel]) |a, b| {
+            const d = @abs(a - b);
+            if (d > w_max_diff) w_max_diff = d;
+        }
+        if (w_max_diff != 0.0) {
+            std.debug.print(
+                "FAIL LoRA ({s}) {s} frozen: max|Δ| = {e} (expected exactly 0)\n",
+                .{ label, p.name, w_max_diff },
+            );
+            return error.LoraWFrozenViolated;
+        }
     }
-    if (w_q_max_diff != 0.0) {
-        std.debug.print(
-            "FAIL LoRA-Q W_q frozen: max|W_q_after - W_q_before| = {e} (expected exactly 0)\n",
-            .{w_q_max_diff},
-        );
-        return error.LoraQWqNotFrozen;
-    }
-    std.debug.print("  W_q frozen          max|Δ| = 0 (over {d} steps)\n", .{n_steps});
+    std.debug.print("  W frozen ({s})    max|Δ| = 0 (over {d} steps)\n", .{ label, n_steps });
 
     // ── Verify loss decreased.
     try runner_lora.forwardLogits(token_ids, logits_lora);
     const final_loss = computeCeLoss(logits_lora, target_ids, n_pos, vocab);
     if (!(final_loss < initial_loss)) {
         std.debug.print(
-            "FAIL LoRA-Q loss: initial={d:.6} final={d:.6} (expected final < initial)\n",
-            .{ initial_loss, final_loss },
+            "FAIL LoRA ({s}) loss: initial={d:.6} final={d:.6} (expected final < initial)\n",
+            .{ label, initial_loss, final_loss },
         );
-        return error.LoraQLossDidNotDecrease;
+        return error.LoraLossDidNotDecrease;
     }
 
     std.debug.print(
-        "PASS GPU train_transformer LoRA-Q via Runner — rank={d} α={d:.1} α/r={d:.2}, CE {d:.4} → {d:.4} ({d:.2}× drop) over {d} steps\n",
-        .{ lora_rank, lora_alpha, lora_alpha / @as(f32, @floatFromInt(lora_rank)), initial_loss, final_loss, initial_loss / final_loss, n_steps },
+        "PASS GPU train_transformer LoRA via Runner — targets={s} ({d}/7) rank={d} α={d:.1} α/r={d:.2}, CE {d:.4} → {d:.4} ({d:.2}× drop) over {d} steps\n",
+        .{ label, @popCount(targets), lora_rank, lora_alpha, lora_alpha / @as(f32, @floatFromInt(lora_rank)), initial_loss, final_loss, initial_loss / final_loss, n_steps },
     );
 }
 

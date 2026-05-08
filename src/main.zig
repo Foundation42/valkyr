@@ -72,6 +72,15 @@ pub fn main() !void {
         try smoke_decoder.runRealModelTrainStepLoraQSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-lora-all-step-smoke")) {
+        // A4-3 perf gate: LoRA on every dense matmul at Qwen3-0.6B
+        // β-5 shape (rank-16, α=32, all 7 projections per layer).
+        // Validates the LoRA-all wiring at production scale and
+        // reports ms/step (compare against the LoRA-Q baseline +
+        // no-LoRA baseline for the per-projection overhead curve).
+        try smoke_decoder.runRealModelTrainStepLoraAllSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-multi-step-smoke")) {
         // β-6a multi-step training loop. Same setup as β-5 but runs 30
         // Adam steps on the same batch, asserts CE drops ≥90%. Validates
@@ -231,12 +240,20 @@ pub fn main() !void {
     }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-q-runner-smoke")) {
         // A4-2 wire test. Drives `train_transformer.Runner.step` with
-        // `cfg.lora_q_enabled = true` end-to-end and asserts (1) step-0
-        // forward parity vs the same Runner with LoRA off (B=0 ⇒ delta
-        // = 0), (2) W_q is unchanged after N Adam steps (LoRA freezes
-        // W_q), (3) loss decreases. The smallest end-to-end gate that
-        // the LoRA helpers compose into Runner.step correctly.
+        // `lora_targets = LoraTarget.q` end-to-end and asserts (1)
+        // step-0 forward parity vs the same Runner with LoRA off (B=0
+        // ⇒ delta = 0), (2) W_q is unchanged after N Adam steps (LoRA
+        // freezes W_q), (3) loss decreases.
         try smoke_gpu_train.runGpuTransformerLoraQSmoke(allocator);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-all-runner-smoke")) {
+        // A4-3 wire test. Same toy shape and three assertions as
+        // --lora-q-runner-smoke but with LoRA on every dense matmul
+        // (Q + K + V + O + gate + up + down). Verifies that all 7 W's
+        // are frozen after training and the Runner converges with the
+        // larger LoRA budget.
+        try smoke_gpu_train.runGpuTransformerLoraAllSmoke(allocator);
         return;
     }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-train-demo")) {
@@ -783,6 +800,7 @@ pub fn main() !void {
     try smoke_gpu_train.runGpuLoraSmoke(allocator);
     try smoke_gpu_train.runGpuLoraRecorderSmoke(allocator);
     try smoke_gpu_train.runGpuTransformerLoraQSmoke(allocator);
+    try smoke_gpu_train.runGpuTransformerLoraAllSmoke(allocator);
     try smoke_gpu_train.runEmbeddedAttachSmoke(allocator);
     try smoke_gpu_train.runEmbeddedRecorderSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulQ4_0Smoke(allocator);

@@ -2211,6 +2211,18 @@ pub fn runRealModelTrainStepSmoke(allocator: std.mem.Allocator) !void {
 // tune scale).
 
 pub fn runRealModelTrainStepLoraQSmoke(allocator: std.mem.Allocator) !void {
+    return runRealModelTrainStepLoraTargetsSmoke(allocator, train_transformer.LoraTarget.q, "Q-only");
+}
+
+pub fn runRealModelTrainStepLoraAllSmoke(allocator: std.mem.Allocator) !void {
+    return runRealModelTrainStepLoraTargetsSmoke(allocator, train_transformer.LoraTarget.all, "all-7");
+}
+
+fn runRealModelTrainStepLoraTargetsSmoke(
+    allocator: std.mem.Allocator,
+    targets: u32,
+    label: []const u8,
+) !void {
     const model_id = "Qwen/Qwen3-0.6B";
     const jsonl_path = "data/train/tiny_facts.jsonl";
     const n_pos: u32 = 16;
@@ -2221,7 +2233,7 @@ pub fn runRealModelTrainStepLoraQSmoke(allocator: std.mem.Allocator) !void {
 
     const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
         error.HfModelNotInCache => {
-            std.debug.print("SKIP runRealModelTrainStepLoraQSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            std.debug.print("SKIP runRealModelTrainStepLora{s}Smoke (Qwen3-0.6B not in HF cache)\n", .{label});
             return;
         },
         else => return err,
@@ -2235,9 +2247,9 @@ pub fn runRealModelTrainStepLoraQSmoke(allocator: std.mem.Allocator) !void {
     defer weights.deinit();
     var cfg = weights.cfg;
     cfg.lr = lr;
-    cfg.lora_q_enabled = true;
-    cfg.lora_q_rank = lora_rank;
-    cfg.lora_q_alpha = lora_alpha;
+    cfg.lora_targets = targets;
+    cfg.lora_rank = lora_rank;
+    cfg.lora_alpha = lora_alpha;
 
     const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
     defer allocator.free(tok_path);
@@ -2268,7 +2280,7 @@ pub fn runRealModelTrainStepLoraQSmoke(allocator: std.mem.Allocator) !void {
     try runner.forwardLogits(input_ids, logits);
     const ce_before = computeMeanCe(logits, target_ids, n_pos, vocab);
     if (!std.math.isFinite(ce_before)) {
-        std.debug.print("LoRA-Q train-step smoke: CE_before not finite ({d})\n", .{ce_before});
+        std.debug.print("LoRA train-step smoke ({s}): CE_before not finite ({d})\n", .{ label, ce_before });
         return error.CeBeforeNotFinite;
     }
 
@@ -2280,14 +2292,14 @@ pub fn runRealModelTrainStepLoraQSmoke(allocator: std.mem.Allocator) !void {
     try runner.forwardLogits(input_ids, logits);
     const ce_after = computeMeanCe(logits, target_ids, n_pos, vocab);
     if (!std.math.isFinite(ce_after)) {
-        std.debug.print("LoRA-Q train-step smoke: CE_after not finite ({d}) after CE_before={d:.6}\n", .{ ce_after, ce_before });
+        std.debug.print("LoRA train-step smoke ({s}): CE_after not finite ({d}) after CE_before={d:.6}\n", .{ label, ce_after, ce_before });
         return error.CeAfterNotFinite;
     }
 
     if (ce_after >= ce_before) {
         std.debug.print(
-            "LoRA-Q train-step smoke: CE did not decrease (before={d:.6} after={d:.6} delta={d:.6}) at lr={e}\n",
-            .{ ce_before, ce_after, ce_after - ce_before, lr },
+            "LoRA train-step smoke ({s}): CE did not decrease (before={d:.6} after={d:.6} delta={d:.6}) at lr={e}\n",
+            .{ label, ce_before, ce_after, ce_after - ce_before, lr },
         );
         return error.CeDidNotDecrease;
     }
@@ -2295,8 +2307,8 @@ pub fn runRealModelTrainStepLoraQSmoke(allocator: std.mem.Allocator) !void {
     const delta = ce_before - ce_after;
     const rel_pct: f64 = 100.0 * @as(f64, delta) / @as(f64, ce_before);
     std.debug.print(
-        "PASS real Qwen3-0.6B LoRA-Q one-step train (n_pos={d} lr={e} rank={d} α={d:.0} α/r={d:.2}; CE {d:.6} → {d:.6}, Δ={d:.6} ({d:.3}%); step={d:.1} ms)\n",
-        .{ n_pos, lr, lora_rank, lora_alpha, lora_alpha / @as(f32, @floatFromInt(lora_rank)), ce_before, ce_after, delta, rel_pct, step_ms },
+        "PASS real Qwen3-0.6B LoRA one-step train ({s}, {d}/7 targets, n_pos={d} lr={e} rank={d} α={d:.0} α/r={d:.2}; CE {d:.6} → {d:.6}, Δ={d:.6} ({d:.3}%); step={d:.1} ms)\n",
+        .{ label, @popCount(targets), n_pos, lr, lora_rank, lora_alpha, lora_alpha / @as(f32, @floatFromInt(lora_rank)), ce_before, ce_after, delta, rel_pct, step_ms },
     );
 }
 
