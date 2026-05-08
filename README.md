@@ -110,17 +110,33 @@ regression (smooth interpolation); right: cross-entropy classifier
 (sharp partition). Same scene, same click mechanics, one config
 switch. Both at refresh rate. <a href="docs/embedding.md#visual-demos">More</a>.</em></p>
 
-**Real transformer fine-tuning** — as of 2026-05-06, the same
-training stack drives Qwen3-0.6B end-to-end. `train_load_real`
-materialises the model's bf16 weights as fp32 train tensors,
-`train_dataset.buildFromJsonl` packs an instruction-style corpus
-into EOS-separated (n_pos+1)-windows, and a single Adam step at
-lr=1e-5 drops batch CE from 2.78 → 1.28 nats in ~330 ms (n_pos=16,
-ReleaseFast). Every architecture primitive — RMSNorm / embedding /
-softmax / fused-attention / RoPE / per-head Q-K-norm / SwiGLU
-backward + GQA + Adam — composed first-try when real weights and
-real data finally flowed through. Multi-step + checkpoint
-persistence is the next layer.
+**Real transformer fine-tuning, end-to-end** — as of 2026-05-08 the
+same training stack drives Qwen3-0.6B from a JSONL through Adam,
+checkpoint save/load, and a probe-sampling diff in one CLI command:
+
+```sh
+./zig-out/bin/valkyr --fine-tune Qwen/Qwen3-0.6B \
+    --data data/train/tiny_facts.jsonl \
+    --steps 30 \
+    --probe "The capital of France is" \
+    --out fine-tuned.vkpt
+```
+
+After 30 Adam steps on a single batch (n_pos=16, lr=1e-5, ~298 ms/step),
+batch CE drops 2.78 → 0.0005 (99.98%) and the probe sample shifts from
+the base model's generic capital-listing to a verbatim memorization of
+the training continuation:
+
+```
+[probe before] The capital of France is Paris. The capital of Italy is Rome. The capital of Spain is Madrid...
+[probe after]  The capital of France is Paris. Paris sits on the river Seine and is famous for...
+```
+
+Every architecture primitive — RMSNorm / embedding / softmax / fused-
+attention / RoPE / per-head Q-K-norm / SwiGLU backward + GQA + Adam +
+CCE + checkpoint round-trip — composed first-try as real weights and
+real data flowed through. Full walkthrough in
+[docs/training.md](docs/training.md).
 
 **Honest framing.** valkyr is younger and smaller than llama.cpp. On
 raw decode tok/s on a single CUDA card, llama.cpp's CUDA path is
@@ -146,6 +162,7 @@ The detail lives in `docs/`. Each page is self-contained.
 | [docs/perf.md](docs/perf.md) | Decode tok/s table on RTX 3090 across the model + precision matrix, plus the bf16 vectorized-read win and what `--tq4v` is (and isn't) for. |
 | [docs/hardware.md](docs/hardware.md) | Vulkan 1.3 GPU requirements + what fits on 24 GiB across the matrix. |
 | [docs/architecture.md](docs/architecture.md) | `src/` and `shaders/` layout + convention notes (RoPE pair convention, Gemma quirks, TurboQuant Algorithm 1, numerical drift). |
+| [docs/training.md](docs/training.md) | Fine-tune your own model — `--fine-tune` CLI, dataset format, `.vkpt` checkpoint format, performance ballpark, smoke-gate primitives. |
 | [docs/embedding.md](docs/embedding.md) | Full guide for embedding valkyr in a Vulkan host — three integration tiers, frame-budget mechanics, lifetime rules. |
 | [docs/server.md](docs/server.md) | OpenAI-compatible HTTP server (`--serve`) — endpoints, streaming, multi-turn, error envelope, openai-python compatibility. |
 | [docs/limitations.md](docs/limitations.md) | What valkyr can't do today + experiments that got reverted (tiled-N matmul, Q4_0 split layout, SwiGLU sparsity skipping). |

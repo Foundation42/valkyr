@@ -103,6 +103,14 @@ zig build run
 # Real-Gemma TQ4 round-trip diagnostic (per-layer K/V MSE)
 ./zig-out/bin/valkyr --tq4-kv-test <model-dir> <token-id>
 
+# Fine-tune a model on a JSONL dataset, optionally probe sample +
+# save a `.vkpt` checkpoint. See docs/training.md for the walkthrough.
+./zig-out/bin/valkyr --fine-tune Qwen/Qwen3-0.6B \
+    --data data/train/tiny_facts.jsonl \
+    --steps 30 \
+    --probe "The capital of France is" \
+    --out fine-tuned.vkpt
+
 # OpenAI-compatible HTTP server (POST /v1/chat/completions, GET /v1/models)
 # See docs/server.md for the full surface — streaming, multi-turn,
 # error envelope, openai-python compatibility.

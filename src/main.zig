@@ -15,6 +15,7 @@ const commands_encode = @import("commands/encode.zig");
 const commands_bench = @import("commands/bench.zig");
 const commands_serve = @import("commands/serve.zig");
 const commands_chat = @import("commands/chat.zig");
+const commands_finetune = @import("commands/finetune.zig");
 const smoke_gpu_gen = @import("smoke/gpu_gen.zig");
 const smoke_session = @import("smoke/session.zig");
 const smoke_misc = @import("smoke/misc.zig");
@@ -83,6 +84,64 @@ pub fn main() !void {
         // batch, asserts at least one generated token differs (training
         // visibly shifted argmax).
         try smoke_decoder.runRealModelSamplingSmoke(allocator);
+        return;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--fine-tune")) {
+        // User-facing fine-tune driver: load real Qwen3-class weights,
+        // train N Adam steps on a JSONL dataset, optionally save a
+        // .vkpt checkpoint, optionally show a probe sample before/after.
+        // Format:
+        //   --fine-tune <model> --data <jsonl> [--steps N] [--lr LR]
+        //                                       [--n-pos N] [--batch IDX]
+        //                                       [--rotate] [--probe TEXT]
+        //                                       [--n-gen N] [--out PATH]
+        //                                       [--print-every K]
+        var opts = commands_finetune.Options{
+            .model = args[2],
+            .data_path = "",
+        };
+        var i: usize = 3;
+        while (i < args.len) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--data") and i + 1 < args.len) {
+                opts.data_path = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--steps") and i + 1 < args.len) {
+                opts.n_steps = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--lr") and i + 1 < args.len) {
+                opts.lr = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--n-pos") and i + 1 < args.len) {
+                opts.n_pos = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--batch") and i + 1 < args.len) {
+                opts.batch_idx = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--rotate")) {
+                opts.rotate = true;
+                i += 1;
+            } else if (std.mem.eql(u8, a, "--probe") and i + 1 < args.len) {
+                opts.probe = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--n-gen") and i + 1 < args.len) {
+                opts.n_gen = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--out") and i + 1 < args.len) {
+                opts.out_path = args[i + 1];
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--print-every") and i + 1 < args.len) {
+                opts.print_every = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if (opts.data_path.len == 0) {
+            std.debug.print("--fine-tune: --data <jsonl> is required\n", .{});
+            return error.MissingDataArg;
+        }
+        try commands_finetune.run(allocator, opts);
         return;
     }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--decoder-stack-train-smoke")) {
