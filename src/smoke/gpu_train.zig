@@ -1948,6 +1948,242 @@ pub fn runCceBench(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── Attention bench: time the 3-dispatch attention chain ──────────────
+//
+// Sweeps `n_kv` across decode (n_q=1, no mask) and prefill-causal
+// (n_q == n_kv) shapes at Qwen3-0.6B's per-layer attention dims
+// (n_heads=16, n_kv_heads=8, head_dim=128). Reports per-kernel wall-
+// clock ms (submitOneShot + vkQueueWaitIdle, so submission overhead
+// is folded in — same caveat as runCceBench), plus the per-layer
+// scores-buffer footprint and a ×28-layer projection (Qwen3-0.6B has
+// 28 transformer blocks, each running this same 3-dispatch chain).
+//
+// The point of this bench is F1 of the FlashAttention arc: size
+// what we'd be replacing. The 3 kernels are
+//
+//     attn_scores       : Q · Kᵀ        → scores [n_heads × n_kv]   fp32
+//     softmax           : per-head row-softmax over scores
+//     attn_output       : softmax · V   → head_out [n_heads × head_dim]
+//
+// (decode variants; prefill uses *_train kernels with an extra n_q
+// dimension and an optional causal-mask flag). Whatever FlashAttention
+// kernel we ship has to beat the totals printed here at the same
+// shapes.
+
+pub fn runAttnBench(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Qwen3-0.6B per-layer attention shape.
+    const n_heads: u32 = 16;
+    const n_kv_heads: u32 = 8;
+    const head_dim: u32 = 128;
+    const n_layers: u32 = 28;
+    const heads_per_kv: u32 = n_heads / n_kv_heads;
+    const inv_sqrt: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    const decode_kvs = [_]u32{ 128, 512, 2048, 8192, 32768 };
+    const prefill_kvs = [_]u32{ 16, 128, 512, 2048 };
+    const decode_max_kv: u32 = 32768;
+    const prefill_max_q: u32 = 2048;
+    const warmup_iters: u32 = 3;
+    const bench_iters: u32 = 5;
+
+    std.debug.print(
+        "Attention bench on {s}\n" ++
+            "  Qwen3-0.6B per-layer: n_heads={d} n_kv_heads={d} head_dim={d} ({d} layers)\n" ++
+            "  warmup {d} / measure {d}    (timings include submitOneShot + waitIdle)\n",
+        .{ ctx.deviceName(), n_heads, n_kv_heads, head_dim, n_layers, warmup_iters, bench_iters },
+    );
+
+    // ── Allocate buffers sized to the larger of {decode, prefill} per
+    // tensor — the cross-product would be 16 GB at decode_max_kv ×
+    // prefill_max_q × n_heads × 4B, but each phase only needs its own
+    // shape, so we cap on the per-tensor max.
+    const q_max_elems: usize = @max(
+        @as(usize, n_heads) * head_dim, // decode (n_q=1)
+        @as(usize, prefill_max_q) * n_heads * head_dim, // prefill
+    );
+    const kv_max_elems: usize = @as(usize, decode_max_kv) * n_kv_heads * head_dim;
+    const scores_max_elems: usize = @max(
+        @as(usize, n_heads) * decode_max_kv, // decode
+        @as(usize, prefill_max_q) * n_heads * prefill_max_q, // prefill (n_q == n_kv)
+    );
+    const out_max_elems: usize = @as(usize, prefill_max_q) * n_heads * head_dim;
+
+    var prng = std.Random.DefaultPrng.init(0xA7_7E_07);
+    const rng = prng.random();
+
+    const q_host = try allocator.alloc(f32, q_max_elems);
+    defer allocator.free(q_host);
+    const kv_host = try allocator.alloc(f32, kv_max_elems);
+    defer allocator.free(kv_host);
+    for (q_host) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+    for (kv_host) |*x| x.* = (rng.float(f32) - 0.5) * 0.1;
+
+    var buf_q = try buffer.Buffer.initStatic(&ctx, f32, q_host);
+    defer buf_q.deinit(ctx.device);
+    var buf_k = try buffer.Buffer.initStatic(&ctx, f32, kv_host);
+    defer buf_k.deinit(ctx.device);
+    var buf_v = try buffer.Buffer.initStatic(&ctx, f32, kv_host);
+    defer buf_v.deinit(ctx.device);
+    var buf_scores = try buffer.Buffer.initDeviceOnly(&ctx, scores_max_elems * @sizeOf(f32));
+    defer buf_scores.deinit(ctx.device);
+    var buf_softmax_out = try buffer.Buffer.initDeviceOnly(&ctx, scores_max_elems * @sizeOf(f32));
+    defer buf_softmax_out.deinit(ctx.device);
+    var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, out_max_elems * @sizeOf(f32));
+    defer buf_out.deinit(ctx.device);
+
+    // ── Pipelines (built once, rebound per case).
+    var k_scores = try pipeline.Kernel.init(&ctx, &shaders.attn_scores, 3, @sizeOf(runtime.AttnScoresPush));
+    defer k_scores.deinit();
+    var k_softmax = try pipeline.Kernel.init(&ctx, &shaders.softmax, 2, @sizeOf(runtime.SoftmaxPush));
+    defer k_softmax.deinit();
+    var k_attn_out = try pipeline.Kernel.init(&ctx, &shaders.attn_output, 3, @sizeOf(runtime.AttnOutputPush));
+    defer k_attn_out.deinit();
+    var k_scores_t = try pipeline.Kernel.init(&ctx, &shaders.attn_scores_train, 3, @sizeOf(runtime.AttnScoresTrainPush));
+    defer k_scores_t.deinit();
+    var k_attn_out_t = try pipeline.Kernel.init(&ctx, &shaders.attn_output_train, 3, @sizeOf(runtime.AttnOutputTrainPush));
+    defer k_attn_out_t.deinit();
+
+    try k_scores.bind(&.{ &buf_q, &buf_k, &buf_scores });
+    try k_softmax.bind(&.{ &buf_scores, &buf_softmax_out });
+    try k_attn_out.bind(&.{ &buf_softmax_out, &buf_v, &buf_out });
+    try k_scores_t.bind(&.{ &buf_q, &buf_k, &buf_scores });
+    try k_attn_out_t.bind(&.{ &buf_softmax_out, &buf_v, &buf_out });
+
+    const ns_per_ms: f64 = 1.0e6;
+
+    const Run = struct {
+        fn one(c_ctx: *const vk.Context, kern: *const pipeline.Kernel, push: anytype, gx: u32, iters: u32) !f64 {
+            var total_ns: u64 = 0;
+            const PushT = @TypeOf(push);
+            const Recorder = struct {
+                k: *const pipeline.Kernel,
+                p: *const PushT,
+                gx_: u32,
+                pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                    s.k.dispatch(cmd, s.p, s.gx_, 1, 1);
+                }
+            };
+            for (0..iters) |_| {
+                const t0 = std.time.nanoTimestamp();
+                try buffer.submitOneShot(c_ctx, Recorder{ .k = kern, .p = &push, .gx_ = gx });
+                const t1 = std.time.nanoTimestamp();
+                total_ns += @intCast(t1 - t0);
+            }
+            return @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(iters));
+        }
+    };
+
+    // ── Decode (n_q=1) ────────────────────────────────────────────────
+    std.debug.print(
+        "\n── Decode (n_q=1, no causal mask) ─────────────────────────────────────\n" ++
+            "  {s:>6}  {s:>10}  {s:>14}  {s:>10}  {s:>14}  {s:>10}  {s:>13}\n",
+        .{ "n_kv", "scoresMB", "attn_scores", "softmax", "attn_output", "total/L", "×28 layers" },
+    );
+
+    for (decode_kvs) |n_kv| {
+        const scores_bytes: usize = @as(usize, n_heads) * n_kv * @sizeOf(f32);
+        const scores_mb: f64 = @as(f64, @floatFromInt(scores_bytes)) / (1024.0 * 1024.0);
+
+        const push_scores = runtime.AttnScoresPush{
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_pos = n_kv,
+            .kv_stride = n_kv_heads * head_dim,
+            .scores_stride = n_kv,
+            .inv_sqrt_dim = inv_sqrt,
+        };
+        const push_softmax = runtime.SoftmaxPush{ .dim = n_kv, .stride = n_kv };
+        const push_attn_out = runtime.AttnOutputPush{
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_pos = n_kv,
+            .kv_stride = n_kv_heads * head_dim,
+            .scores_stride = n_kv,
+        };
+        const gx_scores: u32 = n_heads * n_kv;
+        const gx_softmax: u32 = n_heads;
+        const gx_out: u32 = n_heads * head_dim;
+
+        _ = try Run.one(&ctx, &k_scores, push_scores, gx_scores, warmup_iters);
+        _ = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, warmup_iters);
+        _ = try Run.one(&ctx, &k_attn_out, push_attn_out, gx_out, warmup_iters);
+
+        const t_s = try Run.one(&ctx, &k_scores, push_scores, gx_scores, bench_iters);
+        const t_sm = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, bench_iters);
+        const t_o = try Run.one(&ctx, &k_attn_out, push_attn_out, gx_out, bench_iters);
+        const t_total = (t_s + t_sm + t_o) / ns_per_ms;
+
+        std.debug.print(
+            "  {d:>6}  {d:>10.3}  {d:>11.3} ms  {d:>7.3} ms  {d:>11.3} ms  {d:>7.3} ms  {d:>10.2} ms\n",
+            .{ n_kv, scores_mb, t_s / ns_per_ms, t_sm / ns_per_ms, t_o / ns_per_ms, t_total, t_total * @as(f64, @floatFromInt(n_layers)) },
+        );
+    }
+
+    // ── Prefill causal (n_q == n_kv) ──────────────────────────────────
+    std.debug.print(
+        "\n── Prefill causal (n_q == n_kv) ───────────────────────────────────────\n" ++
+            "  {s:>6}  {s:>10}  {s:>14}  {s:>10}  {s:>14}  {s:>10}  {s:>13}\n",
+        .{ "n_q", "scoresMB", "scores_train", "softmax", "out_train", "total/L", "×28 layers" },
+    );
+
+    for (prefill_kvs) |n_q| {
+        const n_kv = n_q;
+        const scores_bytes: usize = @as(usize, n_q) * n_heads * n_kv * @sizeOf(f32);
+        const scores_mb: f64 = @as(f64, @floatFromInt(scores_bytes)) / (1024.0 * 1024.0);
+
+        const push_scores_t = runtime.AttnScoresTrainPush{
+            .n_q = n_q,
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_kv = n_kv,
+            .kv_stride = n_kv_heads * head_dim,
+            .scores_stride = n_kv,
+            .causal = 1,
+            .inv_sqrt_dim = inv_sqrt,
+        };
+        const push_softmax = runtime.SoftmaxPush{ .dim = n_kv, .stride = n_kv };
+        const push_attn_out_t = runtime.AttnOutputTrainPush{
+            .n_q = n_q,
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_kv = n_kv,
+            .kv_stride = n_kv_heads * head_dim,
+            .attn_stride = n_kv,
+        };
+        const gx_scores_t: u32 = n_q * n_heads * n_kv;
+        const gx_softmax: u32 = n_q * n_heads;
+        const gx_out_t: u32 = n_q * n_heads * head_dim;
+
+        _ = try Run.one(&ctx, &k_scores_t, push_scores_t, gx_scores_t, warmup_iters);
+        _ = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, warmup_iters);
+        _ = try Run.one(&ctx, &k_attn_out_t, push_attn_out_t, gx_out_t, warmup_iters);
+
+        const t_s = try Run.one(&ctx, &k_scores_t, push_scores_t, gx_scores_t, bench_iters);
+        const t_sm = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, bench_iters);
+        const t_o = try Run.one(&ctx, &k_attn_out_t, push_attn_out_t, gx_out_t, bench_iters);
+        const t_total = (t_s + t_sm + t_o) / ns_per_ms;
+
+        std.debug.print(
+            "  {d:>6}  {d:>10.3}  {d:>11.3} ms  {d:>7.3} ms  {d:>11.3} ms  {d:>7.3} ms  {d:>10.2} ms\n",
+            .{ n_q, scores_mb, t_s / ns_per_ms, t_sm / ns_per_ms, t_o / ns_per_ms, t_total, t_total * @as(f64, @floatFromInt(n_layers)) },
+        );
+    }
+
+    std.debug.print(
+        "\n  scoresMB column = per-layer fp32 scores buffer (rows × n_kv × 4B / 2^20).\n" ++
+            "  ×28 layers = total/L extrapolated to Qwen3-0.6B's full attention stack.\n" ++
+            "  These are the totals FlashAttention has to beat at the same shapes.\n",
+        .{},
+    );
+}
+
 // ── GPU CCE backward d_h smoke: vs CPU oracle ─────────────────────────
 //
 // Drives `cce_backward_dh.comp` against the d_h output of

@@ -298,6 +298,15 @@ pub fn main() !void {
         try smoke_gpu_train.runCceBench(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--attn-bench")) {
+        // F1 of the FlashAttention arc: time the 3-dispatch attention
+        // chain (scores → softmax → output) at Qwen3-0.6B per-layer
+        // dims across decode (n_q=1) and prefill-causal (n_q==n_kv)
+        // n_kv sweeps. Sizes the scores-buffer cliff and the
+        // baseline FA has to beat.
+        try smoke_gpu_train.runAttnBench(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-smoke")) {
         // GPU LoRA composition smoke. Drives existing matmul_nt_v2 +
         // linear_backward_d{x,w}_batched + scale + add_in_place
