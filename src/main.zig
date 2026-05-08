@@ -212,6 +212,15 @@ pub fn main() !void {
         try smoke_gpu_train.runGpuLoraSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-rec-smoke")) {
+        // A4-1 foundation smoke. Same parity gate as --lora-smoke but
+        // routed through gpu_recorder.Recorder + the helpers in
+        // src/train/lora.zig — one cmdbuf + one submit per case
+        // instead of 14 separate submitOneShot calls. This is the
+        // path the in-Runner LoRA integration will use.
+        try smoke_gpu_train.runGpuLoraRecorderSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-train-demo")) {
         // End-to-end LoRA training demo: synthetic problem with a target
         // rank-r delta on a frozen base, train Adam-LoRA to recover it.
@@ -754,6 +763,7 @@ pub fn main() !void {
     try smoke_gpu_train.runGpuCceBackwardDhSmoke(allocator);
     try smoke_gpu_train.runGpuCceBackwardDwSmoke(allocator);
     try smoke_gpu_train.runGpuLoraSmoke(allocator);
+    try smoke_gpu_train.runGpuLoraRecorderSmoke(allocator);
     try smoke_gpu_train.runEmbeddedAttachSmoke(allocator);
     try smoke_gpu_train.runEmbeddedRecorderSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulQ4_0Smoke(allocator);

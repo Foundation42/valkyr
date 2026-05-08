@@ -15,6 +15,7 @@ const cpu_math = @import("../cpu/math.zig");
 const cpu_train_transformer = @import("../cpu/train_transformer.zig");
 const cpu_cce = @import("../cpu/cce.zig");
 const cpu_lora = @import("../cpu/lora.zig");
+const train_lora = @import("../train/lora.zig");
 const config_mod = @import("../config.zig");
 const safetensors = @import("../safetensors.zig");
 const q4_0 = @import("../cpu/q4_0.zig");
@@ -523,6 +524,217 @@ pub fn runGpuLoraSmoke(allocator: std.mem.Allocator) !void {
         }
         std.debug.print(
             "PASS GPU LoRA — {s}  α/r={d:.2}  rel(y/dx/dA/dB)=({e},{e},{e},{e})\n",
+            .{ cs.name, cs.aor, y_rel, dx_rel, dA_rel, dB_rel },
+        );
+    }
+}
+
+// ── LoRA Recorder-based dispatch smoke (foundation for Runner integration) ──
+//
+// Same parity gate as runGpuLoraSmoke (LoRA forward + backward against
+// the cpu/lora.zig oracle, three rank/shape cases) but routes every
+// dispatch through `gpu_recorder.Recorder` and the helpers in
+// `src/train/lora.zig`. This is the path the in-Runner LoRA integration
+// (A4-2+) will use — proves the helpers compose correctly under one
+// cmdbuf + one submit before we wire them into transformer.Runner.step.
+//
+// Difference vs runGpuLoraSmoke: that one fires 14 separate submitOneShot
+// calls per case (each with its own vkQueueWaitIdle); this one fires
+// one submit per case with all 14 dispatches recorded sequentially in
+// a single cmdbuf. Recorder injects a memory barrier between dispatches,
+// matching the in-Runner pattern.
+
+pub fn runGpuLoraRecorderSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const Case = struct {
+        name: []const u8,
+        m: u32,
+        n: u32,
+        k: u32,
+        r: u32,
+        aor: f32,
+    };
+    const cases = [_]Case{
+        .{ .name = "rank-4 (M=4 N=8 K=16)", .m = 4, .n = 8, .k = 16, .r = 4, .aor = 2.0 },
+        .{ .name = "rank-16 (M=8 N=64 K=128)", .m = 8, .n = 64, .k = 128, .r = 16, .aor = 2.0 },
+        .{ .name = "rank-32 (M=4 N=32 K=64)", .m = 4, .n = 32, .k = 64, .r = 32, .aor = 1.0 },
+    };
+
+    // Pipelines reused across cases.
+    var k_matmul = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2, 3, @sizeOf(aliases.MatmulPush));
+    defer k_matmul.deinit();
+    var k_lin_dx = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dx_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dx.deinit();
+    var k_lin_dw = try pipeline.Kernel.init(&ctx, &shaders.linear_backward_dw_batched, 3, @sizeOf(runtime.LinearBatchedPush));
+    defer k_lin_dw.deinit();
+    var k_scale = try pipeline.Kernel.init(&ctx, &shaders.scale, 2, @sizeOf(aliases.ScalePush));
+    defer k_scale.deinit();
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+
+    const kernels = train_lora.LoraKernels{
+        .matmul = &k_matmul,
+        .lin_dx = &k_lin_dx,
+        .lin_dw = &k_lin_dw,
+        .scale = &k_scale,
+        .add_in_place = &k_add,
+    };
+
+    // Recorder large enough for ~32 sets — well over the 14 we need
+    // per case, but cheap to over-provision.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 32, 32 * 8);
+    defer rec.deinit();
+
+    for (cases) |cs| {
+        const M: usize = cs.m;
+        const Nn: usize = cs.n;
+        const K: usize = cs.k;
+        const r: usize = cs.r;
+
+        // ── Host-side init.
+        var prng = std.Random.DefaultPrng.init(0xABBA_BEEF +% @as(u64, cs.m) *% 1000 +% cs.n);
+        const rng = prng.random();
+        const x = try allocator.alloc(f32, M * K);
+        defer allocator.free(x);
+        const w = try allocator.alloc(f32, Nn * K);
+        defer allocator.free(w);
+        const a = try allocator.alloc(f32, r * K);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f32, Nn * r);
+        defer allocator.free(b);
+        const dy = try allocator.alloc(f32, M * Nn);
+        defer allocator.free(dy);
+        for (x) |*v| v.* = (rng.float(f32) - 0.5) * 0.3;
+        for (w) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+        for (a) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+        for (b) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+        for (dy) |*v| v.* = (rng.float(f32) - 0.5) * 0.4;
+
+        // ── CPU oracle.
+        const y_cpu = try allocator.alloc(f32, M * Nn);
+        defer allocator.free(y_cpu);
+        const intermediate_cpu = try allocator.alloc(f32, M * r);
+        defer allocator.free(intermediate_cpu);
+        cpu_lora.loraForward(x, w, a, b, M, Nn, K, r, cs.aor, y_cpu, intermediate_cpu);
+        const dx_cpu = try allocator.alloc(f32, M * K);
+        defer allocator.free(dx_cpu);
+        const dA_cpu = try allocator.alloc(f32, r * K);
+        defer allocator.free(dA_cpu);
+        const dB_cpu = try allocator.alloc(f32, Nn * r);
+        defer allocator.free(dB_cpu);
+        @memset(dA_cpu, 0);
+        @memset(dB_cpu, 0);
+        try cpu_lora.loraBackward(dy, x, w, a, b, intermediate_cpu, M, Nn, K, r, cs.aor, dx_cpu, dA_cpu, dB_cpu, allocator);
+
+        // ── Device buffers.
+        var buf_x = try buffer.Buffer.initStatic(&ctx, f32, x);
+        defer buf_x.deinit(ctx.device);
+        var buf_w = try buffer.Buffer.initStatic(&ctx, f32, w);
+        defer buf_w.deinit(ctx.device);
+        var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a);
+        defer buf_a.deinit(ctx.device);
+        var buf_b = try buffer.Buffer.initStatic(&ctx, f32, b);
+        defer buf_b.deinit(ctx.device);
+        var buf_dy = try buffer.Buffer.initStatic(&ctx, f32, dy);
+        defer buf_dy.deinit(ctx.device);
+        var buf_y = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+        defer buf_y.deinit(ctx.device);
+        var buf_intermediate = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+        defer buf_intermediate.deinit(ctx.device);
+        var buf_dx = try buffer.Buffer.initDeviceOnly(&ctx, M * K * @sizeOf(f32));
+        defer buf_dx.deinit(ctx.device);
+        var buf_dA = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+        defer buf_dA.deinit(ctx.device);
+        var buf_dB = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+        defer buf_dB.deinit(ctx.device);
+
+        // Scratches.
+        var sc_y_lora = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+        defer sc_y_lora.deinit(ctx.device);
+        var sc_y_lora_scaled = try buffer.Buffer.initDeviceOnly(&ctx, M * Nn * @sizeOf(f32));
+        defer sc_y_lora_scaled.deinit(ctx.device);
+        var sc_dy_B = try buffer.Buffer.initDeviceOnly(&ctx, M * r * @sizeOf(f32));
+        defer sc_dy_B.deinit(ctx.device);
+        var sc_dx_lora = try buffer.Buffer.initDeviceOnly(&ctx, M * K * @sizeOf(f32));
+        defer sc_dx_lora.deinit(ctx.device);
+        var sc_dx_lora_scaled = try buffer.Buffer.initDeviceOnly(&ctx, M * K * @sizeOf(f32));
+        defer sc_dx_lora_scaled.deinit(ctx.device);
+        var sc_dA_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, r * K * @sizeOf(f32));
+        defer sc_dA_unscaled.deinit(ctx.device);
+        var sc_dB_unscaled = try buffer.Buffer.initDeviceOnly(&ctx, Nn * r * @sizeOf(f32));
+        defer sc_dB_unscaled.deinit(ctx.device);
+
+        // ── Record forward + backward in one cmdbuf, submit once.
+        try rec.reset();
+        try rec.begin();
+        try train_lora.recordLoraForward(
+            &rec,
+            kernels,
+            .{
+                .x = &buf_x,
+                .w = &buf_w,
+                .a = &buf_a,
+                .b = &buf_b,
+                .y = &buf_y,
+                .intermediate_out = &buf_intermediate,
+                .sc_y_lora = &sc_y_lora,
+                .sc_y_lora_scaled = &sc_y_lora_scaled,
+            },
+            .{ .M = cs.m, .N = cs.n, .K = cs.k, .r = cs.r, .alpha_over_r = cs.aor },
+        );
+        try train_lora.recordLoraBackward(
+            &rec,
+            kernels,
+            .{
+                .dy = &buf_dy,
+                .x = &buf_x,
+                .w = &buf_w,
+                .a = &buf_a,
+                .b = &buf_b,
+                .intermediate = &buf_intermediate,
+                .dx = &buf_dx,
+                .dA = &buf_dA,
+                .dB = &buf_dB,
+                .sc_dy_B = &sc_dy_B,
+                .sc_dx_lora = &sc_dx_lora,
+                .sc_dx_lora_scaled = &sc_dx_lora_scaled,
+                .sc_dA_unscaled = &sc_dA_unscaled,
+                .sc_dB_unscaled = &sc_dB_unscaled,
+            },
+            .{ .M = cs.m, .N = cs.n, .K = cs.k, .r = cs.r, .alpha_over_r = cs.aor },
+        );
+        try rec.endAndSubmit();
+
+        // ── Read back + diff.
+        const y_gpu = try allocator.alloc(f32, M * Nn);
+        defer allocator.free(y_gpu);
+        const dx_gpu = try allocator.alloc(f32, M * K);
+        defer allocator.free(dx_gpu);
+        const dA_gpu = try allocator.alloc(f32, r * K);
+        defer allocator.free(dA_gpu);
+        const dB_gpu = try allocator.alloc(f32, Nn * r);
+        defer allocator.free(dB_gpu);
+        try buf_y.readBack(&ctx, f32, y_gpu);
+        try buf_dx.readBack(&ctx, f32, dx_gpu);
+        try buf_dA.readBack(&ctx, f32, dA_gpu);
+        try buf_dB.readBack(&ctx, f32, dB_gpu);
+
+        const tol: f32 = 1e-5;
+        const y_rel = globalRelDiff(y_cpu, y_gpu);
+        const dx_rel = globalRelDiff(dx_cpu, dx_gpu);
+        const dA_rel = globalRelDiff(dA_cpu, dA_gpu);
+        const dB_rel = globalRelDiff(dB_cpu, dB_gpu);
+        if (y_rel >= tol or dx_rel >= tol or dA_rel >= tol or dB_rel >= tol) {
+            std.debug.print(
+                "LoRA Recorder smoke ({s}) FAIL: y_rel={e}  dx_rel={e}  dA_rel={e}  dB_rel={e}  (tol {e})\n",
+                .{ cs.name, y_rel, dx_rel, dA_rel, dB_rel, tol },
+            );
+            return error.ParityFailed;
+        }
+        std.debug.print(
+            "PASS GPU LoRA via Recorder — {s}  α/r={d:.2}  rel(y/dx/dA/dB)=({e},{e},{e},{e})\n",
             .{ cs.name, cs.aor, y_rel, dx_rel, dA_rel, dB_rel },
         );
     }
