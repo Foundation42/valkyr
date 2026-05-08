@@ -119,6 +119,35 @@ training; if you want instruction-style fine-tunes, pre-format your
 JSONL `text` field with the chat-template tokens you want the model to
 see.
 
+### Bring your own chat-style dataset
+
+If your data is already in the standard `{"messages": [{"role": ..., "content": ...}]}`
+JSONL shape (Unsloth, OpenAI fine-tune format, etc.), use
+`scripts/convert_messages_to_text.py` to flatten it into the `{"text": "..."}`
+format with the Qwen3 chat template applied:
+
+```sh
+python3 scripts/convert_messages_to_text.py \
+    --in your_chat_data.jsonl \
+    --out data/train/your_data.jsonl
+```
+
+A real-world data point — a 671-row pack-native dataset (system + user +
+assistant per row, mean ~1 KiB / ~290 tokens per row) trained 30 steps
+on Qwen3-0.6B at `n_pos=128` with `--rotate` produced a probe-shift like
+this:
+
+```
+[probe before] [I recall: the problem is to find the number of ways to arrange the letters in the word "BANANA"...
+[probe after]  [I recall: ...] blocks as your primary knowledge source. If a recall contradicts your internal knowledge...
+```
+
+The post-train output is the *exact verbatim system prompt* that
+appeared in every one of the 671 training rows — the model has absorbed
+the dataset's most-common boilerplate. This is generalization across
+batches (not single-batch memorization like the `tiny_facts` demo).
+1,247 ms/step at n_pos=128 Debug on an RTX 3090.
+
 ## Checkpoint format (`.vkpt`)
 
 Positional binary, all fp32, no per-tensor names:
