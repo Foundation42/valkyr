@@ -147,6 +147,20 @@ pub const Buffer = struct {
         };
     }
 
+    /// Upload `data` into a `static` or `device_only` buffer via a
+    /// transient staging buffer. Init- or checkpoint-time only — pays a
+    /// vkQueueWaitIdle, far too slow for any hot path. Companion to
+    /// `readBack` (the reverse direction). Refuses `dynamic` buffers
+    /// (use `update` there) — no silent fallthrough so a misuse surfaces
+    /// as a clear error.
+    pub fn uploadFromHost(self: *Buffer, ctx: *const vk.Context, comptime T: type, data: []const T) !void {
+        if (self.mode == .dynamic) return error.UseUpdateForDynamicBuffer;
+        if (data.len == 0) return;
+        const bytes = std.mem.sliceAsBytes(data);
+        if (bytes.len > self.bytes) return error.UploadTooLarge;
+        try stagingUpload(ctx, self.handle, bytes);
+    }
+
     /// memcpy `data` into a `dynamic` buffer. No-op on other modes —
     /// silent rather than a crash so a misuse surfaces as stale data
     /// during testing rather than a corruption in production.

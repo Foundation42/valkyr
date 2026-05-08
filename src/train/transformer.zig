@@ -80,6 +80,43 @@ pub const InitWeights = struct {
     layers: []const LayerWeights, // length cfg.n_layers
 };
 
+// ── Checkpoint format (chunk 8c-β-6b) ────────────────────────────────
+// File layout:
+//   [CheckpointHeader: 16 bytes]
+//   [Config: @sizeOf(Config) bytes, std.mem.asBytes(&cfg)]
+//   [body: positional fp32 blocks per `Runner.collectBlobs`]
+// Body order: stack-level (embed, final_norm, lm_head) × (param, m, v),
+// then per-layer × N: (w_n1..w_down + optional w_q_norm/w_k_norm) ×
+// (param, m, v). Sizes are implied by the Config — no per-block names.
+
+const checkpoint_magic: [4]u8 = .{ 'V', 'K', 'P', 'T' };
+const checkpoint_version: u32 = 1;
+
+const CheckpointHeader = extern struct {
+    magic: [4]u8,
+    version: u32,
+    step_t: u32,
+    cfg_size: u32,
+};
+
+const Blob = struct {
+    buf: *buffer.Buffer,
+    numel: usize,
+};
+
+/// Compare two Configs by structural fields only — leaves lr / beta /
+/// eps_adam to the loader. Padding bytes inside Config are unspecified
+/// (it isn't extern), so byte-equality of asBytes(cfg) wouldn't be safe;
+/// field-by-field is.
+fn cfgShapeMatches(a: Config, b: Config) bool {
+    return a.dim == b.dim and a.n_heads == b.n_heads and a.n_kv_heads == b.n_kv_heads and
+        a.head_dim == b.head_dim and a.ff_dim == b.ff_dim and a.n_pos == b.n_pos and
+        a.n_layers == b.n_layers and a.vocab_size == b.vocab_size and
+        a.rms_eps == b.rms_eps and a.causal == b.causal and
+        a.rotary_dim == b.rotary_dim and a.rope_theta == b.rope_theta and
+        a.qk_norm == b.qk_norm;
+}
+
 pub const Runner = struct {
     ctx: *const vk.Context,
     allocator: std.mem.Allocator,
@@ -1053,6 +1090,150 @@ pub const Runner = struct {
         );
         try self.rec.endAndSubmit();
         try self.buf_logits.readBack(self.ctx, f32, out_logits);
+    }
+
+    // ── Checkpoint save/load (chunk 8c-β-6b) ──────────────────────────
+    //
+    // Persist + restore complete training state: all params, all Adam
+    // m/v, the step_t counter, and the cfg snapshot. File format is
+    // positional fp32 (no per-tensor names) — see `collectBlobs` for
+    // the canonical ordering. Skips activations, dW partials, scratch,
+    // pipelines, and the recorder — all rebuilt from params + the next
+    // forward/backward pass.
+
+    pub fn saveCheckpoint(self: *Runner, allocator: std.mem.Allocator, path: []const u8) !void {
+        const blobs = try self.collectBlobs(allocator);
+        defer allocator.free(blobs);
+
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+
+        const header = CheckpointHeader{
+            .magic = checkpoint_magic,
+            .version = checkpoint_version,
+            .step_t = self.step_t,
+            .cfg_size = @sizeOf(Config),
+        };
+        try file.writeAll(std.mem.asBytes(&header));
+        try file.writeAll(std.mem.asBytes(&self.cfg));
+
+        var scratch = std.ArrayList(f32).init(allocator);
+        defer scratch.deinit();
+
+        for (blobs) |b| {
+            try scratch.resize(b.numel);
+            try b.buf.readBack(self.ctx, f32, scratch.items);
+            try file.writeAll(std.mem.sliceAsBytes(scratch.items));
+        }
+    }
+
+    pub fn loadCheckpoint(self: *Runner, allocator: std.mem.Allocator, path: []const u8) !void {
+        const blobs = try self.collectBlobs(allocator);
+        defer allocator.free(blobs);
+
+        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        var header: CheckpointHeader = undefined;
+        try file.reader().readNoEof(std.mem.asBytes(&header));
+        if (!std.mem.eql(u8, &header.magic, &checkpoint_magic)) return error.InvalidCheckpointMagic;
+        if (header.version != checkpoint_version) return error.UnsupportedCheckpointVersion;
+        if (header.cfg_size != @sizeOf(Config)) return error.CheckpointConfigSizeMismatch;
+
+        var saved_cfg: Config = undefined;
+        try file.reader().readNoEof(std.mem.asBytes(&saved_cfg));
+        if (!cfgShapeMatches(saved_cfg, self.cfg)) return error.CheckpointConfigMismatch;
+
+        // Restore optimizer state. The saved cfg's lr/beta/eps_adam are
+        // the snapshot's source of truth; caller can override post-load.
+        self.step_t = header.step_t;
+        self.cfg.lr = saved_cfg.lr;
+        self.cfg.beta1 = saved_cfg.beta1;
+        self.cfg.beta2 = saved_cfg.beta2;
+        self.cfg.eps_adam = saved_cfg.eps_adam;
+
+        var scratch = std.ArrayList(f32).init(allocator);
+        defer scratch.deinit();
+
+        for (blobs) |b| {
+            try scratch.resize(b.numel);
+            try file.reader().readNoEof(std.mem.sliceAsBytes(scratch.items));
+            try b.buf.uploadFromHost(self.ctx, f32, scratch.items);
+        }
+    }
+
+    /// Build the canonical (param, m, v) ordered list of every device
+    /// buffer that needs to round-trip through a checkpoint. Both save
+    /// and load walk this list in the same order.
+    fn collectBlobs(self: *Runner, allocator: std.mem.Allocator) ![]Blob {
+        var out = std.ArrayList(Blob).init(allocator);
+        errdefer out.deinit();
+
+        const cfg = self.cfg;
+        const vocab: usize = @intCast(cfg.vocab_size);
+        const dim: usize = @intCast(cfg.dim);
+        const ff_dim: usize = @intCast(cfg.ff_dim);
+        const head_dim: usize = @intCast(cfg.head_dim);
+        const q_dim: usize = @as(usize, @intCast(cfg.n_heads)) * @as(usize, @intCast(cfg.head_dim));
+        const kv_dim: usize = @as(usize, @intCast(cfg.n_kv_heads)) * @as(usize, @intCast(cfg.head_dim));
+
+        // Stack-level (param, m, v).
+        try out.appendSlice(&[_]Blob{
+            .{ .buf = &self.buf_w_embed, .numel = vocab * dim },
+            .{ .buf = &self.buf_m_embed, .numel = vocab * dim },
+            .{ .buf = &self.buf_v_embed, .numel = vocab * dim },
+            .{ .buf = &self.buf_w_final_norm, .numel = dim },
+            .{ .buf = &self.buf_m_final_norm, .numel = dim },
+            .{ .buf = &self.buf_v_final_norm, .numel = dim },
+            .{ .buf = &self.buf_w_lm_head, .numel = vocab * dim },
+            .{ .buf = &self.buf_m_lm_head, .numel = vocab * dim },
+            .{ .buf = &self.buf_v_lm_head, .numel = vocab * dim },
+        });
+
+        // Per-layer.
+        for (0..cfg.n_layers) |i| {
+            try out.appendSlice(&[_]Blob{
+                .{ .buf = &self.buf_w_n1[i], .numel = dim },
+                .{ .buf = &self.buf_m_n1[i], .numel = dim },
+                .{ .buf = &self.buf_v_n1[i], .numel = dim },
+                .{ .buf = &self.buf_w_q[i], .numel = q_dim * dim },
+                .{ .buf = &self.buf_m_q[i], .numel = q_dim * dim },
+                .{ .buf = &self.buf_v_q[i], .numel = q_dim * dim },
+                .{ .buf = &self.buf_w_k[i], .numel = kv_dim * dim },
+                .{ .buf = &self.buf_m_k[i], .numel = kv_dim * dim },
+                .{ .buf = &self.buf_v_k[i], .numel = kv_dim * dim },
+                .{ .buf = &self.buf_w_v[i], .numel = kv_dim * dim },
+                .{ .buf = &self.buf_m_v[i], .numel = kv_dim * dim },
+                .{ .buf = &self.buf_v_v[i], .numel = kv_dim * dim },
+                .{ .buf = &self.buf_w_o[i], .numel = dim * q_dim },
+                .{ .buf = &self.buf_m_o[i], .numel = dim * q_dim },
+                .{ .buf = &self.buf_v_o[i], .numel = dim * q_dim },
+                .{ .buf = &self.buf_w_n2[i], .numel = dim },
+                .{ .buf = &self.buf_m_n2[i], .numel = dim },
+                .{ .buf = &self.buf_v_n2[i], .numel = dim },
+                .{ .buf = &self.buf_w_gate[i], .numel = ff_dim * dim },
+                .{ .buf = &self.buf_m_gate[i], .numel = ff_dim * dim },
+                .{ .buf = &self.buf_v_gate[i], .numel = ff_dim * dim },
+                .{ .buf = &self.buf_w_up[i], .numel = ff_dim * dim },
+                .{ .buf = &self.buf_m_up[i], .numel = ff_dim * dim },
+                .{ .buf = &self.buf_v_up[i], .numel = ff_dim * dim },
+                .{ .buf = &self.buf_w_down[i], .numel = dim * ff_dim },
+                .{ .buf = &self.buf_m_down[i], .numel = dim * ff_dim },
+                .{ .buf = &self.buf_v_down[i], .numel = dim * ff_dim },
+            });
+            if (cfg.qk_norm) {
+                try out.appendSlice(&[_]Blob{
+                    .{ .buf = &self.buf_w_q_norm[i], .numel = head_dim },
+                    .{ .buf = &self.buf_m_q_norm[i], .numel = head_dim },
+                    .{ .buf = &self.buf_v_q_norm[i], .numel = head_dim },
+                    .{ .buf = &self.buf_w_k_norm[i], .numel = head_dim },
+                    .{ .buf = &self.buf_m_k_norm[i], .numel = head_dim },
+                    .{ .buf = &self.buf_v_k_norm[i], .numel = head_dim },
+                });
+            }
+        }
+
+        return try out.toOwnedSlice();
     }
 
     // ── Internal recording helpers ────────────────────────────────────

@@ -2,6 +2,7 @@
 //! - `--decoder-stack-train-smoke` (synthetic stack, 200-step convergence)
 //! - `--real-train-step-smoke` (Qwen3-0.6B, one Adam step asserts CE_after < CE_before)
 //! - `--real-multi-step-smoke` (Qwen3-0.6B, 30-step overfit gate; β-6a)
+//! - `--checkpoint-smoke` (toy stack save/load round-trip; β-6b)
 //! - plus the no-arg fallthrough's CPU/GPU decoder fine-tune chain.
 //! Extracted from main.zig.
 
@@ -2190,6 +2191,221 @@ pub fn runRealModelTrainStepSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS real Qwen3-0.6B one-step train (n_pos={d} lr={e}; CE {d:.6} → {d:.6}, Δ={d:.6} ({d:.3}%); step={d:.1} ms)\n",
         .{ n_pos, lr, ce_before, ce_after, delta, rel_pct, step_ms },
+    );
+}
+
+// ── chunk 8c-β-6b: checkpoint save/load round-trip ──────────────────
+//
+// Trains a toy 8c-α-3-shape Runner for K steps, saves a checkpoint,
+// then trains M more steps to establish the "continuous" trajectory.
+// Spins up a *fresh* Runner with identical Config, loads the same
+// checkpoint into it, trains M more steps, and asserts the post-load
+// trajectory matches the continuous one within fp tolerance.
+//
+// Three gates:
+//   1. Round-trip integrity (no train): CE on Runner_2 immediately
+//      after load matches CE on Runner_1 at save time.
+//   2. Step-t restored: Runner_2's first post-load Adam step uses the
+//      correct bias-corrected update — checked indirectly by the
+//      trajectory match below.
+//   3. Adam m/v restored: Runner_2's M-step trajectory matches
+//      Runner_1's continuous K+M trajectory. If we forgot to save m or
+//      v, momentum "resets" and CE diverges.
+//
+// Tolerance is generous (1e-2 absolute on a CE value of ~1.0) because
+// GPU subgroup-sum reductions are non-deterministic across runs (and
+// each Adam step compounds the jitter through 51-127 dispatches at
+// this shape). If round-trip integrity holds tightly (<1e-5), the
+// post-train delta is what shows the m/v + step_t recovery worked.
+
+pub fn runDecoderStackCheckpointSmoke(allocator: std.mem.Allocator) !void {
+    const cfg_static = cpu_train_decoder.StackConfig{
+        .base = .{
+            .dim = 16,
+            .n_heads = 2,
+            .n_kv_heads = 2,
+            .head_dim = 8,
+            .ff_dim = 32,
+            .n_pos = 4,
+            .rms_eps = 1e-5,
+            .causal = true,
+            .rotary_dim = 8,
+            .qk_norm = true,
+        },
+        .n_layers = 2,
+        .vocab_size = 8,
+    };
+    const dim = cfg_static.base.dim;
+    const n_pos = cfg_static.base.n_pos;
+    const n_heads = cfg_static.base.n_heads;
+    const n_kv_heads = cfg_static.base.n_kv_heads;
+    const head_dim = cfg_static.base.head_dim;
+    const ff_dim = cfg_static.base.ff_dim;
+    const vocab = cfg_static.vocab_size;
+    const q_dim = n_heads * head_dim;
+    const kv_dim = n_kv_heads * head_dim;
+
+    // Fixed RNG seed so initial weights + token_ids + target_ids are
+    // identical across every Runner instantiation in this smoke.
+    const seed: u64 = 0xC0_DE_CC_07;
+    const init_scale: f32 = 0.1;
+
+    // Build the cpu-side weight buffers we'll feed into both Runners.
+    // Two arenas (one per Runner) keep ownership clear.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const w_embed = try aa.alloc(f32, vocab * dim);
+    const w_final_norm = try aa.alloc(f32, dim);
+    const w_lm_head = try aa.alloc(f32, vocab * dim);
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rng = prng.random();
+    for (w_embed) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+    for (w_final_norm) |*v| v.* = 1.0;
+    for (w_lm_head) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+
+    const layer_weights = try aa.alloc(train_transformer.LayerWeights, cfg_static.n_layers);
+    for (layer_weights) |*lw| {
+        const w_n1 = try aa.alloc(f32, dim);
+        const w_q = try aa.alloc(f32, q_dim * dim);
+        const w_k = try aa.alloc(f32, kv_dim * dim);
+        const w_v = try aa.alloc(f32, kv_dim * dim);
+        const w_o = try aa.alloc(f32, dim * q_dim);
+        const w_n2 = try aa.alloc(f32, dim);
+        const w_gate = try aa.alloc(f32, ff_dim * dim);
+        const w_up = try aa.alloc(f32, ff_dim * dim);
+        const w_down = try aa.alloc(f32, dim * ff_dim);
+        const w_q_norm = try aa.alloc(f32, head_dim);
+        const w_k_norm = try aa.alloc(f32, head_dim);
+        for (w_n1) |*v| v.* = 1.0;
+        for (w_n2) |*v| v.* = 1.0;
+        for (w_q_norm) |*v| v.* = 1.0;
+        for (w_k_norm) |*v| v.* = 1.0;
+        for (w_q) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_k) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_v) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_o) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_gate) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_up) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        for (w_down) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * init_scale;
+        lw.* = .{
+            .w_n1 = w_n1,
+            .w_q = w_q,
+            .w_k = w_k,
+            .w_v = w_v,
+            .w_o = w_o,
+            .w_n2 = w_n2,
+            .w_gate = w_gate,
+            .w_up = w_up,
+            .w_down = w_down,
+            .w_q_norm = w_q_norm,
+            .w_k_norm = w_k_norm,
+        };
+    }
+
+    const token_ids = try aa.alloc(u32, n_pos);
+    const target_ids = try aa.alloc(u32, n_pos);
+    for (token_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, @intCast(vocab));
+    for (target_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, @intCast(vocab));
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const runner_cfg = train_transformer.Config{
+        .dim = @intCast(dim),
+        .n_heads = @intCast(n_heads),
+        .n_kv_heads = @intCast(n_kv_heads),
+        .head_dim = @intCast(head_dim),
+        .ff_dim = @intCast(ff_dim),
+        .n_pos = @intCast(n_pos),
+        .n_layers = @intCast(cfg_static.n_layers),
+        .vocab_size = @intCast(vocab),
+        .rms_eps = cfg_static.base.rms_eps,
+        .causal = cfg_static.base.causal,
+        .rotary_dim = @intCast(cfg_static.base.rotary_dim),
+        .rope_theta = cfg_static.base.rope_theta,
+        .qk_norm = cfg_static.base.qk_norm,
+        .lr = 1e-2,
+    };
+    const init_weights = train_transformer.InitWeights{
+        .embed = w_embed,
+        .final_norm = w_final_norm,
+        .lm_head = w_lm_head,
+        .layers = layer_weights,
+    };
+
+    const k_steps: u32 = 10;
+    const m_steps: u32 = 10;
+    const ckpt_path = "/tmp/valkyr_ckpt_smoke.vkpt";
+    defer std.fs.cwd().deleteFile(ckpt_path) catch {};
+
+    const logits_buf = try allocator.alloc(f32, n_pos * vocab);
+    defer allocator.free(logits_buf);
+
+    // ── Runner A: train K, save, train M more.
+    var runner_a = try train_transformer.Runner.init(allocator, &ctx, runner_cfg, init_weights);
+    defer runner_a.deinit();
+
+    var i: u32 = 0;
+    while (i < k_steps) : (i += 1) try runner_a.step(token_ids, target_ids);
+
+    try runner_a.forwardLogits(token_ids, logits_buf);
+    const ce_at_save = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_at_save)) return error.CeAtSaveNotFinite;
+
+    try runner_a.saveCheckpoint(allocator, ckpt_path);
+
+    i = 0;
+    while (i < m_steps) : (i += 1) try runner_a.step(token_ids, target_ids);
+
+    try runner_a.forwardLogits(token_ids, logits_buf);
+    const ce_continuous = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_continuous)) return error.CeContinuousNotFinite;
+
+    // ── Runner B: fresh init, load checkpoint, train M more.
+    var runner_b = try train_transformer.Runner.init(allocator, &ctx, runner_cfg, init_weights);
+    defer runner_b.deinit();
+    try runner_b.loadCheckpoint(allocator, ckpt_path);
+
+    // Gate 1: round-trip integrity. After load (no further training)
+    // CE on Runner B should match CE at save on Runner A modulo
+    // GPU forward non-determinism (very small at this shape).
+    try runner_b.forwardLogits(token_ids, logits_buf);
+    const ce_after_load = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    const roundtrip_delta = @abs(ce_after_load - ce_at_save);
+    if (roundtrip_delta > 1e-3) {
+        std.debug.print(
+            "Checkpoint round-trip FAIL: ce_at_save={d:.6} ce_after_load={d:.6} delta={e:.3}\n",
+            .{ ce_at_save, ce_after_load, roundtrip_delta },
+        );
+        return error.CheckpointRoundTripFailed;
+    }
+
+    // Gate 2 + 3: trajectory continuity. Runner B trained M steps
+    // post-load should land near Runner A's continuous K+M endpoint.
+    // If Adam m/v or step_t weren't restored, momentum resets and the
+    // M-step trajectory diverges (typically by 0.1-1.0 in CE).
+    i = 0;
+    while (i < m_steps) : (i += 1) try runner_b.step(token_ids, target_ids);
+
+    try runner_b.forwardLogits(token_ids, logits_buf);
+    const ce_after_resume = cpu_train_decoder.softmaxCeLoss(logits_buf, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_after_resume)) return error.CeAfterResumeNotFinite;
+
+    const trajectory_delta = @abs(ce_after_resume - ce_continuous);
+    if (trajectory_delta > 1e-2) {
+        std.debug.print(
+            "Checkpoint trajectory FAIL: ce_continuous={d:.6} ce_after_resume={d:.6} delta={e:.3}\n",
+            .{ ce_continuous, ce_after_resume, trajectory_delta },
+        );
+        return error.CheckpointTrajectoryDivergent;
+    }
+
+    std.debug.print(
+        "PASS Runner checkpoint round-trip ({d}-layer toy stack qk_norm+RoPE; K={d}+M={d} steps; CE save={d:.6} load={d:.6} (Δ={e:.2}); resume {d:.6} vs continuous {d:.6} (Δ={e:.2}))\n",
+        .{ cfg_static.n_layers, k_steps, m_steps, ce_at_save, ce_after_load, roundtrip_delta, ce_after_resume, ce_continuous, trajectory_delta },
     );
 }
 

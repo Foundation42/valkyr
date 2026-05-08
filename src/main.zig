@@ -69,6 +69,14 @@ pub fn main() !void {
         try smoke_decoder.runRealModelMultiStepSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--checkpoint-smoke")) {
+        // β-6b checkpoint save/load round-trip on a toy 2-layer stack.
+        // Trains K, saves, trains M more for the "continuous" baseline,
+        // spins up a fresh Runner, loads, trains M, asserts trajectory
+        // matches. Gates round-trip integrity + Adam state recovery.
+        try smoke_decoder.runDecoderStackCheckpointSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--decoder-stack-train-smoke")) {
         // 200-step synthetic-stack convergence smoke. Stronger trajectory
         // gate than the one-step real-model smoke: asserts final/initial
@@ -658,6 +666,7 @@ pub fn main() !void {
     try smoke_decoder.runRealModelDatasetSmoke(allocator);
     try smoke_decoder.runRealModelTrainStepSmoke(allocator);
     try smoke_decoder.runRealModelMultiStepSmoke(allocator);
+    try smoke_decoder.runDecoderStackCheckpointSmoke(allocator);
     try smoke_decoder.runDecoderBackwardGpuParitySmoke(allocator);
     try smoke_decoder.runDecoderTrainGpuSmoke(allocator);
     try smoke_gpu_kernels.runGpuGegluSmoke(allocator);
