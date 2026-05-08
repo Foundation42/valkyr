@@ -3,6 +3,7 @@
 //! - `--real-train-step-smoke` (Qwen3-0.6B, one Adam step asserts CE_after < CE_before)
 //! - `--real-multi-step-smoke` (Qwen3-0.6B, 30-step overfit gate; β-6a)
 //! - `--checkpoint-smoke` (toy stack save/load round-trip; β-6b)
+//! - `--real-sampling-smoke` (Qwen3-0.6B, sampled-text-shift; β-6c)
 //! - plus the no-arg fallthrough's CPU/GPU decoder fine-tune chain.
 //! Extracted from main.zig.
 
@@ -2407,6 +2408,201 @@ pub fn runDecoderStackCheckpointSmoke(allocator: std.mem.Allocator) !void {
         "PASS Runner checkpoint round-trip ({d}-layer toy stack qk_norm+RoPE; K={d}+M={d} steps; CE save={d:.6} load={d:.6} (Δ={e:.2}); resume {d:.6} vs continuous {d:.6} (Δ={e:.2}))\n",
         .{ cfg_static.n_layers, k_steps, m_steps, ce_at_save, ce_after_load, roundtrip_delta, ce_after_resume, ce_continuous, trajectory_delta },
     );
+}
+
+// ── chunk 8c-β-6c: sampled-text-shift validation ────────────────────
+//
+// Closes the "did this actually do anything observable" loop. Samples
+// tokens from the model before fine-tuning, trains the same K=30 steps
+// β-6a does on batch 0 of `tiny_facts.jsonl`, then samples again with
+// the same prompt. Gate: post-fine-tune token sequence != pre-fine-tune
+// token sequence (training visibly shifted argmax for ≥1 position).
+//
+// Sampling is greedy (argmax) — deterministic, no temperature/top-k. We
+// use Runner.forwardLogits inside an autoregressive loop:
+//   window = [prompt..., pad, pad, ...]   (length n_pos, right-padded)
+//   gen_pos = prompt.len - 1               (where to read next-token logits)
+//   loop n_gen times:
+//     forwardLogits(window) → logits[n_pos × vocab]
+//     pick argmax(logits[gen_pos])
+//     extend in-window (gen_pos++) until full, then slide left
+//
+// Right-padding works because Qwen3 attention is causal — logits at
+// position p depend only on tokens 0..p. Pads at p+1..n_pos-1 are
+// invisible to logits[p].
+//
+// Probe prompt "The capital of France is" matches the start of batch 0
+// of tiny_facts.jsonl, so single-batch overfit memorizes the training
+// continuation (" Paris. Paris sits on the river Seine..."). The pre-
+// fine-tune model probably also says "Paris" (it's a well-known fact in
+// pretraining), but the *literal* continuation past 1-2 tokens diverges:
+// the training data's exact phrasing is unique enough that overfit
+// reproduces it verbatim while pretrained completions are generic.
+
+pub fn runRealModelSamplingSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3-0.6B";
+    const jsonl_path = "data/train/tiny_facts.jsonl";
+    const probe_prompt = "The capital of France is";
+    const n_pos: u32 = 16;
+    const n_gen: u32 = 20;
+    const n_train: u32 = 30;
+    const eos_id: u32 = 151_645;
+    const lr: f32 = 1e-5;
+
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.HfModelNotInCache => {
+            std.debug.print("SKIP runRealModelSamplingSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    var weights = try train_load_real.loadTrainWeights(allocator, &cpu, n_pos);
+    defer weights.deinit();
+    var cfg = weights.cfg;
+    cfg.lr = lr;
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    var ds = try train_dataset.buildFromJsonl(allocator, &tok, jsonl_path, n_pos, eos_id);
+    defer ds.deinit();
+    if (ds.numBatches() == 0) return error.DatasetTooShort;
+
+    const prompt_ids = try tok.encode(allocator, probe_prompt);
+    defer allocator.free(prompt_ids);
+    if (prompt_ids.len == 0 or prompt_ids.len >= n_pos) return error.PromptShape;
+
+    const vocab: usize = cfg.vocab_size;
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var runner = try train_transformer.Runner.init(allocator, &ctx, cfg, weights.view());
+    defer runner.deinit();
+
+    // ── Sample BEFORE fine-tune.
+    const sample_pre = try greedyDecode(allocator, &runner, prompt_ids, n_gen, n_pos, vocab, eos_id);
+    defer allocator.free(sample_pre);
+
+    // ── Train K steps on batch 0.
+    const input_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(input_ids);
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    try ds.batch(0, input_ids, target_ids);
+
+    var i: u32 = 0;
+    while (i < n_train) : (i += 1) {
+        try runner.step(input_ids, target_ids);
+    }
+
+    // ── Sample AFTER fine-tune.
+    const sample_post = try greedyDecode(allocator, &runner, prompt_ids, n_gen, n_pos, vocab, eos_id);
+    defer allocator.free(sample_post);
+
+    // ── Decode both to text.
+    const pre_text = try decodeIdsToText(allocator, &tok, sample_pre);
+    defer allocator.free(pre_text);
+    const post_text = try decodeIdsToText(allocator, &tok, sample_post);
+    defer allocator.free(post_text);
+
+    std.debug.print("    Probe        : \"{s}\"\n", .{probe_prompt});
+    std.debug.print("    Pre-fine-tune: \"{s}\"\n", .{pre_text});
+    std.debug.print("    Post-train   : \"{s}\"\n", .{post_text});
+
+    // ── Gate: at least one sampled token differs.
+    if (sample_pre.len != sample_post.len) return error.SampleLenMismatch;
+    const sampled_offset = prompt_ids.len; // first generated token
+    var differed: usize = 0;
+    for (sample_pre[sampled_offset..], sample_post[sampled_offset..]) |a, b| {
+        if (a != b) differed += 1;
+    }
+    if (differed == 0) {
+        std.debug.print("Sampling smoke: pre and post identical — training did not shift argmax\n", .{});
+        return error.SampleDidNotShift;
+    }
+
+    std.debug.print(
+        "PASS real Qwen3-0.6B sampled-text-shift (prompt=\"{s}\" n_train={d} lr={e}; {d}/{d} generated tokens shifted)\n",
+        .{ probe_prompt, n_train, lr, differed, n_gen },
+    );
+}
+
+/// Greedy autoregressive decode with right-pad, in-window extension
+/// then sliding. Returns an owned `[prompt.len + n_gen]u32` slice.
+fn greedyDecode(
+    allocator: std.mem.Allocator,
+    runner: *train_transformer.Runner,
+    prompt_ids: []const u32,
+    n_gen: u32,
+    n_pos: u32,
+    vocab: usize,
+    pad_id: u32,
+) ![]u32 {
+    const out_len: usize = prompt_ids.len + @as(usize, n_gen);
+    const out = try allocator.alloc(u32, out_len);
+    errdefer allocator.free(out);
+    @memcpy(out[0..prompt_ids.len], prompt_ids);
+
+    const window = try allocator.alloc(u32, n_pos);
+    defer allocator.free(window);
+    const logits = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(logits);
+
+    for (window, 0..) |*w, idx| {
+        w.* = if (idx < prompt_ids.len) prompt_ids[idx] else pad_id;
+    }
+    var gen_pos: usize = prompt_ids.len - 1;
+
+    var step: u32 = 0;
+    while (step < n_gen) : (step += 1) {
+        try runner.forwardLogits(window, logits);
+        const off = gen_pos * vocab;
+        var best: u32 = 0;
+        var best_l: f32 = -std.math.inf(f32);
+        for (0..vocab) |v| {
+            const l = logits[off + v];
+            if (l > best_l) {
+                best_l = l;
+                best = @intCast(v);
+            }
+        }
+        out[prompt_ids.len + step] = best;
+
+        if (gen_pos < n_pos - 1) {
+            gen_pos += 1;
+            window[gen_pos] = best;
+        } else {
+            // Slide left, drop oldest token.
+            for (0..n_pos - 1) |k| window[k] = window[k + 1];
+            window[n_pos - 1] = best;
+        }
+    }
+
+    return out;
+}
+
+/// Concatenate per-token display bytes for a sequence of ids.
+fn decodeIdsToText(
+    allocator: std.mem.Allocator,
+    tok: *const tokenizer_mod.Tokenizer,
+    ids: []const u32,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    for (ids) |id| {
+        const piece = try tok.decodeForDisplay(allocator, @intCast(id));
+        defer allocator.free(piece);
+        try out.appendSlice(piece);
+    }
+    return try out.toOwnedSlice();
 }
 
 // ── chunk 8c-β-6a: multi-step training loop ──────────────────────────

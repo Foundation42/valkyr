@@ -77,6 +77,14 @@ pub fn main() !void {
         try smoke_decoder.runDecoderStackCheckpointSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-sampling-smoke")) {
+        // β-6c sampled-text-shift validation. Greedy-samples N tokens
+        // from a probe prompt before and after fine-tuning on a single
+        // batch, asserts at least one generated token differs (training
+        // visibly shifted argmax).
+        try smoke_decoder.runRealModelSamplingSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--decoder-stack-train-smoke")) {
         // 200-step synthetic-stack convergence smoke. Stronger trajectory
         // gate than the one-step real-model smoke: asserts final/initial
@@ -667,6 +675,7 @@ pub fn main() !void {
     try smoke_decoder.runRealModelTrainStepSmoke(allocator);
     try smoke_decoder.runRealModelMultiStepSmoke(allocator);
     try smoke_decoder.runDecoderStackCheckpointSmoke(allocator);
+    try smoke_decoder.runRealModelSamplingSmoke(allocator);
     try smoke_decoder.runDecoderBackwardGpuParitySmoke(allocator);
     try smoke_decoder.runDecoderTrainGpuSmoke(allocator);
     try smoke_gpu_kernels.runGpuGegluSmoke(allocator);
