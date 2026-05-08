@@ -1,0 +1,109 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_vote       : require
+
+// FlashDecoding split-K phase 2: merge per-split partials emitted by
+// fa_decode_split.comp into the final attention output for each
+// query head.
+//
+// One workgroup per query head h. Reads:
+//     O_partial [n_heads, n_splits, head_dim]   unnormalised from phase 1
+//     M_partial [n_heads, n_splits]             rowmax per split
+//     L_partial [n_heads, n_splits]             rowsum per split
+// Writes:
+//     out [n_heads, head_dim]
+//
+// Math:
+//     m_global  = max_s(M_partial[h, s])
+//     coef[s]   = exp(M_partial[h, s] - m_global)              (0 if -inf)
+//     l_global  = Σ_s coef[s] · L_partial[h, s]
+//     out[h, d] = (Σ_s coef[s] · O_partial[h, s, d]) / l_global
+//
+// Each O_partial[h, s, :] is `Σ_{k ∈ slice_s} exp(S_k - M_partial[s]) · V_k`,
+// so multiplying by coef[s] = exp(M_partial[s] - m_global) lifts every
+// split into a common exponential frame; their sum is the un-normalised
+// global numerator. Divide by l_global to finalise.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Op { float o_partial[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Mp { float m_partial[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer Lp { float l_partial[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer O  { float o_out[]; };
+
+layout(push_constant) uniform Pc {
+    uint n_heads;
+    uint head_dim;
+    uint n_splits;       // ≤ N_SPLITS_MAX (1024) — coef cache size
+} pc;
+
+#define N_SPLITS_MAX  1024u
+
+shared float coef[N_SPLITS_MAX];
+shared float sg_partials[32];
+shared float m_global_shared;
+shared float l_global_shared;
+
+void main() {
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_heads) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint hd  = pc.head_dim;
+    uint base_ml = h * pc.n_splits;
+
+    // ── Phase A: m_global = max over splits.
+    float local_max = NEG_INF;
+    for (uint s = tid; s < pc.n_splits; s += gl_WorkGroupSize.x) {
+        local_max = max(local_max, m_partial[base_ml + s]);
+    }
+    float sg_max = subgroupMax(local_max);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_max;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID] : NEG_INF;
+        float total = subgroupMax(v);
+        if (subgroupElect()) m_global_shared = total;
+    }
+    barrier();
+    float m_global = m_global_shared;
+
+    // ── Phase B: cache coef[s] = exp(m_partial[s] - m_global) and
+    //   accumulate l_global = Σ_s coef[s] · l_partial[s].
+    float local_l = 0.0;
+    for (uint s = tid; s < pc.n_splits; s += gl_WorkGroupSize.x) {
+        float ms = m_partial[base_ml + s];
+        float c  = (ms == NEG_INF) ? 0.0 : exp(ms - m_global);
+        coef[s] = c;
+        local_l += c * l_partial[base_ml + s];
+    }
+    float sg_l = subgroupAdd(local_l);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_l;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? sg_partials[gl_SubgroupInvocationID] : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) l_global_shared = total;
+    }
+    barrier();
+    float l_global = l_global_shared;
+    float inv_l   = (l_global > 0.0) ? 1.0 / l_global : 0.0;
+
+    // ── Phase C: out[h, d] = (Σ_s coef[s] · O_partial[h, s, d]) / l_global.
+    // Each thread owns a contiguous slice of head_dim; the inner loop
+    // over splits is sequential per thread but reads are coalesced
+    // across the workgroup since adjacent threads land on adjacent d.
+    uint base_o = h * pc.n_splits * hd;
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        float acc = 0.0;
+        for (uint s = 0u; s < pc.n_splits; s += 1u) {
+            acc += coef[s] * o_partial[base_o + s * hd + d];
+        }
+        o_out[h * hd + d] = acc * inv_l;
+    }
+}

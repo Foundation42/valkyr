@@ -142,6 +142,18 @@ pub fn main() !void {
         try smoke_gpu_train.runFaRunnerSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-decode-smoke")) {
+        // F5 of the FlashAttention arc: FlashDecoding (Tri Dao 2023)
+        // split-K kernels for decode at long ctx, where fa_forward's
+        // n_heads-only parallelism starves the SMs. Phase 1
+        // (`fa_decode_split`) shards K across n_heads × n_splits WGs
+        // and emits unnormalised partial (O, m, l) triples; phase 2
+        // (`fa_decode_merge`) combines them. Parity vs fa_forward at
+        // 5 ctx-length × split-count cases incl. partial-tail split;
+        // 1e-4 rel-err tolerance.
+        try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-sampling-smoke")) {
         // β-6c sampled-text-shift validation. Greedy-samples N tokens
         // from a probe prompt before and after fine-tuning on a single
@@ -937,6 +949,7 @@ pub fn main() !void {
     try smoke_cpu.runFlashAttentionParitySmoke(allocator);
     try smoke_gpu_train.runFlashAttentionGpuSmoke(allocator);
     try smoke_gpu_train.runFaRunnerSmoke(allocator);
+    try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
     try smoke_gpu_train.runLayerNormBackwardCpuSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulSmoke(allocator);
     try smoke_training.runGpuMlpForwardSmoke(allocator);

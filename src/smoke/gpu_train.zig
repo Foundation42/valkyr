@@ -2055,6 +2055,24 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
     defer k_attn_out_t.deinit();
     var k_fa = try pipeline.Kernel.init(&ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
     defer k_fa.deinit();
+    var k_fd_split = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_split, 6, @sizeOf(runtime.FaDecodeSplitPush));
+    defer k_fd_split.deinit();
+    var k_fd_merge = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush));
+    defer k_fd_merge.deinit();
+
+    // FlashDecoding partial buffers — sized to n_heads × max_n_splits ×
+    // head_dim for O_partial, n_heads × max_n_splits for the (m, l)
+    // pair. max_n_splits caps at the bench's largest decode case
+    // (n_kv=32768, n_splits=128 → 16 × 128 = 2048 (m, l) entries).
+    const max_n_splits: u32 = 128;
+    const o_partial_max: usize = @as(usize, n_heads) * max_n_splits * head_dim;
+    const ml_partial_max: usize = @as(usize, n_heads) * max_n_splits;
+    var buf_o_partial = try buffer.Buffer.initDeviceOnly(&ctx, o_partial_max * @sizeOf(f32));
+    defer buf_o_partial.deinit(ctx.device);
+    var buf_m_partial = try buffer.Buffer.initDeviceOnly(&ctx, ml_partial_max * @sizeOf(f32));
+    defer buf_m_partial.deinit(ctx.device);
+    var buf_l_partial = try buffer.Buffer.initDeviceOnly(&ctx, ml_partial_max * @sizeOf(f32));
+    defer buf_l_partial.deinit(ctx.device);
 
     try k_scores.bind(&.{ &buf_q, &buf_k, &buf_scores });
     try k_softmax.bind(&.{ &buf_scores, &buf_softmax_out });
@@ -2062,6 +2080,8 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
     try k_scores_t.bind(&.{ &buf_q, &buf_k, &buf_scores });
     try k_attn_out_t.bind(&.{ &buf_softmax_out, &buf_v, &buf_out });
     try k_fa.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_out, &buf_lse });
+    try k_fd_split.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o_partial, &buf_m_partial, &buf_l_partial });
+    try k_fd_merge.bind(&.{ &buf_o_partial, &buf_m_partial, &buf_l_partial, &buf_out });
 
     const ns_per_ms: f64 = 1.0e6;
 
@@ -2088,13 +2108,26 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
     };
 
     // ── Decode (n_q=1) ────────────────────────────────────────────────
+    // FlashDecoding split-K: n_splits picked per row to keep WG count
+    // saturating (n_heads × n_splits ≥ ~256 on the 3090). split_size
+    // chosen so n_splits × split_size ≥ n_kv with at most one partial-
+    // tail split.
+    const FdConfig = struct { n_splits: u32, split_size: u32 };
+    const fd_configs = [_]FdConfig{
+        .{ .n_splits = 4, .split_size = 32 }, //   n_kv=128
+        .{ .n_splits = 4, .split_size = 128 }, //  n_kv=512
+        .{ .n_splits = 8, .split_size = 256 }, //  n_kv=2048
+        .{ .n_splits = 32, .split_size = 256 }, // n_kv=8192
+        .{ .n_splits = 128, .split_size = 256 }, // n_kv=32768
+    };
+
     std.debug.print(
         "\n── Decode (n_q=1, no causal mask) ─────────────────────────────────────\n" ++
-            "  {s:>6}  {s:>10}  {s:>9}  {s:>9}  {s:>9}  {s:>10}  {s:>9}  {s:>8}\n",
-        .{ "n_kv", "scoresMB", "scores", "softmax", "attn_out", "3-pass/L", "fa_fwd/L", "speedup" },
+            "  {s:>6}  {s:>9}  {s:>9}  {s:>9}  {s:>9}  {s:>9}  {s:>9}  {s:>8}  {s:>8}\n",
+        .{ "n_kv", "scoresMB", "scores", "attn_out", "3-pass", "fa_fwd", "fa_dec", "fa↑3-p", "fd↑3-p" },
     );
 
-    for (decode_kvs) |n_kv| {
+    for (decode_kvs, 0..) |n_kv, ci| {
         const scores_bytes: usize = @as(usize, n_heads) * n_kv * @sizeOf(f32);
         const scores_mb: f64 = @as(f64, @floatFromInt(scores_bytes)) / (1024.0 * 1024.0);
 
@@ -2127,27 +2160,52 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
             .write_lse = 0,
             .inv_sqrt_dim = inv_sqrt,
         };
+        const fd = fd_configs[ci];
+        const push_fd_split = runtime.FaDecodeSplitPush{
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_kv = n_kv,
+            .kv_stride = n_kv_heads * head_dim,
+            .n_splits = fd.n_splits,
+            .split_size = fd.split_size,
+            .inv_sqrt_dim = inv_sqrt,
+        };
+        const push_fd_merge = runtime.FaDecodeMergePush{
+            .n_heads = n_heads,
+            .head_dim = head_dim,
+            .n_splits = fd.n_splits,
+        };
+
         const gx_scores: u32 = n_heads * n_kv;
         const gx_softmax: u32 = n_heads;
         const gx_out: u32 = n_heads * head_dim;
         const gx_fa: u32 = n_heads;
+        const gx_fd_split: u32 = n_heads * fd.n_splits;
+        const gx_fd_merge: u32 = n_heads;
 
         _ = try Run.one(&ctx, &k_scores, push_scores, gx_scores, warmup_iters);
         _ = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, warmup_iters);
         _ = try Run.one(&ctx, &k_attn_out, push_attn_out, gx_out, warmup_iters);
         _ = try Run.one(&ctx, &k_fa, push_fa, gx_fa, warmup_iters);
+        _ = try Run.one(&ctx, &k_fd_split, push_fd_split, gx_fd_split, warmup_iters);
+        _ = try Run.one(&ctx, &k_fd_merge, push_fd_merge, gx_fd_merge, warmup_iters);
 
         const t_s = try Run.one(&ctx, &k_scores, push_scores, gx_scores, bench_iters);
         const t_sm = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, bench_iters);
         const t_o = try Run.one(&ctx, &k_attn_out, push_attn_out, gx_out, bench_iters);
         const t_fa = try Run.one(&ctx, &k_fa, push_fa, gx_fa, bench_iters);
+        const t_fd_split = try Run.one(&ctx, &k_fd_split, push_fd_split, gx_fd_split, bench_iters);
+        const t_fd_merge = try Run.one(&ctx, &k_fd_merge, push_fd_merge, gx_fd_merge, bench_iters);
         const t_3pass = (t_s + t_sm + t_o) / ns_per_ms;
         const t_fa_ms = t_fa / ns_per_ms;
-        const speedup = if (t_fa_ms > 0) t_3pass / t_fa_ms else 0;
+        const t_fd_ms = (t_fd_split + t_fd_merge) / ns_per_ms;
+        const fa_speedup = if (t_fa_ms > 0) t_3pass / t_fa_ms else 0;
+        const fd_speedup = if (t_fd_ms > 0) t_3pass / t_fd_ms else 0;
 
         std.debug.print(
-            "  {d:>6}  {d:>10.3}  {d:>6.3}ms  {d:>6.3}ms  {d:>6.3}ms  {d:>7.3}ms  {d:>6.3}ms  {d:>6.2}×\n",
-            .{ n_kv, scores_mb, t_s / ns_per_ms, t_sm / ns_per_ms, t_o / ns_per_ms, t_3pass, t_fa_ms, speedup },
+            "  {d:>6}  {d:>9.3}  {d:>6.3}ms  {d:>6.3}ms  {d:>6.3}ms  {d:>6.3}ms  {d:>6.3}ms  {d:>6.2}×  {d:>6.2}×\n",
+            .{ n_kv, scores_mb, t_s / ns_per_ms, t_o / ns_per_ms, t_3pass, t_fa_ms, t_fd_ms, fa_speedup, fd_speedup },
         );
     }
 
@@ -2223,7 +2281,8 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
         "\n  scoresMB column = per-layer fp32 scores buffer (rows × n_kv × 4B / 2^20).\n" ++
             "  3-pass/L = attn_scores + softmax + attn_output (or _train variants for prefill).\n" ++
             "  fa_fwd/L = single fa_forward dispatch — same math, online softmax in shared mem.\n" ++
-            "  speedup  = 3-pass / fa_forward at the per-layer level.\n",
+            "  fa_dec/L = fa_decode_split + fa_decode_merge (FlashDecoding split-K, decode only).\n" ++
+            "  fa↑3-p   = 3-pass / fa_forward.    fd↑3-p = 3-pass / FlashDecoding.\n",
         .{},
     );
 }
@@ -2402,6 +2461,184 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS GPU fa_forward parity ({d} cases incl. GQA + causal + non-aligned, max rel={e:.2}, lse rel={e:.2}) on {s}\n",
         .{ cases.len, max_rel_seen, max_lse_rel_seen, ctx.deviceName() },
+    );
+}
+
+// ── F5: FlashDecoding (split-K) GPU parity vs fa_forward ──────────────
+//
+// At decode (n_q=1) and long n_kv, fa_forward dispatches only n_heads
+// workgroups (16 on Qwen3-0.6B), starving the SMs and losing to the
+// 3-pass chain past n_kv ~ 2048. FlashDecoding (Tri Dao 2023) shards
+// K across `n_splits` workgroups per query head: phase 1
+// (`fa_decode_split`) emits unnormalised partial (O, m, l) triples;
+// phase 2 (`fa_decode_merge`) combines them via running max + rescaled
+// sum. Total parallelism: n_heads × n_splits WGs.
+//
+// Parity gate: drive the two-phase pipeline at 4 decode shapes
+// (sweeping n_kv = 128 → 32768 with proportional n_splits) and
+// compare the merged output against fa_forward (already proven
+// against the CPU oracle at 2.2e-7 rel-err in F3a). Tolerance 1e-4
+// rel-err — both compute online softmax in fp32 but with different
+// reduction order across splits.
+
+pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const FdCase = struct {
+        name: []const u8,
+        n_kv: u32,
+        n_splits: u32,
+        split_size: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+    };
+    // Each case picks split_size such that n_splits × split_size ≥ n_kv
+    // (the last split clamps via min(k_start+split_size, n_kv)).
+    const cases = [_]FdCase{
+        .{ .name = "ctx-128 splits=4 sz=32  GQA 4:2 d=16",   .n_kv = 128,   .n_splits = 4,   .split_size = 32,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16 },
+        .{ .name = "ctx-2048 splits=8 sz=256 GQA 16:8 d=128", .n_kv = 2048,  .n_splits = 8,   .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128 },
+        .{ .name = "ctx-8192 splits=32 sz=256 GQA 16:8 d=128", .n_kv = 8192,  .n_splits = 32,  .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128 },
+        .{ .name = "ctx-32768 splits=128 sz=256 GQA 16:8 d=128", .n_kv = 32768, .n_splits = 128, .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128 },
+        // Empty-tail case: split_size doesn't divide n_kv, last split is partial.
+        .{ .name = "ctx-100 splits=4 sz=32  GQA 4:2 d=16  (last split partial)", .n_kv = 100, .n_splits = 4, .split_size = 32, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16 },
+    };
+
+    var k_fa = try pipeline.Kernel.init(&ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
+    defer k_fa.deinit();
+    var k_split = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_split, 6, @sizeOf(runtime.FaDecodeSplitPush));
+    defer k_split.deinit();
+    var k_merge = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush));
+    defer k_merge.deinit();
+
+    var max_rel_seen: f32 = 0.0;
+
+    for (cases) |cs| {
+        const heads_per_kv = cs.n_heads / cs.n_kv_heads;
+        const q_elems = cs.n_heads * cs.head_dim; // n_q implicit = 1
+        const kv_elems = cs.n_kv * cs.n_kv_heads * cs.head_dim;
+        const out_elems = cs.n_heads * cs.head_dim;
+        const partial_o_elems = cs.n_heads * cs.n_splits * cs.head_dim;
+        const partial_ml_elems = cs.n_heads * cs.n_splits;
+
+        const Q = try allocator.alloc(f32, q_elems);
+        defer allocator.free(Q);
+        const K = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(K);
+        const V = try allocator.alloc(f32, kv_elems);
+        defer allocator.free(V);
+        const out_fa = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_fa);
+        const out_fd = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_fd);
+
+        var prng = std.Random.DefaultPrng.init(0xF5_DEC0DE);
+        const rng = prng.random();
+        for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (V) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+        var buf_q = try buffer.Buffer.initStatic(&ctx, f32, Q);
+        defer buf_q.deinit(ctx.device);
+        var buf_k = try buffer.Buffer.initStatic(&ctx, f32, K);
+        defer buf_k.deinit(ctx.device);
+        var buf_v = try buffer.Buffer.initStatic(&ctx, f32, V);
+        defer buf_v.deinit(ctx.device);
+        var buf_o_fa = try buffer.Buffer.initDeviceOnly(&ctx, out_elems * @sizeOf(f32));
+        defer buf_o_fa.deinit(ctx.device);
+        var buf_lse_fa = try buffer.Buffer.initDeviceOnly(&ctx, cs.n_heads * @sizeOf(f32));
+        defer buf_lse_fa.deinit(ctx.device);
+        var buf_o_partial = try buffer.Buffer.initDeviceOnly(&ctx, partial_o_elems * @sizeOf(f32));
+        defer buf_o_partial.deinit(ctx.device);
+        var buf_m_partial = try buffer.Buffer.initDeviceOnly(&ctx, partial_ml_elems * @sizeOf(f32));
+        defer buf_m_partial.deinit(ctx.device);
+        var buf_l_partial = try buffer.Buffer.initDeviceOnly(&ctx, partial_ml_elems * @sizeOf(f32));
+        defer buf_l_partial.deinit(ctx.device);
+        var buf_o_fd = try buffer.Buffer.initDeviceOnly(&ctx, out_elems * @sizeOf(f32));
+        defer buf_o_fd.deinit(ctx.device);
+
+        // Reference: fa_forward at (n_q=1, no causal).
+        try k_fa.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o_fa, &buf_lse_fa });
+        const push_fa = runtime.FaForwardPush{
+            .n_q = 1,
+            .n_heads = cs.n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cs.head_dim,
+            .n_kv = cs.n_kv,
+            .kv_stride = cs.n_kv_heads * cs.head_dim,
+            .causal = 0,
+            .write_lse = 0,
+            .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.head_dim))),
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaForwardPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_fa, .push = &push_fa, .gx = cs.n_heads });
+        try buf_o_fa.readBack(&ctx, f32, out_fa);
+
+        // Two-phase FlashDecoding.
+        try k_split.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o_partial, &buf_m_partial, &buf_l_partial });
+        const push_split = runtime.FaDecodeSplitPush{
+            .n_heads = cs.n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cs.head_dim,
+            .n_kv = cs.n_kv,
+            .kv_stride = cs.n_kv_heads * cs.head_dim,
+            .n_splits = cs.n_splits,
+            .split_size = cs.split_size,
+            .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.head_dim))),
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaDecodeSplitPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_split, .push = &push_split, .gx = cs.n_heads * cs.n_splits });
+
+        try k_merge.bind(&.{ &buf_o_partial, &buf_m_partial, &buf_l_partial, &buf_o_fd });
+        const push_merge = runtime.FaDecodeMergePush{
+            .n_heads = cs.n_heads,
+            .head_dim = cs.head_dim,
+            .n_splits = cs.n_splits,
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaDecodeMergePush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_merge, .push = &push_merge, .gx = cs.n_heads });
+        try buf_o_fd.readBack(&ctx, f32, out_fd);
+
+        var max_abs: f32 = 0;
+        var max_ref: f32 = 0;
+        for (out_fa, out_fd) |r, g| {
+            const d = @abs(r - g);
+            if (d > max_abs) max_abs = d;
+            if (@abs(r) > max_ref) max_ref = @abs(r);
+        }
+        const rel = if (max_ref > 0) max_abs / max_ref else max_abs;
+        if (rel > 1e-4) {
+            std.debug.print(
+                "FlashDecoding parity FAIL ({s}): max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+                .{ cs.name, max_abs, max_ref, rel },
+            );
+            return error.ParityFailed;
+        }
+        if (rel > max_rel_seen) max_rel_seen = rel;
+    }
+
+    std.debug.print(
+        "PASS GPU fa_decode (split + merge) parity vs fa_forward ({d} cases incl. partial-tail split, max rel={e:.2}) on {s}\n",
+        .{ cases.len, max_rel_seen, ctx.deviceName() },
     );
 }
 

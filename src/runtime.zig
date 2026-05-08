@@ -275,6 +275,40 @@ pub const FaForwardPush = extern struct {
     inv_sqrt_dim: f32,
 };
 
+/// FlashDecoding phase 1 (Tri Dao 2023). Decode-only split-K kernel:
+/// implicit n_q = 1, no causal mask, K-dimension sharded across
+/// `n_splits` workgroups per query head. Dispatch `n_heads × n_splits`
+/// WGs; each WG processes keys [split_id · split_size, (split_id+1)
+/// · split_size) and emits an unnormalised partial (O, m, l) triple.
+///
+/// Bindings (5+ writeable): Q, K, V, O_partial, M_partial, L_partial.
+/// Buffer shapes:
+///   Q          [n_heads, head_dim]
+///   K, V       [n_kv, n_kv_heads, head_dim]
+///   O_partial  [n_heads, n_splits, head_dim]
+///   M_partial  [n_heads, n_splits]
+///   L_partial  [n_heads, n_splits]
+pub const FaDecodeSplitPush = extern struct {
+    n_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    n_kv: u32,
+    kv_stride: u32,
+    n_splits: u32,
+    split_size: u32,
+    inv_sqrt_dim: f32,
+};
+
+/// FlashDecoding phase 2 — merge per-split partials into the final
+/// attention output. Dispatch `n_heads` WGs; each combines the
+/// `n_splits` partials for its head via running max + rescaled sum.
+/// `n_splits` is bounded by the shader's coef-cache size (1024).
+pub const FaDecodeMergePush = extern struct {
+    n_heads: u32,
+    head_dim: u32,
+    n_splits: u32,
+};
+
 pub const Mlp2ForwardBatchedPush = extern struct {
     dim_in: u32,
     dim_hidden: u32,

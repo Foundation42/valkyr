@@ -61,13 +61,20 @@ RTX 3090 / ReleaseFast / Zig 0.14.1 / 5-iter average, includes
 
 **Decode** (single-token, sweeping context length, no causal mask):
 
-| n_kv | scoresMB | scores | softmax | attn_out | 3-pass/L | fa_fwd/L | speedup |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 128 | 0.008 | 0.060 ms | 0.056 | 0.062 | 0.178 | 0.085 | **2.09×** |
-| 512 | 0.031 | 0.076 | 0.056 | 0.073 | 0.205 | 0.171 | 1.19× |
-| 2048 | 0.125 | 0.138 | 0.057 | 0.128 | 0.323 | 0.553 | 0.58× |
-| 8192 | 0.500 | 0.380 | 0.062 | 0.325 | 0.767 | 2.035 | 0.38× |
-| 32768 | 2.000 | 1.461 | 0.100 | 3.646 | 5.206 | 8.015 | 0.65× |
+`fa_dec` = FlashDecoding (Tri Dao 2023), the split-K decode-only
+fork: phase 1 (`fa_decode_split`) shards K across `n_heads × n_splits`
+workgroups and emits unnormalised partial `(O, m, l)` triples; phase 2
+(`fa_decode_merge`) combines them with running-max + rescaled-sum
+per head. n_splits picked per row to keep WG count saturating
+(≥256 on the 3090).
+
+| n_kv | scoresMB | scores | attn_out | 3-pass/L | fa_fwd/L | fa_dec/L | fa↑3-p | fd↑3-p |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 0.008 | 0.059 ms | 0.061 | 0.175 | 0.083 | 0.117 | 2.10× | 1.49× |
+| 512 | 0.031 | 0.075 | 0.071 | 0.201 | 0.169 | 0.142 | 1.19× | 1.41× |
+| 2048 | 0.125 | 0.136 | 0.128 | 0.320 | 0.552 | 0.181 | 0.58× | **1.77×** |
+| 8192 | 0.500 | 0.377 | 0.324 | 0.764 | 2.042 | 0.279 | 0.37× | **2.74×** |
+| 32768 | 2.000 | 1.401 | 3.491 | 4.993 | 7.410 | **0.704** | 0.67× | **7.09×** |
 
 **Prefill causal** (training / long-prompt, `n_q == n_kv`):
 
@@ -90,15 +97,20 @@ prefill shapes** — full forward at `n_q=2048` drops from 6.9 s to
 1.7 s on a 28-layer Qwen3-0.6B forward. This is the regime that
 matters for training and for `--chat` long-prompt prefill.
 
-**Decode beyond `n_kv ≥ 2048` is currently *slower* on FA**, despite
-saving the scores roundtrip. Reason is parallelism: decode dispatches
-only `n_heads = 16` workgroups (one per query-head), each iterating
-all K/V tiles serially. The 3-pass `attn_scores` kernel dispatches
-`n_heads × n_kv = 524288` WGs at `n_kv=32768` — saturating the SMs
-even at fragmentary per-WG work. FA's tiled kernel becomes work-bound
-per-WG once `n_kv` is large enough. The textbook fix is **split-K**
-(FlashDecoding, Tri Dao 2023): partition the K dimension across
-several WGs per `(q, h)` and merge their partial `(O, m, l)` triples
-in a second pass. That's a future F-chunk; for now, the production
-path keeps the 3-pass chain at decode and switches to FA only for
-prefill / training.
+**Decode at long ctx: FlashDecoding takes the lead.** `fa_forward`
+alone underperforms past `n_kv ≥ 2048` because it dispatches only
+`n_heads = 16` workgroups, each iterating all K/V tiles serially —
+under-parallel + work-bound. The 3-pass chain saturates 524288 WGs
+at `n_kv=32768`, but at fragmentary per-WG work. **FlashDecoding
+fixes both ends**: at `n_kv=32768` it runs `16 × 128 = 2048` phase-1
+WGs (saturating the 3090's 82 SMs) over `split_size=256` keys each,
+then merges the partials in a second `n_heads`-WG pass. **7.09×
+speedup vs the 3-pass chain at ctx=32768** — 5.0 ms → 0.7 ms per
+layer, which extrapolates to attention costing 19.7 ms/token instead
+of the F1 baseline's 146 ms/token at the full Qwen3-0.6B 28-layer
+stack.
+
+The split-K kernels still need to be wired into `--chat`'s decode
+path before the win is user-visible (currently chat decode lives
+in `model.zig` / `runtime.zig`, separate from the training Runner).
+Tier-2 follow-up.

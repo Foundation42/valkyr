@@ -1,0 +1,211 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_vote       : require
+
+// FlashDecoding split-K phase 1 (Tri Dao 2023). Decode-only fork of
+// fa_forward: implicit n_q = 1 (single new query), no causal mask
+// (decode sees the full KV history), and the K dimension is sharded
+// across `n_splits` workgroups per query head.
+//
+// One workgroup per (h, split_id). Each WG runs the FA online-softmax
+// loop over keys [split_id · split_size, (split_id+1) · split_size)
+// and emits an unnormalised partial:
+//
+//     O_partial[h, s, :]  = Σ_{k ∈ slice} exp(S_k - m_split) · V_k
+//     m_partial[h, s]     = max_{k ∈ slice} S_k
+//     l_partial[h, s]     = Σ_{k ∈ slice} exp(S_k - m_split)
+//
+// The phase-2 merge kernel combines these into the final output via
+//     m_global = max_s(m_partial[h, s])
+//     coef[s]  = exp(m_partial[s] - m_global)
+//     l_global = Σ_s coef[s] · l_partial[s]
+//     out[h, :] = (Σ_s coef[s] · O_partial[h, s, :]) / l_global
+//
+// The point: at decode (n_q=1) the original fa_forward dispatches
+// only n_heads workgroups (16 on Qwen3-0.6B), starving the SMs at
+// long ctx. Splitting K by `n_splits` exposes n_heads × n_splits WGs
+// of parallelism — the standard FlashDecoding fix.
+
+layout(local_size_x = 256) in;
+
+#define BC            16u
+#define HEAD_DIM_MAX  128u
+
+layout(set = 0, binding = 0, std430) readonly  buffer Q  { float q_buf[];  };
+layout(set = 0, binding = 1, std430) readonly  buffer K  { float k_buf[];  };
+layout(set = 0, binding = 2, std430) readonly  buffer V  { float v_buf[];  };
+layout(set = 0, binding = 3, std430) writeonly buffer Op { float o_partial[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Mp { float m_partial[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer Lp { float l_partial[]; };
+
+layout(push_constant) uniform Pc {
+    uint  n_heads;
+    uint  heads_per_kv;
+    uint  head_dim;
+    uint  n_kv;            // total KV history length (n_q implicit = 1)
+    uint  kv_stride;       // n_kv_heads * head_dim
+    uint  n_splits;        // K-split fan-out (= dispatch.x / n_heads)
+    uint  split_size;      // ceil(n_kv / n_splits) keys per split
+    float inv_sqrt_dim;
+} pc;
+
+shared float Q_row [HEAD_DIM_MAX];
+shared float O_state[HEAD_DIM_MAX];
+shared float K_tile[BC * HEAD_DIM_MAX];
+shared float V_tile[BC * HEAD_DIM_MAX];
+shared float S_row [BC];
+shared float P_row [BC];
+shared float sg_partials[32];
+
+shared float m_state;
+shared float l_state;
+shared float m_tile_shared;
+shared float l_tile_shared;
+
+void main() {
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+
+    uint cell = gl_WorkGroupID.x;
+    uint h = cell / pc.n_splits;
+    uint split_id = cell - h * pc.n_splits;
+    if (h >= pc.n_heads) return;
+
+    uint kv_h = h / pc.heads_per_kv;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd  = pc.head_dim;
+
+    uint k_start = split_id * pc.split_size;
+    uint k_end   = min(k_start + pc.split_size, pc.n_kv);
+
+    // ── Load Q row (q implicit = 0) + init online-softmax state.
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        Q_row[d]   = q_buf[h * hd + d];
+        O_state[d] = 0.0;
+    }
+    if (tid == 0u) {
+        m_state = NEG_INF;
+        l_state = 0.0;
+    }
+    barrier();
+
+    // ── Empty split (n_kv % split_size != 0 and we're past the end):
+    // emit a neutral partial (m=-inf, l=0, O=0) so the merge sees no
+    // contribution from this split. m=-inf gives coef=0 directly.
+    if (k_start >= k_end) {
+        uint base = (h * pc.n_splits + split_id) * hd;
+        for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+            o_partial[base + d] = 0.0;
+        }
+        if (tid == 0u) {
+            uint idx = h * pc.n_splits + split_id;
+            m_partial[idx] = NEG_INF;
+            l_partial[idx] = 0.0;
+        }
+        return;
+    }
+
+    // ── Walk BC tiles within [k_start, k_end).
+    for (uint k_block_start = k_start; k_block_start < k_end; k_block_start += BC) {
+        uint k_block_len = min(BC, k_end - k_block_start);
+
+        uint kv_total = k_block_len * hd;
+        for (uint i = tid; i < kv_total; i += gl_WorkGroupSize.x) {
+            uint kj = i / hd;
+            uint d  = i - kj * hd;
+            uint kv_off = (k_block_start + kj) * pc.kv_stride + kv_h * hd + d;
+            K_tile[kj * hd + d] = k_buf[kv_off];
+            V_tile[kj * hd + d] = v_buf[kv_off];
+        }
+        barrier();
+
+        // S_row[kj] = inv_sqrt_d · Σ_d Q · K[kj]. Subgroup-parallel
+        // dot products: gl_NumSubgroups cells per round.
+        uint sg       = gl_SubgroupID;
+        uint sg_count = gl_NumSubgroups;
+        uint rounds   = (k_block_len + sg_count - 1u) / sg_count;
+        for (uint r = 0u; r < rounds; r += 1u) {
+            uint kj = r * sg_count + sg;
+            if (kj < k_block_len) {
+                float partial = 0.0;
+                for (uint d = gl_SubgroupInvocationID; d < hd; d += gl_SubgroupSize) {
+                    partial += Q_row[d] * K_tile[kj * hd + d];
+                }
+                float total = subgroupAdd(partial);
+                if (subgroupElect()) {
+                    S_row[kj] = total * pc.inv_sqrt_dim;
+                }
+            }
+        }
+        barrier();
+
+        // Cooperative rowmax of S_row[0..k_block_len].
+        float local_max = NEG_INF;
+        for (uint kj = tid; kj < k_block_len; kj += gl_WorkGroupSize.x) {
+            local_max = max(local_max, S_row[kj]);
+        }
+        float sg_max = subgroupMax(local_max);
+        if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_max;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? sg_partials[gl_SubgroupInvocationID] : NEG_INF;
+            float total = subgroupMax(v);
+            if (subgroupElect()) m_tile_shared = total;
+        }
+        barrier();
+
+        float m_old = m_state;
+        float m_new = max(m_old, m_tile_shared);
+
+        float local_sum = 0.0;
+        for (uint kj = tid; kj < k_block_len; kj += gl_WorkGroupSize.x) {
+            float s = S_row[kj];
+            float p = (s == NEG_INF) ? 0.0 : exp(s - m_new);
+            P_row[kj] = p;
+            local_sum += p;
+        }
+        float sg_sum = subgroupAdd(local_sum);
+        if (subgroupElect()) sg_partials[gl_SubgroupID] = sg_sum;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? sg_partials[gl_SubgroupInvocationID] : 0.0;
+            float total = subgroupAdd(v);
+            if (subgroupElect()) l_tile_shared = total;
+        }
+        barrier();
+
+        float scale_old = (m_old == NEG_INF) ? 0.0 : exp(m_old - m_new);
+        float l_tile    = l_tile_shared;
+
+        for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+            float o = O_state[d] * scale_old;
+            for (uint kj = 0u; kj < k_block_len; kj += 1u) {
+                o += P_row[kj] * V_tile[kj * hd + d];
+            }
+            O_state[d] = o;
+        }
+
+        if (tid == 0u) {
+            m_state = m_new;
+            l_state = scale_old * l_state + l_tile;
+        }
+        barrier();
+    }
+
+    // ── Emit partials. O_state is unnormalised: it equals
+    //   Σ_{k ∈ slice} exp(S_k - m_state) · V_k
+    // The merge kernel will rescale by exp(m_state - m_global) and
+    // divide by l_global. Do NOT divide by l_state here — that would
+    // bake the local denominator into the partial and break the merge.
+    uint base = (h * pc.n_splits + split_id) * hd;
+    for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
+        o_partial[base + d] = O_state[d];
+    }
+    if (tid == 0u) {
+        uint idx = h * pc.n_splits + split_id;
+        m_partial[idx] = m_state;
+        l_partial[idx] = l_state;
+    }
+}
