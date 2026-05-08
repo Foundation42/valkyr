@@ -44,50 +44,61 @@ bandwidth, and as **steady memory savings** on the full-attention
 V cache (~5.5× compression) — relevant if you want to push the
 27B's effective context further on a 24 GiB card.
 
-## Attention bench (F1 baseline for FlashAttention)
+## Attention bench (FlashAttention vs the 3-pass baseline)
 
-`valkyr --attn-bench` times the standard 3-dispatch attention chain
-(`attn_scores` → `softmax` → `attn_output`) at Qwen3-0.6B per-layer
-shape (`n_heads=16, n_kv_heads=8, head_dim=128`). Two phases: decode
-(`n_q=1`, no mask) and prefill-causal (`n_q == n_kv`). RTX 3090 /
-ReleaseFast / Zig 0.14.1 / 5-iter average, includes `submitOneShot
-+ waitIdle` overhead.
+`valkyr --attn-bench` times both attention paths side-by-side at
+Qwen3-0.6B per-layer shape (`n_heads=16, n_kv_heads=8, head_dim=128`):
 
-**Decode** (single-token forward, sweeping context length):
+* **3-pass** = `attn_scores` → `softmax` → `attn_output` (or
+  `_train` variants for prefill) — materialises the full
+  `[n_q × n_heads × n_kv]` scores tensor.
+* **fa_forward** = single `shaders/fa_forward.comp` dispatch —
+  tile-on-K with online softmax in shared memory, never materialises
+  the scores tensor.
 
-| n_kv | scoresMB | attn_scores | softmax | attn_output | total/L | ×28 layers |
-|---:|---:|---:|---:|---:|---:|---:|
-| 128 | 0.008 | 0.061 ms | 0.055 ms | 0.062 ms | 0.179 ms | **5.01 ms** |
-| 512 | 0.031 | 0.074 | 0.055 | 0.071 | 0.200 | 5.60 |
-| 2048 | 0.125 | 0.136 | 0.056 | 0.128 | 0.321 | 8.98 |
-| 8192 | 0.500 | 0.376 | 0.061 | 0.327 | 0.764 | 21.38 |
-| 32768 | 2.000 | 1.399 | 0.100 | 3.718 | 5.217 | **146.09 ms** |
+RTX 3090 / ReleaseFast / Zig 0.14.1 / 5-iter average, includes
+`submitOneShot + waitIdle` overhead per dispatch.
 
-**Prefill causal** (training/long-prompt forward, n_q == n_kv):
+**Decode** (single-token, sweeping context length, no causal mask):
 
-| n_q | scoresMB | scores_train | softmax | out_train | total/L | ×28 layers |
-|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 0.016 | 0.064 ms | 0.055 ms | 0.131 ms | 0.250 ms | 6.99 ms |
-| 128 | 1.000 | 0.564 | 0.069 | 0.892 | 1.525 | 42.71 |
-| 512 | 16.000 | 8.409 | 0.105 | 7.448 | 15.962 | 446.93 |
-| 2048 | 256.000 | 118.145 | 0.859 | 127.717 | 246.721 | **6908.19 ms** |
+| n_kv | scoresMB | scores | softmax | attn_out | 3-pass/L | fa_fwd/L | speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 0.008 | 0.060 ms | 0.056 | 0.062 | 0.178 | 0.085 | **2.09×** |
+| 512 | 0.031 | 0.076 | 0.056 | 0.073 | 0.205 | 0.171 | 1.19× |
+| 2048 | 0.125 | 0.138 | 0.057 | 0.128 | 0.323 | 0.553 | 0.58× |
+| 8192 | 0.500 | 0.380 | 0.062 | 0.325 | 0.767 | 2.035 | 0.38× |
+| 32768 | 2.000 | 1.461 | 0.100 | 3.646 | 5.206 | 8.015 | 0.65× |
 
-`scoresMB` is the per-layer fp32 scores buffer (`rows × n_kv × 4B`).
-At decode `n_kv=32768` we shuttle 56 MB of scores per token across
-all 28 layers; at prefill `n_q=2048` it's a 7.2 GB roundtrip per
-forward — the buffer alone exceeds the entire `.lvkpt` checkpoint.
+**Prefill causal** (training / long-prompt, `n_q == n_kv`):
 
-The cliff comes from two compounding factors:
-1. **Quadratic scores buffer** in prefill (`n_q × n_kv`) — 4× n_q
-   gives ~15× total time at the larger shapes.
-2. **Scattered HBM reads** in `attn_output` for decode at long
-   `n_kv` — the kernel reads `[n_heads, n_kv]` scores against
-   `[n_kv, n_kv_heads, head_dim]` V, no spatial reuse.
+| n_q | scoresMB | scores_t | softmax | out_t | 3-pass/L | fa_fwd/L | speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 0.016 | 0.065 ms | 0.055 | 0.130 | 0.250 | 0.061 | **4.10×** |
+| 128 | 1.000 | 0.548 | 0.062 | 0.877 | 1.487 | 0.311 | **4.78×** |
+| 512 | 16.000 | 7.929 | 0.101 | 7.480 | 15.510 | 3.546 | **4.37×** |
+| 2048 | 256.000 | 120.069 | 0.846 | 128.663 | 249.577 | 60.871 | **4.10×** |
 
-**FlashAttention target.** Replace the 3-dispatch chain with a single
-tiled kernel that keeps `O(Br × Bc)` softmax state in shared memory,
-streams K/V blocks through registers, and never materialises the
-full scores tensor. Realistic gains: 2–4× at prefill `n_q ≥ 512`
-(eliminates the quadratic HBM roundtrip), modest at decode (saves
-~1–2 ms/layer at `n_kv ≥ 8192`). Re-run `--attn-bench` post-FA to
-fill in the right column.
+`scoresMB` is the per-layer fp32 scores buffer the 3-pass path
+materialises (`rows × n_kv × 4B`). At prefill `n_q=2048` that's
+**256 MB per layer × 28 = 7.2 GB shuttled per forward** — bigger
+than any `.lvkpt` checkpoint we ship. `fa_forward` keeps the same
+state in `O(Br × Bc) = O(BC)` shared memory and never round-trips
+through HBM.
+
+**Headline.** FlashAttention is a clean **4–4.8× win across all
+prefill shapes** — full forward at `n_q=2048` drops from 6.9 s to
+1.7 s on a 28-layer Qwen3-0.6B forward. This is the regime that
+matters for training and for `--chat` long-prompt prefill.
+
+**Decode beyond `n_kv ≥ 2048` is currently *slower* on FA**, despite
+saving the scores roundtrip. Reason is parallelism: decode dispatches
+only `n_heads = 16` workgroups (one per query-head), each iterating
+all K/V tiles serially. The 3-pass `attn_scores` kernel dispatches
+`n_heads × n_kv = 524288` WGs at `n_kv=32768` — saturating the SMs
+even at fragmentary per-WG work. FA's tiled kernel becomes work-bound
+per-WG once `n_kv` is large enough. The textbook fix is **split-K**
+(FlashDecoding, Tri Dao 2023): partition the K dimension across
+several WGs per `(q, h)` and merge their partial `(O, m, l)` triples
+in a second pass. That's a future F-chunk; for now, the production
+path keeps the 3-pass chain at decode and switches to FA only for
+prefill / training.

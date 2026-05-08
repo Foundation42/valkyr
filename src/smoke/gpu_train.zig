@@ -2034,6 +2034,13 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
     defer buf_softmax_out.deinit(ctx.device);
     var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, out_max_elems * @sizeOf(f32));
     defer buf_out.deinit(ctx.device);
+    // FlashAttention LSE binding — sized to the largest n_q × n_heads
+    // we'll dispatch. write_lse is set to 0 in the bench so the kernel
+    // never writes here, but Vulkan still needs a valid resolved
+    // descriptor.
+    const lse_max_elems: usize = @as(usize, prefill_max_q) * n_heads;
+    var buf_lse = try buffer.Buffer.initDeviceOnly(&ctx, lse_max_elems * @sizeOf(f32));
+    defer buf_lse.deinit(ctx.device);
 
     // ── Pipelines (built once, rebound per case).
     var k_scores = try pipeline.Kernel.init(&ctx, &shaders.attn_scores, 3, @sizeOf(runtime.AttnScoresPush));
@@ -2046,12 +2053,15 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
     defer k_scores_t.deinit();
     var k_attn_out_t = try pipeline.Kernel.init(&ctx, &shaders.attn_output_train, 3, @sizeOf(runtime.AttnOutputTrainPush));
     defer k_attn_out_t.deinit();
+    var k_fa = try pipeline.Kernel.init(&ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
+    defer k_fa.deinit();
 
     try k_scores.bind(&.{ &buf_q, &buf_k, &buf_scores });
     try k_softmax.bind(&.{ &buf_scores, &buf_softmax_out });
     try k_attn_out.bind(&.{ &buf_softmax_out, &buf_v, &buf_out });
     try k_scores_t.bind(&.{ &buf_q, &buf_k, &buf_scores });
     try k_attn_out_t.bind(&.{ &buf_softmax_out, &buf_v, &buf_out });
+    try k_fa.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_out, &buf_lse });
 
     const ns_per_ms: f64 = 1.0e6;
 
@@ -2080,8 +2090,8 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
     // ── Decode (n_q=1) ────────────────────────────────────────────────
     std.debug.print(
         "\n── Decode (n_q=1, no causal mask) ─────────────────────────────────────\n" ++
-            "  {s:>6}  {s:>10}  {s:>14}  {s:>10}  {s:>14}  {s:>10}  {s:>13}\n",
-        .{ "n_kv", "scoresMB", "attn_scores", "softmax", "attn_output", "total/L", "×28 layers" },
+            "  {s:>6}  {s:>10}  {s:>9}  {s:>9}  {s:>9}  {s:>10}  {s:>9}  {s:>8}\n",
+        .{ "n_kv", "scoresMB", "scores", "softmax", "attn_out", "3-pass/L", "fa_fwd/L", "speedup" },
     );
 
     for (decode_kvs) |n_kv| {
@@ -2106,30 +2116,46 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
             .kv_stride = n_kv_heads * head_dim,
             .scores_stride = n_kv,
         };
+        const push_fa = runtime.FaForwardPush{
+            .n_q = 1,
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_kv = n_kv,
+            .kv_stride = n_kv_heads * head_dim,
+            .causal = 0,
+            .write_lse = 0,
+            .inv_sqrt_dim = inv_sqrt,
+        };
         const gx_scores: u32 = n_heads * n_kv;
         const gx_softmax: u32 = n_heads;
         const gx_out: u32 = n_heads * head_dim;
+        const gx_fa: u32 = n_heads;
 
         _ = try Run.one(&ctx, &k_scores, push_scores, gx_scores, warmup_iters);
         _ = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, warmup_iters);
         _ = try Run.one(&ctx, &k_attn_out, push_attn_out, gx_out, warmup_iters);
+        _ = try Run.one(&ctx, &k_fa, push_fa, gx_fa, warmup_iters);
 
         const t_s = try Run.one(&ctx, &k_scores, push_scores, gx_scores, bench_iters);
         const t_sm = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, bench_iters);
         const t_o = try Run.one(&ctx, &k_attn_out, push_attn_out, gx_out, bench_iters);
-        const t_total = (t_s + t_sm + t_o) / ns_per_ms;
+        const t_fa = try Run.one(&ctx, &k_fa, push_fa, gx_fa, bench_iters);
+        const t_3pass = (t_s + t_sm + t_o) / ns_per_ms;
+        const t_fa_ms = t_fa / ns_per_ms;
+        const speedup = if (t_fa_ms > 0) t_3pass / t_fa_ms else 0;
 
         std.debug.print(
-            "  {d:>6}  {d:>10.3}  {d:>11.3} ms  {d:>7.3} ms  {d:>11.3} ms  {d:>7.3} ms  {d:>10.2} ms\n",
-            .{ n_kv, scores_mb, t_s / ns_per_ms, t_sm / ns_per_ms, t_o / ns_per_ms, t_total, t_total * @as(f64, @floatFromInt(n_layers)) },
+            "  {d:>6}  {d:>10.3}  {d:>6.3}ms  {d:>6.3}ms  {d:>6.3}ms  {d:>7.3}ms  {d:>6.3}ms  {d:>6.2}×\n",
+            .{ n_kv, scores_mb, t_s / ns_per_ms, t_sm / ns_per_ms, t_o / ns_per_ms, t_3pass, t_fa_ms, speedup },
         );
     }
 
     // ── Prefill causal (n_q == n_kv) ──────────────────────────────────
     std.debug.print(
         "\n── Prefill causal (n_q == n_kv) ───────────────────────────────────────\n" ++
-            "  {s:>6}  {s:>10}  {s:>14}  {s:>10}  {s:>14}  {s:>10}  {s:>13}\n",
-        .{ "n_q", "scoresMB", "scores_train", "softmax", "out_train", "total/L", "×28 layers" },
+            "  {s:>6}  {s:>10}  {s:>9}  {s:>9}  {s:>9}  {s:>10}  {s:>9}  {s:>8}\n",
+        .{ "n_q", "scoresMB", "scores_t", "softmax", "out_t", "3-pass/L", "fa_fwd/L", "speedup" },
     );
 
     for (prefill_kvs) |n_q| {
@@ -2158,29 +2184,46 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
             .kv_stride = n_kv_heads * head_dim,
             .attn_stride = n_kv,
         };
+        const push_fa = runtime.FaForwardPush{
+            .n_q = n_q,
+            .n_heads = n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_kv = n_kv,
+            .kv_stride = n_kv_heads * head_dim,
+            .causal = 1,
+            .write_lse = 0,
+            .inv_sqrt_dim = inv_sqrt,
+        };
         const gx_scores_t: u32 = n_q * n_heads * n_kv;
         const gx_softmax: u32 = n_q * n_heads;
         const gx_out_t: u32 = n_q * n_heads * head_dim;
+        const gx_fa: u32 = n_q * n_heads;
 
         _ = try Run.one(&ctx, &k_scores_t, push_scores_t, gx_scores_t, warmup_iters);
         _ = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, warmup_iters);
         _ = try Run.one(&ctx, &k_attn_out_t, push_attn_out_t, gx_out_t, warmup_iters);
+        _ = try Run.one(&ctx, &k_fa, push_fa, gx_fa, warmup_iters);
 
         const t_s = try Run.one(&ctx, &k_scores_t, push_scores_t, gx_scores_t, bench_iters);
         const t_sm = try Run.one(&ctx, &k_softmax, push_softmax, gx_softmax, bench_iters);
         const t_o = try Run.one(&ctx, &k_attn_out_t, push_attn_out_t, gx_out_t, bench_iters);
-        const t_total = (t_s + t_sm + t_o) / ns_per_ms;
+        const t_fa = try Run.one(&ctx, &k_fa, push_fa, gx_fa, bench_iters);
+        const t_3pass = (t_s + t_sm + t_o) / ns_per_ms;
+        const t_fa_ms = t_fa / ns_per_ms;
+        const speedup = if (t_fa_ms > 0) t_3pass / t_fa_ms else 0;
 
         std.debug.print(
-            "  {d:>6}  {d:>10.3}  {d:>11.3} ms  {d:>7.3} ms  {d:>11.3} ms  {d:>7.3} ms  {d:>10.2} ms\n",
-            .{ n_q, scores_mb, t_s / ns_per_ms, t_sm / ns_per_ms, t_o / ns_per_ms, t_total, t_total * @as(f64, @floatFromInt(n_layers)) },
+            "  {d:>6}  {d:>10.3}  {d:>6.3}ms  {d:>6.3}ms  {d:>6.3}ms  {d:>7.3}ms  {d:>6.3}ms  {d:>6.2}×\n",
+            .{ n_q, scores_mb, t_s / ns_per_ms, t_sm / ns_per_ms, t_o / ns_per_ms, t_3pass, t_fa_ms, speedup },
         );
     }
 
     std.debug.print(
         "\n  scoresMB column = per-layer fp32 scores buffer (rows × n_kv × 4B / 2^20).\n" ++
-            "  ×28 layers = total/L extrapolated to Qwen3-0.6B's full attention stack.\n" ++
-            "  These are the totals FlashAttention has to beat at the same shapes.\n",
+            "  3-pass/L = attn_scores + softmax + attn_output (or _train variants for prefill).\n" ++
+            "  fa_fwd/L = single fa_forward dispatch — same math, online softmax in shared mem.\n" ++
+            "  speedup  = 3-pass / fa_forward at the per-layer level.\n",
         .{},
     );
 }
