@@ -43,7 +43,9 @@ The two big arcs:
      side, orthogonal to Q4_0/Q4_K. Combined with `--tq4v` gets
      Gemma 2B into a few hundred MiB total.
    - **Training stack** — v0 **shipped**, Tier-1 **shipped**, **Tier-2
-     transformer fine-tune arc shipped 2026-05-06**. The 2-layer-MLP
+     transformer fine-tune arc shipped 2026-05-06**, **Tier-3 (multi-step
+    + checkpoint save/load + sampled-text-shift validation) shipped
+    2026-05-08**. The 2-layer-MLP
      surface (cooperative attach, batched mean-gradient SGD/Adam,
      MSE/CE loss heads, loss-target decay, host-mapped predict
      staging) lives at `src/train/runner.zig` with parity smokes
@@ -65,9 +67,19 @@ The two big arcs:
      packs JSONL examples with EOS separators into (n_pos+1) windows,
      and `train_transformer.Runner.step` drives one Adam step that
      drops batch CE 2.78 → 1.28 nats in ~330 ms (lr=1e-5, n_pos=16,
-     ReleaseFast). **Next tier:** Tier-3 = multi-step training loop
-     + checkpoint persistence (params + Adam m/v) + sampled-text-shift
-     validation. See
+     ReleaseFast). **Tier-3** closed the loop: multi-step training holds
+     past step 1 (CE 2.78 → 0.0005 / 99.98% drop in 30 steps on a single
+     batch); `.vkpt` checkpoint save/load round-trips with bit-equal
+     trajectories at toy scale (new `Buffer.uploadFromHost` +
+     `Runner.saveCheckpoint`/`loadCheckpoint` — header + Config + raw
+     fp32 body for params + Adam m/v + step_t); and a sampled-text-shift
+     smoke shows the post-train model literally regurgitating
+     `tiny_facts.jsonl` batch 0 ("*Paris. Paris sits on the river Seine
+     and is famous for...*") where the pre-train base model gives a
+     generic capital-listing. **Next tier:** Tier-4 = multi-batch
+     training loop (rotate batches across dataset), real-model checkpoint
+     stress (7.4 GB at Qwen3-0.6B fp32), and an Unsloth-equivalent
+     fine-tune driver. See
      [embedding.md § Embedding training](embedding.md#embedding-training).
    - **Architectural blueprints (ONNX / JSON-spec).** Once the
      primitive set has stabilised through the transformer-training
