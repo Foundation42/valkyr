@@ -222,13 +222,22 @@ pub const Runner = struct {
     k_attn_output: pipeline.Kernel,
     k_softmax: pipeline.Kernel,
     k_softmax_bw: pipeline.Kernel,
-    /// FlashAttention forward (single fused kernel). Used by the
-    /// inference path (`forwardLogits`) when `attn_use_fa == true`;
-    /// the training path (`step`) keeps the 3-pass chain because
-    /// backward needs the materialised attn matrix saved per layer.
-    /// Capped at head_dim ≤ 128 (shader compile-time limit); falls
-    /// back to the 3-pass chain for larger heads.
+    /// FlashAttention forward (single fused kernel). Used by both
+    /// `Runner.step` (training, with `write_lse = 1` so the FA-2
+    /// backward can recompute the softmax inline) and
+    /// `forwardLogits` (inference, `write_lse = 0`) when
+    /// `attn_use_fa == true`. Capped at head_dim ≤ 128 (shader
+    /// compile-time limit); falls back to the 3-pass chain for
+    /// larger heads.
     k_fa_forward: pipeline.Kernel,
+    /// FlashAttention-2 backward chain — replaces the 5-kernel 3-pass
+    /// (`attn_dattn → attn_dv → softmax_bw → attn_dq → attn_dk`) when
+    /// `attn_use_fa == true`. Phase 1 reduces D[q, h] = Σ_d O · dO,
+    /// phase 2 accumulates dQ tile-on-K, phase 3 accumulates dK + dV
+    /// tile-on-Q with the GQA fold inside.
+    k_fa_bw_d: pipeline.Kernel,
+    k_fa_bw_dq: pipeline.Kernel,
+    k_fa_bw_dkv: pipeline.Kernel,
     k_attn_dattn: pipeline.Kernel,
     k_attn_dv: pipeline.Kernel,
     k_attn_dq: pipeline.Kernel,
@@ -373,10 +382,17 @@ pub const Runner = struct {
 
     // ── Shared scratch (forward + backward).
     sc_scores: buffer.Buffer,
-    /// FA forward LSE binding scratch [n_pos × n_heads]. Required for
-    /// descriptor population even though `forwardLogits` keeps
-    /// `write_lse = 0` (FA backward will use this slot when F6 lands).
-    buf_fa_lse: buffer.Buffer,
+    /// Per-layer FA forward LSE buffer [n_pos × n_heads]. Populated
+    /// by forward (`write_lse = 1` in training so the FA-2 backward
+    /// can recompute softmax inline; `write_lse = 0` for inference).
+    /// Per-layer because Runner.step records every forward layer
+    /// before any backward — a single buffer would be overwritten
+    /// by later layers.
+    buf_fa_lse: []buffer.Buffer,
+    /// Per-layer FA backward phase-1 output [n_pos × n_heads]. Holds
+    /// `D[q, h] = Σ_d O · dO`; consumed by phases 2 and 3 of the
+    /// same layer's backward.
+    buf_fa_d: []buffer.Buffer,
     sc_o: buffer.Buffer,
     sc_ff_out: buffer.Buffer,
     sc_q_pre: buffer.Buffer, // pre-RoPE Q (matmul/rmsnorm output, RoPE input)
@@ -424,7 +440,16 @@ pub const Runner = struct {
     push_mm_lm_head: runtime.MatmulPush,
     push_attn_scores: runtime.AttnScoresTrainPush,
     push_attn_output: runtime.AttnOutputTrainPush,
+    /// FA forward push for inference (`forwardLogits` /
+    /// `forward_only=true`); `write_lse = 0`.
     push_fa_forward: runtime.FaForwardPush,
+    /// FA forward push for training (`step` / `forward_only=false`);
+    /// `write_lse = 1` so phase-1/2/3 backward can recompute softmax
+    /// from saved LSE.
+    push_fa_forward_train: runtime.FaForwardPush,
+    push_fa_bw_d: runtime.FaBwDPush,
+    push_fa_bw_dq: runtime.FaBwDqPush,
+    push_fa_bw_dkv: runtime.FaBwDkvPush,
     /// True when `head_dim ≤ HEAD_DIM_MAX` (128 — shader compile-time
     /// cap). When false, the FA path falls back to the 3-pass chain
     /// even in `forwardLogits`. Computed once at init from `cfg`.
@@ -513,6 +538,12 @@ pub const Runner = struct {
         errdefer k_softmax_bw.deinit();
         var k_fa_forward = try pipeline.Kernel.init(ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
         errdefer k_fa_forward.deinit();
+        var k_fa_bw_d = try pipeline.Kernel.init(ctx, &shaders.fa_bw_d, 3, @sizeOf(runtime.FaBwDPush));
+        errdefer k_fa_bw_d.deinit();
+        var k_fa_bw_dq = try pipeline.Kernel.init(ctx, &shaders.fa_bw_dq, 7, @sizeOf(runtime.FaBwDqPush));
+        errdefer k_fa_bw_dq.deinit();
+        var k_fa_bw_dkv = try pipeline.Kernel.init(ctx, &shaders.fa_bw_dkv, 8, @sizeOf(runtime.FaBwDkvPush));
+        errdefer k_fa_bw_dkv.deinit();
         var k_attn_dattn = try pipeline.Kernel.init(ctx, &shaders.attn_backward_dattn, 3, @sizeOf(runtime.AttnBackwardDattnPush));
         errdefer k_attn_dattn.deinit();
         var k_attn_dv = try pipeline.Kernel.init(ctx, &shaders.attn_backward_dv, 3, @sizeOf(runtime.AttnBackwardDvPush));
@@ -652,12 +683,27 @@ pub const Runner = struct {
         // ── Shared scratch.
         const sc_scores = try buffer.Buffer.initDeviceOnly(ctx, scores_total * f32sz);
         errdefer @constCast(&sc_scores).deinit(ctx.device);
-        // FA LSE binding [n_pos × n_heads] — small (kilobytes), always
-        // allocated even if `forwardLogits` doesn't write to it; F6
-        // backward will read it.
+        // Per-layer FA LSE + D buffers — sized [n_pos × n_heads] each.
+        // Total at Qwen3-0.6B max_pos=2048: 28 layers × 2048 × 16 × 4B
+        // × 2 = 7.3 MB. Cheap relative to weights.
         const fa_lse_total: usize = @as(usize, cfg.n_pos) * cfg.n_heads;
-        const buf_fa_lse = try buffer.Buffer.initDeviceOnly(ctx, fa_lse_total * f32sz);
-        errdefer @constCast(&buf_fa_lse).deinit(ctx.device);
+        const buf_fa_lse = try allocator.alloc(buffer.Buffer, n_layers);
+        errdefer allocator.free(buf_fa_lse);
+        const buf_fa_d = try allocator.alloc(buffer.Buffer, n_layers);
+        errdefer allocator.free(buf_fa_d);
+        var fa_alloc_count: usize = 0;
+        errdefer {
+            var ii: usize = 0;
+            while (ii < fa_alloc_count) : (ii += 1) {
+                buf_fa_lse[ii].deinit(ctx.device);
+                buf_fa_d[ii].deinit(ctx.device);
+            }
+        }
+        for (0..n_layers) |li| {
+            buf_fa_lse[li] = try buffer.Buffer.initDeviceOnly(ctx, fa_lse_total * f32sz);
+            buf_fa_d[li]   = try buffer.Buffer.initDeviceOnly(ctx, fa_lse_total * f32sz);
+            fa_alloc_count = li + 1;
+        }
         const sc_o = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&sc_o).deinit(ctx.device);
         const sc_ff_out = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
@@ -782,6 +828,37 @@ pub const Runner = struct {
             .write_lse = 0,
             .inv_sqrt_dim = inv_sqrt_d,
         };
+        // Same as `push_fa_forward` but with `write_lse = 1` so the FA-2
+        // backward can recompute softmax from the saved LSE row. Used by
+        // `step` (training) only.
+        var push_fa_forward_train = push_fa_forward;
+        push_fa_forward_train.write_lse = 1;
+        const push_fa_bw_d = runtime.FaBwDPush{
+            .n_q = cfg.n_pos,
+            .n_heads = cfg.n_heads,
+            .head_dim = cfg.head_dim,
+        };
+        const push_fa_bw_dq = runtime.FaBwDqPush{
+            .n_q = cfg.n_pos,
+            .n_heads = cfg.n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cfg.head_dim,
+            .n_kv = cfg.n_pos,
+            .kv_stride = @intCast(kv_dim),
+            .causal = if (cfg.causal) 1 else 0,
+            .inv_sqrt_dim = inv_sqrt_d,
+        };
+        const push_fa_bw_dkv = runtime.FaBwDkvPush{
+            .n_q = cfg.n_pos,
+            .n_kv = cfg.n_pos,
+            .n_heads = cfg.n_heads,
+            .n_kv_heads = cfg.n_kv_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cfg.head_dim,
+            .kv_stride = @intCast(kv_dim),
+            .causal = if (cfg.causal) 1 else 0,
+            .inv_sqrt_dim = inv_sqrt_d,
+        };
         // HEAD_DIM_MAX = 128 in shaders/fa_forward.comp; larger heads
         // (Qwen3.5 d=256) take the 3-pass fallback until a Bc=8 variant
         // ships.
@@ -865,6 +942,9 @@ pub const Runner = struct {
             .k_softmax = k_softmax,
             .k_softmax_bw = k_softmax_bw,
             .k_fa_forward = k_fa_forward,
+            .k_fa_bw_d = k_fa_bw_d,
+            .k_fa_bw_dq = k_fa_bw_dq,
+            .k_fa_bw_dkv = k_fa_bw_dkv,
             .k_attn_dattn = k_attn_dattn,
             .k_attn_dv = k_attn_dv,
             .k_attn_dq = k_attn_dq,
@@ -970,6 +1050,7 @@ pub const Runner = struct {
             .buf_d_x_in = per_layer.d_x_in,
             .sc_scores = sc_scores,
             .buf_fa_lse = buf_fa_lse,
+            .buf_fa_d = buf_fa_d,
             .sc_o = sc_o,
             .sc_ff_out = sc_ff_out,
             .sc_q_pre = sc_q_pre,
@@ -1012,6 +1093,10 @@ pub const Runner = struct {
             .push_attn_scores = push_attn_scores,
             .push_attn_output = push_attn_output,
             .push_fa_forward = push_fa_forward,
+            .push_fa_forward_train = push_fa_forward_train,
+            .push_fa_bw_d = push_fa_bw_d,
+            .push_fa_bw_dq = push_fa_bw_dq,
+            .push_fa_bw_dkv = push_fa_bw_dkv,
             .attn_use_fa = attn_use_fa,
             .push_rope_qk = push_rope_qk,
             .push_rms_qk = push_rms_qk,
@@ -1092,7 +1177,10 @@ pub const Runner = struct {
 
         // Shared scratch.
         self.sc_scores.deinit(dev);
-        self.buf_fa_lse.deinit(dev);
+        for (self.buf_fa_lse) |*b| b.deinit(dev);
+        for (self.buf_fa_d) |*b| b.deinit(dev);
+        self.allocator.free(self.buf_fa_lse);
+        self.allocator.free(self.buf_fa_d);
         self.sc_o.deinit(dev);
         self.sc_ff_out.deinit(dev);
         self.sc_q_pre.deinit(dev);
@@ -1134,6 +1222,9 @@ pub const Runner = struct {
         self.k_softmax.deinit();
         self.k_softmax_bw.deinit();
         self.k_fa_forward.deinit();
+        self.k_fa_bw_d.deinit();
+        self.k_fa_bw_dq.deinit();
+        self.k_fa_bw_dkv.deinit();
         self.k_attn_dattn.deinit();
         self.k_attn_dv.deinit();
         self.k_attn_dq.deinit();
@@ -1739,16 +1830,23 @@ pub const Runner = struct {
             try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_q_pre, &self.buf_q[i], &self.sc_k_pre, &self.buf_k[i] }, &self.push_rope_qk, util.ceilDiv(qk_total, group_lin), 1, 1);
         }
         // 5-7. Attention. Two paths:
-        //   - forward_only && attn_use_fa : single fa_forward dispatch
-        //     (writes directly into buf_attn_out[i]; skips materialising
-        //     buf_attn[i], which is only needed by backward).
+        //   - attn_use_fa : single fa_forward dispatch. Writes
+        //     `buf_attn_out[i]`; emits `buf_fa_lse` when
+        //     `forward_only == false` (training) so the FA-2 backward
+        //     can recompute the softmax inline. Skips materialising
+        //     the [n_pos × n_heads × n_pos] `buf_attn[i]` entirely.
         //   - otherwise : the 3-pass chain (attn_scores → softmax →
-        //     attn_output) that saves buf_attn[i] for backward.
-        if (forward_only and self.attn_use_fa) {
+        //     attn_output) that saves `buf_attn[i]` for backward —
+        //     the head_dim > 128 fallback.
+        if (self.attn_use_fa) {
+            const fa_push: *const runtime.FaForwardPush = if (forward_only)
+                &self.push_fa_forward
+            else
+                &self.push_fa_forward_train;
             try self.rec.dispatch(
                 &self.k_fa_forward,
-                &.{ &self.buf_q[i], &self.buf_k[i], &self.buf_v[i], &self.buf_attn_out[i], &self.buf_fa_lse },
-                &self.push_fa_forward,
+                &.{ &self.buf_q[i], &self.buf_k[i], &self.buf_v[i], &self.buf_attn_out[i], &self.buf_fa_lse[i] },
+                fa_push,
                 cfg.n_pos * cfg.n_heads,
                 1,
                 1,
@@ -1889,12 +1987,28 @@ pub const Runner = struct {
         try self.rec.dispatch(&self.k_add, &.{ d_y_in, &self.sc_d_mid_norm }, &self.push_n_pos_dim, add_groups, 1, 1);
         // O projection backward (LoRA-aware).
         try self.recordProjBackward(.o, li, d_y_in, &self.buf_attn_out[i], &self.buf_w_o[i], &self.sc_d_attn_out, &self.buf_dw_o[i], &self.push_lin_o);
-        // SDPA backward.
-        try self.rec.dispatch(&self.k_attn_dattn, &.{ &self.sc_d_attn_out, &self.buf_v[i], &self.sc_d_attn }, &self.push_dattn, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
-        try self.rec.dispatch(&self.k_attn_dv, &.{ &self.buf_attn[i], &self.sc_d_attn_out, &self.sc_dV }, &self.push_dv, cfg.n_pos * cfg.n_kv_heads * cfg.head_dim, 1, 1);
-        try self.rec.dispatch(&self.k_softmax_bw, &.{ &self.sc_d_attn, &self.buf_attn[i], &self.sc_d_scores }, &self.push_softmax, cfg.n_pos * cfg.n_heads, 1, 1);
-        try self.rec.dispatch(&self.k_attn_dq, &.{ &self.sc_d_scores, &self.buf_k[i], &self.sc_dQ }, &self.push_dq, cfg.n_pos * cfg.n_heads * cfg.head_dim, 1, 1);
-        try self.rec.dispatch(&self.k_attn_dk, &.{ &self.sc_d_scores, &self.buf_q[i], &self.sc_dK }, &self.push_dk, cfg.n_pos * cfg.n_kv_heads * cfg.head_dim, 1, 1);
+        // SDPA backward. Two paths matching the forward gate:
+        //   - attn_use_fa : 3-kernel FA-2 backward (D + dQ + dKV).
+        //     Recomputes the softmax inline from the saved LSE, so
+        //     `buf_attn[i]` is never read on this path.
+        //   - otherwise   : 5-kernel 3-pass chain (head_dim > 128).
+        if (self.attn_use_fa) {
+            // Phase 1: D[q, h] = Σ_d O · dO. Reads buf_attn_out (the
+            // FA-forward `out`) and sc_d_attn_out (the gradient flowing
+            // in from the O-projection backward).
+            try self.rec.dispatch(&self.k_fa_bw_d, &.{ &self.buf_attn_out[i], &self.sc_d_attn_out, &self.buf_fa_d[i] }, &self.push_fa_bw_d, cfg.n_pos * cfg.n_heads, 1, 1);
+            // Phase 2: per-(q, h) dQ accumulation, tile-on-K.
+            try self.rec.dispatch(&self.k_fa_bw_dq, &.{ &self.buf_q[i], &self.buf_k[i], &self.buf_v[i], &self.sc_d_attn_out, &self.buf_fa_lse[i], &self.buf_fa_d[i], &self.sc_dQ }, &self.push_fa_bw_dq, cfg.n_pos * cfg.n_heads, 1, 1);
+            // Phase 3: per-(k, kv_h) dK + dV accumulation, tile-on-Q
+            // with the GQA fold over heads_per_kv inside the WG.
+            try self.rec.dispatch(&self.k_fa_bw_dkv, &.{ &self.buf_q[i], &self.buf_k[i], &self.buf_v[i], &self.sc_d_attn_out, &self.buf_fa_lse[i], &self.buf_fa_d[i], &self.sc_dK, &self.sc_dV }, &self.push_fa_bw_dkv, cfg.n_pos * cfg.n_kv_heads, 1, 1);
+        } else {
+            try self.rec.dispatch(&self.k_attn_dattn, &.{ &self.sc_d_attn_out, &self.buf_v[i], &self.sc_d_attn }, &self.push_dattn, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
+            try self.rec.dispatch(&self.k_attn_dv, &.{ &self.buf_attn[i], &self.sc_d_attn_out, &self.sc_dV }, &self.push_dv, cfg.n_pos * cfg.n_kv_heads * cfg.head_dim, 1, 1);
+            try self.rec.dispatch(&self.k_softmax_bw, &.{ &self.sc_d_attn, &self.buf_attn[i], &self.sc_d_scores }, &self.push_softmax, cfg.n_pos * cfg.n_heads, 1, 1);
+            try self.rec.dispatch(&self.k_attn_dq, &.{ &self.sc_d_scores, &self.buf_k[i], &self.sc_dQ }, &self.push_dq, cfg.n_pos * cfg.n_heads * cfg.head_dim, 1, 1);
+            try self.rec.dispatch(&self.k_attn_dk, &.{ &self.sc_d_scores, &self.buf_q[i], &self.sc_dK }, &self.push_dk, cfg.n_pos * cfg.n_kv_heads * cfg.head_dim, 1, 1);
+        }
 
         // RoPE backward: the dQ / dK from SDPA are gradients of the
         // post-RoPE Q / K. Inverting the rotation lands them as
