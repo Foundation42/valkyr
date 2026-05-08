@@ -222,6 +222,13 @@ pub const Runner = struct {
     k_attn_output: pipeline.Kernel,
     k_softmax: pipeline.Kernel,
     k_softmax_bw: pipeline.Kernel,
+    /// FlashAttention forward (single fused kernel). Used by the
+    /// inference path (`forwardLogits`) when `attn_use_fa == true`;
+    /// the training path (`step`) keeps the 3-pass chain because
+    /// backward needs the materialised attn matrix saved per layer.
+    /// Capped at head_dim ≤ 128 (shader compile-time limit); falls
+    /// back to the 3-pass chain for larger heads.
+    k_fa_forward: pipeline.Kernel,
     k_attn_dattn: pipeline.Kernel,
     k_attn_dv: pipeline.Kernel,
     k_attn_dq: pipeline.Kernel,
@@ -366,6 +373,10 @@ pub const Runner = struct {
 
     // ── Shared scratch (forward + backward).
     sc_scores: buffer.Buffer,
+    /// FA forward LSE binding scratch [n_pos × n_heads]. Required for
+    /// descriptor population even though `forwardLogits` keeps
+    /// `write_lse = 0` (FA backward will use this slot when F6 lands).
+    buf_fa_lse: buffer.Buffer,
     sc_o: buffer.Buffer,
     sc_ff_out: buffer.Buffer,
     sc_q_pre: buffer.Buffer, // pre-RoPE Q (matmul/rmsnorm output, RoPE input)
@@ -413,6 +424,11 @@ pub const Runner = struct {
     push_mm_lm_head: runtime.MatmulPush,
     push_attn_scores: runtime.AttnScoresTrainPush,
     push_attn_output: runtime.AttnOutputTrainPush,
+    push_fa_forward: runtime.FaForwardPush,
+    /// True when `head_dim ≤ HEAD_DIM_MAX` (128 — shader compile-time
+    /// cap). When false, the FA path falls back to the 3-pass chain
+    /// even in `forwardLogits`. Computed once at init from `cfg`.
+    attn_use_fa: bool,
     push_rope_qk: runtime.QkRopeBatchedPush,
     push_rms_qk: runtime.RmsnormPush, // dim = head_dim; same for q-norm + k-norm
     push_lin_lm_head: runtime.LinearBatchedPush,
@@ -495,6 +511,8 @@ pub const Runner = struct {
         errdefer k_softmax.deinit();
         var k_softmax_bw = try pipeline.Kernel.init(ctx, &shaders.softmax_backward, 3, @sizeOf(runtime.SoftmaxPush));
         errdefer k_softmax_bw.deinit();
+        var k_fa_forward = try pipeline.Kernel.init(ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
+        errdefer k_fa_forward.deinit();
         var k_attn_dattn = try pipeline.Kernel.init(ctx, &shaders.attn_backward_dattn, 3, @sizeOf(runtime.AttnBackwardDattnPush));
         errdefer k_attn_dattn.deinit();
         var k_attn_dv = try pipeline.Kernel.init(ctx, &shaders.attn_backward_dv, 3, @sizeOf(runtime.AttnBackwardDvPush));
@@ -634,6 +652,12 @@ pub const Runner = struct {
         // ── Shared scratch.
         const sc_scores = try buffer.Buffer.initDeviceOnly(ctx, scores_total * f32sz);
         errdefer @constCast(&sc_scores).deinit(ctx.device);
+        // FA LSE binding [n_pos × n_heads] — small (kilobytes), always
+        // allocated even if `forwardLogits` doesn't write to it; F6
+        // backward will read it.
+        const fa_lse_total: usize = @as(usize, cfg.n_pos) * cfg.n_heads;
+        const buf_fa_lse = try buffer.Buffer.initDeviceOnly(ctx, fa_lse_total * f32sz);
+        errdefer @constCast(&buf_fa_lse).deinit(ctx.device);
         const sc_o = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
         errdefer @constCast(&sc_o).deinit(ctx.device);
         const sc_ff_out = try buffer.Buffer.initDeviceOnly(ctx, n_pos * dim * f32sz);
@@ -747,6 +771,21 @@ pub const Runner = struct {
             .kv_stride = @intCast(kv_dim),
             .attn_stride = cfg.n_pos,
         };
+        const push_fa_forward = runtime.FaForwardPush{
+            .n_q = cfg.n_pos,
+            .n_heads = cfg.n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = cfg.head_dim,
+            .n_kv = cfg.n_pos,
+            .kv_stride = @intCast(kv_dim),
+            .causal = if (cfg.causal) 1 else 0,
+            .write_lse = 0,
+            .inv_sqrt_dim = inv_sqrt_d,
+        };
+        // HEAD_DIM_MAX = 128 in shaders/fa_forward.comp; larger heads
+        // (Qwen3.5 d=256) take the 3-pass fallback until a Bc=8 variant
+        // ships.
+        const attn_use_fa: bool = cfg.head_dim <= 128;
         const push_rope_qk = runtime.QkRopeBatchedPush{
             .n_pos = cfg.n_pos,
             .n_q_heads = cfg.n_heads,
@@ -825,6 +864,7 @@ pub const Runner = struct {
             .k_attn_output = k_attn_output,
             .k_softmax = k_softmax,
             .k_softmax_bw = k_softmax_bw,
+            .k_fa_forward = k_fa_forward,
             .k_attn_dattn = k_attn_dattn,
             .k_attn_dv = k_attn_dv,
             .k_attn_dq = k_attn_dq,
@@ -929,6 +969,7 @@ pub const Runner = struct {
             .buf_v_k_norm = per_layer.v_k_norm,
             .buf_d_x_in = per_layer.d_x_in,
             .sc_scores = sc_scores,
+            .buf_fa_lse = buf_fa_lse,
             .sc_o = sc_o,
             .sc_ff_out = sc_ff_out,
             .sc_q_pre = sc_q_pre,
@@ -970,6 +1011,8 @@ pub const Runner = struct {
             .push_mm_lm_head = push_mm_lm_head,
             .push_attn_scores = push_attn_scores,
             .push_attn_output = push_attn_output,
+            .push_fa_forward = push_fa_forward,
+            .attn_use_fa = attn_use_fa,
             .push_rope_qk = push_rope_qk,
             .push_rms_qk = push_rms_qk,
             .push_lin_lm_head = push_lin_lm_head,
@@ -1049,6 +1092,7 @@ pub const Runner = struct {
 
         // Shared scratch.
         self.sc_scores.deinit(dev);
+        self.buf_fa_lse.deinit(dev);
         self.sc_o.deinit(dev);
         self.sc_ff_out.deinit(dev);
         self.sc_q_pre.deinit(dev);
@@ -1089,6 +1133,7 @@ pub const Runner = struct {
         self.k_attn_output.deinit();
         self.k_softmax.deinit();
         self.k_softmax_bw.deinit();
+        self.k_fa_forward.deinit();
         self.k_attn_dattn.deinit();
         self.k_attn_dv.deinit();
         self.k_attn_dq.deinit();
@@ -1130,7 +1175,9 @@ pub const Runner = struct {
         try self.rec.reset();
         try self.rec.begin();
         try self.recordEmbedLookup();
-        for (0..cfg.n_layers) |li| try self.recordLayerForward(@intCast(li));
+        // step() runs the full forward-backward loop; backward consumes
+        // buf_attn[i] saved by the 3-pass chain, so forward_only=false.
+        for (0..cfg.n_layers) |li| try self.recordLayerForward(@intCast(li), false);
         try self.recordHeadForwardAndLossGrad();
         try self.recordHeadBackward();
         var li: usize = cfg.n_layers;
@@ -1188,7 +1235,10 @@ pub const Runner = struct {
         try self.rec.reset();
         try self.rec.begin();
         try self.recordEmbedLookup();
-        for (0..cfg.n_layers) |li| try self.recordLayerForward(@intCast(li));
+        // forwardLogits is forward-only (no backward), so when
+        // attn_use_fa the per-layer attention takes the single
+        // fa_forward dispatch instead of the 3-pass chain.
+        for (0..cfg.n_layers) |li| try self.recordLayerForward(@intCast(li), true);
         // final RMSNorm + lm_head matmul (without the loss-grad).
         const last_idx = cfg.n_layers - 1;
         try self.rec.dispatch(
@@ -1640,7 +1690,7 @@ pub const Runner = struct {
         );
     }
 
-    fn recordLayerForward(self: *Runner, li: u32) !void {
+    fn recordLayerForward(self: *Runner, li: u32, forward_only: bool) !void {
         const cfg = self.cfg;
         const x_in_buf: *const buffer.Buffer = if (li == 0) &self.buf_x_emb else &self.buf_y[li - 1];
         const i: usize = @intCast(li);
@@ -1688,12 +1738,29 @@ pub const Runner = struct {
             const qk_total: u32 = cfg.n_pos * (cfg.n_heads + cfg.n_kv_heads) * cfg.head_dim;
             try self.rec.dispatch(&self.k_rope_fwd, &.{ &self.sc_q_pre, &self.buf_q[i], &self.sc_k_pre, &self.buf_k[i] }, &self.push_rope_qk, util.ceilDiv(qk_total, group_lin), 1, 1);
         }
-        // 5. attention scores (causal mask via -inf).
-        try self.rec.dispatch(&self.k_attn_scores, &.{ &self.buf_q[i], &self.buf_k[i], &self.sc_scores }, &self.push_attn_scores, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
-        // 6. softmax.
-        try self.rec.dispatch(&self.k_softmax, &.{ &self.sc_scores, &self.buf_attn[i] }, &self.push_softmax, cfg.n_pos * cfg.n_heads, 1, 1);
-        // 7. attention output.
-        try self.rec.dispatch(&self.k_attn_output, &.{ &self.buf_attn[i], &self.buf_v[i], &self.buf_attn_out[i] }, &self.push_attn_output, cfg.n_pos * cfg.n_heads * cfg.head_dim, 1, 1);
+        // 5-7. Attention. Two paths:
+        //   - forward_only && attn_use_fa : single fa_forward dispatch
+        //     (writes directly into buf_attn_out[i]; skips materialising
+        //     buf_attn[i], which is only needed by backward).
+        //   - otherwise : the 3-pass chain (attn_scores → softmax →
+        //     attn_output) that saves buf_attn[i] for backward.
+        if (forward_only and self.attn_use_fa) {
+            try self.rec.dispatch(
+                &self.k_fa_forward,
+                &.{ &self.buf_q[i], &self.buf_k[i], &self.buf_v[i], &self.buf_attn_out[i], &self.buf_fa_lse },
+                &self.push_fa_forward,
+                cfg.n_pos * cfg.n_heads,
+                1,
+                1,
+            );
+        } else {
+            // 5. attention scores (causal mask via -inf).
+            try self.rec.dispatch(&self.k_attn_scores, &.{ &self.buf_q[i], &self.buf_k[i], &self.sc_scores }, &self.push_attn_scores, cfg.n_pos * cfg.n_heads * cfg.n_pos, 1, 1);
+            // 6. softmax.
+            try self.rec.dispatch(&self.k_softmax, &.{ &self.sc_scores, &self.buf_attn[i] }, &self.push_softmax, cfg.n_pos * cfg.n_heads, 1, 1);
+            // 7. attention output.
+            try self.rec.dispatch(&self.k_attn_output, &.{ &self.buf_attn[i], &self.buf_v[i], &self.buf_attn_out[i] }, &self.push_attn_output, cfg.n_pos * cfg.n_heads * cfg.head_dim, 1, 1);
+        }
         // 8. O projection (LoRA-aware).
         try self.recordProjForward(.o, li, &self.buf_attn_out[i], &self.buf_w_o[i], &self.sc_o, &self.push_mm_o);
         // 9. mid = x_in + o (residual).

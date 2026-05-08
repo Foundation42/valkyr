@@ -2405,6 +2405,148 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── F4: Runner.forwardLogits with FA matches the 3-pass chain ─────────
+//
+// End-to-end gate that the FA path inside `recordLayerForward`
+// produces the same logits as the original 3-pass attention chain.
+// Builds one toy Runner (n_heads=4 GQA 2:1, head_dim=8 → small enough
+// for fast init, head_dim ≤ HEAD_DIM_MAX so attn_use_fa=true), runs
+// forwardLogits twice with `attn_use_fa` toggled between true and
+// false, and compares logits at 1e-4 rel-err. Reduction-order
+// divergence between the cooperative-subgroup FA kernel and the
+// 3-pass chain's serial accumulators means bit-equality is not
+// expected.
+
+pub fn runFaRunnerSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Toy decoder shape — same as the LoRA-Q smoke. head_dim=8 lands
+    // well inside HEAD_DIM_MAX=128, so `attn_use_fa` defaults to true.
+    const dim: u32 = 32;
+    const n_heads: u32 = 4;
+    const n_kv_heads: u32 = 2;
+    const head_dim: u32 = 8;
+    const ff_dim: u32 = 64;
+    const n_pos: u32 = 8;
+    const n_layers: u32 = 2;
+    const vocab: u32 = 64;
+
+    var prng = std.Random.DefaultPrng.init(0xFA_4_F4_F4);
+    const rng = prng.random();
+
+    const w_embed = try allocator.alloc(f32, vocab * dim);
+    defer allocator.free(w_embed);
+    const w_final_norm = try allocator.alloc(f32, dim);
+    defer allocator.free(w_final_norm);
+    const w_lm_head = try allocator.alloc(f32, vocab * dim);
+    defer allocator.free(w_lm_head);
+    for (w_embed) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+    for (w_final_norm) |*v| v.* = 1.0;
+    for (w_lm_head) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+
+    const q_dim: u32 = n_heads * head_dim;
+    const kv_dim: u32 = n_kv_heads * head_dim;
+    const layers = try allocator.alloc(train_transformer.LayerWeights, n_layers);
+    defer allocator.free(layers);
+
+    var layer_storage = std.ArrayList([]f32).init(allocator);
+    defer {
+        for (layer_storage.items) |s| allocator.free(s);
+        layer_storage.deinit();
+    }
+    const allocLayerSlice = struct {
+        fn f(al: std.mem.Allocator, store: *std.ArrayList([]f32), n: usize, r: std.Random, scale: f32, fill_with: ?f32) ![]f32 {
+            const s = try al.alloc(f32, n);
+            if (fill_with) |c| {
+                for (s) |*v| v.* = c;
+            } else {
+                for (s) |*v| v.* = (r.float(f32) - 0.5) * scale;
+            }
+            try store.append(s);
+            return s;
+        }
+    }.f;
+
+    for (0..n_layers) |li| {
+        layers[li] = .{
+            .w_n1 = try allocLayerSlice(allocator, &layer_storage, dim, rng, 0, 1.0),
+            .w_q = try allocLayerSlice(allocator, &layer_storage, q_dim * dim, rng, 0.2, null),
+            .w_k = try allocLayerSlice(allocator, &layer_storage, kv_dim * dim, rng, 0.2, null),
+            .w_v = try allocLayerSlice(allocator, &layer_storage, kv_dim * dim, rng, 0.2, null),
+            .w_o = try allocLayerSlice(allocator, &layer_storage, dim * q_dim, rng, 0.2, null),
+            .w_n2 = try allocLayerSlice(allocator, &layer_storage, dim, rng, 0, 1.0),
+            .w_gate = try allocLayerSlice(allocator, &layer_storage, ff_dim * dim, rng, 0.2, null),
+            .w_up = try allocLayerSlice(allocator, &layer_storage, ff_dim * dim, rng, 0.2, null),
+            .w_down = try allocLayerSlice(allocator, &layer_storage, dim * ff_dim, rng, 0.2, null),
+        };
+    }
+
+    const token_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(token_ids);
+    for (token_ids) |*tid| tid.* = rng.intRangeLessThan(u32, 0, vocab);
+
+    const cfg: train_transformer.Config = .{
+        .dim = dim,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .ff_dim = ff_dim,
+        .n_pos = n_pos,
+        .n_layers = n_layers,
+        .vocab_size = vocab,
+        .lr = 1e-2,
+    };
+    const init_weights: train_transformer.InitWeights = .{
+        .embed = w_embed,
+        .final_norm = w_final_norm,
+        .lm_head = w_lm_head,
+        .layers = layers,
+    };
+
+    var runner = try train_transformer.Runner.init(allocator, &ctx, cfg, init_weights);
+    defer runner.deinit();
+
+    if (!runner.attn_use_fa) {
+        std.debug.print("FA Runner smoke: head_dim={d} too large for HEAD_DIM_MAX, FA branch unreachable — gate is vacuous\n", .{head_dim});
+        return error.ParityFailed;
+    }
+
+    const logits_fa = try allocator.alloc(f32, n_pos * vocab);
+    defer allocator.free(logits_fa);
+    const logits_3pass = try allocator.alloc(f32, n_pos * vocab);
+    defer allocator.free(logits_3pass);
+
+    // Run with FA on (default).
+    runner.attn_use_fa = true;
+    try runner.forwardLogits(token_ids, logits_fa);
+
+    // Force fallback to the 3-pass chain on the same Runner / weights.
+    runner.attn_use_fa = false;
+    try runner.forwardLogits(token_ids, logits_3pass);
+
+    var max_abs: f32 = 0;
+    var max_ref: f32 = 0;
+    for (logits_fa, logits_3pass) |a, b| {
+        const d = @abs(a - b);
+        if (d > max_abs) max_abs = d;
+        if (@abs(b) > max_ref) max_ref = @abs(b);
+    }
+    const rel = if (max_ref > 0) max_abs / max_ref else max_abs;
+    if (rel > 1e-4) {
+        std.debug.print(
+            "FA Runner parity FAIL: max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+            .{ max_abs, max_ref, rel },
+        );
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS Runner.forwardLogits FA vs 3-pass parity (toy {d}L head_dim={d} n_pos={d}, max rel={e:.2}) on {s}\n",
+        .{ n_layers, head_dim, n_pos, rel, ctx.deviceName() },
+    );
+}
+
 // ── GPU CCE backward d_h smoke: vs CPU oracle ─────────────────────────
 //
 // Drives `cce_backward_dh.comp` against the d_h output of
