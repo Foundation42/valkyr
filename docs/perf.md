@@ -122,3 +122,24 @@ the same gate. End-to-end parity gate `runFaDecodeChatPathSmoke`
 runs both paths through the production push values at Qwen3-0.6B
 shape and compares to **4.42e-7 max rel-err** across n_kv ∈
 {16, 64, 256, 1024} — five orders below the 1e-4 tolerance.
+
+**FA-2 backward (F6, 2026-05-08).** `Runner.step` (the training
+path) now dispatches the 3-kernel FA-2 backward chain in place of
+the 5-kernel 3-pass:
+
+  fa_bw_d   — `D[q, h] = Σ_d O · dO`            [n_q × n_heads WGs]
+  fa_bw_dq  — per-(q, h) dQ accumulation        [n_q × n_heads WGs]
+  fa_bw_dkv — per-(k, kv_h) dK + dV (GQA fold)  [n_kv × n_kv_heads WGs]
+
+Same `attn_use_fa = head_dim ≤ 128` gate as the forward — Qwen3.5
+d=256 keeps the 3-pass. Forward writes `LSE = m + log(l)` per
+(q, h) so backward recomputes the softmax inline; **the
+[n_pos × n_heads × n_pos] `buf_attn[i]` softmax matrix is never
+materialised on the FA path** — the 7.2 GB scores roundtrip the F1
+bench measured at `n_q=2048` evaporates from the forward, and the
+training step's backward inherits the same memory profile. Per-layer
+`buf_fa_lse[i]` + `buf_fa_d[i]` buffers (a few MB at typical
+shapes) carry the saved values across layers. Real-model parity vs
+the 3-pass on Qwen3-0.6B / n_pos=16: one-step CE 2.777821 → **1.280139**
+(vs 1.280140 with 3-pass — 6-decimal match), 30-step run 99.98%
+CE drop preserved, checkpoint round-trip bit-equal.

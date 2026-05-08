@@ -28,19 +28,31 @@ The two big arcs:
      deployments.
    - **Symmetric K=TQ / V=TQ** (with care — the softmax variance story
      means K-side needs eyes on PPL, not just argmax).
-   - **Fused FlashAttention-style kernel.** **Forward shipped 2026-05-08
-     across the F1-F5b arc.** `shaders/fa_forward.comp` (single fused
-     kernel, BC=16, HEAD_DIM ≤ 128) wired into `Runner.forwardLogits`
+   - **Fused FlashAttention-style kernel.** **Whole F-arc (F1-F6c)
+     shipped 2026-05-08.** Forward: `shaders/fa_forward.comp` (single
+     fused kernel, BC=16, HEAD_DIM ≤ 128) wired into both
+     `Runner.forwardLogits` (inference) and `Runner.step` (training)
      for **4-4.8× prefill speedup**; `shaders/fa_decode_split.comp` +
      `fa_decode_merge.comp` (Tri Dao FlashDecoding split-K) wired into
      `runtime.recordOneLayer` for chat decode at **7× speedup at
-     ctx=32768** (per-layer attention 5.0 ms → 0.7 ms). TQ4-V-cache
-     composes via the existing `dequant_v` buffer; hybrid Qwen3.5
-     (head_dim=256) auto-falls-back to the 3-pass chain. Outstanding:
-     **F6 (FA backward)** for the training-step swap, and a fused
-     kernel that consumes packed TQ4 K/V directly in the inner loop
-     (skipping the `dequant_v` materialisation) for the bandwidth
-     savings to land at long context.
+     ctx=32768** (per-layer attention 5.0 ms → 0.7 ms). Backward
+     (F6): `shaders/fa_bw_{d,dq,dkv}.comp` — 3-kernel FA-2 chain
+     (Dao 2023, Algorithm 4) replaces the 5-kernel 3-pass in
+     `Runner.step`. Forward writes `LSE = m + log(l)` and backward
+     recomputes the softmax inline, so the [n_pos × n_heads × n_pos]
+     `buf_attn[i]` matrix never materialises (the 7.2 GB scores
+     roundtrip the F1 bench measured at `n_q=2048` evaporates).
+     Real-model parity gate on Qwen3-0.6B/n_pos=16: one-step CE
+     2.777821 → **1.280139** (vs 1.280140 with 3-pass — 6-decimal
+     match), 30-step 99.98% CE drop preserved, checkpoint round-trip
+     bit-equal. TQ4-V-cache composes via the existing `dequant_v`
+     buffer; hybrid Qwen3.5 (head_dim=256) auto-falls-back to the
+     3-pass on the same `attn_use_fa` gate. Outstanding fused-FA
+     deepening: a kernel that consumes packed TQ4 K/V directly in
+     the inner loop (skipping the `dequant_v` materialisation) for
+     the bandwidth savings to land at long context, and a Bc=8 +
+     HEAD_DIM_MAX=256 shader variant that lifts the cap so Qwen3.5
+     joins the FA path.
    - **bf16 LM head + bf16 embedding** kernels — currently fp32, the
      LM head matmul is the single biggest dispatch we do.
    - **GPU-side compute quantize.** Q4_K_M upload is currently 4–6×
