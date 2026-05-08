@@ -62,6 +62,13 @@ pub fn main() !void {
         try smoke_decoder.runRealModelTrainStepSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--real-multi-step-smoke")) {
+        // β-6a multi-step training loop. Same setup as β-5 but runs 30
+        // Adam steps on the same batch, asserts CE drops ≥90%. Validates
+        // the loop holds together past step 1 (Adam state, no NaN bloom).
+        try smoke_decoder.runRealModelMultiStepSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--decoder-stack-train-smoke")) {
         // 200-step synthetic-stack convergence smoke. Stronger trajectory
         // gate than the one-step real-model smoke: asserts final/initial
@@ -650,6 +657,7 @@ pub fn main() !void {
     try smoke_decoder.runRealModelForwardSmoke(allocator);
     try smoke_decoder.runRealModelDatasetSmoke(allocator);
     try smoke_decoder.runRealModelTrainStepSmoke(allocator);
+    try smoke_decoder.runRealModelMultiStepSmoke(allocator);
     try smoke_decoder.runDecoderBackwardGpuParitySmoke(allocator);
     try smoke_decoder.runDecoderTrainGpuSmoke(allocator);
     try smoke_gpu_kernels.runGpuGegluSmoke(allocator);

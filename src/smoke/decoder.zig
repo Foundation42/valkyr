@@ -1,6 +1,7 @@
 //! Decoder + Real-model training smokes invoked via:
 //! - `--decoder-stack-train-smoke` (synthetic stack, 200-step convergence)
 //! - `--real-train-step-smoke` (Qwen3-0.6B, one Adam step asserts CE_after < CE_before)
+//! - `--real-multi-step-smoke` (Qwen3-0.6B, 30-step overfit gate; β-6a)
 //! - plus the no-arg fallthrough's CPU/GPU decoder fine-tune chain.
 //! Extracted from main.zig.
 
@@ -2189,6 +2190,120 @@ pub fn runRealModelTrainStepSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS real Qwen3-0.6B one-step train (n_pos={d} lr={e}; CE {d:.6} → {d:.6}, Δ={d:.6} ({d:.3}%); step={d:.1} ms)\n",
         .{ n_pos, lr, ce_before, ce_after, delta, rel_pct, step_ms },
+    );
+}
+
+// ── chunk 8c-β-6a: multi-step training loop ──────────────────────────
+//
+// Extends β-5 (one Adam step on real Qwen3-0.6B) to N steps on the same
+// batch, validating that the training loop stays healthy past step 1:
+//   - Adam state (m, v, t) updates correctly across iterations
+//   - no NaN bloom from gradient buildup or overflow
+//   - CE drops sharply on a single-batch overfit gate
+//
+// Same setup as β-5: load Qwen3-0.6B, build the dataset, take batch 0.
+// Then loop runner.step n_steps times on that one batch, measure CE
+// before and after via forwardLogits. Mid-training CE checks are
+// intentionally omitted — the per-call cost (~150 ms forward + 9 MB
+// readback) doubles the wallclock for limited diagnostic value when the
+// gate is "did final CE drop" not "did each step monotonically drop".
+//
+// Gate: ce_final < ce_init * 0.1 (90% drop minimum; β-5 already hits 54%
+// in one step, so 30 single-batch steps should easily clear this) and
+// CE is finite at every check.
+
+pub fn runRealModelMultiStepSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3-0.6B";
+    const jsonl_path = "data/train/tiny_facts.jsonl";
+    const n_pos: u32 = 16;
+    const eos_id: u32 = 151_645;
+    const lr: f32 = 1e-5;
+    const n_steps: u32 = 30;
+
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.HfModelNotInCache => {
+            std.debug.print("SKIP runRealModelMultiStepSmoke (Qwen3-0.6B not in HF cache)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    var weights = try train_load_real.loadTrainWeights(allocator, &cpu, n_pos);
+    defer weights.deinit();
+    var cfg = weights.cfg;
+    cfg.lr = lr;
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    var ds = try train_dataset.buildFromJsonl(allocator, &tok, jsonl_path, n_pos, eos_id);
+    defer ds.deinit();
+    if (ds.numBatches() == 0) return error.DatasetTooShort;
+
+    const input_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(input_ids);
+    const target_ids = try allocator.alloc(u32, n_pos);
+    defer allocator.free(target_ids);
+    try ds.batch(0, input_ids, target_ids);
+
+    const vocab: usize = cfg.vocab_size;
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var runner = try train_transformer.Runner.init(allocator, &ctx, cfg, weights.view());
+    defer runner.deinit();
+
+    const logits = try allocator.alloc(f32, @as(usize, n_pos) * vocab);
+    defer allocator.free(logits);
+
+    // ── CE before training.
+    try runner.forwardLogits(input_ids, logits);
+    const ce_init = computeMeanCe(logits, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_init)) {
+        std.debug.print("Multi-step smoke: CE_init not finite ({d})\n", .{ce_init});
+        return error.CeInitNotFinite;
+    }
+
+    // ── N Adam steps on the same batch.
+    var step_ns_total: i128 = 0;
+    for (0..n_steps) |_| {
+        const t_start = std.time.nanoTimestamp();
+        try runner.step(input_ids, target_ids);
+        const t_end = std.time.nanoTimestamp();
+        step_ns_total += t_end - t_start;
+    }
+    const mean_step_ns = @divTrunc(step_ns_total, @as(i128, n_steps));
+    const mean_step_ms: f64 = @as(f64, @floatFromInt(mean_step_ns)) / 1.0e6;
+
+    // ── CE after training.
+    try runner.forwardLogits(input_ids, logits);
+    const ce_final = computeMeanCe(logits, target_ids, n_pos, vocab);
+    if (!std.math.isFinite(ce_final)) {
+        std.debug.print(
+            "Multi-step smoke: CE_final not finite ({d}) after CE_init={d:.6}\n",
+            .{ ce_final, ce_init },
+        );
+        return error.CeFinalNotFinite;
+    }
+    if (ce_final >= ce_init * 0.1) {
+        std.debug.print(
+            "Multi-step smoke: CE did not converge enough (init={d:.6} final={d:.6}, ratio={d:.4} expected < 0.1) at lr={e} over {d} steps\n",
+            .{ ce_init, ce_final, ce_final / ce_init, lr, n_steps },
+        );
+        return error.CeDidNotConverge;
+    }
+
+    const drop_pct: f64 = 100.0 * @as(f64, ce_init - ce_final) / @as(f64, ce_init);
+    std.debug.print(
+        "PASS real Qwen3-0.6B multi-step train (n_steps={d} n_pos={d} lr={e}; CE {d:.6} → {d:.6}, drop {d:.2}%; {d:.1} ms/step)\n",
+        .{ n_steps, n_pos, lr, ce_init, ce_final, drop_pct, mean_step_ms },
     );
 }
 
