@@ -204,8 +204,27 @@ unchanged at ~142 tok/s — the FA win is small at n_kv ≤ 128 where
 matmul dominates, and matches the bench's 1.46× per-layer attention
 saving in absolute ms.)
 
-**Outstanding:** `runtime_hybrid.zig` (the Qwen3.5/3.6 hybrid path)
-still routes its full-attention layers through the 3-pass chain.
-Wiring `fa_decode_split` + `fa_decode_merge` into that module is
-the next chunk to make Qwen3.5 0.8B/4B see the same long-ctx win
-as Gemma 2B does today.
+**Hybrid wiring (E-arc, 2026-05-09 evening).** `runtime_hybrid.zig`
+(the Qwen3.5/3.6 hybrid path's full-attention layer body) now
+mirrors the dense `runtime.recordOneLayer` swap-in: TQ4-V dequant
+lifts above the attention dispatch, then `attn_use_fa` (set from
+`head_dim ≤ FA_HEAD_DIM_MAX = 256`) picks `fa_decode_split +
+fa_decode_merge` over the `scores → softmax → attn_out` trio. Same
+two SPIR-V variants (BC=16 d=128 / BC=8 d=256), same `chooseFa
+DecodeSplit` heuristic, same FA partial buffers (`fa_o_partial /
+fa_m_partial / fa_l_partial`) sized once at scratch init from
+`max_pos`. The Qwen3.5 q-gate (`sigmoid_mul` of `head_out` against
+`gate_attn`) sits downstream of attention so it composes unchanged.
+
+End-to-end gate on Qwen3.5 0.8B (n_heads=8 n_kv_heads=2 d=256, 24L
+hybrid):
+
+  --chat "What is the capital of France?"  →  "The capital of
+                                                France is **Paris**."
+                                                49 tok @ 53.7 tok/s
+  --chat /no_think long-prompt 512 tok      →  steady-state
+                                                52.9 tok/s
+
+The dense `--bench` harness doesn't run hybrid models (separate
+forward dispatcher) so steady-state numbers come from `--chat`
+which folds prefill into the tok/s figure.

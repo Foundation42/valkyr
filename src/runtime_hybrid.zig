@@ -85,10 +85,18 @@ pub const ChatKernels = struct {
     scores: pipeline.Kernel,
     softmax: pipeline.Kernel,
     attn_out: pipeline.Kernel,
+    /// FlashDecoding phase 1 — split-K decode kernel for full-attention
+    /// layers. Replaces the `scores → softmax → attn_out` trio when
+    /// `cfg.head_dim ≤ FA_HEAD_DIM_MAX`. SPIR-V variant picked by
+    /// `runtime.faDecodeSplitSpv(head_dim)` at init.
+    fa_decode_split: pipeline.Kernel,
+    /// FlashDecoding phase 2 — merge per-split (O, m, l) partials.
+    /// Paired with `fa_decode_split`.
+    fa_decode_merge: pipeline.Kernel,
     slice_copy: pipeline.Kernel,
     scale: pipeline.Kernel,
 
-    pub fn init(ctx: *const vk.Context, precision: gpu_model.Precision) !ChatKernels {
+    pub fn init(ctx: *const vk.Context, precision: gpu_model.Precision, head_dim: u32) !ChatKernels {
         // Mirrors the dense `ChatKernels.init`: precision-aware matmul
         // for the per-layer projections, separate selector for the LM
         // head — bf16 when any non-fp32 path is active. lm_head + embed
@@ -125,6 +133,8 @@ pub const ChatKernels = struct {
             .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
             .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
             .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
+            .fa_decode_split = try pipeline.Kernel.init(ctx, runtime.faDecodeSplitSpv(head_dim), 6, @sizeOf(runtime.FaDecodeSplitPush)),
+            .fa_decode_merge = try pipeline.Kernel.init(ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush)),
             .slice_copy = try pipeline.Kernel.init(ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush)),
             .scale = try pipeline.Kernel.init(ctx, &shaders.scale, 2, @sizeOf(ScalePush)),
         };
@@ -135,7 +145,8 @@ pub const ChatKernels = struct {
             "embed",            "rmsnorm",        "matmul",           "matmul_lm_head", "add",
             "swiglu",           "rope_partial",   "split_q_gate",     "sigmoid_mul",    "l2norm_per_head",
             "conv1d_update",    "rmsnorm_gated",  "gated_delta_step", "kv_write",       "scores",
-            "softmax",          "attn_out",       "slice_copy",       "scale",
+            "softmax",          "attn_out",       "fa_decode_split",  "fa_decode_merge",
+            "slice_copy",       "scale",
         }) |fname| {
             @field(self, fname).deinit();
         }
@@ -183,6 +194,14 @@ pub const Scratch = struct {
     head_out: buffer.Buffer,
     head_out_gated: buffer.Buffer,
     scores: buffer.Buffer,
+    /// FlashDecoding phase-1 partials. Sized for the worst-case
+    /// `n_q_heads × max_n_splits × head_dim` (and `n_q_heads ×
+    /// max_n_splits` for the m/l pair) `chooseFaDecodeSplit(max_pos)`
+    /// can produce. Only used on the FA path; the 3-pass fallback
+    /// leaves them untouched.
+    fa_o_partial: buffer.Buffer,
+    fa_m_partial: buffer.Buffer,
+    fa_l_partial: buffer.Buffer,
     /// Shared TQ4-V dequant scratch — sized for one full V history at
     /// `max_pos`, reused across all full-attn layers. Only allocated
     /// when the host is using TQ4 V-cache; otherwise `null`.
@@ -201,6 +220,19 @@ pub const Scratch = struct {
         const conv_dim = cfg.linearAttnConvDim();
         const value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
         const key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+
+        // Worst-case FlashDecoding split count — mirrors the heuristic
+        // in `runtime.chooseFaDecodeSplit` applied to `max_pos`. Inlined
+        // (rather than calling through) to keep this scratch allocator
+        // independent of the per-step push-compute path.
+        const max_n_splits: u32 = if (max_pos <= 4)
+            1
+        else if (max_pos < 1024)
+            4
+        else
+            (max_pos + 255) / 256;
+        const o_partial_elems: usize = n_q * @as(usize, max_n_splits) * head_dim;
+        const ml_partial_elems: usize = n_q * @as(usize, max_n_splits);
         return .{
             .stream          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
             .x_norm          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
@@ -234,6 +266,9 @@ pub const Scratch = struct {
             .head_out        = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
             .head_out_gated  = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
             .scores          = try buffer.Buffer.initDeviceOnly(ctx, n_q * max_pos * f),
+            .fa_o_partial    = try buffer.Buffer.initDeviceOnly(ctx, o_partial_elems * f),
+            .fa_m_partial    = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),
+            .fa_l_partial    = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),
             .dequant_v       = if (tq4v) try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f) else null,
         };
     }
@@ -248,6 +283,7 @@ pub const Scratch = struct {
             "y", "post_norm",
             "q_gate", "q", "gate_attn", "k", "v", "qrot", "krot",
             "head_out", "head_out_gated", "scores",
+            "fa_o_partial", "fa_m_partial", "fa_l_partial",
         }) |fname| {
             @field(self, fname).deinit(device);
         }
@@ -387,6 +423,13 @@ pub const ForwardPushes = struct {
     scores_push: AttnScoresPush,
     softmax_push: SoftmaxPush,
     attn_out_push: AttnOutputPush,
+    /// Whether the full-attention layer takes the FA path. Set when
+    /// `head_dim ≤ runtime.FA_HEAD_DIM_MAX`; otherwise the
+    /// `recordOneLayer` falls through to the 3-pass chain. Decided once
+    /// per session at config-load time (head_dim is constant per model).
+    attn_use_fa: bool,
+    fa_decode_split_push: runtime.FaDecodeSplitPush,
+    fa_decode_merge_push: runtime.FaDecodeMergePush,
     n_pos: u32,
     q_scale: f32,
     key_dim: u32,
@@ -475,6 +518,25 @@ pub fn computeForwardPushes(cfg: config_mod.Config, pos: usize, max_pos: u32) Fo
             .n_pos = n_pos,
             .kv_stride = kv_dim,
             .scores_stride = max_pos,
+        },
+        .attn_use_fa = head_dim <= runtime.FA_HEAD_DIM_MAX,
+        .fa_decode_split_push = blk: {
+            const ch = runtime.chooseFaDecodeSplit(n_pos);
+            break :blk .{
+                .n_heads = n_q_heads,
+                .heads_per_kv = heads_per_kv,
+                .head_dim = head_dim,
+                .n_kv = n_pos,
+                .kv_stride = kv_dim,
+                .n_splits = ch.n_splits,
+                .split_size = ch.split_size,
+                .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+            };
+        },
+        .fa_decode_merge_push = .{
+            .n_heads = n_q_heads,
+            .head_dim = head_dim,
+            .n_splits = runtime.chooseFaDecodeSplit(n_pos).n_splits,
         },
         .n_pos = n_pos,
         .q_scale = q_scale,
@@ -565,15 +627,48 @@ pub fn recordOneLayer(
                 try runtime.recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &state.kv_v[layer_idx].? }, &p.kv_write_push, p.kv_dim);
             }
 
-            try rec.dispatch(&k.scores, &.{ &sc.qrot, &state.kv_k[layer_idx].?, &sc.scores }, &p.scores_push, p.n_q_heads * p.n_pos, 1, 1);
-            try runtime.recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, p.n_q_heads);
-
+            // V buffer for attention: TQ4-V dequants here on-demand
+            // (lifted above the FA / 3-pass branch so both paths read
+            // the same binding). When the host isn't using TQ4-V the
+            // fp32 cache is fed straight in.
             const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
                 const total_blocks: u32 = p.n_pos * t.n_blocks_per_pos;
                 try rec.dispatch(t.unpack, &.{ &state.kv_v_tq4[layer_idx].?, &sc.dequant_v.? }, null, total_blocks, 1, 1);
                 break :blk &sc.dequant_v.?;
             } else &state.kv_v[layer_idx].?;
-            try rec.dispatch(&k.attn_out, &.{ &sc.scores, v_for_attn, &sc.head_out }, &p.attn_out_push, p.n_q_heads * p.head_dim, 1, 1);
+
+            if (p.attn_use_fa) {
+                // FlashDecoding (split-K + merge). `head_dim ≤
+                // FA_HEAD_DIM_MAX` is enforced at `computeForwardPushes`
+                // time. Same kernel pair the dense path uses; the only
+                // difference is Qwen3.5/3.6 has the q-gate branch downstream
+                // (`sigmoid_mul` after `head_out` → `head_out_gated`).
+                const split = p.fa_decode_split_push;
+                try rec.dispatch(
+                    &k.fa_decode_split,
+                    &.{ &sc.qrot, &state.kv_k[layer_idx].?, v_for_attn, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
+                    &split,
+                    p.n_q_heads * split.n_splits,
+                    1,
+                    1,
+                );
+                try rec.dispatch(
+                    &k.fa_decode_merge,
+                    &.{ &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial, &sc.head_out },
+                    &p.fa_decode_merge_push,
+                    p.n_q_heads,
+                    1,
+                    1,
+                );
+            } else {
+                // 3-pass fallback. Used when head_dim > FA_HEAD_DIM_MAX
+                // — currently no Qwen3.5/3.6 hybrid model triggers this,
+                // but it's the same shape-agnostic chain the dense path
+                // uses for non-FA heads.
+                try rec.dispatch(&k.scores, &.{ &sc.qrot, &state.kv_k[layer_idx].?, &sc.scores }, &p.scores_push, p.n_q_heads * p.n_pos, 1, 1);
+                try runtime.recDispatchPerRow(rec, &k.softmax, &.{ &sc.scores, &sc.scores }, &p.softmax_push, p.n_q_heads);
+                try rec.dispatch(&k.attn_out, &.{ &sc.scores, v_for_attn, &sc.head_out }, &p.attn_out_push, p.n_q_heads * p.head_dim, 1, 1);
+            }
             try runtime.recDispatch1D(rec, &k.sigmoid_mul, &.{ &sc.head_out, &sc.gate_attn, &sc.head_out_gated }, &p.sigmul_push, p.q_dim);
             try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out_gated, &layer.o_proj.?, &sc.attn_out }, 1, hidden, p.q_dim);
         },

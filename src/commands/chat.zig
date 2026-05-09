@@ -893,7 +893,7 @@ pub fn runChatQwen35(
     defer sc.deinit(ctx.device);
     var state = try aliases.HybridChatState.init(gpa, &ctx, cfg, max_pos, tq4v_active);
     defer state.deinit(ctx.device);
-    var ks = try aliases.HybridChatKernels.init(&ctx, gm.precision);
+    var ks = try aliases.HybridChatKernels.init(&ctx, gm.precision, @intCast(cfg.head_dim));
     defer ks.deinit();
 
     // TQ4 pack/unpack kernels — picked by head_dim, only built when

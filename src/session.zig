@@ -312,7 +312,7 @@ pub const Session = struct {
         const max_pos: u32 = @intCast(cfg.max_pos);
 
         var backend: Backend = if (cfg_model.family.isHybrid()) blk: {
-            var kernels = try runtime_hybrid.ChatKernels.init(ctx, gm.precision);
+            var kernels = try runtime_hybrid.ChatKernels.init(ctx, gm.precision, @intCast(cfg_model.head_dim));
             errdefer kernels.deinit();
             var scratch = try runtime_hybrid.Scratch.init(ctx, cfg_model, max_pos, false);
             errdefer scratch.deinit(ctx.device);

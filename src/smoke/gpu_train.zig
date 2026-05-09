@@ -5408,7 +5408,7 @@ pub fn runMtpForwardGpuSmoke(allocator: std.mem.Allocator) !void {
     var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, false);
     defer sc.deinit(ctx.device);
 
-    var k = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all);
+    var k = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all, @intCast(cfg.head_dim));
     defer k.deinit();
 
     var mtp_state = try runtime_mtp.MtpRuntimeState.init(allocator, &ctx, cfg, max_pos);
@@ -5530,7 +5530,7 @@ pub fn runMtpDraftChainSmoke(allocator: std.mem.Allocator) !void {
     var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, false);
     defer sc.deinit(ctx.device);
 
-    var k_kernels = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all);
+    var k_kernels = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all, @intCast(cfg.head_dim));
     defer k_kernels.deinit();
 
     var state = try runtime_hybrid.State.init(allocator, &ctx, cfg, max_pos, false);

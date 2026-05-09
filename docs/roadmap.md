@@ -53,10 +53,14 @@ The two big arcs:
      2B IT (head_dim=256) onto the FA path end-to-end —
      `--bench --n 4096` shows ~1.4-1.6× decode speedup at pos 4080
      (8.74 ms/tok vs the 12-14 ms/tok the 3-pass would have run).
-     Qwen3.5 family inherits the kernels at parity (2-7e-7 rel-err
-     across forward / decode / backward) but the chat-path wiring
-     still goes through `runtime_hybrid.zig` — that module's
-     full-attention layers are the next chunk to plumb. Outstanding
+     **E-arc (hybrid wiring, 2026-05-09) shipped:** `runtime_hybrid.zig`
+     full-attention layers now branch on the same `attn_use_fa` gate
+     and swap in `fa_decode_split + fa_decode_merge` (with TQ4-V
+     dequant lifted above the branch). Brings Qwen3.5 0.8B/4B onto
+     the FA path end-to-end via `--chat`. Output gated by parity
+     smokes (chat-path 4.42e-7 rel-err) plus end-to-end Qwen3.5
+     0.8B `--chat`: "What is the capital of France?" → "The capital
+     of France is **Paris**." Outstanding
      fused-FA deepening: a kernel that consumes packed TQ4 K/V
      directly in the inner loop (skipping the `dequant_v`
      materialisation) for the bandwidth savings to land at long
