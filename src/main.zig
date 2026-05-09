@@ -145,6 +145,16 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionTq4VParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--forward-hybrid-batched-smoke")) {
+        // MTP-1c-β-1: CPU oracle for n_q-batched hybrid forward. Loads
+        // Qwen3.5-0.8B, runs the same 4-token sequence through both the
+        // sequential `forwardHybrid` and the new `forwardHybridBatched`
+        // from a fresh `HybridState`. Gates per-row logits parity (1e-5
+        // rel-err), determinism, and top-1 match. Reference for every
+        // downstream GPU parity gate in the batched-prefill arc.
+        try smoke_cpu.runForwardHybridBatchedCpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--mtp-forward-cpu-smoke")) {
         // MTP-1b-α: build-and-shape gate for the CPU MTP forward oracle.
         // Loads Qwen3.5-0.8B (smallest MTP-equipped checkpoint), runs

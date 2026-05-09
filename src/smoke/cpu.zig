@@ -9,6 +9,7 @@ const cpu_train_transformer = @import("../cpu/train_transformer.zig");
 const cpu_lora = @import("../cpu/lora.zig");
 const cpu_flash_attn = @import("../cpu/flash_attn.zig");
 const cpu_mtp = @import("../cpu/mtp.zig");
+const cpu_forward = @import("../cpu/forward.zig");
 const dtype = @import("../dtype.zig");
 const lora_merge = @import("../commands/lora_merge.zig");
 const safetensors = @import("../safetensors.zig");
@@ -1100,6 +1101,155 @@ pub fn runMtpForwardCpuSmoke(allocator: std.mem.Allocator) !void {
         "PASS mtp-forward-cpu ({s}): {d} MTP layer(s), tok_a={d} top1={d} max|logit|={d:.2}, tok_b={d} top1={d} max|logit|={d:.2}, {d:.0} ms (3 steps)\n",
         .{ model_id, model.mtp_head.?.layers.len, tok_a, top1_a, max_abs_a, tok_b, top1_b, max_abs_b, ms_total },
     );
+}
+
+// ── MTP-1c-β-1: forwardHybridBatched parity vs sequential ──────────────
+//
+// Runs `forwardHybridBatched` (n_q-batched forward) and
+// `forwardHybrid` (single-position decode) on the same token sequence
+// from a fresh `HybridState` and gates that the per-row logits match.
+// Invariant: state mutation order is identical (n_q sequential calls
+// vs one batched call), so both paths must produce the same logits
+// row-for-row up to fp32 reduction-order noise. Reference for every
+// downstream GPU parity gate in the MTP-1c-β arc.
+
+pub fn runForwardHybridBatchedCpuSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runForwardHybridBatchedCpuSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+
+    const cfg = model.config;
+    if (cfg.family != .qwen35) {
+        std.debug.print("SKIP runForwardHybridBatchedCpuSmoke ({s} not hybrid)\n", .{model_id});
+        return;
+    }
+
+    const n_q: usize = 4;
+    const max_pos: usize = 16;
+
+    // Token sequence: BOS-ish + a few well-spaced ids, all in vocab.
+    const t0_id: u32 = cfg.eos_token_id orelse 0;
+    var tokens = [_]u32{
+        t0_id,
+        @intCast((@as(usize, t0_id) + 17) % cfg.vocab_size),
+        @intCast((@as(usize, t0_id) + 113) % cfg.vocab_size),
+        @intCast((@as(usize, t0_id) + 251) % cfg.vocab_size),
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // ── Run 1: sequential single-position decode, collect logits/hidden per row.
+    const logits_seq = try allocator.alloc(f32, n_q * cfg.vocab_size);
+    defer allocator.free(logits_seq);
+
+    {
+        var state_seq = try cpu_forward.HybridState.init(allocator, &model, max_pos);
+        defer state_seq.deinit();
+
+        for (0..n_q) |t| {
+            _ = arena.reset(.retain_capacity);
+            const row = logits_seq[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+            try cpu_forward.forwardHybrid(&model, tokens[t], t, &state_seq, arena.allocator(), row);
+        }
+    }
+
+    // ── Run 2: batched n_q forward, fresh state.
+    const logits_batch = try allocator.alloc(f32, n_q * cfg.vocab_size);
+    defer allocator.free(logits_batch);
+    const hidden_batch = try allocator.alloc(f32, n_q * cfg.hidden_size);
+    defer allocator.free(hidden_batch);
+
+    {
+        var state_batch = try cpu_forward.HybridState.init(allocator, &model, max_pos);
+        defer state_batch.deinit();
+        _ = arena.reset(.retain_capacity);
+        try cpu_forward.forwardHybridBatched(&model, &tokens, 0, &state_batch, arena.allocator(), hidden_batch, logits_batch);
+    }
+
+    // ── Run 3: batched again, fresh state — determinism gate.
+    const logits_batch2 = try allocator.alloc(f32, n_q * cfg.vocab_size);
+    defer allocator.free(logits_batch2);
+    {
+        var state_batch2 = try cpu_forward.HybridState.init(allocator, &model, max_pos);
+        defer state_batch2.deinit();
+        _ = arena.reset(.retain_capacity);
+        try cpu_forward.forwardHybridBatched(&model, &tokens, 0, &state_batch2, arena.allocator(), null, logits_batch2);
+    }
+
+    for (logits_batch, logits_batch2, 0..) |a, b, i| {
+        if (a != b) {
+            std.debug.print("FAIL forward-hybrid-batched-cpu nondeterministic: logit[{d}] {e} vs {e}\n", .{ i, a, b });
+            return error.Nondeterministic;
+        }
+    }
+
+    // ── Parity: per-row max abs / rel-err vs sequential.
+    const tol_rel: f32 = 1e-5;
+
+    var worst_abs: f32 = 0;
+    var worst_rel: f32 = 0;
+    var worst_row: usize = 0;
+    var worst_col: usize = 0;
+    for (0..n_q) |t| {
+        const seq_row = logits_seq[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+        const batch_row = logits_batch[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+        for (seq_row, batch_row, 0..) |s, b, j| {
+            const abs_err = @abs(s - b);
+            const denom = @max(@abs(s), @abs(b));
+            const rel = if (denom > 0) abs_err / denom else abs_err;
+            if (rel > worst_rel) {
+                worst_rel = rel;
+                worst_abs = abs_err;
+                worst_row = t;
+                worst_col = j;
+            }
+        }
+    }
+
+    if (worst_rel > tol_rel) {
+        std.debug.print(
+            "FAIL forward-hybrid-batched-cpu parity: row={d} col={d} abs={e} rel={e} (tol {e})\n",
+            .{ worst_row, worst_col, worst_abs, worst_rel, tol_rel },
+        );
+        return error.ParityFailure;
+    }
+
+    // Top-1 per row must match.
+    var top1_seq: [n_q]usize = undefined;
+    var top1_batch: [n_q]usize = undefined;
+    for (0..n_q) |t| {
+        const seq_row = logits_seq[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+        const batch_row = logits_batch[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+        top1_seq[t] = cpu_forward.argmax(seq_row);
+        top1_batch[t] = cpu_forward.argmax(batch_row);
+        if (top1_seq[t] != top1_batch[t]) {
+            std.debug.print(
+                "FAIL forward-hybrid-batched-cpu top-1 mismatch row={d}: seq={d} batch={d}\n",
+                .{ t, top1_seq[t], top1_batch[t] },
+            );
+            return error.Top1Mismatch;
+        }
+    }
+
+    std.debug.print(
+        "PASS forward-hybrid-batched-cpu ({s}, n_q={d}): max rel-err {e} (abs {e}), top1 ",
+        .{ model_id, n_q, worst_rel, worst_abs },
+    );
+    for (top1_batch, 0..) |t1, t| {
+        if (t > 0) std.debug.print(",", .{});
+        std.debug.print("{d}", .{t1});
+    }
+    std.debug.print("\n", .{});
 }
 
 // ── T1: fused FA + TQ4-V CPU oracle parity ─────────────────────────────

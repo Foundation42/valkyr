@@ -273,6 +273,107 @@ pub fn forwardHybrid(
 /// would do at single-position, no-history attention. Currently
 /// requires Gemma 2B's shape (n_kv=1, head_dim=256 — exactly one TQ4
 /// block per layer's V).
+/// n_q-batched hybrid forward — feeds `token_ids[0..n_q]` at positions
+/// `[pos_start..pos_start+n_q)` through every layer in one pass and
+/// writes `n_q * vocab_size` logits in row-major. Optional `hidden_out`
+/// receives the pre-final-norm residual stream (`n_q * hidden_size`)
+/// for callers that need the final hidden state (e.g. MTP head feed).
+///
+/// State is mutated identically to `forwardHybrid` called n_q times in
+/// sequence — that's the parity invariant the GPU oracle gates against.
+pub fn forwardHybridBatched(
+    model: *const model_mod.Model,
+    token_ids: []const u32,
+    pos_start: usize,
+    state: *HybridState,
+    scratch: std.mem.Allocator,
+    hidden_out: ?[]f32,
+    logits: []f32,
+) !void {
+    const cfg = model.config;
+    if (cfg.family != .qwen35) return error.NotHybridFamily;
+    const n_q = token_ids.len;
+    if (n_q == 0) return error.EmptyBatch;
+    if (logits.len != n_q * cfg.vocab_size) return error.LogitsSizeMismatch;
+    if (hidden_out) |h| if (h.len != n_q * cfg.hidden_size) return error.HiddenOutSizeMismatch;
+    for (token_ids) |tid| if (tid >= cfg.vocab_size) return error.TokenOutOfRange;
+
+    const hidden = cfg.hidden_size;
+    const inter = cfg.intermediate_size;
+
+    // ── Residual stream init: n_q × hidden ─────────────────────────
+    const stream = try scratch.alloc(f32, n_q * hidden);
+    for (0..n_q) |t| {
+        try cpu_math.embedRowAsF32(stream[t * hidden .. (t + 1) * hidden], model.embed_tokens, token_ids[t]);
+    }
+    if (cfg.family.embedScalesByDim()) {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(hidden)));
+        for (stream) |*xi| xi.* *= s;
+    }
+
+    // ── Per-layer batched scratch ──────────────────────────────────
+    const x_norm = try scratch.alloc(f32, n_q * hidden);
+    const attn_out = try scratch.alloc(f32, n_q * hidden);
+    const mid_norm = try scratch.alloc(f32, n_q * hidden);
+    const gate = try scratch.alloc(f32, n_q * inter);
+    const up = try scratch.alloc(f32, n_q * inter);
+    const fused = try scratch.alloc(f32, n_q * inter);
+    const ffn_out = try scratch.alloc(f32, n_q * hidden);
+
+    // Sub-arena for per-row gated_delta calls; reset between rows so
+    // the linear-attn path doesn't accumulate scratch across n_q steps.
+    var sub_arena = std.heap.ArenaAllocator.init(scratch);
+    defer sub_arena.deinit();
+
+    for (model.layers, 0..) |layer, i| {
+        // Pre-attention norm (per row).
+        for (0..n_q) |t| {
+            try cpu_math.rmsnorm(x_norm[t * hidden .. (t + 1) * hidden], stream[t * hidden .. (t + 1) * hidden], layer.input_layernorm, cfg.rms_norm_eps, cfg.family);
+        }
+
+        switch (layer.layer_type) {
+            .linear_attention => {
+                // Sequential per-position decode — gated_delta has stateful
+                // recurrence so n_q steps must run in order.
+                for (0..n_q) |t| {
+                    _ = sub_arena.reset(.retain_capacity);
+                    try gated_delta.decodeStep(sub_arena.allocator(), cfg, layer, &state.ssm[i].?, x_norm[t * hidden .. (t + 1) * hidden], attn_out[t * hidden .. (t + 1) * hidden]);
+                }
+            },
+            .full_attention => {
+                try full_attn.prefillStep(scratch, cfg, layer, &state.kv[i].?, x_norm, attn_out, pos_start, n_q);
+            },
+        }
+
+        // First residual.
+        for (stream, attn_out) |*si, ai| si.* += ai;
+
+        // Post-attention norm (per row).
+        for (0..n_q) |t| {
+            try cpu_math.rmsnorm(mid_norm[t * hidden .. (t + 1) * hidden], stream[t * hidden .. (t + 1) * hidden], layer.post_attention_layernorm, cfg.rms_norm_eps, cfg.family);
+        }
+
+        // SwiGLU FFN — matmul_nt natively supports M = n_q.
+        try cpu_math.matmul_nt(gate, mid_norm, layer.gate_proj, n_q, inter, hidden);
+        try cpu_math.matmul_nt(up, mid_norm, layer.up_proj, n_q, inter, hidden);
+        try cpu_math.gatedFfn(fused, gate, up, cfg.family);
+        try cpu_math.matmul_nt(ffn_out, fused, layer.down_proj, n_q, hidden, inter);
+
+        // Second residual.
+        for (stream, ffn_out) |*si, fi| si.* += fi;
+    }
+
+    // Optional hidden-out tap (pre-final-norm).
+    if (hidden_out) |h| @memcpy(h, stream);
+
+    // Final norm + LM head.
+    const final_norm = try scratch.alloc(f32, n_q * hidden);
+    for (0..n_q) |t| {
+        try cpu_math.rmsnorm(final_norm[t * hidden .. (t + 1) * hidden], stream[t * hidden .. (t + 1) * hidden], model.final_norm, cfg.rms_norm_eps, cfg.family);
+    }
+    try cpu_math.matmul_nt(logits, final_norm, model.lm_head, n_q, cfg.vocab_size, hidden);
+}
+
 pub fn forwardTq4V(
     model: *const model_mod.Model,
     token_id: u32,
