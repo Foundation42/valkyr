@@ -314,7 +314,7 @@ pub const Session = struct {
         var backend: Backend = if (cfg_model.family.isHybrid()) blk: {
             var kernels = try runtime_hybrid.ChatKernels.init(ctx, gm.precision, @intCast(cfg_model.head_dim));
             errdefer kernels.deinit();
-            var scratch = try runtime_hybrid.Scratch.init(ctx, cfg_model, max_pos, false);
+            var scratch = try runtime_hybrid.Scratch.init(ctx, cfg_model, max_pos, 1, false);
             errdefer scratch.deinit(ctx.device);
             var state = try runtime_hybrid.State.init(allocator, ctx, cfg_model, max_pos, false);
             errdefer state.deinit(ctx.device);
@@ -621,6 +621,7 @@ pub const Session = struct {
                         const pushes = runtime_hybrid.computeForwardPushes(
                             self.cfg_model,
                             self.pos,
+                            1,
                             self.max_pos,
                         );
                         try runtime_hybrid.recordOneLayer(
@@ -676,6 +677,7 @@ pub const Session = struct {
                     const pushes = runtime_hybrid.computeForwardPushes(
                         self.cfg_model,
                         self.pos,
+                        1,
                         self.max_pos,
                     );
                     const hidden: u32 = @intCast(self.cfg_model.hidden_size);

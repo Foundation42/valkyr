@@ -214,7 +214,15 @@ pub const Scratch = struct {
     /// when the host is using TQ4 V-cache; otherwise `null`.
     dequant_v: ?buffer.Buffer,
 
-    pub fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32, tq4v: bool) !Scratch {
+    /// `max_n_q` is the maximum number of query rows (positions) any
+    /// single forward step records into this scratch. The decode path
+    /// sets it to 1; batched-prefill / MTP-verify paths set it to the
+    /// largest n_q they intend to record (e.g. prompt length, or k+1
+    /// for a k-draft MTP verify). Buffers downstream of attention scale
+    /// linearly with this dim; linear-attn intermediates do not (β-4
+    /// dispatches gated_delta sequentially per row).
+    pub fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: u32, max_n_q: u32, tq4v: bool) !Scratch {
+        if (max_n_q == 0) return error.MaxNqMustBePositive;
         const f = @sizeOf(f32);
         const hidden = cfg.hidden_size;
         const inter = cfg.intermediate_size;
@@ -227,6 +235,7 @@ pub const Scratch = struct {
         const conv_dim = cfg.linearAttnConvDim();
         const value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
         const key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+        const max_n_q_us: usize = max_n_q;
 
         // Worst-case FlashDecoding split count — mirrors the heuristic
         // in `runtime.chooseFaDecodeSplit` applied to `max_pos`. Inlined
@@ -241,16 +250,19 @@ pub const Scratch = struct {
         const o_partial_elems: usize = n_q * @as(usize, max_n_splits) * head_dim;
         const ml_partial_elems: usize = n_q * @as(usize, max_n_splits);
         return .{
-            .stream          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .x_norm          = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .mid_norm        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .attn_out        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .gate            = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .up              = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .fused           = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .ffn_out         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .final_norm_out  = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .logits          = try buffer.Buffer.initDeviceOnly(ctx, cfg.vocab_size * f),
+            .stream          = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * hidden * f),
+            .x_norm          = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * hidden * f),
+            .mid_norm        = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * hidden * f),
+            .attn_out        = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * hidden * f),
+            .gate            = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * inter * f),
+            .up              = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * inter * f),
+            .fused           = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * inter * f),
+            .ffn_out         = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * hidden * f),
+            .final_norm_out  = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * hidden * f),
+            .logits          = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * cfg.vocab_size * f),
+            // Linear-attn intermediates: kept at n_q=1 footprint. β-4
+            // walks `gated_delta_step` sequentially per row, so we only
+            // ever hold one row of linear-attn state at a time.
             .mixed_qkv       = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
             .mixed_qkv_post  = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
             .z               = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
@@ -263,19 +275,28 @@ pub const Scratch = struct {
             .k_lin_n         = try buffer.Buffer.initDeviceOnly(ctx, key_dim * f),
             .y               = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
             .post_norm       = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
-            .q_gate          = try buffer.Buffer.initDeviceOnly(ctx, q_proj_rows * f),
-            .q               = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .gate_attn       = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .k               = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .v               = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .qrot            = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .krot            = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .head_out        = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .head_out_gated  = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .scores          = try buffer.Buffer.initDeviceOnly(ctx, n_q * max_pos * f),
-            .fa_o_partial    = try buffer.Buffer.initDeviceOnly(ctx, o_partial_elems * f),
-            .fa_m_partial    = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),
-            .fa_l_partial    = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),
+            // Full-attn intermediates: scaled to `max_n_q` rows so the
+            // batched-prefill path can carry n_q queries through one
+            // dispatch chain.
+            .q_gate          = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * q_proj_rows * f),
+            .q               = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * q_dim * f),
+            .gate_attn       = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * q_dim * f),
+            .k               = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * kv_dim * f),
+            .v               = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * kv_dim * f),
+            .qrot            = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * q_dim * f),
+            .krot            = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * kv_dim * f),
+            .head_out        = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * q_dim * f),
+            .head_out_gated  = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * q_dim * f),
+            // 3-pass scores: `[max_n_q, n_q_heads, max_pos]`. FA path
+            // doesn't read this; only the `head_dim > FA_HEAD_DIM_MAX`
+            // fallback would.
+            .scores          = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * n_q * max_pos * f),
+            // FA partials: `[max_n_q, n_q_heads, max_n_splits, head_dim]`.
+            .fa_o_partial    = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * o_partial_elems * f),
+            .fa_m_partial    = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * ml_partial_elems * f),
+            .fa_l_partial    = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * ml_partial_elems * f),
+            // Shared V dequant scratch — V history depth is `max_pos`
+            // independent of how many queries read it. No max_n_q scale.
             .dequant_v       = if (tq4v) try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f) else null,
         };
     }
@@ -450,9 +471,25 @@ pub const ForwardPushes = struct {
     q_proj_rows: u32,
     kv_dim: u32,
     conv_dim: u32,
+    /// Starting position of the first query in this batch. The i-th
+    /// query occupies absolute position `pos_start + i`. For the
+    /// single-position decode path this matches the existing `pos`
+    /// argument and `n_q == 1`. β-3+ uses it to drive per-row RoPE +
+    /// KV-write at dispatch time.
+    pos_start: u32,
+    /// Number of query rows recorded in this forward step. Decode
+    /// path = 1; batched-prefill / MTP-verify > 1. Per-row pushes
+    /// (`rope_q_push`, `rope_k_push`, `kv_write_push`) and 3-pass
+    /// attention pushes carry the row-zero values; `recordOneLayer`
+    /// recomputes per-row variants when `n_q > 1`.
+    n_q: u32,
 };
 
-pub fn computeForwardPushes(cfg: config_mod.Config, pos: usize, max_pos: u32) ForwardPushes {
+/// Compute forward-step push constants for a hybrid model. `pos_start`
+/// is the absolute position of the first query in this batch; queries
+/// occupy `[pos_start, pos_start + n_q)`. For decode `(pos, 1)` is
+/// equivalent to the previous single-position signature.
+pub fn computeForwardPushes(cfg: config_mod.Config, pos_start: usize, n_q: u32, max_pos: u32) ForwardPushes {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
     const head_dim: u32 = @intCast(cfg.head_dim);
@@ -475,7 +512,11 @@ pub fn computeForwardPushes(cfg: config_mod.Config, pos: usize, max_pos: u32) Fo
     const q_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.linear_key_head_dim)));
 
     const gemma_quirk: u32 = if (cfg.family.rmsnormAddOne()) 1 else 0;
-    const n_pos: u32 = @intCast(pos + 1);
+    // `n_pos` here = the largest KV history length any query in this
+    // batch will see (i.e. `pos_start + n_q`). Per-row pushes below use
+    // row-zero's `pos_start` for now; β-3 recomputes per-row variants
+    // inside `recordOneLayer` when `n_q > 1`.
+    const n_pos: u32 = @intCast(pos_start + n_q);
 
     return .{
         .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
@@ -497,17 +538,17 @@ pub fn computeForwardPushes(cfg: config_mod.Config, pos: usize, max_pos: u32) Fo
             .n_heads = n_q_heads,
             .head_dim = head_dim,
             .rotary_dim = rotary_dim,
-            .pos = @intCast(pos),
+            .pos = @intCast(pos_start),
             .theta_base = cfg.rope_theta,
         },
         .rope_k_push = .{
             .n_heads = n_kv_heads,
             .head_dim = head_dim,
             .rotary_dim = rotary_dim,
-            .pos = @intCast(pos),
+            .pos = @intCast(pos_start),
             .theta_base = cfg.rope_theta,
         },
-        .kv_write_push = .{ .n = kv_dim, .dst_off = @as(u32, @intCast(pos)) * kv_dim },
+        .kv_write_push = .{ .n = kv_dim, .dst_off = @as(u32, @intCast(pos_start)) * kv_dim },
         .scores_push = .{
             .n_heads = n_q_heads,
             .heads_per_kv = heads_per_kv,
@@ -558,6 +599,8 @@ pub fn computeForwardPushes(cfg: config_mod.Config, pos: usize, max_pos: u32) Fo
         .q_proj_rows = q_proj_rows,
         .kv_dim = kv_dim,
         .conv_dim = conv_dim,
+        .pos_start = @intCast(pos_start),
+        .n_q = n_q,
     };
 }
 
@@ -716,7 +759,7 @@ pub fn recordForwardStep(
     const hidden: u32 = @intCast(cfg.hidden_size);
     const vocab: u32 = @intCast(cfg.vocab_size);
 
-    const pushes = computeForwardPushes(cfg, pos, max_pos);
+    const pushes = computeForwardPushes(cfg, pos, 1, max_pos);
     const embed_push = EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
 
     try runtime.recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);

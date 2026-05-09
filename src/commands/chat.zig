@@ -778,7 +778,7 @@ fn forwardStepProbedHybrid(
     const hidden: u32 = @intCast(cfg.hidden_size);
     const vocab: u32 = @intCast(cfg.vocab_size);
 
-    const pushes = aliases.computeHybridForwardPushes(cfg, pos, max_pos);
+    const pushes = aliases.computeHybridForwardPushes(cfg, pos, 1, max_pos);
     const embed_push = aliases.EmbedLookupPush{ .token_id = token_id, .dim = hidden, .scale = 1.0 };
 
     // ── Embed ───────────────────────────────────────────────────────
@@ -889,7 +889,7 @@ pub fn runChatQwen35(
     const tq4v_active = tq4v and (cfg.head_dim == 128 or cfg.head_dim == 256);
 
     const max_pos: u32 = 2048;
-    var sc = try aliases.HybridChatScratch.init(&ctx, cfg, max_pos, tq4v_active);
+    var sc = try aliases.HybridChatScratch.init(&ctx, cfg, max_pos, 1, tq4v_active);
     defer sc.deinit(ctx.device);
     var state = try aliases.HybridChatState.init(gpa, &ctx, cfg, max_pos, tq4v_active);
     defer state.deinit(ctx.device);

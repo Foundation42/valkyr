@@ -148,7 +148,7 @@ pub fn recordMtpStep(
     const inter: u32 = @intCast(cfg.intermediate_size);
     const vocab: u32 = @intCast(cfg.vocab_size);
 
-    const p = runtime_hybrid.computeForwardPushes(cfg, pos, max_pos);
+    const p = runtime_hybrid.computeForwardPushes(cfg, pos, 1, max_pos);
 
     // ── 1. embed lookup → mtp_state.embed_tmp ──────────────────────
     const embed_push = runtime_hybrid.EmbedLookupPush{
