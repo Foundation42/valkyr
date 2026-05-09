@@ -1971,15 +1971,50 @@ pub fn runCceBench(allocator: std.mem.Allocator) !void {
 // kernel we ship has to beat the totals printed here at the same
 // shapes.
 
+/// Per-model shape for `runAttnBenchAtShape`. The bench runs the same
+/// decode/prefill sweep at any per-layer attention shape — currently
+/// Qwen3-0.6B (d=128, BC=16 fa kernels) and Qwen3.5 0.8B (d=256,
+/// BC=8 _d256 fa variants).
+pub const AttnBenchShape = struct {
+    label: []const u8,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_layers: u32,
+};
+
+/// Bench entry point — Qwen3-0.6B per-layer attention shape (d=128).
 pub fn runAttnBench(allocator: std.mem.Allocator) !void {
+    return runAttnBenchAtShape(allocator, .{
+        .label = "Qwen3-0.6B",
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 128,
+        .n_layers = 28,
+    });
+}
+
+/// Bench entry point — Qwen3.5 0.8B per-layer attention shape (d=256).
+/// Same sweeps as `--attn-bench`, exercises the BC=8 d=256 SPIR-V
+/// variants of fa_forward and fa_decode_split.
+pub fn runAttnBenchD256(allocator: std.mem.Allocator) !void {
+    return runAttnBenchAtShape(allocator, .{
+        .label = "Qwen3.5 0.8B",
+        .n_heads = 8,
+        .n_kv_heads = 2,
+        .head_dim = 256,
+        .n_layers = 24,
+    });
+}
+
+fn runAttnBenchAtShape(allocator: std.mem.Allocator, shape: AttnBenchShape) !void {
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
 
-    // Qwen3-0.6B per-layer attention shape.
-    const n_heads: u32 = 16;
-    const n_kv_heads: u32 = 8;
-    const head_dim: u32 = 128;
-    const n_layers: u32 = 28;
+    const n_heads: u32 = shape.n_heads;
+    const n_kv_heads: u32 = shape.n_kv_heads;
+    const head_dim: u32 = shape.head_dim;
+    const n_layers: u32 = shape.n_layers;
     const heads_per_kv: u32 = n_heads / n_kv_heads;
     const inv_sqrt: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
@@ -1992,9 +2027,9 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
 
     std.debug.print(
         "Attention bench on {s}\n" ++
-            "  Qwen3-0.6B per-layer: n_heads={d} n_kv_heads={d} head_dim={d} ({d} layers)\n" ++
+            "  {s} per-layer: n_heads={d} n_kv_heads={d} head_dim={d} ({d} layers)\n" ++
             "  warmup {d} / measure {d}    (timings include submitOneShot + waitIdle)\n",
-        .{ ctx.deviceName(), n_heads, n_kv_heads, head_dim, n_layers, warmup_iters, bench_iters },
+        .{ ctx.deviceName(), shape.label, n_heads, n_kv_heads, head_dim, n_layers, warmup_iters, bench_iters },
     );
 
     // ── Allocate buffers sized to the larger of {decode, prefill} per
@@ -2053,9 +2088,10 @@ pub fn runAttnBench(allocator: std.mem.Allocator) !void {
     defer k_scores_t.deinit();
     var k_attn_out_t = try pipeline.Kernel.init(&ctx, &shaders.attn_output_train, 3, @sizeOf(runtime.AttnOutputTrainPush));
     defer k_attn_out_t.deinit();
-    var k_fa = try pipeline.Kernel.init(&ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
+    // Pick the right BC=16 d=128 / BC=8 d=256 SPIR-V variant per shape.
+    var k_fa = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(head_dim), 5, @sizeOf(runtime.FaForwardPush));
     defer k_fa.deinit();
-    var k_fd_split = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_split, 6, @sizeOf(runtime.FaDecodeSplitPush));
+    var k_fd_split = try pipeline.Kernel.init(&ctx, runtime.faDecodeSplitSpv(head_dim), 6, @sizeOf(runtime.FaDecodeSplitPush));
     defer k_fd_split.deinit();
     var k_fd_merge = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush));
     defer k_fd_merge.deinit();

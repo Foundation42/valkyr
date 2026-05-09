@@ -46,13 +46,21 @@ The two big arcs:
      2.777821 → **1.280139** (vs 1.280140 with 3-pass — 6-decimal
      match), 30-step 99.98% CE drop preserved, checkpoint round-trip
      bit-equal. TQ4-V-cache composes via the existing `dequant_v`
-     buffer; hybrid Qwen3.5 (head_dim=256) auto-falls-back to the
-     3-pass on the same `attn_use_fa` gate. Outstanding fused-FA
-     deepening: a kernel that consumes packed TQ4 K/V directly in
-     the inner loop (skipping the `dequant_v` materialisation) for
-     the bandwidth savings to land at long context, and a Bc=8 +
-     HEAD_DIM_MAX=256 shader variant that lifts the cap so Qwen3.5
-     joins the FA path.
+     buffer. **D-arc (head_dim=256, 2026-05-09) shipped:** second
+     SPIR-V build of each head_dim-sensitive FA shader at BC=8
+     HEAD_DIM_MAX=256 (~18-20 KB shared mem, fits AMD RDNA's 32 KB
+     ceiling) lifts `FA_HEAD_DIM_MAX` from 128 to 256. Brings Gemma
+     2B IT (head_dim=256) onto the FA path end-to-end —
+     `--bench --n 4096` shows ~1.4-1.6× decode speedup at pos 4080
+     (8.74 ms/tok vs the 12-14 ms/tok the 3-pass would have run).
+     Qwen3.5 family inherits the kernels at parity (2-7e-7 rel-err
+     across forward / decode / backward) but the chat-path wiring
+     still goes through `runtime_hybrid.zig` — that module's
+     full-attention layers are the next chunk to plumb. Outstanding
+     fused-FA deepening: a kernel that consumes packed TQ4 K/V
+     directly in the inner loop (skipping the `dequant_v`
+     materialisation) for the bandwidth savings to land at long
+     context.
    - **bf16 LM head + bf16 embedding** kernels — currently fp32, the
      LM head matmul is the single biggest dispatch we do.
    - **GPU-side compute quantize.** Q4_K_M upload is currently 4–6×

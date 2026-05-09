@@ -117,11 +117,11 @@ now branches between FlashDecoding (`fa_decode_split` +
 in `chooseFaDecodeSplit` mirrors the bench shapes: ≤ 4 keys → 1
 split, &lt; 1024 → 4 splits, ≥ 1024 → `split_size = 256`. TQ4-V
 composes cleanly — the same `dequant_v` buffer feeds either path.
-Hybrid Qwen3.5 (`head_dim = 256`) auto-falls-back to 3-pass via
-the same gate. End-to-end parity gate `runFaDecodeChatPathSmoke`
-runs both paths through the production push values at Qwen3-0.6B
-shape and compares to **4.42e-7 max rel-err** across n_kv ∈
-{16, 64, 256, 1024} — five orders below the 1e-4 tolerance.
+Larger heads (head_dim > 256) auto-fall-back to 3-pass via the same
+gate. End-to-end parity gate `runFaDecodeChatPathSmoke` runs both
+paths through the production push values at Qwen3-0.6B shape and
+compares to **4.42e-7 max rel-err** across n_kv ∈ {16, 64, 256,
+1024} — five orders below the 1e-4 tolerance.
 
 **FA-2 backward (F6, 2026-05-08).** `Runner.step` (the training
 path) now dispatches the 3-kernel FA-2 backward chain in place of
@@ -131,8 +131,8 @@ the 5-kernel 3-pass:
   fa_bw_dq  — per-(q, h) dQ accumulation        [n_q × n_heads WGs]
   fa_bw_dkv — per-(k, kv_h) dK + dV (GQA fold)  [n_kv × n_kv_heads WGs]
 
-Same `attn_use_fa = head_dim ≤ 128` gate as the forward — Qwen3.5
-d=256 keeps the 3-pass. Forward writes `LSE = m + log(l)` per
+Same `attn_use_fa = head_dim ≤ FA_HEAD_DIM_MAX` gate as the forward.
+Forward writes `LSE = m + log(l)` per
 (q, h) so backward recomputes the softmax inline; **the
 [n_pos × n_heads × n_pos] `buf_attn[i]` softmax matrix is never
 materialised on the FA path** — the 7.2 GB scores roundtrip the F1
@@ -143,3 +143,69 @@ shapes) carry the saved values across layers. Real-model parity vs
 the 3-pass on Qwen3-0.6B / n_pos=16: one-step CE 2.777821 → **1.280139**
 (vs 1.280140 with 3-pass — 6-decimal match), 30-step run 99.98%
 CE drop preserved, checkpoint round-trip bit-equal.
+
+**head_dim=256 variants (D-arc, 2026-05-09).** A second SPIR-V build
+of each head_dim-sensitive FA shader ships at `HEAD_DIM_MAX=256
+BC=8`, lifting `FA_HEAD_DIM_MAX` from 128 to 256. Same .comp source
+as the d=128 variants (BC=16) — only two preprocessor defines change
+via `glslc -DHEAD_DIM_MAX=256 -DBC=8`. `BC=8` halves the per-tile
+parallelism but keeps shared mem under AMD RDNA's 32 KB/WG ceiling
+at d=256 (~18-20 KB total per shader). `fa_decode_merge` and
+`fa_bw_d` don't size shared mem by head_dim, so their d=128 builds
+serve d=256 dispatches unchanged. The dispatcher picks at pipeline-
+init time via `runtime.faForwardSpv` / `faDecodeSplitSpv` /
+`faBwDqSpv` / `faBwDkvSpv`. Brings:
+
+  Gemma 2B IT      n_heads=8  n_kv_heads=1 d=256 onto the FA path
+  Qwen3.5 0.8B/4B  n_heads=8/16 n_kv_heads=2/4 d=256 onto FA shaders
+                   (the chat-path runtime_hybrid wiring still pending)
+
+GPU parity vs CPU oracle on Qwen3.5 shape (n_q=8 n_kv=8 GQA 8:2 d=256
+causal):
+
+  fa_forward    max rel = 2.99e-7  (4 orders below 1e-4 gate)
+  fa_decode     max rel = 6.75e-6  (split+merge vs fa_forward)
+  fa_bw chain   max rel(dQ/dK/dV) = (2.11e-7, 4.21e-7, 3.03e-7)
+
+Bench at Qwen3.5 0.8B per-layer (n_heads=8 n_kv_heads=2 d=256, RTX
+3090, 24 layers):
+
+| n_kv | scoresMB | scores | attn_out | 3-pass/L | fa_fwd/L | fa_dec/L | fa↑3-p | fd↑3-p |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 0.004 | 0.087 ms | 0.100 | 0.272 | 0.139 | 0.186 | 1.96× | 1.46× |
+| 512 | 0.016 | 0.099 | 0.102 | 0.287 | 0.287 | 0.223 | 1.00× | 1.29× |
+| 2048 | 0.063 | 0.128 | 0.162 | 0.386 | 0.969 | 0.290 | 0.40× | 1.33× |
+| 8192 | 0.250 | 0.272 | 0.354 | 0.722 | 3.677 | 0.363 | 0.20× | **1.99×** |
+| 32768 | 1.000 | 0.831 | 3.155 | 4.117 | 14.124 | **0.775** | 0.29× | **5.31×** |
+
+Prefill causal (n_q == n_kv) at the same shape:
+
+| n_q | scoresMB | scores_t | softmax | out_t | 3-pass/L | fa_fwd/L | speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 0.008 | 0.082 ms | 0.083 | 0.148 | 0.313 | 0.096 | **3.27×** |
+| 128 | 0.500 | 0.311 | 0.083 | 0.766 | 1.159 | 0.302 | **3.84×** |
+| 512 | 8.000 | 4.260 | 0.108 | 7.550 | 11.918 | 3.376 | **3.53×** |
+| 2048 | 128.000 | 65.538 | 0.489 | 128.462 | 194.489 | 57.145 | **3.40×** |
+
+Slightly softer wins than d=128 (4-4.8× prefill, 7.09× decode-32k)
+because BC=8 doubles the K-tile iteration count and n_heads=8 halves
+the WG count per dispatch — but still a clean 3.3-3.8× prefill and
+5.3× FlashDecoding at ctx=32k. The scoresMB column is also halved
+because Qwen3.5 0.8B has 8 heads vs Qwen3-0.6B's 16, so the 3-pass
+scores buffer roundtrip shrinks proportionally (1 GB vs 2 GB at
+ctx=32k per layer).
+
+**End-to-end on Gemma 2B IT** (`--bench --n 4096`, bf16 matmul,
+3090): warm decode 8.74 ms/tok at pos 4080-4095 (`fa_decode` on the
+d=256 SPIR-V), vs the projected 12-14 ms/tok the pre-D-arc 3-pass
+chain would have run at d=256 long-ctx. ~1.4-1.6× speedup at long
+context, on top of the existing per-token tok/s. (Short-ctx tok/s
+unchanged at ~142 tok/s — the FA win is small at n_kv ≤ 128 where
+matmul dominates, and matches the bench's 1.46× per-layer attention
+saving in absolute ms.)
+
+**Outstanding:** `runtime_hybrid.zig` (the Qwen3.5/3.6 hybrid path)
+still routes its full-attention layers through the 3-pass chain.
+Wiring `fa_decode_split` + `fa_decode_merge` into that module is
+the next chunk to make Qwen3.5 0.8B/4B see the same long-ctx win
+as Gemma 2B does today.

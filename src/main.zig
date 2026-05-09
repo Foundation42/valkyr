@@ -378,6 +378,13 @@ pub fn main() !void {
         try smoke_gpu_train.runAttnBench(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--attn-bench-d256")) {
+        // Same sweeps as --attn-bench but at Qwen3.5 0.8B per-layer
+        // shape (n_heads=8 n_kv_heads=2 head_dim=256). Exercises the
+        // BC=8 d=256 SPIR-V variants of fa_forward + fa_decode_split.
+        try smoke_gpu_train.runAttnBenchD256(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-smoke")) {
         // GPU LoRA composition smoke. Drives existing matmul_nt_v2 +
         // linear_backward_d{x,w}_batched + scale + add_in_place
