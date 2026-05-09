@@ -60,11 +60,20 @@ The two big arcs:
      the FA path end-to-end via `--chat`. Output gated by parity
      smokes (chat-path 4.42e-7 rel-err) plus end-to-end Qwen3.5
      0.8B `--chat`: "What is the capital of France?" → "The capital
-     of France is **Paris**." Outstanding
-     fused-FA deepening: a kernel that consumes packed TQ4 K/V
-     directly in the inner loop (skipping the `dequant_v`
-     materialisation) for the bandwidth savings to land at long
-     context.
+     of France is **Paris**." **T-arc (fused TQ4-V FlashDecoding,
+     2026-05-09 evening)** investigated and parked: a fused kernel
+     `shaders/fa_decode_split_tq4v.comp` that consumes packed TQ4 V
+     directly in the FA inner loop ships, parity-checked at 1.90e-6
+     rel-err, but bench shows it's **1.45× slower** than the
+     unfused `tq4_unpack + fa_decode_split` path on RTX 3090
+     (Gemma 2B ctx=16k: 17.10 vs 12.81 ms/tok). The unfused path's
+     `n_pos × n_kv_heads`-WG dispatch saturates the 3090 trivially;
+     the fused kernel crams the same dequant work into the FA path's
+     8× fewer workgroups. Workgroup-parallelism, not HBM bandwidth,
+     was the actual bottleneck. Kernel + CPU oracle + smokes stay
+     shipped (reproducible experiment); runtime dispatchers route
+     through the unfused path. See `docs/perf.md` § "Fused TQ4-V
+     (T-arc, investigated, not engaged)".
    - **bf16 LM head + bf16 embedding** kernels — currently fp32, the
      LM head matmul is the single biggest dispatch we do.
    - **GPU-side compute quantize.** Q4_K_M upload is currently 4–6×

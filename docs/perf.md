@@ -228,3 +228,73 @@ hybrid):
 The dense `--bench` harness doesn't run hybrid models (separate
 forward dispatcher) so steady-state numbers come from `--chat`
 which folds prefill into the tok/s figure.
+
+## Fused TQ4-V FlashDecoding (T-arc, investigated, not engaged)
+
+The natural-looking next step after the D-arc and E-arc was to
+**fuse** the TQ4 V dequant into `fa_decode_split` directly — read
+the packed V cache (33 u32 per 256-element block) inside the FA
+inner loop, dequant per K-tile, never round-trip fp32 V through HBM.
+Bandwidth-arithmetic predicts a clean win at long ctx:
+
+  Unfused TQ4-V per layer per token, d=256, n_kv=N:
+    tq4_unpack:  read N × n_kv_heads × 33 × 4B    (packed in)
+                 write N × n_kv_heads × 256 × 4B  (fp32 out)
+    fa_decode:   read N × n_kv_heads × 256 × 4B   (fp32 V back)
+    Total       ≈ N × n_kv_heads × (132 + 1024 + 1024) ≈ 2.2 KB
+                 of HBM per pos per kv-head.
+
+  Fused per layer per token:
+    fa_decode_tq4v: read N × n_kv_heads × 33 × 4B = 132 B per pos.
+    Total       ≈ N × n_kv_heads × 132 B — **~16× less HBM**.
+
+We built the fused kernel: `shaders/fa_decode_split_tq4v.comp`,
+parity-checked by `--flash-attention-tq4v-smoke` (CPU oracle, bit-
+exact, rel=0.00) and `--fa-decode-tq4v-smoke` (GPU vs CPU oracle,
+4 cases at Gemma 2B + Qwen3.5 0.8B shapes, max rel=1.90e-6). The
+math identity that makes the fusion cheap is:
+
+  V_k = γ_k · S · IFWHT(c_k)             (S = constant TBQ sign vec)
+  Σ_k P_k · V_k[d]
+    = S[d] · IFWHT(Σ_k P_k · γ_k · c_k)[d]   (linearity)
+
+So we accumulate `Y_state[d] = Σ_k P_k · γ_k · centroid[indices_k[d]]`
+in the inner loop (just an index lookup × scalar MAC per (k, d))
+and apply IFWHT + sign-flip + 1/256 *exactly once* at the end of
+the workgroup. No per-K-tile butterflies — collapses dequant work
+from BC × 8 = 64 sync barriers per K-tile down to ~3.
+
+**The fused kernel is slower than the unfused path on RTX 3090.**
+Bench at Gemma 2B IT (n_heads=8, n_kv_heads=1, head_dim=256, 18L,
+ReleaseFast, n=16384, late pos 16368):
+
+  fp32 V (no tq4v)             11.76 ms/tok    103.2 tok/s warm
+  Unfused TQ4-V                12.81 ms/tok     97.2 tok/s warm
+  Fused TQ4-V (T-arc)          17.10 ms/tok     83.8 tok/s warm
+
+The fused path is **1.45× slower** than unfused TQ4-V at long ctx.
+Why: HBM bandwidth wasn't the bottleneck — *workgroup parallelism*
+was. The unfused `tq4_unpack` dispatches `n_pos × n_kv_heads`
+workgroups (16k+ at long ctx on Gemma 2B) and trivially saturates
+the 3090's 82 SMs. Each WG runs a single 256-element IFWHT
+butterfly + one HBM write and finishes fast. The fused FA path
+has only `n_heads × n_splits = 8 × 64 = 512` workgroups at the
+same shape — 32× less parallelism — and crams the same dequant
+work *plus* the FA online-softmax loop into each. The "wasteful"
+fp32 V roundtrip turns out to be free because it runs wide.
+
+This is the kind of GPU-architectural lesson that doesn't fall out
+of the bandwidth math: **workgroup count is a real resource**.
+The fused kernel might still pay on a different shape (lots of
+heads, few splits — fewer unfused unpack WGs to start with) or a
+different GPU (one with much weaker HBM). Easy to revisit.
+
+Status: the kernel + CPU oracle + parity smokes (`--flash-attention-
+tq4v-smoke`, `--fa-decode-tq4v-smoke`) **stay shipped** so the
+experiment is reproducible and the math identity is captured. The
+runtime dispatchers (`runtime.recordOneLayer`,
+`runtime_hybrid.recordOneLayer`) **route through the unfused
+`tq4_unpack + fa_decode_split` path** by default — the fused kernel
+is built but never dispatched. The pipeline lives in `ChatKernels`
+in case a future session wants to flip the gate back on for a
+shape where it pays.

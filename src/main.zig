@@ -682,15 +682,22 @@ pub fn main() !void {
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--bench")) {
         var n: usize = 64;
+        var tq4v: bool = false;
         var i: usize = 3;
-        while (i < args.len) : (i += 2) {
+        while (i < args.len) {
             if (std.mem.eql(u8, args[i], "--n") and i + 1 < args.len) {
                 n = try std.fmt.parseInt(usize, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, args[i], "--tq4v")) {
+                tq4v = true;
+                i += 1;
+            } else {
+                i += 1;
             }
         }
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
-        try commands_bench.runBench(allocator, dir, n);
+        try commands_bench.runBench(allocator, dir, n, tq4v);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--session-smoke")) {

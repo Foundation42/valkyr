@@ -634,18 +634,20 @@ pub fn recordOneLayer(
                 try runtime.recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &state.kv_v[layer_idx].? }, &p.kv_write_push, p.kv_dim);
             }
 
-            // V buffer for attention. Two paths:
-            //   * Fused TQ4-V FA (head_dim==256 + tq4_v + attn_use_fa):
-            //     read packed V cache directly inside the FA kernel,
-            //     skip the t.unpack dispatch + dequant_v scratch.
-            //   * Otherwise: lift t.unpack here so all attention kernels
-            //     see the same fp32 V layout.
-            const fused_tq4v_path: bool = p.attn_use_fa and tq4_v != null and p.head_dim == 256;
+            // V buffer for attention: TQ4-V dequants here on-demand
+            // (lifted above the FA / 3-pass branch so both paths read
+            // the same binding). When the host isn't using TQ4-V the
+            // fp32 cache is fed straight in.
+            //
+            // The T-arc fused `fa_decode_split_tq4v` kernel exists and
+            // parity-matches (see `--fa-decode-tq4v-smoke`) but is *not*
+            // dispatched here — see the matching note in
+            // `runtime.recordOneLayer` and `docs/perf.md` §"Fused TQ4-V"
+            // for the bench data showing why the unfused parallel
+            // unpack wins on RTX 3090.
             const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
-                if (!fused_tq4v_path) {
-                    const total_blocks: u32 = p.n_pos * t.n_blocks_per_pos;
-                    try rec.dispatch(t.unpack, &.{ &state.kv_v_tq4[layer_idx].?, &sc.dequant_v.? }, null, total_blocks, 1, 1);
-                }
+                const total_blocks: u32 = p.n_pos * t.n_blocks_per_pos;
+                try rec.dispatch(t.unpack, &.{ &state.kv_v_tq4[layer_idx].?, &sc.dequant_v.? }, null, total_blocks, 1, 1);
                 break :blk &sc.dequant_v.?;
             } else &state.kv_v[layer_idx].?;
 
@@ -656,26 +658,14 @@ pub fn recordOneLayer(
                 // difference is Qwen3.5/3.6 has the q-gate branch downstream
                 // (`sigmoid_mul` after `head_out` → `head_out_gated`).
                 const split = p.fa_decode_split_push;
-                if (fused_tq4v_path) {
-                    // Fused-TQ4-V FAST path: bind packed V cache directly.
-                    try rec.dispatch(
-                        &k.fa_decode_split_tq4v,
-                        &.{ &sc.qrot, &state.kv_k[layer_idx].?, &state.kv_v_tq4[layer_idx].?, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
-                        &split,
-                        p.n_q_heads * split.n_splits,
-                        1,
-                        1,
-                    );
-                } else {
-                    try rec.dispatch(
-                        &k.fa_decode_split,
-                        &.{ &sc.qrot, &state.kv_k[layer_idx].?, v_for_attn, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
-                        &split,
-                        p.n_q_heads * split.n_splits,
-                        1,
-                        1,
-                    );
-                }
+                try rec.dispatch(
+                    &k.fa_decode_split,
+                    &.{ &sc.qrot, &state.kv_k[layer_idx].?, v_for_attn, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
+                    &split,
+                    p.n_q_heads * split.n_splits,
+                    1,
+                    1,
+                );
                 try rec.dispatch(
                     &k.fa_decode_merge,
                     &.{ &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial, &sc.head_out },

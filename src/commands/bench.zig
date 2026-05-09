@@ -9,10 +9,12 @@ const model_mod = @import("../model.zig");
 const gpu_model = @import("../gpu/model.zig");
 const gpu_scratch = @import("../gpu/scratch.zig");
 const gpu_recorder = @import("../gpu/recorder.zig");
+const pipeline = @import("../gpu/pipeline.zig");
 const runtime = @import("../runtime.zig");
 const cpu_forward = @import("../cpu/forward.zig");
+const shaders = @import("shaders");
 
-pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !void {
+pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq4v: bool) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
     const cfg = cpu.config;
@@ -42,6 +44,38 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !v
     var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
     defer k.deinit();
 
+    // Optional TQ4-V cache (asymmetric K=fp / V=TQ4). Mirrors the chat
+    // command's setup — only allocated when --tq4v was passed. The fp32
+    // kv buffer above is still used for K; we just substitute the V path.
+    var kv_tq4 = if (tq4v)
+        try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos)
+    else
+        null;
+    defer if (kv_tq4) |*c| c.deinit(ctx.device);
+    const tq_pack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+        &shaders.tq4_pack_to_cache128
+    else
+        &shaders.tq4_pack_to_cache;
+    const tq_unpack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+        &shaders.tq4_unpack128
+    else
+        &shaders.tq4_unpack256;
+    var tq_pack: ?pipeline.Kernel = if (tq4v)
+        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(runtime.Tq4PackPush))
+    else
+        null;
+    defer if (tq_pack) |*kk| kk.deinit();
+    var tq_unpack: ?pipeline.Kernel = if (tq4v)
+        try pipeline.Kernel.init(&ctx, tq_unpack_spv, 2, 0)
+    else
+        null;
+    defer if (tq_unpack) |*kk| kk.deinit();
+    const tq4_hooks: ?runtime.Tq4VHooks = if (tq4v)
+        runtime.Tq4VHooks{ .pack = &tq_pack.?, .unpack = &tq_unpack.?, .cache = &kv_tq4.? }
+    else
+        null;
+    if (tq4v) try stdout.print("kv: K=fp32 V=TQ4 (asymmetric)\n", .{});
+
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
     defer rec.deinit();
 
@@ -65,7 +99,7 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !v
     for (0..n_steps) |step| {
         if (step > 0) try rec.reset();
         try rec.begin();
-        try runtime.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, step, current, null, true);
+        try runtime.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, step, current, tq4_hooks, true);
         const t0 = std.time.nanoTimestamp();
         try rec.endAndSubmit();
         const t1 = std.time.nanoTimestamp();

@@ -3,32 +3,42 @@
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_vote       : require
 
-// FlashDecoding split-K phase 1, fused with TQ4 V-cache dequant
-// (Tri Dao 2023 + TurboQuant inline). Same dispatch shape and same
-// online-softmax algorithm as `fa_decode_split.comp`, but reads V
-// from the GPU TQ4 cache layout (33 u32 per 256-element block) and
-// dequantises inline per K-tile via the existing `tq4_unpack256`
-// IFWHT pattern — never materialises the fp32 V history in HBM.
+// FlashDecoding split-K phase 1, fused with TQ4-V dequant via the
+// "WHT-domain accumulator" trick. Same dispatch shape and online-
+// softmax algorithm as `fa_decode_split.comp`, but reads V from the
+// GPU TQ4 cache (33 u32 per 256-element block) and *exploits the
+// linearity of IFWHT* to move the 256-element butterfly out of the
+// K-tile inner loop.
 //
-// d=256 only — block size matches `head_dim` exactly so each (k, kv_h)
-// V vector is one TQ4 block. The d=128 TQ4 layout (blocks of 128
-// elements, two per kv-head) needs its own variant; not yet shipped.
+// Key identity (`S` = TBQ sign vector, constant across blocks):
 //
-// Shared-mem layout @ HEAD_DIM_MAX=256, BC=8:
-//   Q_row    [256]               = 1 KB
-//   O_state  [256]               = 1 KB
-//   K_tile   [BC × 256] = 8 × 256 = 8 KB    (still fp32, K not packed)
-//   V_tile   [BC × 256] = 8 × 256 = 8 KB    (dequanted in-place)
-//   S_row, P_row, sg_partials, scalars      <1 KB
-// Total ~19 KB, fits AMD RDNA's 32 KB/WG ceiling and NVIDIA Ampere's
-// default 48 KB.
+//   V_k = γ_k · S · IFWHT(c_k)            with c_k = LM_CENTROIDS_B4[indices_k]
+//   Σ_k P_k · V_k[d]
+//     = S[d] · Σ_k P_k · γ_k · IFWHT(c_k)[d]
+//     = S[d] · IFWHT(Σ_k P_k · γ_k · c_k)[d]
 //
-// Per K-tile load: BC sequential cooperative IFWHTs (8 butterfly
-// rounds + barrier each) over the 256-element V row. The
-// dequantisation cost is N × 8 × barrier_latency per K-tile, which
-// trades against the HBM bandwidth saved by skipping the fp32 V
-// roundtrip. Net win lands at long ctx where V history dominates
-// attention bandwidth.
+// So we accumulate `Y_state[d] = Σ_k P_k · γ_k · c_k[d]` (just an
+// elementwise centroid lookup × scalar MAC per (k, d)) inside the
+// K-tile loop, with the standard online-softmax `scale_old` rescaling
+// applied to Y_state, and apply IFWHT + sign-flip + 1/256 *exactly
+// once* at the end of the workgroup. That collapses the per-K-tile
+// dequant cost from BC × 8 = 64 cooperative-butterfly barriers down
+// to ~3 (γ broadcast + Y rescale), and replaces the BC-per-tile
+// IFWHTs with a single WG-final one.
+//
+// d=256 only — block size matches `head_dim` exactly so each
+// (k, kv_h) V vector is one TQ4 block. Bandwidth saving vs the
+// unfused tq4_unpack + standard fa_decode_split path: skip the fp32
+// V history roundtrip in HBM (~85% of V-side traffic at d=256).
+//
+// Shared-mem layout @ HEAD_DIM_MAX=256 BC=8:
+//   Q_row    [256]                           = 1 KB
+//   Y_state  [256]                           = 1 KB    WHT-domain accumulator
+//   K_tile   [BC × 256]   = 8 × 256          = 8 KB    fp32 K (unchanged)
+//   S_row, P_row, sg_partials, scalars       <1 KB
+// Total ~12 KB, comfortably under both AMD RDNA's 32 KB/WG ceiling and
+// NVIDIA Ampere's default 48 KB. (Drops by ~7 KB vs the standard
+// fa_decode_split_d256 because the V_tile is gone.)
 
 layout(local_size_x = 256) in;
 
@@ -59,8 +69,7 @@ layout(push_constant) uniform Pc {
     float inv_sqrt_dim;
 } pc;
 
-// TBQ sign table (matches `tbq_signs` in cpu/turboquant.zig, identical
-// to `TBQ_SIGN_WORDS` in tq4_unpack256.comp / tq4_pack_to_cache.comp).
+// TBQ sign table (matches `tbq_signs` in cpu/turboquant.zig).
 const uint TBQ_SIGN_WORDS[8] = uint[8](
     0xf4913ba7u, 0x0e58c26du, 0xd6247fb3u, 0x1cea4589u,
     0x52d8af63u, 0x3de10b97u, 0xfe19c476u, 0xdb2c854au
@@ -79,9 +88,8 @@ const float LM_CENTROIDS_B4[16] = float[16](
 );
 
 shared float Q_row [HEAD_DIM_MAX];
-shared float O_state[HEAD_DIM_MAX];
+shared float Y_state[HEAD_DIM_MAX];
 shared float K_tile[BC * HEAD_DIM_MAX];
-shared float V_tile[BC * HEAD_DIM_MAX];
 shared float S_row [BC];
 shared float P_row [BC];
 shared float sg_partials[32];
@@ -90,7 +98,7 @@ shared float m_state;
 shared float l_state;
 shared float m_tile_shared;
 shared float l_tile_shared;
-shared float gamma_kj;        // per-kj γ broadcast for inline dequant
+shared float gamma_kj;
 
 void main() {
     const float NEG_INF = uintBitsToFloat(0xff800000u);
@@ -115,7 +123,7 @@ void main() {
     // ── Load Q row (q implicit = 0) + init online-softmax state.
     for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
         Q_row[d]   = q_buf[h * hd + d];
-        O_state[d] = 0.0;
+        Y_state[d] = 0.0;
     }
     if (tid == 0u) {
         m_state = NEG_INF;
@@ -151,73 +159,8 @@ void main() {
         }
         barrier();
 
-        // ── 2. Inline TQ4 dequant of V_tile, one block per kj. The
-        //    workgroup of 256 threads cooperates on each block in turn:
-        //    threads 0..127 own pairs (2*tid, 2*tid+1) for the IFWHT
-        //    butterfly; threads 128..255 are idle during butterfly
-        //    rounds but participate in centroid load + sign/γ scale.
-        for (uint kj = 0u; kj < k_block_len; kj += 1u) {
-            uint k_abs = k_block_start + kj;
-            uint base_in = (k_abs * n_blocks_per_pos + kv_h) * 33u;
-
-            // γ broadcast.
-            if (tid == 0u) {
-                gamma_kj = uintBitsToFloat(v_packed[base_in]);
-            }
-            barrier();
-            float gamma = gamma_kj;
-
-            // ── 2a. Centroid load: each thread t<128 reads 2 nibbles
-            // (1 byte) from word (1 + t/4), shifted by (t%4)*8, and
-            // writes the centroid pair into V_tile[kj*256 + 2t / 2t+1].
-            // Zero-γ short circuit: V_tile row gets zeroed.
-            if (gamma == 0.0) {
-                for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
-                    V_tile[kj * hd + d] = 0.0;
-                }
-                barrier();
-                continue;
-            }
-
-            if (tid < 128u) {
-                uint i0 = 2u * tid;
-                uint i1 = i0 + 1u;
-                uint word_idx   = 1u + (tid >> 2u);
-                uint byte_shift = (tid & 3u) << 3u;
-                uint byte_val = (v_packed[base_in + word_idx] >> byte_shift) & 0xffu;
-                uint idx0 = byte_val & 0xfu;
-                uint idx1 = (byte_val >> 4u) & 0xfu;
-                V_tile[kj * hd + i0] = LM_CENTROIDS_B4[idx0];
-                V_tile[kj * hd + i1] = LM_CENTROIDS_B4[idx1];
-            }
-            barrier();
-
-            // ── 2b. IFWHT butterfly: 8 rounds, length = 1, 2, 4, ..., 128.
-            // Threads 0..127 each handle one (i, j=i+length) pair per round.
-            for (uint length = 1u; length < 256u; length <<= 1u) {
-                if (tid < 128u) {
-                    uint block_idx = tid / length;
-                    uint pos       = tid % length;
-                    uint i = block_idx * (2u * length) + pos;
-                    uint j = i + length;
-                    float u = V_tile[kj * hd + i];
-                    float v = V_tile[kj * hd + j];
-                    V_tile[kj * hd + i] = u + v;
-                    V_tile[kj * hd + j] = u - v;
-                }
-                barrier();
-            }
-
-            // ── 2c. Sign-flip + γ scale + IFWHT-divisor (1/256). All
-            // 256 threads contribute: thread d handles V_tile[kj*256 + d].
-            for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
-                V_tile[kj * hd + d] = V_tile[kj * hd + d] * INV_256 * rhtSign(d) * gamma;
-            }
-            barrier();
-        }
-
-        // ── 3. Compute S_row[kj] = inv_sqrt_d · Σ_d Q · K[kj].
-        // Subgroup-parallel dot products, identical to fa_decode_split.
+        // ── 2. S_row[kj] = inv_sqrt_d · Σ_d Q · K[kj]. Same subgroup-
+        // parallel dot products as fa_decode_split.
         uint sg = gl_SubgroupID;
         uint sg_count = gl_NumSubgroups;
         uint rounds = (k_block_len + sg_count - 1u) / sg_count;
@@ -236,7 +179,7 @@ void main() {
         }
         barrier();
 
-        // ── 4. Cooperative rowmax of S_row[0..k_block_len].
+        // ── 3. Cooperative rowmax of S_row[0..k_block_len].
         float local_max = NEG_INF;
         for (uint kj = tid; kj < k_block_len; kj += gl_WorkGroupSize.x) {
             local_max = max(local_max, S_row[kj]);
@@ -255,7 +198,7 @@ void main() {
         float m_old = m_state;
         float m_new = max(m_old, m_tile_shared);
 
-        // ── 5. P_row[kj] = exp(S_row[kj] − m_new); cooperative rowsum.
+        // ── 4. P_row[kj] = exp(S_row[kj] − m_new); cooperative rowsum.
         float local_sum = 0.0;
         for (uint kj = tid; kj < k_block_len; kj += gl_WorkGroupSize.x) {
             float s = S_row[kj];
@@ -277,14 +220,44 @@ void main() {
         float scale_old = (m_old == NEG_INF) ? 0.0 : exp(m_old - m_new);
         float l_tile    = l_tile_shared;
 
-        // ── 6. Update O: O = scale_old · O + Σ_kj P_row[kj] · V_tile[kj, :].
+        // ── 5. Rescale Y_state by scale_old (online-softmax invariant).
+        // Each thread owns its slice of head_dim. The Y_state lives in
+        // the WHT (post-RHT, pre-IFWHT) domain.
         for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
-            float o = O_state[d] * scale_old;
-            for (uint kj = 0u; kj < k_block_len; kj += 1u) {
-                o += P_row[kj] * V_tile[kj * hd + d];
-            }
-            O_state[d] = o;
+            Y_state[d] *= scale_old;
         }
+        barrier();
+
+        // ── 6. Accumulate centroid contributions: per-kj, all 256 threads
+        // each look up their nibble for element d=tid and update
+        // Y_state[d] += P_kj · γ_kj · LM_CENTROIDS_B4[indices_kj[d]].
+        // Each thread only ever writes to Y_state[tid] within this loop,
+        // so no barrier is needed between kj iterations *for the writes*
+        // — but we DO need a barrier for the γ broadcast at each kj.
+        for (uint kj = 0u; kj < k_block_len; kj += 1u) {
+            uint k_abs = k_block_start + kj;
+            uint base_in = (k_abs * n_blocks_per_pos + kv_h) * 33u;
+            if (tid == 0u) {
+                gamma_kj = uintBitsToFloat(v_packed[base_in]);
+            }
+            barrier();
+            float gamma = gamma_kj;
+            if (gamma == 0.0) continue;
+
+            float pg = P_row[kj] * gamma;
+            // Each thread t in [0, 256) handles element d = t. The nibble
+            // index = t (running 0..255). u32 index = 1 + t/8; nibble
+            // shift within u32 = (t % 8) * 4 bits. Matches the packing
+            // convention in tq4_pack256.comp / tq4_pack_to_cache.comp.
+            if (tid < hd) {
+                uint d = tid;
+                uint word_idx   = 1u + (d >> 3u);
+                uint nibble_sh  = (d & 7u) << 2u;
+                uint idx = (v_packed[base_in + word_idx] >> nibble_sh) & 0xfu;
+                Y_state[d] += pg * LM_CENTROIDS_B4[idx];
+            }
+        }
+        barrier();
 
         if (tid == 0u) {
             m_state = m_new;
@@ -293,10 +266,30 @@ void main() {
         barrier();
     }
 
-    // ── 7. Emit unnormalised partials. Identical to fa_decode_split.
+    // ── 7. Final IFWHT on Y_state (8 butterfly rounds) + sign-flip +
+    // 1/256 to lift back to the spatial domain. This is the *only*
+    // butterfly the kernel runs, vs the K-tile loop's BC×iter butterflies
+    // that the per-tile-dequant approach would need.
+    for (uint length = 1u; length < 256u; length <<= 1u) {
+        if (tid < 128u) {
+            uint block_idx = tid / length;
+            uint pos       = tid % length;
+            uint i = block_idx * (2u * length) + pos;
+            uint j = i + length;
+            float u = Y_state[i];
+            float v = Y_state[j];
+            Y_state[i] = u + v;
+            Y_state[j] = u - v;
+        }
+        barrier();
+    }
+
+    // ── 8. Spatial-domain partial: O[d] = S[d] · Y[d] / 256. Unnormalised
+    // (the merge phase divides by l_global). Each thread writes its own
+    // element back to global memory; no further barriers needed.
     uint base = (h * pc.n_splits + split_id) * hd;
     for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {
-        o_partial[base + d] = O_state[d];
+        o_partial[base + d] = Y_state[d] * INV_256 * rhtSign(d);
     }
     if (tid == 0u) {
         uint idx = h * pc.n_splits + split_id;
