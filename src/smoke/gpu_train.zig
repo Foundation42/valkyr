@@ -34,6 +34,7 @@ const hf_cache = @import("../hf_cache.zig");
 const cpu_mtp = @import("../cpu/mtp.zig");
 const runtime_hybrid = @import("../runtime_hybrid.zig");
 const runtime_mtp = @import("../runtime_mtp.zig");
+const tokenizer_mod = @import("../tokenizer.zig");
 
 pub fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -5473,4 +5474,192 @@ pub fn runMtpForwardGpuSmoke(allocator: std.mem.Allocator) !void {
         "PASS mtp-forward-gpu ({s} fp32_all, {d} MTP layer(s)): rel={e} top1={s} (cpu={d}, gpu={d}); {d:.0} ms CPU, {d:.0} ms GPU\n",
         .{ model_id, gm.mtp_head.?.layers.len, rel, if (top1_match) "match" else "DIVERGED", top1_cpu, top1_gpu, cpu_ms, gpu_ms },
     );
+}
+
+// ── MTP draft chain smoke (chunk MTP-1c-α) ──────────────────────────
+//
+// End-to-end demo that the main → MTP recursive draft chain works on a
+// real model. Loads Qwen3.5-0.8B, runs:
+//
+//   1. Main forward at pos=0 with BOS → snapshot last hidden, sample c_1.
+//   2. For slot s in 0..k-1:
+//        recordMtpStep with prev token + (last_hidden if s=0 else h_out)
+//        → sample draft token c_{2+s}.
+//
+// Decodes tokens via the loaded tokenizer and prints the chain. Sanity
+// gates: every token is in-vocab, deterministic across re-runs.
+// Verify (compare drafts against a real main forward at each draft
+// position) lands in MTP-1c-β; chat-path integration lands in
+// MTP-1c-γ.
+
+pub fn runMtpDraftChainSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runMtpDraftChainSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+    if (cpu.mtp_head == null) {
+        std.debug.print("FAIL runMtpDraftChainSmoke: {s} has no MTP head on disk\n", .{model_id});
+        return error.NoMtpHead;
+    }
+
+    var gm = try gpu_model.GpuModel.upload(allocator, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    const cfg = gm.config;
+    const max_pos: u32 = 32;
+    const k_drafts: usize = 3;
+    const hidden_u32: u32 = @intCast(cfg.hidden_size);
+
+    // ── Runtime + MTP state ─────────────────────────────────────────
+    var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, false);
+    defer sc.deinit(ctx.device);
+
+    var k_kernels = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all);
+    defer k_kernels.deinit();
+
+    var state = try runtime_hybrid.State.init(allocator, &ctx, cfg, max_pos, false);
+    defer state.deinit(ctx.device);
+
+    var mtp_state = try runtime_mtp.MtpRuntimeState.init(allocator, &ctx, cfg, max_pos);
+    defer mtp_state.deinit(ctx.device);
+
+    // 24-layer Qwen3.5-0.8B (18 linear-attn + 6 full-attn) needs ~540
+    // dispatches per main forward; size with headroom for the MTP step
+    // chain that comes after.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
+    defer rec.deinit();
+
+    var last_hidden_buf = try buffer.Buffer.initDeviceOnly(&ctx, cfg.hidden_size * @sizeOf(f32));
+    defer last_hidden_buf.deinit(ctx.device);
+    var draft_logits_buf = try buffer.Buffer.initDeviceOnly(&ctx, cfg.vocab_size * @sizeOf(f32));
+    defer draft_logits_buf.deinit(ctx.device);
+
+    const logits_host = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_host);
+
+    const argmax = struct {
+        fn run(arr: []const f32) !u32 {
+            var best: u32 = 0;
+            var best_v = arr[0];
+            for (arr, 0..) |x, i| {
+                if (std.math.isNan(x) or std.math.isInf(x)) return error.NonFinite;
+                if (x > best_v) {
+                    best_v = x;
+                    best = @intCast(i);
+                }
+            }
+            return best;
+        }
+    }.run;
+
+    // ── Step 0: main forward at pos=0 with BOS ──────────────────────
+    const bos: u32 = cfg.bos_token_id orelse 0;
+    {
+        try rec.reset();
+        try rec.begin();
+        try runtime_hybrid.recordForwardStep(&rec, &sc, &state, &gm, cfg, &k_kernels, 0, bos, max_pos, null, true);
+        // Snapshot last hidden (sc.stream is unread after the layer loop's
+        // residual_add until final_norm reads it; slice_copy here just
+        // forks a copy out for the MTP head's first slot).
+        const sc_h = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = hidden_u32 };
+        try runtime.recDispatch1D(&rec, &k_kernels.slice_copy, &.{ &sc.stream, &last_hidden_buf }, &sc_h, hidden_u32);
+        try rec.endAndSubmit();
+    }
+    try sc.logits.readBack(&ctx, f32, logits_host);
+    const token_main = try argmax(logits_host);
+
+    // ── Steps 1..k: MTP draft slots ─────────────────────────────────
+    var draft_tokens: [16]u32 = undefined;
+    if (k_drafts > draft_tokens.len) return error.TooManyDrafts;
+    var prev_token = token_main;
+    for (0..k_drafts) |s| {
+        const h_prev_buf = if (s == 0) &last_hidden_buf else &mtp_state.h_out;
+        try rec.reset();
+        try rec.begin();
+        try runtime_mtp.recordMtpStep(
+            &rec, &sc, &gm, cfg, &k_kernels, &mtp_state,
+            h_prev_buf, prev_token, s, max_pos, &draft_logits_buf,
+        );
+        try rec.endAndSubmit();
+
+        try draft_logits_buf.readBack(&ctx, f32, logits_host);
+        const top1 = try argmax(logits_host);
+        draft_tokens[s] = top1;
+        prev_token = top1;
+    }
+
+    // ── Determinism re-run (fresh state) ────────────────────────────
+    try state.reset(&ctx);  // ssm only — kv slots get overwritten on prefill
+    var mtp_state2 = try runtime_mtp.MtpRuntimeState.init(allocator, &ctx, cfg, max_pos);
+    defer mtp_state2.deinit(ctx.device);
+
+    var token_main2: u32 = 0;
+    var draft_tokens2: [16]u32 = undefined;
+    {
+        try rec.reset();
+        try rec.begin();
+        try runtime_hybrid.recordForwardStep(&rec, &sc, &state, &gm, cfg, &k_kernels, 0, bos, max_pos, null, true);
+        const sc_h = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = hidden_u32 };
+        try runtime.recDispatch1D(&rec, &k_kernels.slice_copy, &.{ &sc.stream, &last_hidden_buf }, &sc_h, hidden_u32);
+        try rec.endAndSubmit();
+        try sc.logits.readBack(&ctx, f32, logits_host);
+        token_main2 = try argmax(logits_host);
+    }
+    if (token_main2 != token_main) {
+        std.debug.print("FAIL mtp-draft-chain: main token nondeterministic ({d} vs {d})\n", .{ token_main, token_main2 });
+        return error.Nondeterministic;
+    }
+    var prev2 = token_main2;
+    for (0..k_drafts) |s| {
+        const h_prev_buf = if (s == 0) &last_hidden_buf else &mtp_state2.h_out;
+        try rec.reset();
+        try rec.begin();
+        try runtime_mtp.recordMtpStep(
+            &rec, &sc, &gm, cfg, &k_kernels, &mtp_state2,
+            h_prev_buf, prev2, s, max_pos, &draft_logits_buf,
+        );
+        try rec.endAndSubmit();
+        try draft_logits_buf.readBack(&ctx, f32, logits_host);
+        const top1 = try argmax(logits_host);
+        draft_tokens2[s] = top1;
+        prev2 = top1;
+        if (top1 != draft_tokens[s]) {
+            std.debug.print("FAIL mtp-draft-chain: draft[{d}] nondeterministic ({d} vs {d})\n", .{ s, draft_tokens[s], top1 });
+            return error.Nondeterministic;
+        }
+    }
+
+    // ── Decode + print ──────────────────────────────────────────────
+    std.debug.print("PASS mtp-draft-chain ({s}, fp32_all, {d} MTP layer(s)):\n", .{ model_id, gm.mtp_head.?.layers.len });
+    {
+        const txt = try tok.decodeForDisplay(allocator, bos);
+        defer allocator.free(txt);
+        std.debug.print("  prompt: bos={d} \"{s}\"\n", .{ bos, txt });
+    }
+    {
+        const txt = try tok.decodeForDisplay(allocator, token_main);
+        defer allocator.free(txt);
+        std.debug.print("  main:   {d} \"{s}\"\n", .{ token_main, txt });
+    }
+    for (0..k_drafts) |s| {
+        const txt = try tok.decodeForDisplay(allocator, draft_tokens[s]);
+        defer allocator.free(txt);
+        std.debug.print("  draft{d}: {d} \"{s}\"\n", .{ s, draft_tokens[s], txt });
+    }
 }

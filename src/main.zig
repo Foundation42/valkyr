@@ -164,6 +164,15 @@ pub fn main() !void {
         try smoke_gpu_train.runMtpForwardGpuSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mtp-draft-chain-smoke")) {
+        // MTP-1c-α: end-to-end MTP draft chain demo. Main forward at
+        // pos=0 with BOS → snapshot last hidden, sample first token →
+        // recordMtpStep recursively for k draft slots, sampling each
+        // top-1 token. Decodes via the loaded tokenizer and prints the
+        // chain. Verify path lands in MTP-1c-β.
+        try smoke_gpu_train.runMtpDraftChainSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-forward-smoke")) {
         // F3 of the FlashAttention arc: GPU SPIR-V kernel parity vs
         // the F2 CPU oracle. Drives `shaders/fa_forward.comp` (one
