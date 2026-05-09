@@ -1101,3 +1101,147 @@ pub fn runMtpForwardCpuSmoke(allocator: std.mem.Allocator) !void {
         .{ model_id, model.mtp_head.?.layers.len, tok_a, top1_a, max_abs_a, tok_b, top1_b, max_abs_b, ms_total },
     );
 }
+
+// ── T1: fused FA + TQ4-V CPU oracle parity ─────────────────────────────
+//
+// Gates `cpu/flash_attn.zig:flashAttentionDecodeForwardTq4V` against
+// the standard `flashAttentionForward` running on V values that have
+// been pre-dequanted via the SAME `dequantizeBlockTQ4` round-trip the
+// fused oracle uses. Both paths therefore consume identical V values;
+// the only difference is the inner-loop fusion. Bit-exactness expected
+// modulo fp32 reduction-order — tolerance 1e-5 rel-err.
+//
+// What this smoke does NOT test: TQ4 reconstruction quality (that's
+// gated by `--turboquant-smoke`). What it gates: the fused inner-loop
+// math + the cache-slice ↔ BlockTQ4 round-trip. Cases sweep the two
+// shapes the T-arc targets:
+//
+//   gemma2b      n_kv=64  GQA 8:1  d=256  (Gemma 2B per-layer)
+//   qwen35-08b   n_kv=64  GQA 8:2  d=256  (Qwen3.5 0.8B per-layer)
+//   gemma2b-256  n_kv=256 GQA 8:1  d=256  (longer ctx, more tile iterations)
+
+const cpu_turboquant = @import("../cpu/turboquant.zig");
+
+const Tq4VCase = struct {
+    name: []const u8,
+    n_kv: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+};
+
+fn runOneTq4VCase(allocator: std.mem.Allocator, case: Tq4VCase) !f32 {
+    const head_dim: usize = 256;
+    const n_kv: usize = case.n_kv;
+    const n_heads: usize = case.n_heads;
+    const n_kv_heads: usize = case.n_kv_heads;
+    const n_blocks_per_pos: usize = n_kv_heads;
+
+    const Q = try allocator.alloc(f32, n_heads * head_dim);
+    defer allocator.free(Q);
+    const K = try allocator.alloc(f32, n_kv * n_kv_heads * head_dim);
+    defer allocator.free(K);
+    const V_fp = try allocator.alloc(f32, n_kv * n_kv_heads * head_dim);
+    defer allocator.free(V_fp);
+    const V_tq4 = try allocator.alloc(u32, n_kv * n_blocks_per_pos * 33);
+    defer allocator.free(V_tq4);
+
+    var prng = std.Random.DefaultPrng.init(0xFADEC4DEC0);
+    const rng = prng.random();
+    for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+    for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+    // V values that look like layer activations — Gaussian-ish.
+    var v_raw = try allocator.alloc(f32, n_kv * n_kv_heads * head_dim);
+    defer allocator.free(v_raw);
+    for (v_raw) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+    // Pack V into the GPU cache layout, then dequant back into V_fp so
+    // both paths consume the identical (post-quantisation) V values.
+    var blk_in: [256]f32 = undefined;
+    var blk_out: [256]f32 = undefined;
+    for (0..n_kv) |k| {
+        for (0..n_kv_heads) |kv_h| {
+            const v_off = (k * n_kv_heads + kv_h) * head_dim;
+            @memcpy(&blk_in, v_raw[v_off..][0..head_dim]);
+
+            var blk_struct: cpu_turboquant.BlockTQ4(256) = undefined;
+            cpu_turboquant.quantizeBlockTQ4(256, &blk_in, &blk_struct);
+
+            const cache_off = (k * n_blocks_per_pos + kv_h) * 33;
+            cpu_flash_attn.blockTq4ToCacheSlice_256(&blk_struct, V_tq4[cache_off..][0..33]);
+
+            // Dequant via the same struct → V_fp. This is the "reference"
+            // V the standard FA path will see.
+            cpu_turboquant.dequantizeBlockTQ4(256, &blk_struct, &blk_out);
+            @memcpy(V_fp[v_off..][0..head_dim], &blk_out);
+        }
+    }
+
+    // Reference: standard FA at n_q=1 on the pre-dequanted V.
+    const out_ref = try allocator.alloc(f32, n_heads * head_dim);
+    defer allocator.free(out_ref);
+    const Br: usize = 1;
+    const Bc: usize = 8;
+    const s_tile = try allocator.alloc(f32, Br * Bc);
+    defer allocator.free(s_tile);
+    const p_tile = try allocator.alloc(f32, Br * Bc);
+    defer allocator.free(p_tile);
+    const o_acc = try allocator.alloc(f32, Br * head_dim);
+    defer allocator.free(o_acc);
+    const m_acc = try allocator.alloc(f32, Br);
+    defer allocator.free(m_acc);
+    const l_acc = try allocator.alloc(f32, Br);
+    defer allocator.free(l_acc);
+    cpu_flash_attn.flashAttentionForward(
+        Q, K, V_fp,
+        1, n_kv, n_heads, n_kv_heads, head_dim,
+        false, Br, Bc,
+        out_ref, null,
+        s_tile, p_tile, o_acc, m_acc, l_acc,
+    );
+
+    // Fused: same FA at n_q=1 reading V from the TQ4 cache.
+    const out_fused = try allocator.alloc(f32, n_heads * head_dim);
+    defer allocator.free(out_fused);
+    const v_block = try allocator.alloc(f32, head_dim);
+    defer allocator.free(v_block);
+    cpu_flash_attn.flashAttentionDecodeForwardTq4V(
+        Q, K, V_tq4,
+        n_kv, n_heads, n_kv_heads, n_blocks_per_pos, Bc,
+        out_fused,
+        s_tile, p_tile, o_acc, v_block,
+    );
+
+    var max_abs: f32 = 0;
+    var max_ref: f32 = 0;
+    for (out_ref, out_fused) |r, f| {
+        const d = @abs(r - f);
+        if (d > max_abs) max_abs = d;
+        if (@abs(r) > max_ref) max_ref = @abs(r);
+    }
+    const rel = if (max_ref > 0) max_abs / max_ref else max_abs;
+    if (rel > 1e-5) {
+        std.debug.print(
+            "FA TQ4-V parity FAIL ({s}): max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+            .{ case.name, max_abs, max_ref, rel },
+        );
+        return error.ParityFailed;
+    }
+    return rel;
+}
+
+pub fn runFlashAttentionTq4VParitySmoke(allocator: std.mem.Allocator) !void {
+    const cases = [_]Tq4VCase{
+        .{ .name = "gemma2b      (n_kv=64  GQA 8:1 d=256)", .n_kv = 64,  .n_heads = 8, .n_kv_heads = 1 },
+        .{ .name = "qwen35-08b   (n_kv=64  GQA 8:2 d=256)", .n_kv = 64,  .n_heads = 8, .n_kv_heads = 2 },
+        .{ .name = "gemma2b-256  (n_kv=256 GQA 8:1 d=256)", .n_kv = 256, .n_heads = 8, .n_kv_heads = 1 },
+    };
+    var max_rel: f32 = 0;
+    for (cases) |c| {
+        const r = try runOneTq4VCase(allocator, c);
+        if (r > max_rel) max_rel = r;
+    }
+    std.debug.print(
+        "PASS flash-attention TQ4-V CPU oracle parity ({d} cases incl. Gemma 2B + Qwen3.5 0.8B per-layer, max rel={e:.2})\n",
+        .{ cases.len, max_rel },
+    );
+}

@@ -31,8 +31,37 @@
 //! each tile.
 
 const std = @import("std");
+const cpu_turboquant = @import("turboquant.zig");
 
 const NEG_INF: f32 = -std.math.inf(f32);
+
+/// Re-assemble a 256-element TQ4 block from the GPU-cache u32 layout
+/// (33 u32s per block: word[0] = fp32-bits of fp16-quantised gamma,
+/// words[1..33] = 32 LE u32s of packed 4-bit indices) back into the
+/// CPU `BlockTQ4(256)` struct that `dequantizeBlockTQ4` consumes. The
+/// gamma round-trip is exact because the cache value is the fp32
+/// representation of the fp16-rounded gamma — `@floatCast` to f16 is
+/// the inverse.
+inline fn cacheSliceToBlockTq4_256(cache: *const [33]u32) cpu_turboquant.BlockTQ4(256) {
+    var blk: cpu_turboquant.BlockTQ4(256) = undefined;
+    const gamma_f32: f32 = @bitCast(cache[0]);
+    blk.gamma = @floatCast(gamma_f32);
+    inline for (0..32) |w| {
+        std.mem.writeInt(u32, blk.indices[w * 4 ..][0..4], cache[1 + w], .little);
+    }
+    return blk;
+}
+
+/// Inverse of `cacheSliceToBlockTq4_256`: pack a `BlockTQ4(256)` into
+/// the 33-u32 GPU cache layout. Used by smokes to feed CPU-quantised
+/// blocks into the GPU shader.
+pub fn blockTq4ToCacheSlice_256(blk: *const cpu_turboquant.BlockTQ4(256), cache: *[33]u32) void {
+    const gamma_f32: f32 = @floatCast(blk.gamma);
+    cache[0] = @bitCast(gamma_f32);
+    inline for (0..32) |w| {
+        cache[1 + w] = std.mem.readInt(u32, blk.indices[w * 4 ..][0..4], .little);
+    }
+}
 
 inline fn causalKeyLimit(q: usize, n_q: usize, n_kv: usize) usize {
     return q + (n_kv - n_q);
@@ -342,6 +371,149 @@ pub fn flashAttentionBackward(
                     dK[k_off + d] += dS_scaled * Q[o_off + d];
                 }
             }
+        }
+    }
+}
+
+
+// ── Fused FlashAttention decode forward with TQ4-packed V cache ──────
+//
+// Same algorithm as `flashAttentionForward` (decode-only: n_q is
+// implicit in `Q.len == n_heads × head_dim`), but reads V from the
+// GPU TQ4 cache layout instead of a fp32 V tensor. Each per-(k, kv_h)
+// V vector is dequantised inline from a 256-element TQ4 block (33 u32s)
+// just before it's consumed by the running-O update.
+//
+// The mathematical contract matches the GPU `fa_decode_split_tq4v.comp`
+// kernel under construction: gamma is stored as the fp32 representation
+// of the fp16-rounded value, indices are 4-bit Lloyd-Max picks of the
+// L2-normalised RHT-rotated input. Reconstruction error is the
+// dequantizeBlockTQ4 norm-rel-err (~1e-4 on Gaussian inputs), so parity
+// vs the unfused fp-V FA path holds within that tolerance, NOT bit-equal.
+//
+// d=256 only — the block size is fixed at 256, matching head_dim for
+// every model in this T-arc (Gemma 2B + Qwen3.5 0.8B/4B). A d=128
+// variant would need its own helper around `BlockTQ4(128)` (and the
+// matching `tq4_unpack128.comp`).
+
+/// Decode-mode (n_q = 1) flash-attention with TQ4-V cache.
+///
+/// Shapes:
+///   Q          [n_heads × 256]
+///   K          [n_kv × n_kv_heads × 256]
+///   V_tq4      [n_kv × n_blocks_per_pos × 33]    GPU cache layout
+///                                                 (n_blocks_per_pos == n_kv_heads for d=256)
+///   out        [n_heads × 256]
+///   v_block    [256]                              dequant scratch (caller-allocated)
+///   s_tile     [Bc]                               score scratch
+///   p_tile     [Bc]                               probability scratch
+///   o_acc      [256]                              running O accumulator
+///
+/// Tolerance vs fp-V reference: ~1e-4 norm-rel (TQ4 reconstruction
+/// error), NOT bit-equal — same headroom the GPU smoke uses.
+pub fn flashAttentionDecodeForwardTq4V(
+    Q: []const f32,
+    K: []const f32,
+    V_tq4: []const u32,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_blocks_per_pos: usize,
+    Bc: usize,
+    out: []f32,
+    s_tile: []f32,
+    p_tile: []f32,
+    o_acc: []f32,
+    v_block: []f32,
+) void {
+    const head_dim: usize = 256;
+    std.debug.assert(n_heads % n_kv_heads == 0);
+    const heads_per_kv = n_heads / n_kv_heads;
+    std.debug.assert(Q.len == n_heads * head_dim);
+    std.debug.assert(K.len == n_kv * n_kv_heads * head_dim);
+    std.debug.assert(V_tq4.len == n_kv * n_blocks_per_pos * 33);
+    std.debug.assert(out.len == n_heads * head_dim);
+    std.debug.assert(s_tile.len >= Bc);
+    std.debug.assert(p_tile.len >= Bc);
+    std.debug.assert(o_acc.len >= head_dim);
+    std.debug.assert(v_block.len >= head_dim);
+    // d=256 path assumes one TQ4 block per (kv_h, head_dim chunk). For
+    // GQA models with kv_dim > head_dim, n_blocks_per_pos == n_kv_heads.
+    std.debug.assert(n_blocks_per_pos == n_kv_heads);
+
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    for (0..n_heads) |h| {
+        const kv_h = h / heads_per_kv;
+        const q_off = h * head_dim;
+
+        var m_state: f32 = NEG_INF;
+        var l_state: f32 = 0.0;
+        for (0..head_dim) |d| o_acc[d] = 0.0;
+
+        var k_block_start: usize = 0;
+        while (k_block_start < n_kv) : (k_block_start += Bc) {
+            const k_block_end = @min(k_block_start + Bc, n_kv);
+            const k_block_len = k_block_end - k_block_start;
+
+            // S_tile[ki] = Q · K[k_block_start + ki, kv_h, :] · inv_sqrt_d.
+            // K stays fp32 — only V is TQ4-packed in this T-arc.
+            for (0..k_block_len) |ki| {
+                const k = k_block_start + ki;
+                const k_off = k * n_kv_heads * head_dim + kv_h * head_dim;
+                var s: f64 = 0;
+                for (0..head_dim) |d| {
+                    s += @as(f64, Q[q_off + d]) * @as(f64, K[k_off + d]);
+                }
+                s_tile[ki] = @as(f32, @floatCast(s)) * inv_sqrt_d;
+            }
+
+            // Tile rowmax + online softmax update.
+            var m_tile: f32 = NEG_INF;
+            for (0..k_block_len) |ki| {
+                if (s_tile[ki] > m_tile) m_tile = s_tile[ki];
+            }
+            const m_old = m_state;
+            const m_new: f32 = if (m_tile > m_old) m_tile else m_old;
+
+            var l_tile: f64 = 0;
+            for (0..k_block_len) |ki| {
+                const p: f32 = @exp(s_tile[ki] - m_new);
+                p_tile[ki] = p;
+                l_tile += p;
+            }
+
+            const scale_old: f32 = if (m_old == NEG_INF) 0.0 else @exp(m_old - m_new);
+            // Rescale running O before adding this tile's contribution.
+            for (0..head_dim) |d| o_acc[d] *= scale_old;
+
+            // For each key in this tile, dequant its V block from the
+            // TQ4 cache and add P_tile[ki] · V to o_acc.
+            for (0..k_block_len) |ki| {
+                const k = k_block_start + ki;
+                const block_idx: usize = k * n_blocks_per_pos + kv_h;
+                const cache_off: usize = block_idx * 33;
+                const cache_slice = V_tq4[cache_off..][0..33];
+                const blk = cacheSliceToBlockTq4_256(cache_slice);
+                var v_arr: [256]f32 = undefined;
+                cpu_turboquant.dequantizeBlockTQ4(256, &blk, &v_arr);
+                @memcpy(v_block[0..head_dim], v_arr[0..]);
+
+                const p = p_tile[ki];
+                if (p == 0.0) continue;
+                for (0..head_dim) |d| {
+                    o_acc[d] += p * v_block[d];
+                }
+            }
+
+            m_state = m_new;
+            l_state = scale_old * l_state + @as(f32, @floatCast(l_tile));
+        }
+
+        // Final normalise + write out.
+        const inv_l: f32 = if (l_state > 0) 1.0 / l_state else 0.0;
+        for (0..head_dim) |d| {
+            out[q_off + d] = o_acc[d] * inv_l;
         }
     }
 }

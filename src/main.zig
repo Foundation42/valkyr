@@ -134,6 +134,17 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionBackwardParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--flash-attention-tq4v-smoke")) {
+        // T1 of the fused-TQ4 arc: CPU parity for the fused FA decode
+        // path that reads V from the GPU TQ4 cache layout (33 u32 per
+        // 256-element block). Compares against standard FA on V values
+        // pre-dequanted via the same `dequantizeBlockTQ4` round-trip,
+        // so the only difference is the inner-loop fusion. Tolerance
+        // 1e-5 rel-err; TQ4 reconstruction quality is gated separately
+        // by `--turboquant-smoke`.
+        try smoke_cpu.runFlashAttentionTq4VParitySmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--mtp-forward-cpu-smoke")) {
         // MTP-1b-α: build-and-shape gate for the CPU MTP forward oracle.
         // Loads Qwen3.5-0.8B (smallest MTP-equipped checkpoint), runs
@@ -1025,6 +1036,7 @@ pub fn main() !void {
     try smoke_cpu.runLoraMergeMathSmoke(allocator);
     try smoke_cpu.runFlashAttentionParitySmoke(allocator);
     try smoke_cpu.runFlashAttentionBackwardParitySmoke(allocator);
+    try smoke_cpu.runFlashAttentionTq4VParitySmoke(allocator);
     try smoke_gpu_train.runFlashAttentionGpuSmoke(allocator);
     try smoke_gpu_train.runFaRunnerSmoke(allocator);
     try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
