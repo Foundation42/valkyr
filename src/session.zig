@@ -324,7 +324,7 @@ pub const Session = struct {
                 .state = state,
             } };
         } else blk: {
-            var kernels = try runtime.ChatKernels.init(ctx, gm.precision, cfg_model.family);
+            var kernels = try runtime.ChatKernels.init(ctx, gm.precision, cfg_model.family, @intCast(cfg_model.head_dim));
             errdefer kernels.deinit();
             var scratch = try gpu_scratch.GpuScratch.init(ctx, cfg_model, cfg.max_pos);
             errdefer scratch.deinit(ctx.device);

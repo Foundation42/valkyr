@@ -536,13 +536,17 @@ pub const Runner = struct {
         errdefer k_softmax.deinit();
         var k_softmax_bw = try pipeline.Kernel.init(ctx, &shaders.softmax_backward, 3, @sizeOf(runtime.SoftmaxPush));
         errdefer k_softmax_bw.deinit();
-        var k_fa_forward = try pipeline.Kernel.init(ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
+        // FlashAttention shader picks: d=128 default, _d256 variant when
+        // cfg.head_dim > 128 (Qwen3.5 family). fa_bw_d has no head_dim-
+        // sized shared mem so it shares the d=128 build at d=256.
+        const head_dim_u32: u32 = @intCast(cfg.head_dim);
+        var k_fa_forward = try pipeline.Kernel.init(ctx, runtime.faForwardSpv(head_dim_u32), 5, @sizeOf(runtime.FaForwardPush));
         errdefer k_fa_forward.deinit();
         var k_fa_bw_d = try pipeline.Kernel.init(ctx, &shaders.fa_bw_d, 3, @sizeOf(runtime.FaBwDPush));
         errdefer k_fa_bw_d.deinit();
-        var k_fa_bw_dq = try pipeline.Kernel.init(ctx, &shaders.fa_bw_dq, 7, @sizeOf(runtime.FaBwDqPush));
+        var k_fa_bw_dq = try pipeline.Kernel.init(ctx, runtime.faBwDqSpv(head_dim_u32), 7, @sizeOf(runtime.FaBwDqPush));
         errdefer k_fa_bw_dq.deinit();
-        var k_fa_bw_dkv = try pipeline.Kernel.init(ctx, &shaders.fa_bw_dkv, 8, @sizeOf(runtime.FaBwDkvPush));
+        var k_fa_bw_dkv = try pipeline.Kernel.init(ctx, runtime.faBwDkvSpv(head_dim_u32), 8, @sizeOf(runtime.FaBwDkvPush));
         errdefer k_fa_bw_dkv.deinit();
         var k_attn_dattn = try pipeline.Kernel.init(ctx, &shaders.attn_backward_dattn, 3, @sizeOf(runtime.AttnBackwardDattnPush));
         errdefer k_attn_dattn.deinit();
@@ -859,10 +863,11 @@ pub const Runner = struct {
             .causal = if (cfg.causal) 1 else 0,
             .inv_sqrt_dim = inv_sqrt_d,
         };
-        // HEAD_DIM_MAX = 128 in shaders/fa_forward.comp; larger heads
-        // (Qwen3.5 d=256) take the 3-pass fallback until a Bc=8 variant
-        // ships.
-        const attn_use_fa: bool = cfg.head_dim <= 128;
+        // FA shaders ship in two HEAD_DIM_MAX variants (128 default
+        // BC=16; _d256 BC=8) — both fit AMD RDNA's 32 KB/WG ceiling.
+        // The pipeline pick above selected the right SPIR-V; here we
+        // gate the FA dispatch off for anything still above the cap.
+        const attn_use_fa: bool = head_dim_u32 <= runtime.FA_HEAD_DIM_MAX;
         const push_rope_qk = runtime.QkRopeBatchedPush{
             .n_pos = cfg.n_pos,
             .n_q_heads = cfg.n_heads,

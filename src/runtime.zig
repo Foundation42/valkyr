@@ -336,10 +336,31 @@ pub fn chooseFaDecodeSplit(n_kv: u32) struct { n_splits: u32, split_size: u32 } 
 }
 
 /// Maximum head_dim the FlashAttention / FlashDecoding shaders accept.
-/// Compile-time cap in `shaders/fa_forward.comp`,
-/// `shaders/fa_decode_split.comp`. Larger heads (Qwen3.5 d=256) take
-/// the 3-pass fallback automatically.
-pub const FA_HEAD_DIM_MAX: u32 = 128;
+/// Two SPIR-V variants ship per FA shader: the default d=128 build
+/// (BC=16) and a `_d256` build (BC=8) that lifts the cap to 256 so the
+/// Qwen3.5 family (head_dim=256) joins the FA path. The dispatcher
+/// picks at pipeline-init time via `faForwardSpv` / `faDecodeSplitSpv`
+/// / `faBwDqSpv` / `faBwDkvSpv` below — `fa_decode_merge` and `fa_bw_d`
+/// share their d=128 build at d=256 (no head_dim-sized shared mem).
+/// Heads above 256 still take the 3-pass fallback.
+pub const FA_HEAD_DIM_MAX: u32 = 256;
+
+/// FA SPIR-V variant selector. `head_dim` ≤ 128 picks the BC=16 build;
+/// (128, 256] picks the BC=8 `_d256` build. Caller is responsible for
+/// gating with `head_dim ≤ FA_HEAD_DIM_MAX` first — anything larger
+/// would silently get the d=256 build and overflow shared mem.
+pub fn faForwardSpv(head_dim: u32) []const u8 {
+    return if (head_dim <= 128) shaders.fa_forward[0..] else shaders.fa_forward_d256[0..];
+}
+pub fn faDecodeSplitSpv(head_dim: u32) []const u8 {
+    return if (head_dim <= 128) shaders.fa_decode_split[0..] else shaders.fa_decode_split_d256[0..];
+}
+pub fn faBwDqSpv(head_dim: u32) []const u8 {
+    return if (head_dim <= 128) shaders.fa_bw_dq[0..] else shaders.fa_bw_dq_d256[0..];
+}
+pub fn faBwDkvSpv(head_dim: u32) []const u8 {
+    return if (head_dim <= 128) shaders.fa_bw_dkv[0..] else shaders.fa_bw_dkv_d256[0..];
+}
 
 /// FlashAttention-2 backward, phase 1 — per-row D reduction
 /// (`shaders/fa_bw_d.comp`). Computes `D[q, h] = Σ_d O · dO`. Dispatch
@@ -521,6 +542,7 @@ pub const ChatKernels = struct {
         ctx: *const vk.Context,
         precision: gpu_model.Precision,
         family: config_mod.Family,
+        head_dim: u32,
     ) !ChatKernels {
         const matmul_spv: []align(4) const u8 = switch (precision) {
             .fp32_all => &shaders.matmul_nt_v2,
@@ -554,7 +576,7 @@ pub const ChatKernels = struct {
             .scores = try pipeline.Kernel.init(ctx, &shaders.attn_scores, 3, @sizeOf(AttnScoresPush)),
             .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
             .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
-            .fa_decode_split = try pipeline.Kernel.init(ctx, &shaders.fa_decode_split, 6, @sizeOf(FaDecodeSplitPush)),
+            .fa_decode_split = try pipeline.Kernel.init(ctx, faDecodeSplitSpv(head_dim), 6, @sizeOf(FaDecodeSplitPush)),
             .fa_decode_merge = try pipeline.Kernel.init(ctx, &shaders.fa_decode_merge, 4, @sizeOf(FaDecodeMergePush)),
             .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
             .geglu = try pipeline.Kernel.init(ctx, ffn_spv, 3, @sizeOf(GegluPush)),
@@ -964,7 +986,7 @@ pub const Forward = struct {
         gm: *const gpu_model.GpuModel,
     ) !Forward {
         return .{
-            .kernels = try ChatKernels.init(ctx, gm.precision, gm.config.family),
+            .kernels = try ChatKernels.init(ctx, gm.precision, gm.config.family, @intCast(gm.config.head_dim)),
             .cfg = gm.config,
         };
     }

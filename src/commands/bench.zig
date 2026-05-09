@@ -39,7 +39,7 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize) !v
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
     defer k.deinit();
 
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);

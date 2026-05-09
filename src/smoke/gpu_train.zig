@@ -2322,10 +2322,17 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "prefill-causal    (n_q=4 n_kv=4 GQA 4:2 d=16)", .n_q = 4, .n_kv = 4, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = true },
         .{ .name = "prefill-qwen3     (n_q=16 n_kv=16 GQA 16:8 d=128)", .n_q = 16, .n_kv = 16, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true, .check_lse = false },
         .{ .name = "non-aligned-kv    (n_q=10 n_kv=37 GQA 4:2 d=16)", .n_q = 10, .n_kv = 37, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = false },
+        .{ .name = "decode-qwen35     (n_q=1 n_kv=128 GQA 8:2 d=256)", .n_q = 1, .n_kv = 128, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256, .causal = false, .check_lse = false },
+        .{ .name = "prefill-qwen35    (n_q=8 n_kv=8 GQA 8:2 d=256)", .n_q = 8, .n_kv = 8, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256, .causal = true, .check_lse = true },
     };
 
-    var kern = try pipeline.Kernel.init(&ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
-    defer kern.deinit();
+    // Two pipelines: BC=16 HEAD_DIM=128 (d=128 cases) and BC=8 HEAD_DIM=256
+    // (d=256 cases). Selected per case below — same .comp source, different
+    // SPIR-V variant emitted via -DHEAD_DIM_MAX=256 -DBC=8.
+    var kern_d128 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(128), 5, @sizeOf(runtime.FaForwardPush));
+    defer kern_d128.deinit();
+    var kern_d256 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(256), 5, @sizeOf(runtime.FaForwardPush));
+    defer kern_d256.deinit();
 
     var max_rel_seen: f32 = 0.0;
     var max_lse_rel_seen: f32 = 0.0;
@@ -2391,6 +2398,7 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
         var buf_lse = try buffer.Buffer.initDeviceOnly(&ctx, lse_elems * @sizeOf(f32));
         defer buf_lse.deinit(ctx.device);
 
+        var kern: *pipeline.Kernel = if (cs.head_dim <= 128) &kern_d128 else &kern_d256;
         try kern.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o, &buf_lse });
 
         const push = runtime.FaForwardPush{
@@ -2413,7 +2421,7 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
             }
-        }{ .kern = &kern, .push = &push, .gx = gx });
+        }{ .kern = kern, .push = &push, .gx = gx });
 
         try buf_o.readBack(&ctx, f32, out_gpu);
         if (cs.check_lse) try buf_lse.readBack(&ctx, f32, lse_gpu);
@@ -2459,7 +2467,7 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print(
-        "PASS GPU fa_forward parity ({d} cases incl. GQA + causal + non-aligned, max rel={e:.2}, lse rel={e:.2}) on {s}\n",
+        "PASS GPU fa_forward parity ({d} cases incl. GQA + causal + non-aligned + d=128 + d=256, max rel={e:.2}, lse rel={e:.2}) on {s}\n",
         .{ cases.len, max_rel_seen, max_lse_rel_seen, ctx.deviceName() },
     );
 }
@@ -2503,12 +2511,18 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "ctx-32768 splits=128 sz=256 GQA 16:8 d=128", .n_kv = 32768, .n_splits = 128, .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128 },
         // Empty-tail case: split_size doesn't divide n_kv, last split is partial.
         .{ .name = "ctx-100 splits=4 sz=32  GQA 4:2 d=16  (last split partial)", .n_kv = 100, .n_splits = 4, .split_size = 32, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16 },
+        // Qwen3.5 0.8B / 4B per-layer at long ctx — exercises BC=8 d=256 variant.
+        .{ .name = "ctx-1024 splits=4 sz=256 GQA 8:2 d=256 (qwen3.5)", .n_kv = 1024, .n_splits = 4, .split_size = 256, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256 },
     };
 
-    var k_fa = try pipeline.Kernel.init(&ctx, &shaders.fa_forward, 5, @sizeOf(runtime.FaForwardPush));
-    defer k_fa.deinit();
-    var k_split = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_split, 6, @sizeOf(runtime.FaDecodeSplitPush));
-    defer k_split.deinit();
+    var k_fa_d128 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(128), 5, @sizeOf(runtime.FaForwardPush));
+    defer k_fa_d128.deinit();
+    var k_fa_d256 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(256), 5, @sizeOf(runtime.FaForwardPush));
+    defer k_fa_d256.deinit();
+    var k_split_d128 = try pipeline.Kernel.init(&ctx, runtime.faDecodeSplitSpv(128), 6, @sizeOf(runtime.FaDecodeSplitPush));
+    defer k_split_d128.deinit();
+    var k_split_d256 = try pipeline.Kernel.init(&ctx, runtime.faDecodeSplitSpv(256), 6, @sizeOf(runtime.FaDecodeSplitPush));
+    defer k_split_d256.deinit();
     var k_merge = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush));
     defer k_merge.deinit();
 
@@ -2558,7 +2572,9 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
         var buf_o_fd = try buffer.Buffer.initDeviceOnly(&ctx, out_elems * @sizeOf(f32));
         defer buf_o_fd.deinit(ctx.device);
 
-        // Reference: fa_forward at (n_q=1, no causal).
+        // Reference: fa_forward at (n_q=1, no causal). Pick by head_dim.
+        const k_fa: *pipeline.Kernel = if (cs.head_dim <= 128) &k_fa_d128 else &k_fa_d256;
+        const k_split: *pipeline.Kernel = if (cs.head_dim <= 128) &k_split_d128 else &k_split_d256;
         try k_fa.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o_fa, &buf_lse_fa });
         const push_fa = runtime.FaForwardPush{
             .n_q = 1,
@@ -2578,7 +2594,7 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
             }
-        }{ .kern = &k_fa, .push = &push_fa, .gx = cs.n_heads });
+        }{ .kern = k_fa, .push = &push_fa, .gx = cs.n_heads });
         try buf_o_fa.readBack(&ctx, f32, out_fa);
 
         // Two-phase FlashDecoding.
@@ -2600,7 +2616,7 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
             }
-        }{ .kern = &k_split, .push = &push_split, .gx = cs.n_heads * cs.n_splits });
+        }{ .kern = k_split, .push = &push_split, .gx = cs.n_heads * cs.n_splits });
 
         try k_merge.bind(&.{ &buf_o_partial, &buf_m_partial, &buf_l_partial, &buf_o_fd });
         const push_merge = runtime.FaDecodeMergePush{
@@ -2637,7 +2653,7 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print(
-        "PASS GPU fa_decode (split + merge) parity vs fa_forward ({d} cases incl. partial-tail split, max rel={e:.2}) on {s}\n",
+        "PASS GPU fa_decode (split + merge) parity vs fa_forward ({d} cases incl. partial-tail split + d=256 (qwen3.5), max rel={e:.2}) on {s}\n",
         .{ cases.len, max_rel_seen, ctx.deviceName() },
     );
 }
@@ -2884,14 +2900,20 @@ pub fn runFlashAttentionBackwardGpuSmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "non-aligned (n_q=10 n_kv=12 GQA 4:2 d=16 causal)", .n_q = 10, .n_kv = 12, .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = true  },
         .{ .name = "gqa-4to1 (n_q=8 n_kv=8 heads_per_kv=4 d=16)",     .n_q = 8,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 1, .head_dim = 16,  .causal = true  },
         .{ .name = "non-causal (n_q=4 n_kv=8 GQA 4:2 d=16)",          .n_q = 4,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = false },
+        .{ .name = "prefill-qwen35 (n_q=8 n_kv=8 GQA 8:2 d=256)",      .n_q = 8,  .n_kv = 8,  .n_heads = 8,  .n_kv_heads = 2, .head_dim = 256, .causal = true  },
     };
 
+    // fa_bw_d has no head_dim-sized shared mem so it shares the d=128 build at d=256.
     var k_d = try pipeline.Kernel.init(&ctx, &shaders.fa_bw_d, 3, @sizeOf(runtime.FaBwDPush));
     defer k_d.deinit();
-    var k_dq = try pipeline.Kernel.init(&ctx, &shaders.fa_bw_dq, 7, @sizeOf(runtime.FaBwDqPush));
-    defer k_dq.deinit();
-    var k_dkv = try pipeline.Kernel.init(&ctx, &shaders.fa_bw_dkv, 8, @sizeOf(runtime.FaBwDkvPush));
-    defer k_dkv.deinit();
+    var k_dq_d128 = try pipeline.Kernel.init(&ctx, runtime.faBwDqSpv(128), 7, @sizeOf(runtime.FaBwDqPush));
+    defer k_dq_d128.deinit();
+    var k_dq_d256 = try pipeline.Kernel.init(&ctx, runtime.faBwDqSpv(256), 7, @sizeOf(runtime.FaBwDqPush));
+    defer k_dq_d256.deinit();
+    var k_dkv_d128 = try pipeline.Kernel.init(&ctx, runtime.faBwDkvSpv(128), 8, @sizeOf(runtime.FaBwDkvPush));
+    defer k_dkv_d128.deinit();
+    var k_dkv_d256 = try pipeline.Kernel.init(&ctx, runtime.faBwDkvSpv(256), 8, @sizeOf(runtime.FaBwDkvPush));
+    defer k_dkv_d256.deinit();
 
     var max_dq_seen: f32 = 0;
     var max_dk_seen: f32 = 0;
@@ -2998,7 +3020,9 @@ pub fn runFlashAttentionBackwardGpuSmoke(allocator: std.mem.Allocator) !void {
             }
         }{ .kern = &k_d, .push = &push_d, .gx = cs.n_q * cs.n_heads });
 
-        // Phase 2: dQ accumulation.
+        // Phase 2: dQ accumulation. Pick d=128 / d=256 pipeline by case.
+        const k_dq: *pipeline.Kernel = if (cs.head_dim <= 128) &k_dq_d128 else &k_dq_d256;
+        const k_dkv: *pipeline.Kernel = if (cs.head_dim <= 128) &k_dkv_d128 else &k_dkv_d256;
         try k_dq.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_do, &buf_lse, &buf_d, &buf_dq });
         const push_dq = runtime.FaBwDqPush{
             .n_q = cs.n_q,
@@ -3017,9 +3041,9 @@ pub fn runFlashAttentionBackwardGpuSmoke(allocator: std.mem.Allocator) !void {
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
             }
-        }{ .kern = &k_dq, .push = &push_dq, .gx = cs.n_q * cs.n_heads });
+        }{ .kern = k_dq, .push = &push_dq, .gx = cs.n_q * cs.n_heads });
 
-        // Phase 3: dK + dV accumulation.
+        // Phase 3: dK + dV accumulation. (k_dkv pre-picked above.)
         try k_dkv.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_do, &buf_lse, &buf_d, &buf_dk, &buf_dv });
         const push_dkv = runtime.FaBwDkvPush{
             .n_q = cs.n_q,
@@ -3039,7 +3063,7 @@ pub fn runFlashAttentionBackwardGpuSmoke(allocator: std.mem.Allocator) !void {
             pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
                 s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
             }
-        }{ .kern = &k_dkv, .push = &push_dkv, .gx = cs.n_kv * cs.n_kv_heads });
+        }{ .kern = k_dkv, .push = &push_dkv, .gx = cs.n_kv * cs.n_kv_heads });
 
         const dQ_gpu = try allocator.alloc(f32, q_elems);
         defer allocator.free(dQ_gpu);
@@ -3082,7 +3106,7 @@ pub fn runFlashAttentionBackwardGpuSmoke(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print(
-        "PASS GPU fa_bw (D + dQ + dKV) parity vs CPU FA-2 oracle ({d} cases incl. GQA + causal + non-aligned + d=128, max rel(dQ/dK/dV)=({e:.2},{e:.2},{e:.2})) on {s}\n",
+        "PASS GPU fa_bw (D + dQ + dKV) parity vs CPU FA-2 oracle ({d} cases incl. GQA + causal + non-aligned + d=128 + d=256, max rel(dQ/dK/dV)=({e:.2},{e:.2},{e:.2})) on {s}\n",
         .{ cases.len, max_dq_seen, max_dk_seen, max_dv_seen, ctx.deviceName() },
     );
 }

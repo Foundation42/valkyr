@@ -150,7 +150,7 @@ pub fn runChat(
         null;
     defer if (kv_tq4) |*c| c.deinit(ctx.device);
 
-    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
     defer k.deinit();
 
     // TQ4 pack/unpack kernels — picked by head_dim, only built in

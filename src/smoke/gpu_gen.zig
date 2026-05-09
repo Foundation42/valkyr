@@ -49,7 +49,7 @@ pub fn runGpuGenMany(gpa: std.mem.Allocator, dir_path: []const u8, first_token: 
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
 
-    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
     defer k.deinit();
 
     var rec = try gpu_recorder.Recorder.init(&ctx, 512, 2048);
@@ -133,7 +133,7 @@ pub fn runGpuGenTq4V(gpa: std.mem.Allocator, dir_path: []const u8, token_id: u32
     var kv_tq4 = try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos);
     defer kv_tq4.deinit(ctx.device);
 
-    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family);
+    var k = try aliases.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
     defer k.deinit();
 
     var tq_pack = try pipeline.Kernel.init(&ctx, &shaders.tq4_pack_to_cache, 2, @sizeOf(aliases.Tq4PackPush));
