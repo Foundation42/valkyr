@@ -8,9 +8,12 @@ const cpu_train = @import("../cpu/train.zig");
 const cpu_train_transformer = @import("../cpu/train_transformer.zig");
 const cpu_lora = @import("../cpu/lora.zig");
 const cpu_flash_attn = @import("../cpu/flash_attn.zig");
+const cpu_mtp = @import("../cpu/mtp.zig");
 const dtype = @import("../dtype.zig");
 const lora_merge = @import("../commands/lora_merge.zig");
 const safetensors = @import("../safetensors.zig");
+const model_mod = @import("../model.zig");
+const hf_cache = @import("../hf_cache.zig");
 
 // ── matmul smoke: synthetic A·B^T, hand-checked oracle ──────────────
 
@@ -941,4 +944,160 @@ fn matmulNt(x: []const f32, w: []const f32, y: []f32, M: usize, N: usize, K: usi
             y[m * N + n] = @floatCast(s);
         }
     }
+}
+
+// ── MTP forward CPU sanity smoke (chunk MTP-1b-α) ───────────────────
+//
+// Loads Qwen3.5-0.8B (smallest MTP-equipped checkpoint), runs
+// `forwardMtpStep` end-to-end on a synthetic h_prev, and checks:
+//
+//   1. No NaN / Inf in logits or h_out (numerical health).
+//   2. Deterministic across re-runs from a fresh state (no state leak).
+//   3. Output depends on input — running with two different tokens from
+//      the same h_prev / pos yields different logits.
+//   4. Magnitude is sane (max |logit| < 100, otherwise flag warning).
+//
+// This is the build-and-shape gate for MTP forward; tighter
+// CPU/HF-reference parity will land alongside the GPU recorder in
+// MTP-1b-β. Real-model smoke pattern (graceful SKIP if Qwen3.5-0.8B
+// isn't in the HF cache).
+
+pub fn runMtpForwardCpuSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runMtpForwardCpuSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var model = try model_mod.Model.load(allocator, dir_path);
+    defer model.deinit();
+
+    if (model.mtp_head == null) {
+        std.debug.print("FAIL runMtpForwardCpuSmoke: {s} has no MTP head\n", .{model_id});
+        return error.NoMtpHead;
+    }
+
+    const cfg = model.config;
+
+    var prng = std.Random.DefaultPrng.init(0x1B_DEC0DE);
+    const rng = prng.random();
+
+    const h_prev = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(h_prev);
+    // Small Gaussian-ish noise — avoids the all-zero degenerate path
+    // through RMSNorm and keeps q_norm/k_norm well-conditioned.
+    for (h_prev) |*v| v.* = rng.floatNorm(f32) * 0.1;
+
+    const h_out_a = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(h_out_a);
+    const logits_a = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_a);
+
+    const h_out_a2 = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(h_out_a2);
+    const logits_a2 = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_a2);
+
+    const h_out_b = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(h_out_b);
+    const logits_b = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_b);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tok_a: u32 = cfg.eos_token_id orelse 0;
+    const tok_b: u32 = if (tok_a + 100 < @as(u32, @intCast(cfg.vocab_size))) tok_a + 100 else 1;
+
+    const t0 = std.time.nanoTimestamp();
+
+    // Run 1: tok_a, fresh state.
+    {
+        var state = try cpu_mtp.MtpState.init(allocator, &model, 8);
+        defer state.deinit();
+        _ = arena.reset(.retain_capacity);
+        try cpu_mtp.forwardMtpStep(&model, &state, tok_a, h_prev, 0, arena.allocator(), h_out_a, logits_a);
+    }
+
+    // Run 2: tok_a, fresh state — must match run 1 (determinism).
+    {
+        var state = try cpu_mtp.MtpState.init(allocator, &model, 8);
+        defer state.deinit();
+        _ = arena.reset(.retain_capacity);
+        try cpu_mtp.forwardMtpStep(&model, &state, tok_a, h_prev, 0, arena.allocator(), h_out_a2, logits_a2);
+    }
+
+    // Run 3: tok_b, fresh state — must produce different logits.
+    {
+        var state = try cpu_mtp.MtpState.init(allocator, &model, 8);
+        defer state.deinit();
+        _ = arena.reset(.retain_capacity);
+        try cpu_mtp.forwardMtpStep(&model, &state, tok_b, h_prev, 0, arena.allocator(), h_out_b, logits_b);
+    }
+
+    const t1 = std.time.nanoTimestamp();
+    const ms_total: f64 = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+
+    // ── Determinism gate ────────────────────────────────────────────
+    for (logits_a, logits_a2, 0..) |a, a2, i| {
+        if (a != a2) {
+            std.debug.print("FAIL mtp-forward-cpu nondeterministic: logit[{d}] {e} vs {e}\n", .{ i, a, a2 });
+            return error.Nondeterministic;
+        }
+    }
+
+    // ── Numerical-health + magnitude + top-1 ────────────────────────
+    var max_abs_a: f32 = 0;
+    var max_abs_b: f32 = 0;
+    var top1_a: usize = 0;
+    var top1_b: usize = 0;
+    for (logits_a, 0..) |x, i| {
+        if (std.math.isNan(x) or std.math.isInf(x)) {
+            std.debug.print("FAIL mtp-forward-cpu: logits_a[{d}] is NaN/Inf\n", .{i});
+            return error.NonFinite;
+        }
+        const ax = @abs(x);
+        if (ax > max_abs_a) max_abs_a = ax;
+        if (x > logits_a[top1_a]) top1_a = i;
+    }
+    for (logits_b, 0..) |x, i| {
+        if (std.math.isNan(x) or std.math.isInf(x)) {
+            std.debug.print("FAIL mtp-forward-cpu: logits_b[{d}] is NaN/Inf\n", .{i});
+            return error.NonFinite;
+        }
+        const ax = @abs(x);
+        if (ax > max_abs_b) max_abs_b = ax;
+        if (x > logits_b[top1_b]) top1_b = i;
+    }
+    for (h_out_a) |x| {
+        if (std.math.isNan(x) or std.math.isInf(x)) {
+            std.debug.print("FAIL mtp-forward-cpu: h_out_a NaN/Inf\n", .{});
+            return error.NonFinite;
+        }
+    }
+    if (max_abs_a > 100.0 or max_abs_b > 100.0) {
+        std.debug.print("WARN mtp-forward-cpu: |logit| max max(a,b)={d:.3} (> 100, possible blow-up)\n", .{@max(max_abs_a, max_abs_b)});
+    }
+
+    // ── Input-dependence gate ───────────────────────────────────────
+    var any_diff = false;
+    for (logits_a, logits_b) |a, b| {
+        if (a != b) {
+            any_diff = true;
+            break;
+        }
+    }
+    if (!any_diff) {
+        std.debug.print("FAIL mtp-forward-cpu: identical logits despite tok_a={d} != tok_b={d}\n", .{ tok_a, tok_b });
+        return error.NoInputDependence;
+    }
+
+    std.debug.print(
+        "PASS mtp-forward-cpu ({s}): {d} MTP layer(s), tok_a={d} top1={d} max|logit|={d:.2}, tok_b={d} top1={d} max|logit|={d:.2}, {d:.0} ms (3 steps)\n",
+        .{ model_id, model.mtp_head.?.layers.len, tok_a, top1_a, max_abs_a, tok_b, top1_b, max_abs_b, ms_total },
+    );
 }

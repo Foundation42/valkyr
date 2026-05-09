@@ -134,6 +134,17 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionBackwardParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mtp-forward-cpu-smoke")) {
+        // MTP-1b-α: build-and-shape gate for the CPU MTP forward oracle.
+        // Loads Qwen3.5-0.8B (smallest MTP-equipped checkpoint), runs
+        // `forwardMtpStep` on a synthetic h_prev for two different tokens,
+        // checks numerical health (no NaN/Inf), determinism across
+        // re-runs, and that the output actually depends on the input.
+        // Tighter CPU/HF-reference parity lands in MTP-1b-β alongside the
+        // GPU recorder.
+        try smoke_cpu.runMtpForwardCpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-forward-smoke")) {
         // F3 of the FlashAttention arc: GPU SPIR-V kernel parity vs
         // the F2 CPU oracle. Drives `shaders/fa_forward.comp` (one
