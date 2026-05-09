@@ -215,6 +215,14 @@ pub fn main() !void {
         try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-decode-tq4v-smoke")) {
+        // T2 of the fused-TQ4 arc: GPU parity for the fused FlashDecoding
+        // path that reads V from the GPU TQ4 cache layout (33 u32 per
+        // 256-element block) and dequants inline per K-tile. Parity vs
+        // T1 CPU oracle; both consume identical TQ4 cache bits.
+        try smoke_gpu_train.runFaDecodeTq4VGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-bw-smoke")) {
         // F6b of the FlashAttention arc: GPU SPIR-V parity for the
         // 3-kernel FA-2 backward chain (`fa_bw_d → fa_bw_dq → fa_bw_dkv`)
@@ -1040,6 +1048,7 @@ pub fn main() !void {
     try smoke_gpu_train.runFlashAttentionGpuSmoke(allocator);
     try smoke_gpu_train.runFaRunnerSmoke(allocator);
     try smoke_gpu_train.runFlashDecodingGpuSmoke(allocator);
+    try smoke_gpu_train.runFaDecodeTq4VGpuSmoke(allocator);
     try smoke_gpu_train.runFaDecodeChatPathSmoke(allocator);
     try smoke_gpu_train.runFlashAttentionBackwardGpuSmoke(allocator);
     try smoke_gpu_train.runLayerNormBackwardCpuSmoke(allocator);

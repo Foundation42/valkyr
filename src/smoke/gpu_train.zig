@@ -16,6 +16,7 @@ const cpu_train_transformer = @import("../cpu/train_transformer.zig");
 const cpu_cce = @import("../cpu/cce.zig");
 const cpu_lora = @import("../cpu/lora.zig");
 const cpu_flash_attn = @import("../cpu/flash_attn.zig");
+const cpu_turboquant = @import("../cpu/turboquant.zig");
 const train_lora = @import("../train/lora.zig");
 const train_transformer = @import("../train/transformer.zig");
 const config_mod = @import("../config.zig");
@@ -5662,4 +5663,176 @@ pub fn runMtpDraftChainSmoke(allocator: std.mem.Allocator) !void {
         defer allocator.free(txt);
         std.debug.print("  draft{d}: {d} \"{s}\"\n", .{ s, draft_tokens[s], txt });
     }
+}
+
+// ── T2: fused FA decode with TQ4-packed V cache (GPU parity) ─────────
+//
+// Drives `shaders/fa_decode_split_tq4v.comp` + `fa_decode_merge.comp`
+// against the CPU oracle in `cpu_flash_attn.flashAttentionDecodeForwardTq4V`.
+// Both consume identical TQ4 cache bits → outputs match within fp32
+// reduction-order noise (1e-4 rel-err gate, comfortable headroom in
+// practice).
+//
+// Cases mirror the T1 CPU smoke: Gemma 2B (n_kv_heads=1) + Qwen3.5 0.8B
+// (n_kv_heads=2) at d=256, plus a longer-ctx case to exercise the
+// chooseFaDecodeSplit ≥ 1024 branch where the fused path's bandwidth
+// savings start to matter.
+
+pub fn runFaDecodeTq4VGpuSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const Case = struct {
+        name: []const u8,
+        n_kv: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        n_splits: u32,
+        split_size: u32,
+    };
+    const cases = [_]Case{
+        .{ .name = "gemma2b      n_kv=64   GQA 8:1 d=256  splits=4 sz=16",   .n_kv = 64,   .n_heads = 8, .n_kv_heads = 1, .n_splits = 4,   .split_size = 16 },
+        .{ .name = "qwen35-08b   n_kv=64   GQA 8:2 d=256  splits=4 sz=16",   .n_kv = 64,   .n_heads = 8, .n_kv_heads = 2, .n_splits = 4,   .split_size = 16 },
+        .{ .name = "gemma2b      n_kv=1024 GQA 8:1 d=256  splits=4 sz=256",  .n_kv = 1024, .n_heads = 8, .n_kv_heads = 1, .n_splits = 4,   .split_size = 256 },
+        .{ .name = "qwen35-08b   n_kv=1024 GQA 8:2 d=256  splits=4 sz=256",  .n_kv = 1024, .n_heads = 8, .n_kv_heads = 2, .n_splits = 4,   .split_size = 256 },
+    };
+
+    var k_split = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_split_tq4v, 6, @sizeOf(runtime.FaDecodeSplitPush));
+    defer k_split.deinit();
+    var k_merge = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush));
+    defer k_merge.deinit();
+
+    var max_rel_seen: f32 = 0;
+
+    for (cases) |cs| {
+        const head_dim: u32 = 256;
+        const heads_per_kv = cs.n_heads / cs.n_kv_heads;
+        const n_blocks_per_pos: u32 = cs.n_kv_heads;
+        const q_elems = cs.n_heads * head_dim;
+        const k_elems = cs.n_kv * cs.n_kv_heads * head_dim;
+        const v_packed_u32: u32 = cs.n_kv * n_blocks_per_pos * 33;
+        const out_elems = cs.n_heads * head_dim;
+        const partial_o_elems = cs.n_heads * cs.n_splits * head_dim;
+        const partial_ml_elems = cs.n_heads * cs.n_splits;
+
+        const Q = try allocator.alloc(f32, q_elems);
+        defer allocator.free(Q);
+        const K = try allocator.alloc(f32, k_elems);
+        defer allocator.free(K);
+        const V_tq4 = try allocator.alloc(u32, v_packed_u32);
+        defer allocator.free(V_tq4);
+        const out_ref = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_ref);
+        const out_gpu = try allocator.alloc(f32, out_elems);
+        defer allocator.free(out_gpu);
+
+        var prng = std.Random.DefaultPrng.init(0xFA_DEC_BEEF);
+        const rng = prng.random();
+        for (Q) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+        for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+
+        // Random V → quantize block-by-block into the GPU cache layout.
+        var blk_in: [256]f32 = undefined;
+        for (0..cs.n_kv) |k| {
+            for (0..cs.n_kv_heads) |kv_h| {
+                for (&blk_in) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
+                var blk_struct: cpu_turboquant.BlockTQ4(256) = undefined;
+                cpu_turboquant.quantizeBlockTQ4(256, &blk_in, &blk_struct);
+                const cache_off = (k * n_blocks_per_pos + kv_h) * 33;
+                cpu_flash_attn.blockTq4ToCacheSlice_256(&blk_struct, V_tq4[cache_off..][0..33]);
+            }
+        }
+
+        // CPU reference.
+        const Bc: usize = 8;
+        const s_tile = try allocator.alloc(f32, Bc);
+        defer allocator.free(s_tile);
+        const p_tile = try allocator.alloc(f32, Bc);
+        defer allocator.free(p_tile);
+        const o_acc = try allocator.alloc(f32, head_dim);
+        defer allocator.free(o_acc);
+        const v_block = try allocator.alloc(f32, head_dim);
+        defer allocator.free(v_block);
+        cpu_flash_attn.flashAttentionDecodeForwardTq4V(
+            Q, K, V_tq4,
+            cs.n_kv, cs.n_heads, cs.n_kv_heads, n_blocks_per_pos, Bc,
+            out_ref,
+            s_tile, p_tile, o_acc, v_block,
+        );
+
+        // GPU two-phase dispatch.
+        var buf_q = try buffer.Buffer.initStatic(&ctx, f32, Q);
+        defer buf_q.deinit(ctx.device);
+        var buf_k = try buffer.Buffer.initStatic(&ctx, f32, K);
+        defer buf_k.deinit(ctx.device);
+        var buf_v = try buffer.Buffer.initStatic(&ctx, u32, V_tq4);
+        defer buf_v.deinit(ctx.device);
+        var buf_o_partial = try buffer.Buffer.initDeviceOnly(&ctx, partial_o_elems * @sizeOf(f32));
+        defer buf_o_partial.deinit(ctx.device);
+        var buf_m_partial = try buffer.Buffer.initDeviceOnly(&ctx, partial_ml_elems * @sizeOf(f32));
+        defer buf_m_partial.deinit(ctx.device);
+        var buf_l_partial = try buffer.Buffer.initDeviceOnly(&ctx, partial_ml_elems * @sizeOf(f32));
+        defer buf_l_partial.deinit(ctx.device);
+        var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, out_elems * @sizeOf(f32));
+        defer buf_out.deinit(ctx.device);
+
+        try k_split.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o_partial, &buf_m_partial, &buf_l_partial });
+        const push_split = runtime.FaDecodeSplitPush{
+            .n_heads = cs.n_heads,
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim,
+            .n_kv = cs.n_kv,
+            .kv_stride = cs.n_kv_heads * head_dim,
+            .n_splits = cs.n_splits,
+            .split_size = cs.split_size,
+            .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaDecodeSplitPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_split, .push = &push_split, .gx = cs.n_heads * cs.n_splits });
+
+        try k_merge.bind(&.{ &buf_o_partial, &buf_m_partial, &buf_l_partial, &buf_out });
+        const push_merge = runtime.FaDecodeMergePush{
+            .n_heads = cs.n_heads,
+            .head_dim = head_dim,
+            .n_splits = cs.n_splits,
+        };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const runtime.FaDecodeMergePush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &k_merge, .push = &push_merge, .gx = cs.n_heads });
+
+        try buf_out.readBack(&ctx, f32, out_gpu);
+
+        var max_abs: f32 = 0;
+        var max_ref: f32 = 0;
+        for (out_ref, out_gpu) |r, g| {
+            const d = @abs(r - g);
+            if (d > max_abs) max_abs = d;
+            if (@abs(r) > max_ref) max_ref = @abs(r);
+        }
+        const rel = if (max_ref > 0) max_abs / max_ref else max_abs;
+        if (rel > 1e-4) {
+            std.debug.print(
+                "FA TQ4-V GPU parity FAIL ({s}): max|Δ|={e:.3} max|ref|={e:.3} rel={e:.3}\n",
+                .{ cs.name, max_abs, max_ref, rel },
+            );
+            return error.ParityFailed;
+        }
+        if (rel > max_rel_seen) max_rel_seen = rel;
+    }
+
+    std.debug.print(
+        "PASS GPU fa_decode_tq4v (split + merge) parity vs CPU FA+TQ4-V oracle ({d} cases incl. Gemma 2B + Qwen3.5 0.8B at n_kv=64,1024, max rel={e:.2}) on {s}\n",
+        .{ cases.len, max_rel_seen, ctx.deviceName() },
+    );
 }

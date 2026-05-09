@@ -116,6 +116,11 @@ pub fn build(b: *std.Build) void {
     const fa_bw_dkv_d256_spv = compileShaderD(b, "fa_bw_dkv", "fa_bw_dkv_d256", &.{
         "HEAD_DIM_MAX=256u", "BR=8u",
     });
+    // Fused FA decode with TQ4-packed V cache (T-arc, 2026-05-09). Same
+    // dispatch shape and online-softmax algorithm as fa_decode_split, but
+    // dequantises one TQ4 block per kj inline via the existing IFWHT
+    // pattern — never round-trips fp32 V through HBM. d=256 only.
+    const fa_decode_split_tq4v_d256_spv = compileShader(b, "fa_decode_split_tq4v");
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -214,6 +219,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(fa_decode_split_d256_spv, "fa_decode_split_d256.spv");
     _ = wf.addCopyFile(fa_bw_dq_d256_spv, "fa_bw_dq_d256.spv");
     _ = wf.addCopyFile(fa_bw_dkv_d256_spv, "fa_bw_dkv_d256.spv");
+    _ = wf.addCopyFile(fa_decode_split_tq4v_d256_spv, "fa_decode_split_tq4v.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -307,6 +313,7 @@ pub fn build(b: *std.Build) void {
         \\pub const fa_decode_split_d256 align(4) = @embedFile("fa_decode_split_d256.spv").*;
         \\pub const fa_bw_dq_d256 align(4) = @embedFile("fa_bw_dq_d256.spv").*;
         \\pub const fa_bw_dkv_d256 align(4) = @embedFile("fa_bw_dkv_d256.spv").*;
+        \\pub const fa_decode_split_tq4v align(4) = @embedFile("fa_decode_split_tq4v.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──
