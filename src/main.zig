@@ -145,6 +145,16 @@ pub fn main() !void {
         try smoke_cpu.runMtpForwardCpuSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mtp-gpu-upload-smoke")) {
+        // MTP-1b-β-1: GPU upload scaffold for the MTP head. Loads
+        // Qwen3.5-0.8B, uploads at .fp32_all precision, asserts
+        // `gm.mtp_head` non-null and that every uploaded buffer matches
+        // its expected fp32 footprint (allowing capacity ≥ data — the
+        // pool's slack policy permits over-alloc). The recorder + parity
+        // gate land in MTP-1b-β-2.
+        try smoke_gpu_train.runMtpGpuUploadSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-forward-smoke")) {
         // F3 of the FlashAttention arc: GPU SPIR-V kernel parity vs
         // the F2 CPU oracle. Drives `shaders/fa_forward.comp` (one

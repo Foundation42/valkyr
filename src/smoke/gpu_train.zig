@@ -28,6 +28,9 @@ const shaders = @import("shaders");
 const aliases = @import("../runtime_aliases.zig");
 const helpers = @import("../smoke/helpers.zig");
 const util = @import("../util.zig");
+const gpu_model = @import("../gpu/model.zig");
+const model_mod = @import("../model.zig");
+const hf_cache = @import("../hf_cache.zig");
 
 pub fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -5222,5 +5225,113 @@ pub fn runRopeBackwardSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS RoPE backward (n_heads={d} head_dim={d} rotary_dim={d}; round-trip OK, numeric-grad ≤ 1%, GPU max |Δ| = {e})\n",
         .{ n_heads, head_dim, rotary_dim, max_abs },
+    );
+}
+
+// ── MTP head GPU upload smoke (chunk MTP-1b-β-1) ────────────────────
+//
+// Loads Qwen3.5-0.8B (smallest MTP-equipped checkpoint), uploads to GPU
+// at .fp32_all precision, verifies `gm.mtp_head` is non-null and that
+// every uploaded buffer matches its expected fp32 footprint. Builds the
+// scaffolding the MTP-1b-β-2 recorder + parity smoke land on.
+
+pub fn runMtpGpuUploadSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runMtpGpuUploadSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    if (cpu.mtp_head == null) {
+        std.debug.print("FAIL runMtpGpuUploadSmoke: {s} has no MTP head on disk\n", .{model_id});
+        return error.NoMtpHead;
+    }
+
+    const t0 = std.time.nanoTimestamp();
+    var gm = try gpu_model.GpuModel.upload(allocator, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+    const t1 = std.time.nanoTimestamp();
+    const upload_ms: f64 = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+
+    if (gm.mtp_head == null) {
+        std.debug.print("FAIL runMtpGpuUploadSmoke: GpuModel.upload skipped MTP head despite cpu.mtp_head non-null\n", .{});
+        return error.MtpHeadUploadSkipped;
+    }
+    const cfg = gm.config;
+    const mtp = gm.mtp_head.?;
+
+    // Expected fp32 footprints (capacity may exceed, due to alignment slack).
+    const hidden = cfg.hidden_size;
+    const inter = cfg.intermediate_size;
+    const q_dim = cfg.num_attention_heads * cfg.head_dim;
+    const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+    const q_proj_rows: usize = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
+    const fp32_bytes = struct {
+        fn run(numel: usize) usize {
+            return numel * 4;
+        }
+    }.run;
+
+    if (mtp.layers.len != cfg.mtp_num_hidden_layers) {
+        std.debug.print("FAIL: gm.mtp_head.layers.len={d}, expected {d}\n", .{ mtp.layers.len, cfg.mtp_num_hidden_layers });
+        return error.MtpLayerCountMismatch;
+    }
+
+    const checks = [_]struct { name: []const u8, got: usize, want: usize }{
+        .{ .name = "mtp.fc",                    .got = mtp.fc.bytes,                    .want = fp32_bytes(hidden * 2 * hidden) },
+        .{ .name = "mtp.pre_fc_norm_embedding", .got = mtp.pre_fc_norm_embedding.bytes, .want = fp32_bytes(hidden) },
+        .{ .name = "mtp.pre_fc_norm_hidden",    .got = mtp.pre_fc_norm_hidden.bytes,    .want = fp32_bytes(hidden) },
+        .{ .name = "mtp.norm",                  .got = mtp.norm.bytes,                  .want = fp32_bytes(hidden) },
+    };
+    for (checks) |chk| {
+        if (chk.got < chk.want) {
+            std.debug.print("FAIL: {s}.bytes={d} < expected {d}\n", .{ chk.name, chk.got, chk.want });
+            return error.UploadBufferUndersized;
+        }
+    }
+
+    for (mtp.layers, 0..) |layer, i| {
+        const layer_checks = [_]struct { name: []const u8, got: usize, want: usize }{
+            .{ .name = "input_layernorm",          .got = layer.input_layernorm.bytes,          .want = fp32_bytes(hidden) },
+            .{ .name = "post_attention_layernorm", .got = layer.post_attention_layernorm.bytes, .want = fp32_bytes(hidden) },
+            .{ .name = "gate_proj",                .got = layer.gate_proj.bytes,                .want = fp32_bytes(inter * hidden) },
+            .{ .name = "up_proj",                  .got = layer.up_proj.bytes,                  .want = fp32_bytes(inter * hidden) },
+            .{ .name = "down_proj",                .got = layer.down_proj.bytes,                .want = fp32_bytes(hidden * inter) },
+            .{ .name = "q_proj",                   .got = layer.q_proj.?.bytes,                 .want = fp32_bytes(q_proj_rows * hidden) },
+            .{ .name = "k_proj",                   .got = layer.k_proj.?.bytes,                 .want = fp32_bytes(kv_dim * hidden) },
+            .{ .name = "v_proj",                   .got = layer.v_proj.?.bytes,                 .want = fp32_bytes(kv_dim * hidden) },
+            .{ .name = "o_proj",                   .got = layer.o_proj.?.bytes,                 .want = fp32_bytes(hidden * q_dim) },
+        };
+        for (layer_checks) |chk| {
+            if (chk.got < chk.want) {
+                std.debug.print("FAIL: mtp.layers[{d}].{s}.bytes={d} < expected {d}\n", .{ i, chk.name, chk.got, chk.want });
+                return error.UploadBufferUndersized;
+            }
+        }
+        if (cfg.family.hasQkNorm()) {
+            if (layer.q_norm == null or layer.k_norm == null) {
+                std.debug.print("FAIL: mtp.layers[{d}] missing q_norm/k_norm despite family.hasQkNorm()\n", .{i});
+                return error.MissingQkNorm;
+            }
+            if (layer.q_norm.?.bytes < fp32_bytes(cfg.head_dim) or layer.k_norm.?.bytes < fp32_bytes(cfg.head_dim)) {
+                std.debug.print("FAIL: mtp.layers[{d}] q_norm/k_norm undersized\n", .{i});
+                return error.UploadBufferUndersized;
+            }
+        }
+    }
+
+    std.debug.print(
+        "PASS mtp-gpu-upload ({s} fp32_all, {d} MTP layer(s), {d:.0} ms upload total): mtp.fc {d:.1} MiB, layers fp32-sized as expected\n",
+        .{ model_id, mtp.layers.len, upload_ms, @as(f64, @floatFromInt(mtp.fc.bytes)) / (1024.0 * 1024.0) },
     );
 }

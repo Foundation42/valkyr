@@ -114,6 +114,34 @@ pub const GpuLayer = struct {
     }
 };
 
+/// GPU-resident Multi-Token Prediction head. Mirrors `model.MtpHead`
+/// after `GpuModel.upload`. Tensor shapes / paths:
+///
+///   - `fc`                    matmul-path  [hidden_size, 2*hidden_size]
+///   - `pre_fc_norm_embedding` fp32         [hidden_size]
+///   - `pre_fc_norm_hidden`    fp32         [hidden_size]
+///   - `norm`                  fp32         [hidden_size]
+///   - `layers`                full-attention `GpuLayer` slice; identical
+///                             contract to base full-attn layers (q/k/v/o
+///                             + q_norm/k_norm + FFN trio + 2 layernorms,
+///                             attn_output_gate-doubled q_proj if cfg).
+pub const GpuMtpHead = struct {
+    fc: buffer.Buffer,
+    pre_fc_norm_embedding: buffer.Buffer,
+    pre_fc_norm_hidden: buffer.Buffer,
+    norm: buffer.Buffer,
+    layers: []GpuLayer,
+
+    pub fn deinit(self: *GpuMtpHead, gpa: std.mem.Allocator, device: vk.c.VkDevice) void {
+        self.fc.deinit(device);
+        self.pre_fc_norm_embedding.deinit(device);
+        self.pre_fc_norm_hidden.deinit(device);
+        self.norm.deinit(device);
+        for (self.layers) |*l| l.deinit(device);
+        gpa.free(self.layers);
+    }
+};
+
 pub const GpuModel = struct {
     config: config_mod.Config,
     precision: Precision,
@@ -135,6 +163,10 @@ pub const GpuModel = struct {
     /// at the tail of `upload`.
     pool: buffer.BufferPool,
     allocator: std.mem.Allocator,
+    /// Multi-Token Prediction head module (Qwen3.5/3.6 et al). Null when
+    /// `cpu.mtp_head == null`. Borrows from the same VkDeviceMemory
+    /// `pool` the rest of the model lives in.
+    mtp_head: ?GpuMtpHead = null,
 
     pub fn upload(
         gpa: std.mem.Allocator,
@@ -222,6 +254,30 @@ pub const GpuModel = struct {
             }
         }
 
+        // MTP head — same path policy as base layers (matmul-path for
+        // weight projections, fp32 for layernorm gains).
+        if (cpu.mtp_head) |mtp| {
+            accountTensor(mtp.fc,                    matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            accountTensor(mtp.pre_fc_norm_embedding, .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            accountTensor(mtp.pre_fc_norm_hidden,    .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            accountTensor(mtp.norm,                  .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            for (mtp.layers) |layer| {
+                // MTP transformer blocks are full_attention only — no
+                // linear-attn branch to handle.
+                accountTensor(layer.input_layernorm,          .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.post_attention_layernorm, .fp32,       &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.gate_proj,                matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.up_proj,                  matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.down_proj,                matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.q_proj.?,                 matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.k_proj.?,                 matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.v_proj.?,                 matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                accountTensor(layer.o_proj.?,                 matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                if (layer.q_norm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                if (layer.k_norm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            }
+        }
+
         // Staging buffer must fit the largest tensor in one shot —
         // otherwise we'd have to chunk it. 64 KiB extra to absorb any
         // stray alignment slop. Mid-stream flushes happen automatically
@@ -290,6 +346,56 @@ pub const GpuModel = struct {
             uploaded_layers = i + 1;
         }
 
+        // ── MTP head (when present) ─────────────────────────────────
+        // Same pool, same matmul/fp32 policy as the base layers. The
+        // transformer blocks are full_attention only — q_norm/k_norm
+        // are the family's tell, so we mirror the base full-attn upload.
+        var mtp_head: ?GpuMtpHead = null;
+        errdefer if (mtp_head) |*m| m.deinit(gpa, ctx.device);
+        if (cpu.mtp_head) |cpu_mtp| {
+            var fc = try uploadByPath(gpa, ctx, cpu_mtp.fc, matmul_path, js, &pool);
+            errdefer fc.deinit(ctx.device);
+            var pe = try uploadTensor(gpa, ctx, cpu_mtp.pre_fc_norm_embedding, js, &pool);
+            errdefer pe.deinit(ctx.device);
+            var ph = try uploadTensor(gpa, ctx, cpu_mtp.pre_fc_norm_hidden, js, &pool);
+            errdefer ph.deinit(ctx.device);
+            var mn = try uploadTensor(gpa, ctx, cpu_mtp.norm, js, &pool);
+            errdefer mn.deinit(ctx.device);
+
+            const mtp_layers = try gpa.alloc(GpuLayer, cpu_mtp.layers.len);
+            var n_mtp_uploaded: usize = 0;
+            errdefer {
+                var i: usize = 0;
+                while (i < n_mtp_uploaded) : (i += 1) mtp_layers[i].deinit(ctx.device);
+                gpa.free(mtp_layers);
+            }
+            for (cpu_mtp.layers, 0..) |layer, i| {
+                mtp_layers[i] = .{
+                    .layer_type = .full_attention,
+                    .input_layernorm = try uploadTensor(gpa, ctx, layer.input_layernorm, js, &pool),
+                    .post_attention_layernorm = try uploadTensor(gpa, ctx, layer.post_attention_layernorm, js, &pool),
+                    .gate_proj = try uploadByPath(gpa, ctx, layer.gate_proj, matmul_path, js, &pool),
+                    .up_proj = try uploadByPath(gpa, ctx, layer.up_proj, matmul_path, js, &pool),
+                    .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path, js, &pool),
+                };
+                mtp_layers[i].q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path, js, &pool);
+                mtp_layers[i].k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path, js, &pool);
+                mtp_layers[i].v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path, js, &pool);
+                mtp_layers[i].o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path, js, &pool);
+                if (layer.q_norm) |t| mtp_layers[i].q_norm = try uploadTensor(gpa, ctx, t, js, &pool);
+                if (layer.k_norm) |t| mtp_layers[i].k_norm = try uploadTensor(gpa, ctx, t, js, &pool);
+                n_mtp_uploaded = i + 1;
+            }
+
+            mtp_head = .{
+                .fc = fc,
+                .pre_fc_norm_embedding = pe,
+                .pre_fc_norm_hidden = ph,
+                .norm = mn,
+                .layers = mtp_layers,
+            };
+        }
+
         // Submit the final batch + tear down staging. Pool's
         // VkDeviceMemory survives in `GpuModel` so weight reads stay
         // valid.
@@ -305,6 +411,7 @@ pub const GpuModel = struct {
             .lm_head_tied = cpu.isLmHeadTied(),
             .pool = pool,
             .allocator = gpa,
+            .mtp_head = mtp_head,
         };
     }
 
@@ -314,6 +421,7 @@ pub const GpuModel = struct {
         self.embed_tokens.deinit(device);
         self.final_norm.deinit(device);
         self.lm_head.deinit(device);
+        if (self.mtp_head) |*m| m.deinit(self.allocator, device);
         // VkBuffer handles came from the pool; the pool owns their
         // backing VkDeviceMemory.
         self.pool.deinit(device);
