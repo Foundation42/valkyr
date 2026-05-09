@@ -37,8 +37,15 @@
 
 layout(local_size_x = 256) in;
 
+// Compile-time tunables. Overridable via glslc -DBC=<n> -DHEAD_DIM_MAX=<n>
+// so a `_d256` SPIR-V variant can ship at HEAD_DIM_MAX=256 BC=8 without
+// duplicating the source.
+#ifndef BC
 #define BC            16u
+#endif
+#ifndef HEAD_DIM_MAX
 #define HEAD_DIM_MAX  128u
+#endif
 
 layout(set = 0, binding = 0, std430) readonly  buffer Q   { float q_buf[];   };
 layout(set = 0, binding = 1, std430) readonly  buffer K   { float k_buf[];   };

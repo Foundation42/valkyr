@@ -37,8 +37,14 @@
 
 layout(local_size_x = 256) in;
 
+// Compile-time tunables. Overridable via glslc -DBR=<n> -DHEAD_DIM_MAX=<n>
+// for the `_d256` variant (HEAD_DIM_MAX=256 BR=8).
+#ifndef BR
 #define BR            16u
+#endif
+#ifndef HEAD_DIM_MAX
 #define HEAD_DIM_MAX  128u
+#endif
 
 layout(set = 0, binding = 0, std430) readonly  buffer Q   { float q_buf[];   };
 layout(set = 0, binding = 1, std430) readonly  buffer K   { float k_buf[];   };

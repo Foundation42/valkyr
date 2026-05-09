@@ -97,6 +97,25 @@ pub fn build(b: *std.Build) void {
     const fa_bw_d_spv = compileShader(b, "fa_bw_d");
     const fa_bw_dq_spv = compileShader(b, "fa_bw_dq");
     const fa_bw_dkv_spv = compileShader(b, "fa_bw_dkv");
+    // Qwen3.5-class head_dim=256 variants. Bc=8 (Br=8 for the dKV shader)
+    // halves the per-tile parallelism but keeps shared mem under the AMD
+    // RDNA 32 KB/WG ceiling at HEAD_DIM_MAX=256 (~18-20 KB total). Same
+    // .comp source as the d=128 variants — only the two compile-time
+    // defines differ. fa_decode_merge and fa_bw_d don't size shared mem
+    // by head_dim, so they have no _d256 variant — the d=128 builds
+    // serve d=256 dispatches unchanged.
+    const fa_forward_d256_spv = compileShaderD(b, "fa_forward", "fa_forward_d256", &.{
+        "HEAD_DIM_MAX=256u", "BC=8u",
+    });
+    const fa_decode_split_d256_spv = compileShaderD(b, "fa_decode_split", "fa_decode_split_d256", &.{
+        "HEAD_DIM_MAX=256u", "BC=8u",
+    });
+    const fa_bw_dq_d256_spv = compileShaderD(b, "fa_bw_dq", "fa_bw_dq_d256", &.{
+        "HEAD_DIM_MAX=256u", "BC=8u",
+    });
+    const fa_bw_dkv_d256_spv = compileShaderD(b, "fa_bw_dkv", "fa_bw_dkv_d256", &.{
+        "HEAD_DIM_MAX=256u", "BR=8u",
+    });
 
     // Stage compiled SPIR-V into one anonymous module. SPIR-V must be
     // 4-byte aligned for Vulkan's pCode field; dereferencing the
@@ -191,6 +210,10 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(fa_bw_d_spv, "fa_bw_d.spv");
     _ = wf.addCopyFile(fa_bw_dq_spv, "fa_bw_dq.spv");
     _ = wf.addCopyFile(fa_bw_dkv_spv, "fa_bw_dkv.spv");
+    _ = wf.addCopyFile(fa_forward_d256_spv, "fa_forward_d256.spv");
+    _ = wf.addCopyFile(fa_decode_split_d256_spv, "fa_decode_split_d256.spv");
+    _ = wf.addCopyFile(fa_bw_dq_d256_spv, "fa_bw_dq_d256.spv");
+    _ = wf.addCopyFile(fa_bw_dkv_d256_spv, "fa_bw_dkv_d256.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const vec_add align(4) = @embedFile("vec_add.spv").*;
         \\pub const matmul_nt align(4) = @embedFile("matmul_nt.spv").*;
@@ -280,6 +303,10 @@ pub fn build(b: *std.Build) void {
         \\pub const fa_bw_d align(4) = @embedFile("fa_bw_d.spv").*;
         \\pub const fa_bw_dq align(4) = @embedFile("fa_bw_dq.spv").*;
         \\pub const fa_bw_dkv align(4) = @embedFile("fa_bw_dkv.spv").*;
+        \\pub const fa_forward_d256 align(4) = @embedFile("fa_forward_d256.spv").*;
+        \\pub const fa_decode_split_d256 align(4) = @embedFile("fa_decode_split_d256.spv").*;
+        \\pub const fa_bw_dq_d256 align(4) = @embedFile("fa_bw_dq_d256.spv").*;
+        \\pub const fa_bw_dkv_d256 align(4) = @embedFile("fa_bw_dkv_d256.spv").*;
     );
 
     // ── Public Zig module for host-engine embedding ──
@@ -340,12 +367,25 @@ pub fn build(b: *std.Build) void {
 }
 
 fn compileShader(b: *std.Build, name: []const u8) std.Build.LazyPath {
-    const src = b.fmt("shaders/{s}.comp", .{name});
-    const spv = b.fmt("{s}.spv", .{name});
-    const dep = b.fmt("{s}.d", .{name});
+    return compileShaderD(b, name, name, &.{});
+}
+
+/// Compile a shader with optional `-D` defines under a separate output
+/// name. `src_name` selects the .comp source; `out_name` becomes both
+/// the .spv filename and (with the parallel build.zig embed line) the
+/// `shaders.<out_name>` Zig identifier. Use this to stamp variants of
+/// the same source — e.g. `fa_forward` (default d=128) and
+/// `fa_forward_d256` (HEAD_DIM_MAX=256 BC=8) from one .comp file.
+fn compileShaderD(b: *std.Build, src_name: []const u8, out_name: []const u8, defines: []const []const u8) std.Build.LazyPath {
+    const src = b.fmt("shaders/{s}.comp", .{src_name});
+    const spv = b.fmt("{s}.spv", .{out_name});
+    const dep = b.fmt("{s}.d", .{out_name});
     const cmd = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.3" });
     cmd.addArg("-I");
     cmd.addDirectoryArg(b.path("shaders"));
+    for (defines) |def| {
+        cmd.addArg(b.fmt("-D{s}", .{def}));
+    }
     cmd.addArg("-MD");
     cmd.addArg("-MF");
     _ = cmd.addDepFileOutputArg(dep);
