@@ -744,6 +744,8 @@ pub fn runFlashAttentionParitySmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "decode-medium (n_q=1 n_kv=128 GQA 4:2 d=32)", .n_q = 1, .n_kv = 128, .n_heads = 4, .n_kv_heads = 2, .head_dim = 32, .causal = false, .Br = 1, .Bc = 32 },
         .{ .name = "prefill-causal (n_q=4 n_kv=4 GQA 4:2 d=16)", .n_q = 4, .n_kv = 4, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .Br = 2, .Bc = 2 },
         .{ .name = "prefill-qwen3 (n_q=16 n_kv=16 GQA 16:8 d=128)", .n_q = 16, .n_kv = 16, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true, .Br = 4, .Bc = 4 },
+        .{ .name = "decode-qwen35 (n_q=1 n_kv=128 GQA 8:2 d=256)", .n_q = 1, .n_kv = 128, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256, .causal = false, .Br = 1, .Bc = 8 },
+        .{ .name = "prefill-qwen35 (n_q=8 n_kv=8 GQA 8:2 d=256)", .n_q = 8, .n_kv = 8, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256, .causal = true, .Br = 4, .Bc = 4 },
         .{ .name = "non-aligned blocks (n_q=10 n_kv=12 Br=4 Bc=5)", .n_q = 10, .n_kv = 12, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .Br = 4, .Bc = 5 },
     };
 
@@ -904,6 +906,7 @@ pub fn runFlashAttentionBackwardParitySmoke(allocator: std.mem.Allocator) !void 
     const cases = [_]FlashBackwardCase{
         .{ .name = "prefill-tiny (n_q=4 n_kv=4 GQA 4:2 d=16)",        .n_q = 4,  .n_kv = 4,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = true  },
         .{ .name = "prefill-qwen3 (n_q=16 n_kv=16 GQA 16:8 d=128)",   .n_q = 16, .n_kv = 16, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true  },
+        .{ .name = "prefill-qwen35 (n_q=8 n_kv=8 GQA 8:2 d=256)",     .n_q = 8,  .n_kv = 8,  .n_heads = 8,  .n_kv_heads = 2, .head_dim = 256, .causal = true  },
         .{ .name = "non-aligned (n_q=10 n_kv=12 GQA 4:2 d=16 causal)", .n_q = 10, .n_kv = 12, .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = true  },
         .{ .name = "gqa-4to1 (n_q=8 n_kv=8 heads_per_kv=4 d=16)",     .n_q = 8,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 1, .head_dim = 16,  .causal = true  },
         .{ .name = "non-causal (n_q=4 n_kv=8 GQA 4:2 d=16)",          .n_q = 4,  .n_kv = 8,  .n_heads = 4,  .n_kv_heads = 2, .head_dim = 16,  .causal = false },
@@ -920,7 +923,7 @@ pub fn runFlashAttentionBackwardParitySmoke(allocator: std.mem.Allocator) !void 
     }
 
     std.debug.print(
-        "PASS flash-attention backward parity ({d} cases incl. GQA + causal + non-aligned + d=128, max rel(dQ/dK/dV)=({e:.2},{e:.2},{e:.2}))\n",
+        "PASS flash-attention backward parity ({d} cases incl. GQA + causal + non-aligned + d=128 + d=256, max rel(dQ/dK/dV)=({e:.2},{e:.2},{e:.2}))\n",
         .{ cases.len, max_dq, max_dk, max_dv },
     );
 }
