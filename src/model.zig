@@ -84,6 +84,48 @@ pub const Layer = struct {
     out_proj: ?Tensor = null,
 };
 
+/// Multi-Token Prediction head module (Qwen3.5/3.6, DeepSeek-V3, etc.).
+///
+/// Architecture (Qwen3.6, `mtp_num_hidden_layers=1`):
+///
+///   1. RMSNorm the embedding (`pre_fc_norm_embedding`) and the previous
+///      hidden state (`pre_fc_norm_hidden`).
+///   2. Concatenate along the channel axis → `[2 * hidden_size]` per token.
+///   3. Project back to `hidden_size` via `fc.weight` (the eh_proj).
+///   4. Run `mtp_num_hidden_layers` of normal transformer blocks (same
+///      shape as the base model's full-attention layers, including
+///      `q_norm`/`k_norm` and any `attn_output_gate`).
+///   5. RMSNorm with `norm.weight`, then share the base model's `lm_head`
+///      to produce next-token logits for slot k.
+///
+/// At inference the same module is reused recursively across slots: feed
+/// the previous slot's hidden into step 1 to predict slot k+1. The number
+/// of slots is a runtime knob (`--mtp-draft-n`); the on-disk depth lives
+/// in `cfg.mtp_num_hidden_layers`.
+///
+/// Tensor names live under `mtp.*` at the safetensors root — they do NOT
+/// take the `cfg.family.tensorPrefix()` (no `model.language_model.*`
+/// wrapping). All references borrow from the parent Model's shards.
+pub const MtpHead = struct {
+    /// `mtp.fc.weight`: projects concat(norm(embed), norm(prev_h)) back
+    /// to hidden. Shape `[hidden_size, 2 * hidden_size]`.
+    fc: Tensor,
+    /// `mtp.pre_fc_norm_embedding.weight`: RMSNorm gain on the embedding
+    /// side before fc. Shape `[hidden_size]`.
+    pre_fc_norm_embedding: Tensor,
+    /// `mtp.pre_fc_norm_hidden.weight`: RMSNorm gain on the hidden side
+    /// before fc. Shape `[hidden_size]`.
+    pre_fc_norm_hidden: Tensor,
+    /// `mtp.norm.weight`: final RMSNorm before the (shared) lm_head.
+    /// Shape `[hidden_size]`.
+    norm: Tensor,
+    /// `mtp.layers.{0..mtp_num_hidden_layers-1}.*`: one full-attention
+    /// transformer block per depth slot. Same shape as the base model's
+    /// `Layer` (full_attention flavor), including q_norm/k_norm and any
+    /// attn_output_gate-doubled q_proj.
+    layers: []Layer,
+};
+
 pub const Model = struct {
     config: Config,
     /// Owned. Keeps every shard's mmap alive for the lifetime of the
@@ -100,6 +142,10 @@ pub const Model = struct {
     /// the same bytes as `embed_tokens` — callers should not assume the
     /// two are distinct allocations.
     lm_head: Tensor,
+    /// MTP head module. Null on checkpoints without MTP heads (i.e.
+    /// `cfg.mtp_num_hidden_layers == 0`). Borrows from `shards`; freed
+    /// implicitly when the model's arena is torn down.
+    mtp_head: ?MtpHead = null,
 
     pub fn load(gpa: std.mem.Allocator, dir_path: []const u8) !Model {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -254,6 +300,98 @@ pub const Model = struct {
             break :blk embed;
         };
 
+        // ── MTP head (optional) ─────────────────────────────────────
+        // Names live at the safetensors root (`mtp.*`), NOT under the
+        // family's `tensorPrefix()` — even on Qwen3.5/3.6 where the main
+        // model is wrapped under `model.language_model.*`. Verified
+        // 2026-05-09 against Qwen3.6-27B safetensors index.
+        //
+        // The transformer blocks have the same shape contract as the base
+        // model's full-attention layers (q_norm/k_norm if the family has
+        // them; q_proj doubled when `attn_output_gate`). Loading this is
+        // the loader part of the MTP-1 arc; the runtime path lights up in
+        // MTP-1b/1c.
+        const mtp_head: ?MtpHead = blk: {
+            if (cfg.mtp_num_hidden_layers == 0) break :blk null;
+
+            // Dedicated MTP embeddings aren't in any model we support
+            // today — surface as an error rather than silently falling
+            // back to the shared `embed_tokens`.
+            if (cfg.mtp_use_dedicated_embeddings) return error.MtpDedicatedEmbedNotSupported;
+
+            const fc = try requireTensor(&shards, "mtp.fc.weight");
+            try expectShape(fc, "mtp.fc.weight", &.{ cfg.hidden_size, 2 * cfg.hidden_size });
+
+            const pe = try requireTensor(&shards, "mtp.pre_fc_norm_embedding.weight");
+            try expectShape(pe, "mtp.pre_fc_norm_embedding.weight", &.{cfg.hidden_size});
+
+            const ph = try requireTensor(&shards, "mtp.pre_fc_norm_hidden.weight");
+            try expectShape(ph, "mtp.pre_fc_norm_hidden.weight", &.{cfg.hidden_size});
+
+            const mtp_norm = try requireTensor(&shards, "mtp.norm.weight");
+            try expectShape(mtp_norm, "mtp.norm.weight", &.{cfg.hidden_size});
+
+            const mtp_layers = try a.alloc(Layer, cfg.mtp_num_hidden_layers);
+            for (mtp_layers, 0..) |*ml, i| {
+                ml.* = .{
+                    .layer_type = .full_attention,
+                    .input_layernorm = undefined,
+                    .post_attention_layernorm = undefined,
+                    .gate_proj = undefined,
+                    .up_proj = undefined,
+                    .down_proj = undefined,
+                };
+
+                ml.input_layernorm = try requireLayerTensor(a, &shards, "mtp.", i, "input_layernorm.weight");
+                try expectShape(ml.input_layernorm, "mtp input_layernorm", &.{cfg.hidden_size});
+
+                ml.post_attention_layernorm = try requireLayerTensor(a, &shards, "mtp.", i, "post_attention_layernorm.weight");
+                try expectShape(ml.post_attention_layernorm, "mtp post_attention_layernorm", &.{cfg.hidden_size});
+
+                ml.gate_proj = try requireLayerTensor(a, &shards, "mtp.", i, "mlp.gate_proj.weight");
+                try expectShape(ml.gate_proj, "mtp gate_proj", &.{ cfg.intermediate_size, cfg.hidden_size });
+
+                ml.up_proj = try requireLayerTensor(a, &shards, "mtp.", i, "mlp.up_proj.weight");
+                try expectShape(ml.up_proj, "mtp up_proj", &.{ cfg.intermediate_size, cfg.hidden_size });
+
+                ml.down_proj = try requireLayerTensor(a, &shards, "mtp.", i, "mlp.down_proj.weight");
+                try expectShape(ml.down_proj, "mtp down_proj", &.{ cfg.hidden_size, cfg.intermediate_size });
+
+                const q = try requireLayerTensor(a, &shards, "mtp.", i, "self_attn.q_proj.weight");
+                try expectShape(q, "mtp q_proj", &.{ q_proj_rows, cfg.hidden_size });
+                ml.q_proj = q;
+
+                const k = try requireLayerTensor(a, &shards, "mtp.", i, "self_attn.k_proj.weight");
+                try expectShape(k, "mtp k_proj", &.{ kv_dim, cfg.hidden_size });
+                ml.k_proj = k;
+
+                const v = try requireLayerTensor(a, &shards, "mtp.", i, "self_attn.v_proj.weight");
+                try expectShape(v, "mtp v_proj", &.{ kv_dim, cfg.hidden_size });
+                ml.v_proj = v;
+
+                const o = try requireLayerTensor(a, &shards, "mtp.", i, "self_attn.o_proj.weight");
+                try expectShape(o, "mtp o_proj", &.{ cfg.hidden_size, q_dim });
+                ml.o_proj = o;
+
+                if (cfg.family.hasQkNorm()) {
+                    const qn = try requireLayerTensor(a, &shards, "mtp.", i, "self_attn.q_norm.weight");
+                    try expectShape(qn, "mtp q_norm", &.{cfg.head_dim});
+                    ml.q_norm = qn;
+                    const kn = try requireLayerTensor(a, &shards, "mtp.", i, "self_attn.k_norm.weight");
+                    try expectShape(kn, "mtp k_norm", &.{cfg.head_dim});
+                    ml.k_norm = kn;
+                }
+            }
+
+            break :blk MtpHead{
+                .fc = fc,
+                .pre_fc_norm_embedding = pe,
+                .pre_fc_norm_hidden = ph,
+                .norm = mtp_norm,
+                .layers = mtp_layers,
+            };
+        };
+
         return .{
             .config = cfg,
             .shards = shards,
@@ -262,6 +400,7 @@ pub const Model = struct {
             .layers = layers,
             .final_norm = final_norm,
             .lm_head = lm_head,
+            .mtp_head = mtp_head,
         };
     }
 

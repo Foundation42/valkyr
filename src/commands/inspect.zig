@@ -205,6 +205,41 @@ pub fn runLoad(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     bytes_touched +%= @intCast(model.embed_tokens.bytes[0]);
     bytes_touched +%= @intCast(model.final_norm.bytes[0]);
     bytes_touched +%= @intCast(model.lm_head.bytes[0]);
+
+    // Multi-Token Prediction head (Qwen3.5/3.6, DeepSeek-V3 style). Same
+    // page-touch sweep as the main layers, plus the four shared apparatus
+    // tensors. Reported so a user inspecting an MTP-equipped checkpoint
+    // sees something concrete back.
+    if (model.mtp_head) |mtp| {
+        try stdout.print("\nMTP head: present ({d} layer(s))\n", .{mtp.layers.len});
+        bytes_touched +%= @intCast(mtp.fc.bytes[0]);
+        bytes_touched +%= @intCast(mtp.pre_fc_norm_embedding.bytes[0]);
+        bytes_touched +%= @intCast(mtp.pre_fc_norm_hidden.bytes[0]);
+        bytes_touched +%= @intCast(mtp.norm.bytes[0]);
+        for (mtp.layers) |layer| {
+            inline for (.{
+                "input_layernorm",          "post_attention_layernorm",
+                "gate_proj",                "up_proj",                  "down_proj",
+            }) |fname| {
+                const t = @field(layer, fname);
+                if (t.bytes.len > 0) {
+                    bytes_touched +%= @intCast(t.bytes[0]);
+                    bytes_touched +%= @intCast(t.bytes[t.bytes.len - 1]);
+                }
+            }
+            inline for (.{ "q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm" }) |fname| {
+                if (@field(layer, fname)) |t| {
+                    if (t.bytes.len > 0) {
+                        bytes_touched +%= @intCast(t.bytes[0]);
+                        bytes_touched +%= @intCast(t.bytes[t.bytes.len - 1]);
+                    }
+                }
+            }
+        }
+    } else {
+        try stdout.print("\nMTP head: none\n", .{});
+    }
+
     // The xor folds the first/last byte of every weight into one word —
     // a cheap way to force the OS to actually touch each tensor page.
     // Print it so the optimizer can't elide the loop.

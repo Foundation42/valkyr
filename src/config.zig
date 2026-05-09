@@ -182,6 +182,22 @@ pub const Config = struct {
     linear_key_head_dim: usize = 0,
     linear_value_head_dim: usize = 0,
 
+    // ── MTP (Multi-Token Prediction) heads ──────────────────────────
+    // Qwen3.5/3.6, Gemma 4 26B-A4B, DeepSeek-V3, MiMo-V2.5 ship dormant
+    // MTP heads alongside the main model (DeepSeek-V3 §2.3). At inference
+    // they're recursively reused as a built-in draft for self-speculation.
+    /// Depth of the MTP head module (number of stacked transformer blocks
+    /// inside it). Zero ≡ no MTP heads in the checkpoint. Sourced from
+    /// `text_config.mtp_num_hidden_layers` (Qwen3.5/3.6) — other families
+    /// likely use a flat top-level field; default-zero parse keeps it
+    /// backward-compatible. The number of *draft slots* at inference is a
+    /// separate runtime knob; the same MTP block is reused across slots.
+    mtp_num_hidden_layers: usize = 0,
+    /// Whether the MTP head ships its own dedicated `embed_tokens` table.
+    /// Qwen3.5/3.6 set this to false (shared with the main model). When
+    /// true, the loader looks for a separate `mtp.embed_tokens.weight`.
+    mtp_use_dedicated_embeddings: bool = false,
+
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
         const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
         defer file.close();
@@ -300,6 +316,12 @@ pub const Config = struct {
             cfg.linear_value_head_dim = optionalUsize(inner, "linear_value_head_dim") orelse 0;
         }
 
+        // MTP head fields. Qwen3.5/3.6 nest under `text_config`; older
+        // families don't ship them at all. Default-zero / default-false
+        // makes non-MTP checkpoints load unchanged.
+        cfg.mtp_num_hidden_layers = optionalUsize(inner, "mtp_num_hidden_layers") orelse 0;
+        cfg.mtp_use_dedicated_embeddings = optionalBool(inner, "mtp_use_dedicated_embeddings") orelse false;
+
         return cfg;
     }
 
@@ -338,6 +360,10 @@ pub const Config = struct {
                 .full_attention => n_full += 1,
             };
             try w.print("layer schedule:          {d} linear / {d} full\n", .{ n_lin, n_full });
+        }
+        if (self.mtp_num_hidden_layers > 0) {
+            try w.print("mtp_num_hidden_layers:   {d}\n", .{self.mtp_num_hidden_layers});
+            try w.print("mtp_dedicated_embed:     {}\n", .{self.mtp_use_dedicated_embeddings});
         }
     }
 };
