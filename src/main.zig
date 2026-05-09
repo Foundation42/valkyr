@@ -155,6 +155,15 @@ pub fn main() !void {
         try smoke_gpu_train.runMtpGpuUploadSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mtp-forward-gpu-smoke")) {
+        // MTP-1b-β-2: end-to-end GPU/CPU parity gate for the MTP forward.
+        // Loads Qwen3.5-0.8B at fp32_all, runs `recordMtpStep` and
+        // `forwardMtpStep` with identical synthetic h_prev + token,
+        // compares logits at 1e-4 max rel-err. Single-step gate; the
+        // draft+verify chain lands in MTP-1c.
+        try smoke_gpu_train.runMtpForwardGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--fa-forward-smoke")) {
         // F3 of the FlashAttention arc: GPU SPIR-V kernel parity vs
         // the F2 CPU oracle. Drives `shaders/fa_forward.comp` (one

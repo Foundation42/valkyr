@@ -31,6 +31,9 @@ const util = @import("../util.zig");
 const gpu_model = @import("../gpu/model.zig");
 const model_mod = @import("../model.zig");
 const hf_cache = @import("../hf_cache.zig");
+const cpu_mtp = @import("../cpu/mtp.zig");
+const runtime_hybrid = @import("../runtime_hybrid.zig");
+const runtime_mtp = @import("../runtime_mtp.zig");
 
 pub fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     var ctx = try vk.Context.init(allocator);
@@ -5333,5 +5336,141 @@ pub fn runMtpGpuUploadSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS mtp-gpu-upload ({s} fp32_all, {d} MTP layer(s), {d:.0} ms upload total): mtp.fc {d:.1} MiB, layers fp32-sized as expected\n",
         .{ model_id, mtp.layers.len, upload_ms, @as(f64, @floatFromInt(mtp.fc.bytes)) / (1024.0 * 1024.0) },
+    );
+}
+
+// ── MTP forward GPU/CPU parity smoke (chunk MTP-1b-β-2) ─────────────
+//
+// Loads Qwen3.5-0.8B at fp32_all, runs `recordMtpStep` (GPU) and
+// `forwardMtpStep` (CPU) with identical inputs (same synthetic h_prev,
+// same token, pos=0), reads back GPU logits, compares to CPU logits.
+//
+// Tolerance: 1e-4 max rel-err. fp32 weights everywhere so any drift is
+// reduction-order divergence (subgroup ops vs serial accumulation),
+// well-behaved across the kernel inventory we already trust.
+
+pub fn runMtpForwardGpuSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runMtpForwardGpuSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    if (cpu.mtp_head == null) {
+        std.debug.print("FAIL runMtpForwardGpuSmoke: {s} has no MTP head on disk\n", .{model_id});
+        return error.NoMtpHead;
+    }
+
+    var gm = try gpu_model.GpuModel.upload(allocator, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+
+    const cfg = gm.config;
+
+    // ── Synthetic inputs ────────────────────────────────────────────
+    var prng = std.Random.DefaultPrng.init(0xB2_DEC0DE);
+    const rng = prng.random();
+    const h_prev = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(h_prev);
+    for (h_prev) |*v| v.* = rng.floatNorm(f32) * 0.1;
+    const token_id: u32 = cfg.eos_token_id orelse 0;
+    const pos: usize = 0;
+    const max_pos: u32 = 8;
+
+    // ── CPU oracle ──────────────────────────────────────────────────
+    var cpu_state = try cpu_mtp.MtpState.init(allocator, &cpu, max_pos);
+    defer cpu_state.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const h_out_cpu = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(h_out_cpu);
+    const logits_cpu = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_cpu);
+
+    const t_cpu0 = std.time.nanoTimestamp();
+    try cpu_mtp.forwardMtpStep(&cpu, &cpu_state, token_id, h_prev, pos, arena.allocator(), h_out_cpu, logits_cpu);
+    const t_cpu1 = std.time.nanoTimestamp();
+    const cpu_ms: f64 = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+    // ── GPU recorder + state ────────────────────────────────────────
+    var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, false);
+    defer sc.deinit(ctx.device);
+
+    var k = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all);
+    defer k.deinit();
+
+    var mtp_state = try runtime_mtp.MtpRuntimeState.init(allocator, &ctx, cfg, max_pos);
+    defer mtp_state.deinit(ctx.device);
+
+    var buf_h_prev = try buffer.Buffer.initStatic(&ctx, f32, h_prev);
+    defer buf_h_prev.deinit(ctx.device);
+
+    var buf_logits = try buffer.Buffer.initDeviceOnly(&ctx, cfg.vocab_size * @sizeOf(f32));
+    defer buf_logits.deinit(ctx.device);
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 64, 64 * 8);
+    defer rec.deinit();
+
+    const t_gpu0 = std.time.nanoTimestamp();
+    try rec.reset();
+    try rec.begin();
+    try runtime_mtp.recordMtpStep(
+        &rec,
+        &sc,
+        &gm,
+        cfg,
+        &k,
+        &mtp_state,
+        &buf_h_prev,
+        token_id,
+        pos,
+        max_pos,
+        &buf_logits,
+    );
+    try rec.endAndSubmit();
+    const t_gpu1 = std.time.nanoTimestamp();
+    const gpu_ms: f64 = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+    const logits_gpu = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(logits_gpu);
+    try buf_logits.readBack(&ctx, f32, logits_gpu);
+
+    // ── Parity gate ─────────────────────────────────────────────────
+    const tol: f32 = 1e-4;
+    const rel = globalRelDiff(logits_cpu, logits_gpu);
+    if (rel >= tol) {
+        var n_diff_gt_1pct: usize = 0;
+        for (logits_cpu, logits_gpu) |a, b| {
+            const denom = @max(@abs(a), 1e-6);
+            if (@abs(a - b) / denom > 0.01) n_diff_gt_1pct += 1;
+        }
+        std.debug.print(
+            "FAIL mtp-forward-gpu parity: rel={e} (tol {e}); {d}/{d} elems diverge >1%\n",
+            .{ rel, tol, n_diff_gt_1pct, logits_cpu.len },
+        );
+        return error.ParityFailed;
+    }
+
+    // top-1 sanity (should agree even at tighter tolerance).
+    var top1_cpu: usize = 0;
+    var top1_gpu: usize = 0;
+    for (logits_cpu, 0..) |x, i| if (x > logits_cpu[top1_cpu]) { top1_cpu = i; };
+    for (logits_gpu, 0..) |x, i| if (x > logits_gpu[top1_gpu]) { top1_gpu = i; };
+    const top1_match = top1_cpu == top1_gpu;
+
+    std.debug.print(
+        "PASS mtp-forward-gpu ({s} fp32_all, {d} MTP layer(s)): rel={e} top1={s} (cpu={d}, gpu={d}); {d:.0} ms CPU, {d:.0} ms GPU\n",
+        .{ model_id, gm.mtp_head.?.layers.len, rel, if (top1_match) "match" else "DIVERGED", top1_cpu, top1_gpu, cpu_ms, gpu_ms },
     );
 }
