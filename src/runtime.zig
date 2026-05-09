@@ -535,6 +535,13 @@ pub const ChatKernels = struct {
     /// FlashDecoding phase 2 — merge per-split (O, m, l) partials into
     /// final attention output. Paired with `fa_decode_split`.
     fa_decode_merge: pipeline.Kernel,
+    /// Fused FlashDecoding + TQ4 V dequant. Used when `cfg.head_dim ==
+    /// 256` and `--tq4v` is active — the kernel reads the packed V
+    /// cache directly and dequants inline per K-tile, skipping the
+    /// `tq4_unpack` dispatch and `dequant_v` HBM scratch entirely.
+    /// Always built (single d=256 SPIR-V variant); the dispatcher
+    /// gates by head_dim + tq4_v presence.
+    fa_decode_split_tq4v: pipeline.Kernel,
     add: pipeline.Kernel,
     geglu: pipeline.Kernel,
 
@@ -578,6 +585,7 @@ pub const ChatKernels = struct {
             .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
             .fa_decode_split = try pipeline.Kernel.init(ctx, faDecodeSplitSpv(head_dim), 6, @sizeOf(FaDecodeSplitPush)),
             .fa_decode_merge = try pipeline.Kernel.init(ctx, &shaders.fa_decode_merge, 4, @sizeOf(FaDecodeMergePush)),
+            .fa_decode_split_tq4v = try pipeline.Kernel.init(ctx, &shaders.fa_decode_split_tq4v, 6, @sizeOf(FaDecodeSplitPush)),
             .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
             .geglu = try pipeline.Kernel.init(ctx, ffn_spv, 3, @sizeOf(GegluPush)),
         };
@@ -596,6 +604,7 @@ pub const ChatKernels = struct {
         self.attn_out.deinit();
         self.fa_decode_split.deinit();
         self.fa_decode_merge.deinit();
+        self.fa_decode_split_tq4v.deinit();
         self.add.deinit();
         self.geglu.deinit();
     }
@@ -834,15 +843,20 @@ pub fn recordOneLayer(
         try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &p.kv_write_push, kv_dim);
     }
 
-    // V cache for attention. With `--tq4v` we unpack the whole V cache
-    // into `dequant_v` first; the attention kernel(s) below see the
-    // same fp32 layout `[n_pos, n_kv_heads, head_dim]` either way.
-    // Lifted above the attention dispatch so the FA-decode path can
-    // read it as a single binding.
+    // V cache for attention. Two interesting paths:
+    //   * Fused TQ4-V FA decode (head_dim==256 + tq4_v): the kernel
+    //     reads the packed V cache directly and dequants inline. Skip
+    //     the `tq4_unpack` dispatch and the `dequant_v` HBM scratch
+    //     entirely — pure bandwidth win at long ctx.
+    //   * Everything else: lift the unpack here so all attention
+    //     kernels see the same fp32 V layout.
+    const fused_tq4v_path: bool = p.attn_use_fa and tq4_v != null and cfg.head_dim == 256;
     const v_for_attn: *const buffer.Buffer = if (tq4_v) |t| blk: {
-        const tq_layer = &t.cache.layers[layer_idx];
-        const total_blocks: u32 = p.n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
-        try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, total_blocks, 1, 1);
+        if (!fused_tq4v_path) {
+            const tq_layer = &t.cache.layers[layer_idx];
+            const total_blocks: u32 = p.n_pos * @as(u32, @intCast(t.cache.n_blocks_per_pos));
+            try rec.dispatch(t.unpack, &.{ &tq_layer.v_cache, &t.cache.dequant_v }, null, total_blocks, 1, 1);
+        }
         break :blk &t.cache.dequant_v;
     } else &kv_layer.v_cache;
 
@@ -853,14 +867,27 @@ pub fn recordOneLayer(
         // phase 2 combines them into `head_out` with running-max +
         // rescaled-sum.
         const split = p.fa_decode_split_push;
-        try rec.dispatch(
-            &k.fa_decode_split,
-            &.{ &sc.q_rot, &kv_layer.k_cache, v_for_attn, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
-            &split,
-            @as(u32, @intCast(cfg.num_attention_heads)) * split.n_splits,
-            1,
-            1,
-        );
+        if (fused_tq4v_path) {
+            // Fused-TQ4-V FAST path: bind the packed V cache straight in.
+            const tq_layer = &tq4_v.?.cache.layers[layer_idx];
+            try rec.dispatch(
+                &k.fa_decode_split_tq4v,
+                &.{ &sc.q_rot, &kv_layer.k_cache, &tq_layer.v_cache, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
+                &split,
+                @as(u32, @intCast(cfg.num_attention_heads)) * split.n_splits,
+                1,
+                1,
+            );
+        } else {
+            try rec.dispatch(
+                &k.fa_decode_split,
+                &.{ &sc.q_rot, &kv_layer.k_cache, v_for_attn, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
+                &split,
+                @as(u32, @intCast(cfg.num_attention_heads)) * split.n_splits,
+                1,
+                1,
+            );
+        }
         try rec.dispatch(
             &k.fa_decode_merge,
             &.{ &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial, &sc.head_out },
