@@ -145,6 +145,18 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionTq4VParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mtp-verify-gpu-smoke")) {
+        // MTP-1c-β-6: closes the SpecDec verify arc. Main forward at
+        // pos 0 with BOS produces `main_tok` + `last_hidden`; MTP draft
+        // chain produces `[d_0..d_{k-1}]`; one batched verify forward
+        // at `pos_start = 1, n_q = k` feeds the drafts back through
+        // the main model and reads `[k, vocab]` logits. Per-row argmax
+        // + SpecDec accept rule emit the verified token sequence.
+        // Determinism-gated end-to-end (re-run from fresh state must
+        // produce bit-identical tokens).
+        try smoke_gpu_train.runMtpVerifyGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--forward-hybrid-batched-gpu-smoke")) {
         // MTP-1c-β-5: end-to-end batched hybrid forward (GPU parity).
         // Drives `recordForwardStepBatched` against the β-1 CPU oracle

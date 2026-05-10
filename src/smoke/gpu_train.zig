@@ -6032,6 +6032,316 @@ pub fn runLinearAttnPrefillGpuSmoke(allocator: std.mem.Allocator) !void {
     );
 }
 
+// ── MTP-1c-β-6: SpecDec verify on a real model (closes the verify arc)─
+//
+// End-to-end MTP speculative-decoding verify path: main forward at
+// pos 0 with BOS produces `main_tok` and the last hidden; MTP draft
+// chain produces `[d_0, d_1, ..., d_{k-1}]`; then a single batched
+// verify forward (`recordForwardStepBatched` at `n_q = k`) feeds the
+// drafts back through the main model at positions [1..k] and reads
+// out `[k, vocab]` logits. Per-row argmax + the `main_tok` anchor
+// drive the SpecDec accept rule.
+//
+// Gates:
+//   1. Determinism — re-run from fresh state, every emitted token
+//      must match.
+//   2. Logits sanity — no NaN/Inf, reasonable magnitude.
+//   3. SpecDec accept rule applied correctly: walk d_0..d_{k-1},
+//      accept while previous prediction matches; first reject (or
+//      end of chain) gives the correction/continuation token.
+//
+// On a BOS-only seed the drafts are nonsensical so accept_count is
+// expected to be 0 — but the verify forward itself is correctness-
+// gated by β-5's per-row parity (3.85e-5 rel-err vs CPU oracle).
+// This smoke just exercises the wiring + accept logic and prints
+// the resulting tokens. Real-prompt accept-rate measurement lands
+// in MTP-1c-γ when `--chat --mtp` lands.
+
+pub fn runMtpVerifyGpuSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runMtpVerifyGpuSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+    if (cpu.mtp_head == null) {
+        std.debug.print("FAIL runMtpVerifyGpuSmoke: {s} has no MTP head on disk\n", .{model_id});
+        return error.NoMtpHead;
+    }
+
+    var gm = try gpu_model.GpuModel.upload(allocator, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+
+    const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});
+    defer allocator.free(tok_path);
+    var tok = try tokenizer_mod.Tokenizer.loadFromFile(allocator, tok_path);
+    defer tok.deinit();
+
+    const cfg = gm.config;
+    const max_pos: u32 = 32;
+    const k_drafts: u32 = 3;
+    const hidden_u32: u32 = @intCast(cfg.hidden_size);
+
+    // Scratch sized for max_n_q = k_drafts so the verify forward can
+    // run all draft positions in one batched call.
+    var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, k_drafts, false);
+    defer sc.deinit(ctx.device);
+
+    var k_kernels = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all, @intCast(cfg.head_dim));
+    defer k_kernels.deinit();
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
+    defer rec.deinit();
+
+    var last_hidden_buf = try buffer.Buffer.initDeviceOnly(&ctx, cfg.hidden_size * @sizeOf(f32));
+    defer last_hidden_buf.deinit(ctx.device);
+    var draft_logits_buf = try buffer.Buffer.initDeviceOnly(&ctx, cfg.vocab_size * @sizeOf(f32));
+    defer draft_logits_buf.deinit(ctx.device);
+
+    const vocab_logits = try allocator.alloc(f32, cfg.vocab_size);
+    defer allocator.free(vocab_logits);
+
+    const verify_logits = try allocator.alloc(f32, k_drafts * cfg.vocab_size);
+    defer allocator.free(verify_logits);
+
+    const argmax = struct {
+        fn run(arr: []const f32) !u32 {
+            var best: u32 = 0;
+            var best_v = arr[0];
+            for (arr, 0..) |x, i| {
+                if (std.math.isNan(x) or std.math.isInf(x)) return error.NonFinite;
+                if (x > best_v) {
+                    best_v = x;
+                    best = @intCast(i);
+                }
+            }
+            return best;
+        }
+    }.run;
+
+    // ── runOnce: full main-forward → MTP draft chain → verify forward,
+    // returns the verified token sequence. Two invocations gate
+    // determinism end-to-end. ────────────────────────────────────────
+    const RunResult = struct {
+        token_main: u32,
+        drafts: [16]u32,
+        verify_argmax: [16]u32,
+        accept_count: u32,
+        emitted: [16]u32,
+        n_emitted: u32,
+    };
+
+    const runOnce = struct {
+        fn go(
+            r: *gpu_recorder.Recorder,
+            scratch: *const runtime_hybrid.Scratch,
+            gpu: *const gpu_model.GpuModel,
+            cfgg: config_mod.Config,
+            kk: *const runtime_hybrid.ChatKernels,
+            ctx_p: *const vk.Context,
+            allocator_p: std.mem.Allocator,
+            last_h_buf: *buffer.Buffer,
+            draft_buf: *buffer.Buffer,
+            v_logits: []f32,
+            scratch_logits_host: []f32,
+            argmax_fn: *const fn (arr: []const f32) anyerror!u32,
+            n_drafts: u32,
+            mp: u32,
+            hidden_u: u32,
+        ) !RunResult {
+            var st = try runtime_hybrid.State.init(allocator_p, ctx_p, cfgg, mp, false);
+            defer st.deinit(ctx_p.device);
+            try st.reset(ctx_p);
+
+            var ms = try runtime_mtp.MtpRuntimeState.init(allocator_p, ctx_p, cfgg, mp);
+            defer ms.deinit(ctx_p.device);
+
+            const bos: u32 = cfgg.bos_token_id orelse 0;
+            // Step 0: main forward at pos 0 with BOS → main_tok + last_hidden snapshot.
+            try r.reset();
+            try r.begin();
+            try runtime_hybrid.recordForwardStep(r, scratch, &st, gpu, cfgg, kk, 0, bos, mp, null, true);
+            const sc_h = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = hidden_u };
+            try runtime.recDispatch1D(r, &kk.slice_copy, &.{ &scratch.stream, last_h_buf }, &sc_h, hidden_u);
+            try r.endAndSubmit();
+            try scratch.logits.readBack(ctx_p, f32, scratch_logits_host);
+            const token_main = try argmax_fn(scratch_logits_host);
+
+            // Steps 1..k: MTP draft chain.
+            var drafts: [16]u32 = undefined;
+            if (n_drafts > drafts.len) return error.TooManyDrafts;
+            var prev_token = token_main;
+            var s: u32 = 0;
+            while (s < n_drafts) : (s += 1) {
+                const h_prev_buf = if (s == 0) last_h_buf else &ms.h_out;
+                try r.reset();
+                try r.begin();
+                try runtime_mtp.recordMtpStep(
+                    r, scratch, gpu, cfgg, kk, &ms,
+                    h_prev_buf, prev_token, s, mp, draft_buf,
+                );
+                try r.endAndSubmit();
+                try draft_buf.readBack(ctx_p, f32, scratch_logits_host);
+                const top1 = try argmax_fn(scratch_logits_host);
+                drafts[s] = top1;
+                prev_token = top1;
+            }
+
+            // Step verify: feed drafts at positions [1, 2, ..., k].
+            const drafts_slice = drafts[0..n_drafts];
+            try r.reset();
+            try r.begin();
+            try runtime_hybrid.recordForwardStepBatched(
+                r, scratch, &st, gpu, cfgg, kk,
+                1, drafts_slice, mp, true,
+            );
+            try r.endAndSubmit();
+            try scratch.logits.readBack(ctx_p, f32, v_logits);
+
+            // Per-row argmax of the verify logits.
+            var verify_argmax: [16]u32 = undefined;
+            var i: u32 = 0;
+            while (i < n_drafts) : (i += 1) {
+                const row = v_logits[i * cfgg.vocab_size .. (i + 1) * cfgg.vocab_size];
+                verify_argmax[i] = try argmax_fn(row);
+            }
+
+            // Accept rule (SpecDec):
+            //   accept[0] = (drafts[0] == token_main)
+            //   accept[i] = accept[i-1] AND (verify_argmax[i-1] == drafts[i])
+            //   stop at first reject.
+            //   continuation = verify_argmax[accept_count] (or [k-1] if all accepted).
+            var accept_count: u32 = 0;
+            if (drafts_slice[0] == token_main) {
+                accept_count = 1;
+                var j: u32 = 1;
+                while (j < n_drafts) : (j += 1) {
+                    if (verify_argmax[j - 1] == drafts_slice[j]) {
+                        accept_count += 1;
+                    } else break;
+                }
+            }
+            // emitted = first `accept_count` drafts, plus 1 continuation token.
+            // - if accept_count == k: continuation = verify_argmax[k-1].
+            // - if accept_count < k: correction = verify_argmax[accept_count]
+            //   (which differs from drafts[accept_count] by definition,
+            //   except when accept_count == 0 in which case the correction
+            //   IS token_main — main's own prediction for pos 1 trumps a
+            //   wrong d_0).
+            var emitted: [16]u32 = undefined;
+            var n_emitted: u32 = 0;
+            i = 0;
+            while (i < accept_count) : (i += 1) {
+                emitted[n_emitted] = drafts_slice[i];
+                n_emitted += 1;
+            }
+            if (accept_count == 0) {
+                emitted[n_emitted] = token_main;
+            } else if (accept_count < n_drafts) {
+                emitted[n_emitted] = verify_argmax[accept_count];
+            } else {
+                emitted[n_emitted] = verify_argmax[n_drafts - 1];
+            }
+            n_emitted += 1;
+
+            return RunResult{
+                .token_main = token_main,
+                .drafts = drafts,
+                .verify_argmax = verify_argmax,
+                .accept_count = accept_count,
+                .emitted = emitted,
+                .n_emitted = n_emitted,
+            };
+        }
+    }.go;
+
+    const ctx_const_p: *const vk.Context = &ctx;
+
+    const argmax_ptr: *const fn (arr: []const f32) anyerror!u32 = &argmax;
+
+    const r1 = try runOnce(&rec, &sc, &gm, cfg, &k_kernels, ctx_const_p, allocator, &last_hidden_buf, &draft_logits_buf, verify_logits, vocab_logits, argmax_ptr, k_drafts, max_pos, hidden_u32);
+    const r2 = try runOnce(&rec, &sc, &gm, cfg, &k_kernels, ctx_const_p, allocator, &last_hidden_buf, &draft_logits_buf, verify_logits, vocab_logits, argmax_ptr, k_drafts, max_pos, hidden_u32);
+
+    // ── Determinism gate ────────────────────────────────────────────
+    if (r1.token_main != r2.token_main) {
+        std.debug.print("FAIL mtp-verify-gpu: token_main nondeterministic ({d} vs {d})\n", .{ r1.token_main, r2.token_main });
+        return error.Nondeterministic;
+    }
+    {
+        var i: u32 = 0;
+        while (i < k_drafts) : (i += 1) {
+            if (r1.drafts[i] != r2.drafts[i]) {
+                std.debug.print("FAIL mtp-verify-gpu: draft[{d}] nondeterministic ({d} vs {d})\n", .{ i, r1.drafts[i], r2.drafts[i] });
+                return error.Nondeterministic;
+            }
+            if (r1.verify_argmax[i] != r2.verify_argmax[i]) {
+                std.debug.print("FAIL mtp-verify-gpu: verify_argmax[{d}] nondeterministic ({d} vs {d})\n", .{ i, r1.verify_argmax[i], r2.verify_argmax[i] });
+                return error.Nondeterministic;
+            }
+        }
+    }
+    if (r1.accept_count != r2.accept_count or r1.n_emitted != r2.n_emitted) {
+        std.debug.print("FAIL mtp-verify-gpu: accept/emitted nondeterministic\n", .{});
+        return error.Nondeterministic;
+    }
+    {
+        var i: u32 = 0;
+        while (i < r1.n_emitted) : (i += 1) {
+            if (r1.emitted[i] != r2.emitted[i]) {
+                std.debug.print("FAIL mtp-verify-gpu: emitted[{d}] nondeterministic ({d} vs {d})\n", .{ i, r1.emitted[i], r2.emitted[i] });
+                return error.Nondeterministic;
+            }
+        }
+    }
+
+    // ── Print result ────────────────────────────────────────────────
+    std.debug.print("PASS mtp-verify-gpu ({s}, fp32_all, {d} MTP layer(s), k={d}):\n", .{ model_id, gm.mtp_head.?.layers.len, k_drafts });
+    {
+        const txt = try tok.decodeForDisplay(allocator, cfg.bos_token_id orelse 0);
+        defer allocator.free(txt);
+        std.debug.print("  prompt: bos={d} \"{s}\"\n", .{ cfg.bos_token_id orelse 0, txt });
+    }
+    {
+        const txt = try tok.decodeForDisplay(allocator, r1.token_main);
+        defer allocator.free(txt);
+        std.debug.print("  main:   {d} \"{s}\"\n", .{ r1.token_main, txt });
+    }
+    var i: u32 = 0;
+    while (i < k_drafts) : (i += 1) {
+        const txt_d = try tok.decodeForDisplay(allocator, r1.drafts[i]);
+        defer allocator.free(txt_d);
+        const txt_v = try tok.decodeForDisplay(allocator, r1.verify_argmax[i]);
+        defer allocator.free(txt_v);
+        std.debug.print(
+            "  slot {d}: draft={d} \"{s}\"  verify_argmax={d} \"{s}\" {s}\n",
+            .{
+                i, r1.drafts[i], txt_d, r1.verify_argmax[i], txt_v,
+                if (i == 0)
+                    (if (r1.drafts[i] == r1.token_main) "(d == main, accept)" else "(d != main, reject)")
+                else
+                    (if (i <= r1.accept_count and r1.verify_argmax[i - 1] == r1.drafts[i]) "(prev pred == d, accept)" else "(prev pred != d, reject)"),
+            },
+        );
+    }
+    std.debug.print("  accept_count={d}/{d}, emitted {d} token(s):", .{ r1.accept_count, k_drafts, r1.n_emitted });
+    var e: u32 = 0;
+    while (e < r1.n_emitted) : (e += 1) {
+        const txt = try tok.decodeForDisplay(allocator, r1.emitted[e]);
+        defer allocator.free(txt);
+        std.debug.print(" {d}=\"{s}\"", .{ r1.emitted[e], txt });
+    }
+    std.debug.print("\n", .{});
+}
+
 // ── MTP-1c-β-5: end-to-end batched hybrid forward (GPU parity) ────────
 //
 // Drives `runtime_hybrid.recordForwardStepBatched` against the CPU
