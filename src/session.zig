@@ -635,6 +635,8 @@ pub const Session = struct {
                             self.pos,
                             &pushes,
                             null,
+                            null,
+                            0,
                         );
                         if (self.cfg.on_layer) |cb| {
                             // Branch on the per-layer schedule: full-attn

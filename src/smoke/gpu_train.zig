@@ -6002,6 +6002,8 @@ pub fn runLinearAttnPrefillGpuSmoke(allocator: std.mem.Allocator) !void {
         &pushes,
         &sc.x_norm,
         &sc.attn_out,
+        null,
+        0,
     );
     try rec.endAndSubmit();
 
@@ -6203,6 +6205,7 @@ pub fn runMtpVerifyGpuSmoke(allocator: std.mem.Allocator) !void {
             try runtime_hybrid.recordForwardStepBatched(
                 r, scratch, &st, gpu, cfgg, kk,
                 1, drafts_slice, mp, true,
+                null, 0,
             );
             try r.endAndSubmit();
             try scratch.logits.readBack(ctx_p, f32, v_logits);
@@ -6444,6 +6447,8 @@ pub fn runForwardHybridBatchedGpuSmoke(allocator: std.mem.Allocator) !void {
             tokens,
             max_pos,
             true,
+            null,
+            0,
         );
         try rec.endAndSubmit();
 

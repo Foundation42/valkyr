@@ -468,6 +468,142 @@ pub const Tq4VHooks = struct {
     n_blocks_per_pos: u32,
 };
 
+/// Per-layer per-step snapshot of the Gated-DeltaNet SSM state. Used
+/// by the MTP-SpecDec verify forward to checkpoint SSM after each
+/// draft row, so we can restore to any `accept_count + 1` step on
+/// rejection — eliminating the redo single-token forwards that
+/// MTP-1d's snapshot-once approach paid.
+///
+/// Layout: `n_layers × n_steps` — full-attn layer slots are `null`.
+/// `step_idx == 0` is the "before verify" snapshot. `step_idx == t`
+/// (1 ≤ t ≤ n_steps - 1) is the snapshot taken after the verify's
+/// row `(t - 1)` was processed.
+///
+/// Memory budget: `n_steps × n_linear_layers × (conv_buf + rec_buf)`.
+/// Dominant term is `rec_buf = n_v_heads × head_k × head_v × 4 bytes`
+/// (~2 MB on Qwen3.5-0.8B), so e.g. 18 linear × 5 steps × 2 MB ≈
+/// 180 MB at draft_n=3.
+pub const SsmStepCheckpoint = struct {
+    /// Flat `[n_layers * n_steps]` slot array; index via
+    /// `convAt(layer, step)` / `recAt(layer, step)`. Slot is `null`
+    /// when `cfg.layer_types[layer] != .linear_attention`.
+    ssm_conv: []?buffer.Buffer,
+    ssm_rec: []?buffer.Buffer,
+    n_layers: usize,
+    n_steps: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        ctx: *const vk.Context,
+        cfg: config_mod.Config,
+        n_steps: usize,
+    ) !SsmStepCheckpoint {
+        if (n_steps == 0) return error.NStepsMustBePositive;
+        const f = @sizeOf(f32);
+        const conv_dim = cfg.linearAttnConvDim();
+        const conv_kernel = cfg.linear_conv_kernel_dim;
+        const head_k = cfg.linear_key_head_dim;
+        const head_v = cfg.linear_value_head_dim;
+        const n_v_heads = cfg.linear_num_value_heads;
+        const total = cfg.num_hidden_layers * n_steps;
+
+        var ssm_conv = try gpa.alloc(?buffer.Buffer, total);
+        @memset(ssm_conv, null);
+        errdefer gpa.free(ssm_conv);
+        var ssm_rec = try gpa.alloc(?buffer.Buffer, total);
+        @memset(ssm_rec, null);
+        errdefer gpa.free(ssm_rec);
+        errdefer {
+            for (ssm_conv) |*b| if (b.*) |*v| v.deinit(ctx.device);
+            for (ssm_rec) |*b| if (b.*) |*v| v.deinit(ctx.device);
+        }
+
+        for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| {
+            if (lt != .linear_attention) continue;
+            var s: usize = 0;
+            while (s < n_steps) : (s += 1) {
+                const idx = i * n_steps + s;
+                ssm_conv[idx] = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * conv_kernel * f);
+                ssm_rec[idx] = try buffer.Buffer.initDeviceOnly(ctx, n_v_heads * head_k * head_v * f);
+            }
+        }
+        return .{
+            .ssm_conv = ssm_conv,
+            .ssm_rec = ssm_rec,
+            .n_layers = cfg.num_hidden_layers,
+            .n_steps = n_steps,
+            .allocator = gpa,
+        };
+    }
+
+    pub fn deinit(self: *SsmStepCheckpoint, device: vk.c.VkDevice) void {
+        for (self.ssm_conv) |*b| if (b.*) |*v| v.deinit(device);
+        for (self.ssm_rec) |*b| if (b.*) |*v| v.deinit(device);
+        self.allocator.free(self.ssm_conv);
+        self.allocator.free(self.ssm_rec);
+    }
+
+    pub inline fn convAt(self: *const SsmStepCheckpoint, layer: usize, step: usize) ?*const buffer.Buffer {
+        if (self.ssm_conv[layer * self.n_steps + step]) |*b| return b;
+        return null;
+    }
+
+    pub inline fn recAt(self: *const SsmStepCheckpoint, layer: usize, step: usize) ?*const buffer.Buffer {
+        if (self.ssm_rec[layer * self.n_steps + step]) |*b| return b;
+        return null;
+    }
+};
+
+/// Record `slice_copy` dispatches that snapshot every linear-attn
+/// layer's `state.ssm_{conv,rec}` into `ckpt[layer][step_idx]`.
+/// Caller wraps in its own `rec.begin/endAndSubmit`.
+pub fn recordSnapshotSsmAtStep(
+    rec: *recorder.Recorder,
+    k: *const ChatKernels,
+    state: *const State,
+    ckpt: *const SsmStepCheckpoint,
+    cfg: config_mod.Config,
+    step_idx: usize,
+) !void {
+    if (step_idx >= ckpt.n_steps) return error.StepOutOfRange;
+    const conv_n: u32 = @intCast(cfg.linearAttnConvDim() * cfg.linear_conv_kernel_dim);
+    const rec_n: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim);
+    for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| {
+        if (lt != .linear_attention) continue;
+        const conv_dst = ckpt.convAt(i, step_idx).?;
+        const rec_dst = ckpt.recAt(i, step_idx).?;
+        const conv_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = conv_n };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &state.ssm_conv[i].?, conv_dst }, &conv_push, conv_n);
+        const rec_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = rec_n };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &state.ssm_rec[i].?, rec_dst }, &rec_push, rec_n);
+    }
+}
+
+/// Inverse of `recordSnapshotSsmAtStep`: copy each
+/// `ckpt[layer][step_idx]` back into `state.ssm_{conv,rec}[layer]`.
+pub fn recordRestoreSsmAtStep(
+    rec: *recorder.Recorder,
+    k: *const ChatKernels,
+    state: *const State,
+    ckpt: *const SsmStepCheckpoint,
+    cfg: config_mod.Config,
+    step_idx: usize,
+) !void {
+    if (step_idx >= ckpt.n_steps) return error.StepOutOfRange;
+    const conv_n: u32 = @intCast(cfg.linearAttnConvDim() * cfg.linear_conv_kernel_dim);
+    const rec_n: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim);
+    for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| {
+        if (lt != .linear_attention) continue;
+        const conv_src = ckpt.convAt(i, step_idx).?;
+        const rec_src = ckpt.recAt(i, step_idx).?;
+        const conv_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = conv_n };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ conv_src, &state.ssm_conv[i].? }, &conv_push, conv_n);
+        const rec_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = rec_n };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ rec_src, &state.ssm_rec[i].? }, &rec_push, rec_n);
+    }
+}
+
 // ── Per-step push computation ─────────────────────────────────────
 
 pub const ForwardPushes = struct {
@@ -698,6 +834,8 @@ pub fn recordOneLayer(
     pos: usize,
     p: *const ForwardPushes,
     tq4_v: ?Tq4VHooks,
+    ssm_ckpt: ?*const SsmStepCheckpoint,
+    ssm_ckpt_step_offset: u32,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
@@ -714,7 +852,7 @@ pub fn recordOneLayer(
         // that silently ignores the TQ4 cache.
         if (tq4_v != null) return error.TqV4PrefillNotSupported;
         switch (layer.layer_type) {
-            .linear_attention => try recordLinearAttnLayerBatched(rec, sc, state, gm, cfg, k, layer_idx, p, &sc.x_norm, &sc.attn_out),
+            .linear_attention => try recordLinearAttnLayerBatched(rec, sc, state, gm, cfg, k, layer_idx, p, &sc.x_norm, &sc.attn_out, ssm_ckpt, ssm_ckpt_step_offset),
             .full_attention => try recordFullAttnLayerBatched(rec, sc, state, gm, cfg, k, layer_idx, p, &sc.x_norm, &sc.attn_out),
         }
     } else switch (layer.layer_type) {
@@ -958,6 +1096,14 @@ pub fn recordLinearAttnLayerBatched(
     p: *const ForwardPushes,
     x_norm_in: *const buffer.Buffer,
     attn_out: *const buffer.Buffer,
+    /// MTP-1e per-step SSM checkpoint. When non-null, after each
+    /// row's `gated_delta_step` we slice_copy the layer's
+    /// `state.ssm_{conv,rec}` into `ckpt[layer_idx][step_offset + row]`.
+    /// `step_offset` is normally 1 — `step_offset + 0` snapshots
+    /// state-after-row-0 into checkpoint slot 1, leaving slot 0 for
+    /// the pre-verify snapshot the caller takes separately.
+    ckpt: ?*const SsmStepCheckpoint,
+    ckpt_step_offset: u32,
 ) !void {
     if (p.n_q < 1) return error.InvalidNq;
     const layer = &gm.layers[layer_idx];
@@ -1013,6 +1159,23 @@ pub fn recordLinearAttnLayerBatched(
             .n_elem = hidden,
         };
         try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &sc.attn_out_lin, attn_out }, &slice_out, hidden);
+
+        // 4. (Optional) Per-step SSM checkpoint. After this row's
+        //    `gated_delta_step` mutated `state.ssm_{conv,rec}`,
+        //    snapshot into `ckpt[layer_idx][step_offset + t]` so we
+        //    can restore the SSM to this exact step on rejection.
+        if (ckpt) |c| {
+            const step = ckpt_step_offset + t;
+            if (step >= c.n_steps) return error.CheckpointStepOverflow;
+            const conv_n: u32 = @intCast(cfg.linearAttnConvDim() * cfg.linear_conv_kernel_dim);
+            const rec_n: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim);
+            const conv_dst = c.convAt(layer_idx, step).?;
+            const rec_dst = c.recAt(layer_idx, step).?;
+            const conv_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = conv_n };
+            try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &state.ssm_conv[layer_idx].?, conv_dst }, &conv_push, conv_n);
+            const rec_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = rec_n };
+            try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &state.ssm_rec[layer_idx].?, rec_dst }, &rec_push, rec_n);
+        }
     }
 }
 
@@ -1041,7 +1204,7 @@ pub fn recordForwardStep(
     try runtime.recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.stream }, &embed_push, hidden);
 
     for (0..cfg.num_hidden_layers) |layer_idx| {
-        try recordOneLayer(rec, sc, state, gm, cfg, k, layer_idx, pos, &pushes, tq4_v);
+        try recordOneLayer(rec, sc, state, gm, cfg, k, layer_idx, pos, &pushes, tq4_v, null, 0);
     }
 
     if (compute_logits) {
@@ -1078,6 +1241,13 @@ pub fn recordForwardStepBatched(
     token_ids: []const u32,
     max_pos: u32,
     compute_logits: bool,
+    /// MTP-1e per-step SSM checkpoint. Threaded down to
+    /// `recordLinearAttnLayerBatched`, which snapshots after each
+    /// row's `gated_delta_step` into `ckpt[layer][step_offset + row]`.
+    /// `ckpt_step_offset` is normally 1 — caller writes the
+    /// pre-verify step-0 snapshot separately.
+    ssm_ckpt: ?*const SsmStepCheckpoint,
+    ssm_ckpt_step_offset: u32,
 ) !void {
     const n_q: u32 = @intCast(token_ids.len);
     if (n_q == 0) return error.EmptyBatch;
@@ -1108,7 +1278,7 @@ pub fn recordForwardStepBatched(
     }
 
     for (0..cfg.num_hidden_layers) |layer_idx| {
-        try recordOneLayer(rec, sc, state, gm, cfg, k, layer_idx, pos_start, &pushes, null);
+        try recordOneLayer(rec, sc, state, gm, cfg, k, layer_idx, pos_start, &pushes, null, ssm_ckpt, ssm_ckpt_step_offset);
     }
 
     if (compute_logits) {

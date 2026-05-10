@@ -40,80 +40,25 @@ pub const MtpOptions = struct {
     draft_n: u32 = 3,
 };
 
-/// Per-linear-layer SSM-state snapshot. Each round, we copy
-/// `state.ssm_{conv,rec}` for every linear-attention layer here
-/// before the batched verify forward, then restore from here after
-/// the accept rule fires. The redo single-token forwards then
-/// re-advance the SSM by exactly `accept_count + 1` steps.
-///
-/// Full-attention layers don't need a snapshot — KV is "overwrite at
-/// position", so the next forward at the corrected pos cleanly
-/// rewrites that slot.
-///
-/// Sized at chat-session init; reused across all rounds and turns.
-pub const SsmSnapshot = struct {
-    /// `[num_layers]` per-layer Gated DeltaNet conv-state snapshot.
-    /// `null` slots mark full-attention layers (no SSM to snapshot).
-    ssm_conv: []?buffer.Buffer,
-    /// `[num_layers]` per-layer Gated DeltaNet recurrent-state snapshot.
-    ssm_rec: []?buffer.Buffer,
-    allocator: std.mem.Allocator,
-
-    pub fn init(
-        gpa: std.mem.Allocator,
-        ctx: *const vk.Context,
-        cfg: config_mod.Config,
-    ) !SsmSnapshot {
-        const f = @sizeOf(f32);
-        const conv_dim = cfg.linearAttnConvDim();
-        const conv_kernel = cfg.linear_conv_kernel_dim;
-        const head_k = cfg.linear_key_head_dim;
-        const head_v = cfg.linear_value_head_dim;
-        const n_v_heads = cfg.linear_num_value_heads;
-
-        var ssm_conv = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
-        @memset(ssm_conv, null);
-        errdefer gpa.free(ssm_conv);
-        var ssm_rec = try gpa.alloc(?buffer.Buffer, cfg.num_hidden_layers);
-        @memset(ssm_rec, null);
-        errdefer gpa.free(ssm_rec);
-
-        // Cleanup-on-failure walks the whole slice — null slots are
-        // safely skipped, mirroring `runtime_hybrid.State.init`.
-        errdefer {
-            for (ssm_conv) |*b| if (b.*) |*v| v.deinit(ctx.device);
-            for (ssm_rec) |*b| if (b.*) |*v| v.deinit(ctx.device);
-        }
-        for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| switch (lt) {
-            .linear_attention => {
-                ssm_conv[i] = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * conv_kernel * f);
-                ssm_rec[i] = try buffer.Buffer.initDeviceOnly(ctx, n_v_heads * head_k * head_v * f);
-            },
-            .full_attention => {},
-        };
-        return .{ .ssm_conv = ssm_conv, .ssm_rec = ssm_rec, .allocator = gpa };
-    }
-
-    pub fn deinit(self: *SsmSnapshot, device: vk.c.VkDevice) void {
-        for (self.ssm_conv) |*b| if (b.*) |*v| v.deinit(device);
-        for (self.ssm_rec) |*b| if (b.*) |*v| v.deinit(device);
-        self.allocator.free(self.ssm_conv);
-        self.allocator.free(self.ssm_rec);
-    }
-};
-
 /// Per-turn state for the MTP decode path. Carries the run-time MTP
 /// state (per-MTP-layer KV + draft-step intermediates), the
 /// `last_hidden` snapshot buffer, the per-round draft-logits readback
-/// buffer, the verify-pass logits readback host buffer, the SSM
-/// snapshot for hybrid rollback, and cumulative accept-rate statistics.
+/// buffer, the verify-pass logits readback host buffer, the
+/// per-step SSM checkpoint for hybrid rollback (MTP-1e), and
+/// cumulative accept-rate statistics.
 pub const MtpRound = struct {
     options: MtpOptions,
     state: runtime_mtp.MtpRuntimeState,
     last_hidden_buf: buffer.Buffer,
     draft_logits_buf: buffer.Buffer,
     verify_logits_host: []f32,
-    ssm_snapshot: SsmSnapshot,
+    /// Per-step SSM checkpoint sized for `draft_n + 2` slots: slot 0
+    /// is the pre-verify state; slots 1..draft_n+1 are taken after
+    /// each verify row's `gated_delta_step`. Restore-by-step lets us
+    /// roll back to "after step `accept_count + 1`" in O(1) without
+    /// any redo forwards (just one correction forward to write KV at
+    /// the rejection position).
+    ssm_ckpt: runtime_hybrid.SsmStepCheckpoint,
     /// Cumulative across all turns: total drafts proposed.
     cumulative_drafts: usize = 0,
     /// Cumulative drafts that passed verify.
@@ -141,20 +86,22 @@ pub const MtpRound = struct {
         // rows of vocab logits.
         const v_logits = try gpa.alloc(f32, (opts.draft_n + 1) * cfg.vocab_size);
         errdefer gpa.free(v_logits);
-        const snapshot = try SsmSnapshot.init(gpa, ctx, cfg);
-        errdefer @constCast(&snapshot).deinit(ctx.device);
+        // Step 0 = pre-verify; steps 1..draft_n+1 = after each row.
+        // Total slots = draft_n + 2.
+        const ckpt = try runtime_hybrid.SsmStepCheckpoint.init(gpa, ctx, cfg, opts.draft_n + 2);
+        errdefer @constCast(&ckpt).deinit(ctx.device);
         return .{
             .options = opts,
             .state = state,
             .last_hidden_buf = last_hidden,
             .draft_logits_buf = draft_logits,
             .verify_logits_host = v_logits,
-            .ssm_snapshot = snapshot,
+            .ssm_ckpt = ckpt,
         };
     }
 
     pub fn deinit(self: *MtpRound, gpa: std.mem.Allocator, device: vk.c.VkDevice) void {
-        self.ssm_snapshot.deinit(device);
+        self.ssm_ckpt.deinit(device);
         gpa.free(self.verify_logits_host);
         self.draft_logits_buf.deinit(device);
         self.last_hidden_buf.deinit(device);
@@ -162,50 +109,10 @@ pub const MtpRound = struct {
     }
 };
 
-/// Record per-layer slice_copy dispatches that copy each linear-attn
-/// layer's `state.ssm_{conv,rec}` into the corresponding snapshot
-/// buffer. Caller frames it in its own `rec.begin()/endAndSubmit()`
-/// or includes it in the MTP draft session.
-fn recordSnapshotSsm(
-    rec: *gpu_recorder.Recorder,
-    ks: *const aliases.HybridChatKernels,
-    state: *const aliases.HybridChatState,
-    snapshot: *const SsmSnapshot,
-    cfg: config_mod.Config,
-) !void {
-    const conv_n: u32 = @intCast(cfg.linearAttnConvDim() * cfg.linear_conv_kernel_dim);
-    const rec_n: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim);
-    for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| {
-        if (lt != .linear_attention) continue;
-        const conv_push = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = conv_n };
-        try runtime.recDispatch1D(rec, &ks.slice_copy, &.{ &state.ssm_conv[i].?, &snapshot.ssm_conv[i].? }, &conv_push, conv_n);
-        const rec_push = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = rec_n };
-        try runtime.recDispatch1D(rec, &ks.slice_copy, &.{ &state.ssm_rec[i].?, &snapshot.ssm_rec[i].? }, &rec_push, rec_n);
-    }
-}
-
-/// Record the inverse of `recordSnapshotSsm`: copies each snapshot
-/// buffer back into `state.ssm_{conv,rec}`. After this, the SSM is
-/// back at the pre-verify state and we can advance it by exactly
-/// `accept_count + 1` steps via single-token forwards to commit the
-/// verified prefix correctly.
-fn recordRestoreSsm(
-    rec: *gpu_recorder.Recorder,
-    ks: *const aliases.HybridChatKernels,
-    state: *const aliases.HybridChatState,
-    snapshot: *const SsmSnapshot,
-    cfg: config_mod.Config,
-) !void {
-    const conv_n: u32 = @intCast(cfg.linearAttnConvDim() * cfg.linear_conv_kernel_dim);
-    const rec_n: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim);
-    for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| {
-        if (lt != .linear_attention) continue;
-        const conv_push = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = conv_n };
-        try runtime.recDispatch1D(rec, &ks.slice_copy, &.{ &snapshot.ssm_conv[i].?, &state.ssm_conv[i].? }, &conv_push, conv_n);
-        const rec_push = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = rec_n };
-        try runtime.recDispatch1D(rec, &ks.slice_copy, &.{ &snapshot.ssm_rec[i].?, &state.ssm_rec[i].? }, &rec_push, rec_n);
-    }
-}
+// (Per-step SSM checkpoint + helper functions live in runtime_hybrid.zig
+// as `SsmStepCheckpoint` / `recordSnapshotSsmAtStep` / `recordRestoreSsmAtStep`.
+// MTP-1e moved them out of chat.zig so the verify forward can interleave
+// per-row snapshots automatically via `recordForwardStepBatched(..., ckpt, 1)`.)
 
 /// One entry from a `--prompts` TSV: `<label>\t<prompt>` per line.
 /// Both fields are slices into the file's read buffer (LoadedPrompts);
@@ -990,7 +897,7 @@ fn forwardStepProbedHybrid(
 
         try rec.reset();
         try rec.begin();
-        try aliases.recordOneHybridLayer(rec, sc, state, gm, cfg, k, layer_idx, pos, &pushes, tq4_v);
+        try aliases.recordOneHybridLayer(rec, sc, state, gm, cfg, k, layer_idx, pos, &pushes, tq4_v, null, 0);
         try rec.endAndSubmit();
 
         // sc.scores holds post-softmax attention weights ONLY on
@@ -1630,15 +1537,13 @@ fn mtpDecodeRounds(
         // past the cache capacity would silently truncate.
         if (verify_pos + k_drafts + 1 > max_pos) break;
 
-        // ── 1. Snapshot SSM state (per-linear-layer ssm_{conv,rec}) ─
-        // The corrected verify advances SSM by k+1 steps (1 anchor
-        // main_tok + k drafts). We commit `accept_count + 2` (the
-        // anchor + accepted drafts + correction/continuation). After
-        // the accept rule we restore SSM and re-advance by exactly
-        // those committed tokens via single-token forwards.
+        // ── 1. Snapshot SSM at step 0 (pre-verify). ────────────────
+        // The verify forward will advance SSM by k+1 steps and take
+        // per-row snapshots into `ssm_ckpt[layer][1..k+1]` inline.
+        // Step 0 stays as the pre-verify state for safety.
         try rec.reset();
         try rec.begin();
-        try recordSnapshotSsm(rec, ks, state, &mtp.ssm_snapshot, cfg);
+        try runtime_hybrid.recordSnapshotSsmAtStep(rec, ks, state, &mtp.ssm_ckpt, cfg, 0);
         try rec.endAndSubmit();
 
         // ── 2. MTP draft chain — k sequential steps with read-back ──
@@ -1677,6 +1582,7 @@ fn mtpDecodeRounds(
         try runtime_hybrid.recordForwardStepBatched(
             rec, sc, state, gm, cfg, ks,
             verify_pos, verify_input[0 .. k_drafts + 1], max_pos, true,
+            &mtp.ssm_ckpt, 1,
         );
         try rec.endAndSubmit();
         try sc.logits.readBack(ctx, f32, mtp.verify_logits_host);
@@ -1704,33 +1610,20 @@ fn mtpDecodeRounds(
         // the bonus prediction at pos P+k+1.
         const next_anchor_tok: u32 = verify_argmax[accept_count];
 
-        // ── 5. Restore SSM to pre-verify state ──────────────────────
+        // ── 5. Restore SSM to "after row accept_count" state. ───────
+        // ckpt[layer][accept_count + 1] holds SSM right after the
+        // verify processed row `accept_count` — that's main_tok if
+        // accept_count == 0 or drafts[accept_count - 1] otherwise,
+        // both of which are committed (correct) tokens.
         try rec.reset();
         try rec.begin();
-        try recordRestoreSsm(rec, ks, state, &mtp.ssm_snapshot, cfg);
+        try runtime_hybrid.recordRestoreSsmAtStep(rec, ks, state, &mtp.ssm_ckpt, cfg, accept_count + 1);
         try rec.endAndSubmit();
 
-        // ── 6. Re-advance SSM via (accept_count + 2) single-token
-        // forwards using committed tokens: main_tok + accepted drafts
-        // + correction/continuation. These also write the right KV
-        // for full-attention layers (verify wrote drafts there; the
-        // anchored re-forwards overwrite). The LAST forward provides
-        // logits for next round's main_tok and `sc.stream` for the
-        // next MTP feed.
-        var commit_pos: usize = verify_pos;
-
-        // Forward 1: main_tok at verify_pos. Always runs; main_tok
-        // is verified (came from prior forward's logits). Emit was
-        // done pre-loop or by previous round.
-        try rec.reset();
-        try rec.begin();
-        try aliases.recordHybridForwardStep(rec, sc, state, gm, cfg, ks, commit_pos, main_tok, max_pos, null, false);
-        try rec.endAndSubmit();
-        commit_pos += 1;
-
-        // Forwards 2..accept_count+1: accepted drafts at positions
-        // verify_pos+1..verify_pos+accept_count. Emit each as it
-        // commits.
+        // ── 6. Emit the verified prefix. KV for these positions is
+        // correct from the verify forward (drafts == main predictions
+        // by definition of acceptance). SSM was just restored to the
+        // matching step. No redo forwards needed.
         var done_emit = false;
         var i_commit: u32 = 0;
         while (i_commit < accept_count) : (i_commit += 1) {
@@ -1739,12 +1632,6 @@ fn mtpDecodeRounds(
                 done_emit = true;
                 break;
             }
-            try rec.reset();
-            try rec.begin();
-            try aliases.recordHybridForwardStep(rec, sc, state, gm, cfg, ks, commit_pos, tok_id, max_pos, null, false);
-            try rec.endAndSubmit();
-            commit_pos += 1;
-
             try printTokenForDisplay(gpa, stdout, tok, tok_id);
             mtp.cumulative_emitted += 1;
             generated.* += 1;
@@ -1755,20 +1642,17 @@ fn mtpDecodeRounds(
         }
         if (done_emit) break;
 
-        // EOS check on the correction/continuation before we run its
-        // forward — avoids one wasted forward on the final round.
-        if (next_anchor_tok == eot or (eos != null and next_anchor_tok == eos.?)) {
-            break;
-        }
+        if (next_anchor_tok == eot or (eos != null and next_anchor_tok == eos.?)) break;
 
-        // Forward accept_count+2: correction/continuation at
-        // verify_pos + accept_count + 1. compute_logits=true to
-        // seed next round's main_tok.
+        // ── 7. ONE correction forward — the only redo per round. ───
+        // Writes KV[verify_pos+accept_count+1] (= the correction's
+        // position; was wrong d_{accept_count} for accept<k or
+        // unwritten for accept==k). Advances SSM by 1 step. Returns
+        // logits for next-round main_tok + last_hidden snapshot.
+        const correction_pos: usize = verify_pos + accept_count + 1;
         try rec.reset();
         try rec.begin();
-        try aliases.recordHybridForwardStep(rec, sc, state, gm, cfg, ks, commit_pos, next_anchor_tok, max_pos, null, true);
-        // Snapshot sc.stream → last_hidden_buf for next round's
-        // MTP slot 0 input.
+        try aliases.recordHybridForwardStep(rec, sc, state, gm, cfg, ks, correction_pos, next_anchor_tok, max_pos, null, true);
         const sc_h = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = hidden_u };
         try runtime.recDispatch1D(rec, &ks.slice_copy, &.{ &sc.stream, &mtp.last_hidden_buf }, &sc_h, hidden_u);
         try rec.endAndSubmit();
@@ -1778,15 +1662,9 @@ fn mtpDecodeRounds(
         generated.* += 1;
         if (generated.* >= max_response) break;
 
-        // Sample next round's main_tok from the correction's logits.
-        // It's the predicted token at position commit_pos + 1, which
-        // becomes the next round's verify-anchor (placed at
-        // verify_pos_(R+1) = commit_pos + 1). Emit it now — it's the
-        // next token in the user-visible output stream, conceptually
-        // the "second part" of round R's emission (round R-1 emitted
-        // its own main_tok via the pre-loop step or the prior round's
-        // emit-on-sample). Emitting here keeps every position in the
-        // generated stream printed exactly once.
+        // Sample next round's main_tok and emit it (it's the token
+        // at position correction_pos + 1, where round R+1's verify
+        // will place the new anchor).
         try sc.logits.readBack(ctx, f32, logits);
         const next_main = try cpu_forward.sample(logits, sample_params, rng, sample_scratch);
         main_tok = @intCast(next_main);
@@ -1797,11 +1675,8 @@ fn mtpDecodeRounds(
         generated.* += 1;
         if (generated.* >= max_response) break;
 
-        // ── 7. Advance position counters ────────────────────────────
-        // commit_pos is the position of the just-anchored correction.
-        // main_tok occupies pos commit_pos + 1; the next round's
-        // verify writes starting there.
-        pos.* = commit_pos + 1;
+        // ── 8. Advance position counters. ──────────────────────────
+        pos.* = correction_pos + 1;
         verify_pos = pos.*;
     }
 }
