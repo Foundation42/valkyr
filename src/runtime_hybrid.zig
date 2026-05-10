@@ -191,6 +191,17 @@ pub const Scratch = struct {
     final_norm_out: buffer.Buffer,
     logits: buffer.Buffer,
     // Linear-attn scratch
+    /// Single-row x_norm feeder for the linear-attn batched-prefill
+    /// path. Linear attention is sequential per row (each step mutates
+    /// the SSM state), so β-4 dispatches `gated_delta_step` n_q times;
+    /// each iteration `slice_copy`s row t of `x_norm` into here, runs
+    /// the existing single-row chain, then `slice_copy`s the row's
+    /// output back. Sized at the n_q=1 footprint regardless of
+    /// `max_n_q` — only one row is live at a time.
+    x_norm_lin: buffer.Buffer,
+    /// Single-row attn_out catcher for the linear-attn batched-prefill
+    /// path. Mirrors `x_norm_lin` on the output side.
+    attn_out_lin: buffer.Buffer,
     mixed_qkv: buffer.Buffer,
     mixed_qkv_post: buffer.Buffer,
     z: buffer.Buffer,
@@ -281,7 +292,11 @@ pub const Scratch = struct {
             .logits          = try buffer.Buffer.initDeviceOnly(ctx, max_n_q_us * cfg.vocab_size * f),
             // Linear-attn intermediates: kept at n_q=1 footprint. β-4
             // walks `gated_delta_step` sequentially per row, so we only
-            // ever hold one row of linear-attn state at a time.
+            // ever hold one row of linear-attn state at a time. The
+            // two row-feeders bridge the multi-row x_norm / attn_out
+            // buffers to the single-row chain.
+            .x_norm_lin      = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .attn_out_lin    = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
             .mixed_qkv       = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
             .mixed_qkv_post  = try buffer.Buffer.initDeviceOnly(ctx, conv_dim * f),
             .z               = try buffer.Buffer.initDeviceOnly(ctx, value_dim * f),
@@ -326,6 +341,7 @@ pub const Scratch = struct {
             "stream", "x_norm", "mid_norm", "attn_out",
             "gate", "up", "fused", "ffn_out",
             "final_norm_out", "logits",
+            "x_norm_lin", "attn_out_lin",
             "mixed_qkv", "mixed_qkv_post", "z", "b_raw", "a_raw",
             "q_lin", "k_lin", "v_lin", "q_lin_n", "k_lin_n",
             "y", "post_norm",
@@ -894,6 +910,90 @@ pub fn recordFullAttnLayerBatched(
 
     // 9. o_proj — M = n_q.
     try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out_gated, &layer.o_proj.?, attn_out }, n_q_rows, hidden, p.q_dim);
+}
+
+/// Record a single Gated-DeltaNet (linear-attention) layer's forward
+/// at n_q query rows. Linear-attention recurrence is fundamentally
+/// sequential — each row mutates `state.ssm_{conv,rec}` in place — so
+/// this loops the existing single-row chain n_q times, slicing one
+/// row of `x_norm_in` into `sc.x_norm_lin` per iteration and slicing
+/// the per-row output from `sc.attn_out_lin` into the right offset of
+/// `attn_out`.
+///
+/// β-4 building block: GPU companion to a sequential
+/// `gated_delta.decodeStep` loop on the CPU side. β-5 will dispatch
+/// it from `recordOneLayer` when `p.n_q > 1`.
+///
+/// Inputs:
+///   `x_norm_in`  — `[n_q, hidden_size]` fp32, pre-attn RMSNorm output.
+///   `attn_out`   — `[n_q, hidden_size]` fp32, written row-by-row.
+pub fn recordLinearAttnLayerBatched(
+    rec: *recorder.Recorder,
+    sc: *const Scratch,
+    state: *const State,
+    gm: *const gpu_model.GpuModel,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    layer_idx: usize,
+    p: *const ForwardPushes,
+    x_norm_in: *const buffer.Buffer,
+    attn_out: *const buffer.Buffer,
+) !void {
+    if (p.n_q < 1) return error.InvalidNq;
+    const layer = &gm.layers[layer_idx];
+    if (layer.layer_type != .linear_attention) return error.NotLinearLayer;
+
+    const hidden: u32 = @intCast(cfg.hidden_size);
+
+    var t: u32 = 0;
+    while (t < p.n_q) : (t += 1) {
+        // 1. slice_copy x_norm[t] → x_norm_lin
+        const slice_in = SliceCopyPush{
+            .src_off = t * hidden,
+            .dst_off = 0,
+            .n_elem = hidden,
+        };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ x_norm_in, &sc.x_norm_lin }, &slice_in, hidden);
+
+        // 2. Single-row chain on x_norm_lin → attn_out_lin. Mirrors
+        //    the existing `.linear_attention` arm of `recordOneLayer`,
+        //    swapping `&sc.x_norm` for `&sc.x_norm_lin` and
+        //    `&sc.attn_out` for `&sc.attn_out_lin` so this iteration
+        //    doesn't smear across rows.
+        try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm_lin, &layer.in_proj_qkv.?, &sc.mixed_qkv }, 1, p.conv_dim, hidden);
+        try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm_lin, &layer.in_proj_z.?, &sc.z }, 1, p.value_dim, hidden);
+        try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm_lin, &layer.in_proj_b.?, &sc.b_raw }, 1, p.n_v_heads, hidden);
+        try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm_lin, &layer.in_proj_a.?, &sc.a_raw }, 1, p.n_v_heads, hidden);
+        try runtime.recDispatch1D(rec, &k.conv1d_update, &.{ &sc.mixed_qkv, &layer.conv1d_weight.?, &state.ssm_conv[layer_idx].?, &sc.mixed_qkv_post }, &p.conv1d_push, p.conv_dim);
+
+        const slice_q_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = p.key_dim };
+        const slice_k_push = SliceCopyPush{ .src_off = p.key_dim, .dst_off = 0, .n_elem = p.key_dim };
+        const slice_v_push = SliceCopyPush{ .src_off = 2 * p.key_dim, .dst_off = 0, .n_elem = p.value_dim };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.q_lin }, &slice_q_push, p.key_dim);
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.k_lin }, &slice_k_push, p.key_dim);
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &sc.mixed_qkv_post, &sc.v_lin }, &slice_v_push, p.value_dim);
+
+        try rec.dispatch(&k.l2norm_per_head, &.{ &sc.q_lin, &sc.q_lin_n }, &p.l2_push, p.n_k_heads_lin, 1, 1);
+        try rec.dispatch(&k.l2norm_per_head, &.{ &sc.k_lin, &sc.k_lin_n }, &p.l2_push, p.n_k_heads_lin, 1, 1);
+        const scale_push = ScalePush{ .n = p.key_dim, .scale = p.q_scale };
+        try runtime.recDispatch1D(rec, &k.scale, &.{ &sc.q_lin_n, &sc.q_lin }, &scale_push, p.key_dim);
+
+        try rec.dispatch(&k.gated_delta_step, &.{
+            &state.ssm_rec[layer_idx].?, &sc.q_lin, &sc.k_lin_n, &sc.v_lin,
+            &sc.b_raw, &sc.a_raw, &layer.A_log.?, &layer.dt_bias.?,
+            &sc.y,
+        }, &p.gds_push, p.n_v_heads, 1, 1);
+        try rec.dispatch(&k.rmsnorm_gated, &.{ &sc.y, &sc.z, &layer.ssm_norm_weight.?, &sc.post_norm }, &p.rms_gated_push, p.n_v_heads, 1, 1);
+        try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.post_norm, &layer.out_proj.?, &sc.attn_out_lin }, 1, hidden, p.value_dim);
+
+        // 3. slice_copy attn_out_lin → attn_out[t]
+        const slice_out = SliceCopyPush{
+            .src_off = 0,
+            .dst_off = t * hidden,
+            .n_elem = hidden,
+        };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &sc.attn_out_lin, attn_out }, &slice_out, hidden);
+    }
 }
 
 /// One-call full hybrid forward: embed → all layers → optional

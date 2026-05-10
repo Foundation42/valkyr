@@ -145,6 +145,16 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionTq4VParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--linear-attn-prefill-gpu-smoke")) {
+        // MTP-1c-β-4: GPU primitive for batched-prefill of a single
+        // linear-attention layer. Drives `recordLinearAttnLayerBatched`
+        // (n_q sequential `gated_delta_step` dispatches, slice_copy at
+        // the row boundaries) against the CPU oracle (n_q sequential
+        // `gated_delta.decodeStep` calls). Gates parity at 1e-4 rel-err
+        // on the first `.linear_attention` layer of Qwen3.5-0.8B.
+        try smoke_gpu_train.runLinearAttnPrefillGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--full-attn-prefill-gpu-smoke")) {
         // MTP-1c-β-3: GPU primitive for batched-prefill of a single
         // full-attention layer. Drives `recordFullAttnLayerBatched`

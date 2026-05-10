@@ -34,6 +34,7 @@ const model_mod = @import("../model.zig");
 const hf_cache = @import("../hf_cache.zig");
 const cpu_mtp = @import("../cpu/mtp.zig");
 const cpu_full_attn = @import("../cpu/full_attn.zig");
+const cpu_gated_delta = @import("../cpu/gated_delta.zig");
 const runtime_hybrid = @import("../runtime_hybrid.zig");
 const runtime_mtp = @import("../runtime_mtp.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
@@ -5880,6 +5881,153 @@ pub fn runFullAttnPrefillGpuSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print(
         "PASS full-attn-prefill-gpu ({s} layer {d}, fp32_all, {d} cases): worst rel={e}\n",
         .{ model_id, layer_idx, cases.len, worst_rel },
+    );
+}
+
+// ── MTP-1c-β-4: GPU batched-prefill linear-attention layer parity ─────
+//
+// Drives `runtime_hybrid.recordLinearAttnLayerBatched` against the
+// CPU oracle `cpu/gated_delta.zig::decodeStep` looped n_q times on a
+// real `.linear_attention` layer of Qwen3.5-0.8B. Both paths consume
+// identical synthetic x_norm input from a fresh SSM state; outputs
+// (attn_out, n_q × hidden) must match within 1e-4 rel-err. Full-
+// attention layers stay on the β-3 path.
+
+pub fn runLinearAttnPrefillGpuSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runLinearAttnPrefillGpuSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    const cfg = cpu.config;
+    if (cfg.family != .qwen35) {
+        std.debug.print("SKIP runLinearAttnPrefillGpuSmoke ({s} not hybrid)\n", .{model_id});
+        return;
+    }
+
+    // Pick the first .linear_attention layer in the schedule (Qwen3.5
+    // schedule starts with three linear layers, so this is layer 0).
+    var layer_idx: usize = std.math.maxInt(usize);
+    for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| {
+        if (lt == .linear_attention) {
+            layer_idx = i;
+            break;
+        }
+    }
+    if (layer_idx == std.math.maxInt(usize)) {
+        std.debug.print("SKIP runLinearAttnPrefillGpuSmoke (no linear-attention layer in {s})\n", .{model_id});
+        return;
+    }
+
+    var gm = try gpu_model.GpuModel.upload(allocator, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+
+    const n_q: u32 = 4;
+    const max_pos: u32 = 16;
+    const hidden = cfg.hidden_size;
+
+    // Synthetic post-RMSNorm input — Gaussian-ish so SSM gates and
+    // RMSNormGated all stay well-conditioned.
+    var prng = std.Random.DefaultPrng.init(0xB4_DEC0DE);
+    const rng = prng.random();
+    const x_norm = try allocator.alloc(f32, n_q * hidden);
+    defer allocator.free(x_norm);
+    for (x_norm) |*v| v.* = rng.floatNorm(f32) * 0.1;
+
+    // ── CPU oracle: n_q sequential `decodeStep` calls on fresh SSM ──
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var cpu_state = try cpu_gated_delta.State.init(allocator, cfg);
+    defer cpu_state.deinit(allocator);
+
+    const attn_out_cpu = try allocator.alloc(f32, n_q * hidden);
+    defer allocator.free(attn_out_cpu);
+
+    const t_cpu0 = std.time.nanoTimestamp();
+    var t: usize = 0;
+    while (t < n_q) : (t += 1) {
+        _ = arena.reset(.retain_capacity);
+        const x_row = x_norm[t * hidden .. (t + 1) * hidden];
+        const out_row = attn_out_cpu[t * hidden .. (t + 1) * hidden];
+        try cpu_gated_delta.decodeStep(arena.allocator(), cfg, cpu.layers[layer_idx], &cpu_state, x_row, out_row);
+    }
+    const t_cpu1 = std.time.nanoTimestamp();
+    const cpu_ms: f64 = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+    // ── GPU side ────────────────────────────────────────────────────
+    var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, n_q, false);
+    defer sc.deinit(ctx.device);
+
+    var k = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all, @intCast(cfg.head_dim));
+    defer k.deinit();
+
+    var state = try runtime_hybrid.State.init(allocator, &ctx, cfg, max_pos, false);
+    defer state.deinit(ctx.device);
+    // Fresh SSM state — `State.init` allocates device-only buffers
+    // without zeroing, but `reset` fillZero's the SSM buffers (matches
+    // CPU's `gated_delta.State.init` which @memset's to 0).
+    try state.reset(&ctx);
+
+    try sc.x_norm.uploadFromHost(&ctx, f32, x_norm);
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 256, 1024);
+    defer rec.deinit();
+
+    const pushes = runtime_hybrid.computeForwardPushes(cfg, 0, n_q, max_pos);
+
+    const t_gpu0 = std.time.nanoTimestamp();
+    try rec.reset();
+    try rec.begin();
+    try runtime_hybrid.recordLinearAttnLayerBatched(
+        &rec,
+        &sc,
+        &state,
+        &gm,
+        cfg,
+        &k,
+        layer_idx,
+        &pushes,
+        &sc.x_norm,
+        &sc.attn_out,
+    );
+    try rec.endAndSubmit();
+
+    const attn_out_gpu = try allocator.alloc(f32, n_q * hidden);
+    defer allocator.free(attn_out_gpu);
+    try sc.attn_out.readBack(&ctx, f32, attn_out_gpu);
+    const t_gpu1 = std.time.nanoTimestamp();
+    const gpu_ms: f64 = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+    // ── Parity ──────────────────────────────────────────────────────
+    const tol: f32 = 1e-4;
+    const rel = globalRelDiff(attn_out_cpu, attn_out_gpu);
+    if (rel > tol) {
+        std.debug.print("FAIL linear-attn-prefill-gpu parity (layer {d}, n_q={d}): rel={e} (tol {e})\n", .{ layer_idx, n_q, rel, tol });
+        return error.ParityFailed;
+    }
+
+    // Sanity: per-row magnitude.
+    var max_abs: f32 = 0;
+    for (attn_out_gpu) |v| {
+        const a = @abs(v);
+        if (a > max_abs) max_abs = a;
+    }
+
+    std.debug.print(
+        "PASS linear-attn-prefill-gpu ({s} layer {d}, n_q={d}, fp32_all): rel={e} max|out|={d:.3} ({d:.0} ms CPU, {d:.0} ms GPU)\n",
+        .{ model_id, layer_idx, n_q, rel, max_abs, cpu_ms, gpu_ms },
     );
 }
 
