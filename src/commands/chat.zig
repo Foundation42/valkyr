@@ -21,6 +21,76 @@ const shaders = @import("shaders");
 
 const aliases = @import("../runtime_aliases.zig");
 const lora_merge = @import("lora_merge.zig");
+const runtime = @import("../runtime.zig");
+const runtime_hybrid = @import("../runtime_hybrid.zig");
+const runtime_mtp = @import("../runtime_mtp.zig");
+const buffer = @import("../gpu/buffer.zig");
+
+/// `--mtp` CLI options. Enables architecture-level multi-token-prediction
+/// SpecDec: MTP head produces k drafts per round, main model verifies
+/// them in one batched forward (`recordForwardStepBatched` at `n_q = k`),
+/// and we accept the longest matching prefix. Net effect: up to k+1
+/// emitted tokens per ~2 main forwards (anchor + verify), giving 1.5–2×
+/// decode speedup on Qwen3.5/3.6 MTP-equipped checkpoints.
+pub const MtpOptions = struct {
+    /// Enable MTP-SpecDec on the chat decode path.
+    enabled: bool = false,
+    /// Number of drafts per round (k). 1 ≈ plain decode (waste), > 4 has
+    /// diminishing returns because accept rates fall off the chain.
+    draft_n: u32 = 3,
+};
+
+/// Per-turn state for the MTP decode path. Carries the run-time MTP
+/// state (per-MTP-layer KV + draft-step intermediates), the
+/// `last_hidden` snapshot buffer, the per-round draft-logits readback
+/// buffer, the verify-pass logits readback host buffer, and cumulative
+/// accept-rate statistics.
+pub const MtpRound = struct {
+    options: MtpOptions,
+    state: runtime_mtp.MtpRuntimeState,
+    last_hidden_buf: buffer.Buffer,
+    draft_logits_buf: buffer.Buffer,
+    verify_logits_host: []f32,
+    /// Cumulative across all turns: total drafts proposed.
+    cumulative_drafts: usize = 0,
+    /// Cumulative drafts that passed verify.
+    cumulative_accepted: usize = 0,
+    /// Cumulative emitted tokens via MTP rounds (drafts + corrections).
+    cumulative_emitted: usize = 0,
+    /// Cumulative MTP rounds run.
+    cumulative_rounds: usize = 0,
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        ctx: *const vk.Context,
+        cfg: config_mod.Config,
+        opts: MtpOptions,
+        max_pos: u32,
+    ) !MtpRound {
+        const state = try runtime_mtp.MtpRuntimeState.init(gpa, ctx, cfg, max_pos);
+        errdefer @constCast(&state).deinit(ctx.device);
+        const last_hidden = try buffer.Buffer.initDeviceOnly(ctx, cfg.hidden_size * @sizeOf(f32));
+        errdefer @constCast(&last_hidden).deinit(ctx.device);
+        const draft_logits = try buffer.Buffer.initDeviceOnly(ctx, cfg.vocab_size * @sizeOf(f32));
+        errdefer @constCast(&draft_logits).deinit(ctx.device);
+        const v_logits = try gpa.alloc(f32, opts.draft_n * cfg.vocab_size);
+        errdefer gpa.free(v_logits);
+        return .{
+            .options = opts,
+            .state = state,
+            .last_hidden_buf = last_hidden,
+            .draft_logits_buf = draft_logits,
+            .verify_logits_host = v_logits,
+        };
+    }
+
+    pub fn deinit(self: *MtpRound, gpa: std.mem.Allocator, device: vk.c.VkDevice) void {
+        gpa.free(self.verify_logits_host);
+        self.draft_logits_buf.deinit(device);
+        self.last_hidden_buf.deinit(device);
+        self.state.deinit(device);
+    }
+};
 
 /// One entry from a `--prompts` TSV: `<label>\t<prompt>` per line.
 /// Both fields are slices into the file's read buffer (LoadedPrompts);
@@ -847,11 +917,60 @@ pub fn runChatQwen35(
     batch_prompts: ?[]const PromptEntry,
     probe_prefix: ?[]const u8,
     max_new: usize,
+    mtp_options: MtpOptions,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
     const cfg = cpu.config;
     if (!cfg.family.isHybrid()) return error.NotHybridFamily;
+    // ── MTP validation ──────────────────────────────────────────────
+    if (mtp_options.enabled) {
+        if (cpu.mtp_head == null) {
+            std.debug.print("--mtp: model has no MTP head — only Qwen3.5 / Qwen3.6 checkpoints with `mtp_num_hidden_layers > 0` are supported\n", .{});
+            return error.NoMtpHead;
+        }
+        if (tq4v) {
+            std.debug.print("--mtp: not yet supported with --tq4v (the verify path doesn't have a fused TQ4-V kernel — use one of --mtp or --tq4v but not both for now)\n", .{});
+            return error.MtpTq4VConflict;
+        }
+        if (mtp_options.draft_n == 0 or mtp_options.draft_n > 16) {
+            std.debug.print("--mtp-draft-n must be in [1, 16] (got {d})\n", .{mtp_options.draft_n});
+            return error.InvalidMtpDraftN;
+        }
+        // SSM-state rollback gate. Qwen3.5/3.6 hybrid models advance the
+        // Gated-DeltaNet recurrent state in linear-attention layers once
+        // per token fed through the forward. The batched verify
+        // (`recordForwardStepBatched(n_q=k)`) advances the SSM by k
+        // steps, but we only commit `accept_count + 1` tokens per round,
+        // leaving the SSM corrupted by `k - (accept_count + 1)` steps
+        // every round. Without rollback the chat output becomes
+        // incoherent within ~2 rounds (verified empirically:
+        // round 0 = "<think>" ✓, round 1 = "\n\n" ✓, round 2 = garbage).
+        //
+        // Full-attention KV is just "overwrite at position" so it
+        // doesn't need rollback — but DeltaNet's recurrent update is
+        // not trivially invertible. The fix is snapshot + restore of
+        // `state.ssm_{conv,rec}` for all linear layers around each
+        // verify, which is the next planned chunk (MTP-1d).
+        std.debug.print(
+            \\--mtp gate: hybrid SSM-state rollback hasn't shipped yet (MTP-1d).
+            \\
+            \\The CLI + dispatch wiring is in place — `--mtp` parses, `MtpRound`
+            \\state allocates, and `mtpDecodeRounds` records the right kernels.
+            \\But Qwen3.5/3.6's Gated-DeltaNet recurrent state gets advanced k
+            \\times by the batched verify forward, then we only commit
+            \\`accept_count + 1` tokens per round, so the SSM ends up too far
+            \\ahead and subsequent rounds produce wrong predictions.
+            \\
+            \\Next chunk (MTP-1d): snapshot/restore `state.ssm_{{conv,rec}}` around
+            \\each verify so the rollback is correct. Until then `--mtp` is gated
+            \\here.
+            \\
+            \\See `project_mtp_plan.md` for the full picture.
+            \\
+        , .{});
+        return error.MtpHybridRollbackPending;
+    }
 
     const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{dir_path});
     defer gpa.free(tok_path);
@@ -889,8 +1008,21 @@ pub fn runChatQwen35(
     const tq4v_active = tq4v and (cfg.head_dim == 128 or cfg.head_dim == 256);
 
     const max_pos: u32 = 2048;
-    var sc = try aliases.HybridChatScratch.init(&ctx, cfg, max_pos, 1, tq4v_active);
+    // MTP-SpecDec verify dispatches `recordForwardStepBatched(n_q = draft_n)`,
+    // so Scratch needs `max_n_q ≥ draft_n` when MTP is on. Plain decode
+    // stays at max_n_q = 1.
+    const scratch_max_n_q: u32 = if (mtp_options.enabled) mtp_options.draft_n else 1;
+    var sc = try aliases.HybridChatScratch.init(&ctx, cfg, max_pos, scratch_max_n_q, tq4v_active);
     defer sc.deinit(ctx.device);
+
+    // MTP runtime state — only allocated when --mtp is on. Owned for the
+    // duration of the chat session; reset between turns isn't needed (the
+    // per-MTP-layer KV cache is overwritten each round).
+    var mtp_round: ?MtpRound = if (mtp_options.enabled)
+        try MtpRound.init(gpa, &ctx, cfg, mtp_options, max_pos)
+    else
+        null;
+    defer if (mtp_round) |*m| m.deinit(gpa, ctx.device);
     var state = try aliases.HybridChatState.init(gpa, &ctx, cfg, max_pos, tq4v_active);
     defer state.deinit(ctx.device);
     var ks = try aliases.HybridChatKernels.init(&ctx, gm.precision, @intCast(cfg.head_dim));
@@ -925,8 +1057,16 @@ pub fn runChatQwen35(
 
     // Recorder pool sized for one full forward step. ~30 dispatches per
     // linear layer + ~16 per full layer + ~3 head/tail = up to ~30*32 +
-    // 3 ≈ 1k sets. Round generously.
-    const sets_per_step: u32 = @intCast(@max(@as(usize, 1024), cfg.num_hidden_layers * 40));
+    // 3 ≈ 1k sets at n_q=1. With MTP, the verify forward records every
+    // layer at n_q=draft_n in one submit, and linear-attn layers loop
+    // their single-row chain n_q times — so the budget scales linearly
+    // in n_q. Round generously (×40 dispatches/layer × n_q is a loose
+    // upper bound that covers prefill, decode, and verify submits).
+    const dispatch_max_n_q: u32 = if (mtp_options.enabled) mtp_options.draft_n else 1;
+    const sets_per_step: u32 = @intCast(@max(
+        @as(usize, 1024),
+        cfg.num_hidden_layers * 40 * @as(usize, dispatch_max_n_q),
+    ));
     var rec = try gpu_recorder.Recorder.init(&ctx, sets_per_step, sets_per_step * 4);
     defer rec.deinit();
 
@@ -1074,6 +1214,7 @@ pub fn runChatQwen35(
                 sample_scratch, sample_params, rng, tmpl, false, max_pos, tq4_hooks,
                 &bus, probe_info, &token_index, hidden_scratch, attn_scratch,
                 max_new,
+                if (mtp_round) |*m| m else null,
             );
         }
         return;
@@ -1091,7 +1232,9 @@ pub fn runChatQwen35(
             probe_hidden_scratch,
             probe_attn_scratch,
             max_new,
+            if (mtp_round) |*mr| mr else null,
         );
+        if (mtp_round) |*mr| try printMtpStats(stdout, mr);
         return;
     }
 
@@ -1115,12 +1258,33 @@ pub fn runChatQwen35(
             probe_hidden_scratch,
             probe_attn_scratch,
             max_new,
+            if (mtp_round) |*mr| mr else null,
         );
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
             break;
         }
     }
+    if (mtp_round) |*mr| try printMtpStats(stdout, mr);
+}
+
+/// Print cumulative MTP-SpecDec statistics for a chat session.
+fn printMtpStats(writer: anytype, mr: *const MtpRound) !void {
+    if (mr.cumulative_rounds == 0) return;
+    const accept_rate: f64 = @as(f64, @floatFromInt(mr.cumulative_accepted)) /
+        @as(f64, @floatFromInt(mr.cumulative_drafts));
+    const tokens_per_round: f64 = @as(f64, @floatFromInt(mr.cumulative_emitted)) /
+        @as(f64, @floatFromInt(mr.cumulative_rounds));
+    try writer.print(
+        "[mtp: {d} rounds, k={d}, {d}/{d} drafts accepted ({d:.1}%), {d:.2} tok/round, {d} tokens via mtp]\n",
+        .{
+            mr.cumulative_rounds, mr.options.draft_n,
+            mr.cumulative_accepted, mr.cumulative_drafts,
+            accept_rate * 100.0,
+            tokens_per_round,
+            mr.cumulative_emitted,
+        },
+    );
 }
 
 fn chatTurnHybrid(
@@ -1149,6 +1313,7 @@ fn chatTurnHybrid(
     probe_hidden_scratch: ?[]f32,
     probe_attn_scratch: ?[]f32,
     max_new: usize,
+    mtp_round: ?*MtpRound,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -1265,6 +1430,21 @@ fn chatTurnHybrid(
         if (next == eot) break;
         if (eos != null and next == eos.?) break;
 
+        if (mtp_round) |mtp| {
+            // ── MTP-SpecDec decode loop ─────────────────────────────
+            // Hands off the decode phase to the SpecDec verify path:
+            // each round runs an MTP draft chain (k drafts), one
+            // batched verify forward (`recordForwardStepBatched(n_q=k)`),
+            // and an anchor forward to set up the next round's KV +
+            // main_tok. Emits up to k+1 tokens per round.
+            try mtpDecodeRounds(
+                gpa, ctx, rec, sc, state, gm, cfg, ks, tok, mtp,
+                @intCast(next), pos, logits, sample_scratch, sample_params, rng,
+                stdout, max_pos, max_response, &generated, eos, eot,
+            );
+            break;
+        }
+
         try printTokenForDisplay(gpa, stdout, tok, @intCast(next));
 
         generated += 1;
@@ -1278,5 +1458,191 @@ fn chatTurnHybrid(
         const ms_total = @as(f64, @floatFromInt(t_end - t_decode_start)) / 1_000_000.0;
         const tokps = @as(f64, @floatFromInt(generated)) * 1000.0 / ms_total;
         try stdout.print("[{d} tok in {d:.0} ms, {d:.1} tok/s]\n", .{ generated, ms_total, tokps });
+    }
+}
+
+/// MTP-SpecDec decode loop. Called once per chat turn, after the
+/// prompt has been prefilled and the first main-token prediction
+/// (`first_main_tok`) was sampled from the last prefill forward's
+/// logits. `pos.*` is the position where this turn's first decoded
+/// token will be placed.
+///
+/// Each round:
+///   1. (round 0 only) snapshot `sc.stream` (= hidden at pos*-1 from
+///      prefill's last forward) into `mtp.last_hidden_buf`.
+///   2. Run `k` MTP draft steps (sequential, with read-back between —
+///      each step's output token feeds the next).
+///   3. Run one batched verify forward at pos_start = pos.* with the
+///      drafts as input. Read back `[k, vocab]` logits.
+///   4. Apply the SpecDec accept rule:
+///        accept[0] = (drafts[0] == main_tok)
+///        accept[i] = accept[i-1] AND (verify_argmax[i-1] == drafts[i])
+///   5. Emit `accept_count` verified drafts + 1 correction/continuation.
+///   6. Run one anchor forward at the last emitted token's position to
+///      (a) overwrite KV[pos] with the correction (when accept_count<k)
+///      or write a fresh KV[pos] for the continuation (when ==k), and
+///      (b) produce the next round's `main_tok` + `last_hidden`.
+///
+/// Loop exits on EOS/EOT in any emitted token, or
+/// `generated >= max_response`. KV state outside the verified prefix
+/// may contain stale drafts; future writes overwrite naturally as long
+/// as the next forward at pos X writes KV[X] before reading KV[X+1..].
+fn mtpDecodeRounds(
+    gpa: std.mem.Allocator,
+    ctx: *const vk.Context,
+    rec: *gpu_recorder.Recorder,
+    sc: *const aliases.HybridChatScratch,
+    state: *const aliases.HybridChatState,
+    gm: *const gpu_model.GpuModel,
+    cfg: config_mod.Config,
+    ks: *const aliases.HybridChatKernels,
+    tok: *const tokenizer_mod.Tokenizer,
+    mtp: *MtpRound,
+    first_main_tok: u32,
+    pos: *usize,
+    logits: []f32,
+    sample_scratch: []f32,
+    sample_params: cpu_forward.SampleParams,
+    rng: std.Random,
+    stdout: anytype,
+    max_pos: u32,
+    max_response: usize,
+    generated: *usize,
+    eos: ?u32,
+    eot: u32,
+) !void {
+    const k_drafts: u32 = mtp.options.draft_n;
+    const hidden_u: u32 = @intCast(cfg.hidden_size);
+    const vocab: usize = cfg.vocab_size;
+
+    // Round 0 setup: snapshot prefill's last hidden (sc.stream after
+    // the last prefill forward = hidden at pos*-1) into last_hidden_buf.
+    {
+        try rec.reset();
+        try rec.begin();
+        const sc_h = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = hidden_u };
+        try runtime.recDispatch1D(rec, &ks.slice_copy, &.{ &sc.stream, &mtp.last_hidden_buf }, &sc_h, hidden_u);
+        try rec.endAndSubmit();
+    }
+
+    var main_tok: u32 = first_main_tok;
+    var verify_pos: usize = pos.*;
+
+    var drafts: [16]u32 = undefined;
+    var verify_argmax: [16]u32 = undefined;
+
+    while (generated.* < max_response) {
+        // ── 1. MTP draft chain — k sequential steps with read-back ──
+        var prev_token = main_tok;
+        var s: u32 = 0;
+        while (s < k_drafts) : (s += 1) {
+            const h_prev_buf = if (s == 0) &mtp.last_hidden_buf else &mtp.state.h_out;
+            try rec.reset();
+            try rec.begin();
+            try runtime_mtp.recordMtpStep(
+                rec, sc, gm, cfg, ks, &mtp.state,
+                h_prev_buf, prev_token, s, max_pos, &mtp.draft_logits_buf,
+            );
+            try rec.endAndSubmit();
+            try mtp.draft_logits_buf.readBack(ctx, f32, logits);
+            const top1: usize = cpu_forward.argmax(logits);
+            drafts[s] = @intCast(top1);
+            prev_token = drafts[s];
+        }
+
+        // ── 2. Verify forward (batched, n_q = k) ────────────────────
+        try rec.reset();
+        try rec.begin();
+        try runtime_hybrid.recordForwardStepBatched(
+            rec, sc, state, gm, cfg, ks,
+            verify_pos, drafts[0..k_drafts], max_pos, true,
+        );
+        try rec.endAndSubmit();
+        try sc.logits.readBack(ctx, f32, mtp.verify_logits_host);
+
+        // ── 3. Per-row argmax + accept rule ─────────────────────────
+        var i_a: u32 = 0;
+        while (i_a < k_drafts) : (i_a += 1) {
+            const row = mtp.verify_logits_host[i_a * vocab .. (i_a + 1) * vocab];
+            verify_argmax[i_a] = @intCast(cpu_forward.argmax(row));
+        }
+        var accept_count: u32 = 0;
+        if (drafts[0] == main_tok) {
+            accept_count = 1;
+            var j: u32 = 1;
+            while (j < k_drafts) : (j += 1) {
+                if (verify_argmax[j - 1] == drafts[j]) {
+                    accept_count += 1;
+                } else break;
+            }
+        }
+        mtp.cumulative_drafts += k_drafts;
+        mtp.cumulative_accepted += accept_count;
+        mtp.cumulative_rounds += 1;
+
+        // ── 4. Emit accepted drafts ─────────────────────────────────
+        var done = false;
+        var emit_count: u32 = 0;
+        var i_emit: u32 = 0;
+        while (i_emit < accept_count) : (i_emit += 1) {
+            const tok_id = drafts[i_emit];
+            if (tok_id == eot or (eos != null and tok_id == eos.?)) {
+                done = true;
+                break;
+            }
+            try printTokenForDisplay(gpa, stdout, tok, tok_id);
+            emit_count += 1;
+            generated.* += 1;
+            if (generated.* >= max_response) {
+                done = true;
+                break;
+            }
+        }
+        mtp.cumulative_emitted += emit_count;
+        if (done) break;
+
+        // ── 5. Compute and emit correction/continuation ─────────────
+        const next_anchor_tok: u32 = if (accept_count == k_drafts)
+            verify_argmax[k_drafts - 1]
+        else if (accept_count == 0)
+            main_tok
+        else
+            verify_argmax[accept_count - 1];
+
+        if (next_anchor_tok == eot or (eos != null and next_anchor_tok == eos.?)) {
+            break;
+        }
+        try printTokenForDisplay(gpa, stdout, tok, next_anchor_tok);
+        mtp.cumulative_emitted += 1;
+        generated.* += 1;
+        if (generated.* >= max_response) break;
+
+        // ── 6. Anchor forward for next round ────────────────────────
+        // Position of the just-emitted next_anchor_tok = verify_pos +
+        // accept_count. Anchor forward writes KV at that position
+        // (overwrites wrong d_{accept_count} for accept_count<k, or
+        // writes fresh KV for accept_count==k).
+        const last_emitted_pos: usize = verify_pos + accept_count;
+
+        // Cap the next round's verify range against max_pos — recording
+        // past the cache capacity would silently truncate.
+        if (last_emitted_pos + 1 + k_drafts > max_pos) break;
+
+        try rec.reset();
+        try rec.begin();
+        try aliases.recordHybridForwardStep(rec, sc, state, gm, cfg, ks, last_emitted_pos, next_anchor_tok, max_pos, null, true);
+        // Snapshot last_hidden = sc.stream for the next round's MTP feed.
+        const sc_h = runtime_hybrid.SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = hidden_u };
+        try runtime.recDispatch1D(rec, &ks.slice_copy, &.{ &sc.stream, &mtp.last_hidden_buf }, &sc_h, hidden_u);
+        try rec.endAndSubmit();
+
+        // ── 7. Sample main_tok for the next round ───────────────────
+        try sc.logits.readBack(ctx, f32, logits);
+        const next_main = try cpu_forward.sample(logits, sample_params, rng, sample_scratch);
+        main_tok = @intCast(next_main);
+
+        // ── 8. Advance position counters ────────────────────────────
+        pos.* = last_emitted_pos + 1;
+        verify_pos = pos.*;
     }
 }

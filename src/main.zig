@@ -952,6 +952,7 @@ pub fn main() !void {
         var lora_targets: u32 = 0;
         var lora_rank: u32 = 0;
         var lora_alpha: f32 = 0.0;
+        var mtp_options: commands_chat.MtpOptions = .{};
         var i: usize = 3;
         while (i < args.len) {
             const a = args[i];
@@ -1002,6 +1003,12 @@ pub fn main() !void {
                 i += 2;
             } else if (std.mem.eql(u8, a, "--lora-alpha") and i + 1 < args.len) {
                 lora_alpha = try std.fmt.parseFloat(f32, args[i + 1]);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--mtp")) {
+                mtp_options.enabled = true;
+                i += 1;
+            } else if (std.mem.eql(u8, a, "--mtp-draft-n") and i + 1 < args.len) {
+                mtp_options.draft_n = try std.fmt.parseInt(u32, args[i + 1], 10);
                 i += 2;
             } else {
                 user_msg = a;
@@ -1082,8 +1089,12 @@ pub fn main() !void {
                 std.debug.print("--lora-ckpt is not yet supported on Qwen3.5-style hybrid models (q_proj is widened by attn_output_gate)\n", .{});
                 return;
             }
-            try commands_chat.runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new);
+            try commands_chat.runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, mtp_options);
         } else {
+            if (mtp_options.enabled) {
+                std.debug.print("--mtp is only supported on Qwen3.5/3.6 hybrid checkpoints (this model is {s})\n", .{@tagName(cfg.family)});
+                return;
+            }
             try commands_chat.runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, lora_ckpt);
         }
         return;
