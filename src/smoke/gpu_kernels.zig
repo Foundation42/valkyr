@@ -606,6 +606,7 @@ pub fn runGpuRopeBatchedSmoke(allocator: std.mem.Allocator) !void {
         .head_dim = @intCast(head_dim),
         .rotary_dim = @intCast(rotary_dim),
         .theta_base = theta_base,
+        .pos_offset = 0,
     };
     const local: u32 = 256;
     const groups: u32 = (@as(u32, @intCast(total)) + local - 1) / local;

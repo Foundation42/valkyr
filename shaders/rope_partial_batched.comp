@@ -1,8 +1,9 @@
 #version 460
 // Batched partial-rotation RoPE: applies the same rotation primitive as
 // `rope_partial.comp` but across `n_pos` query positions in one dispatch.
-// Position for row `p` is just `p` (training-style absolute positioning,
-// 0-indexed from the start of the sequence).
+// Absolute position for row `p` is `pos_offset + p`, so the same shader
+// covers training-style prefill (pos_offset = 0) and chat-side batched
+// prefill that picks up where decode left off (pos_offset > 0).
 //
 // Layout per row: [n_heads, head_dim] (matching `applyRopePartial`'s
 // input convention). Total elements per row = n_heads * head_dim.
@@ -25,6 +26,7 @@ layout(push_constant) uniform Pc {
     uint head_dim;
     uint rotary_dim;
     float theta_base;
+    uint pos_offset;
 } pc;
 
 void main() {
@@ -46,7 +48,7 @@ void main() {
     uint half_r = pc.rotary_dim / 2;
     uint freq_idx = (i < half_r) ? i : (i - half_r);
     float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
-    float angle = float(p) * freq;
+    float angle = float(pc.pos_offset + p) * freq;
     float c_a = cos(angle);
     float s_a = sin(angle);
 

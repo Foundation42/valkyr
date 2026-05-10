@@ -33,6 +33,7 @@ const gpu_model = @import("../gpu/model.zig");
 const model_mod = @import("../model.zig");
 const hf_cache = @import("../hf_cache.zig");
 const cpu_mtp = @import("../cpu/mtp.zig");
+const cpu_full_attn = @import("../cpu/full_attn.zig");
 const runtime_hybrid = @import("../runtime_hybrid.zig");
 const runtime_mtp = @import("../runtime_mtp.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
@@ -5663,6 +5664,223 @@ pub fn runMtpDraftChainSmoke(allocator: std.mem.Allocator) !void {
         defer allocator.free(txt);
         std.debug.print("  draft{d}: {d} \"{s}\"\n", .{ s, draft_tokens[s], txt });
     }
+}
+
+// ── MTP-1c-β-3: GPU batched-prefill full-attention layer parity ─────────
+//
+// Drives `runtime_hybrid.recordFullAttnLayerBatched` against the CPU
+// oracle `cpu/full_attn.zig::prefillStep` on a synthetic n_q-row input
+// for a real `.full_attention` layer of Qwen3.5-0.8B. Both paths
+// consume the same x_norm input and same fresh KV state; outputs
+// (attn_out, n_q × hidden) must match within 1e-4 rel-err. Linear-
+// attention layers are skipped — β-4 widens those.
+
+pub fn runFullAttnPrefillGpuSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runFullAttnPrefillGpuSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    const cfg = cpu.config;
+    if (cfg.family != .qwen35) {
+        std.debug.print("SKIP runFullAttnPrefillGpuSmoke ({s} not hybrid)\n", .{model_id});
+        return;
+    }
+
+    // Pick the first .full_attention layer in the schedule.
+    var layer_idx: usize = std.math.maxInt(usize);
+    for (cfg.layer_types[0..cfg.num_hidden_layers], 0..) |lt, i| {
+        if (lt == .full_attention) {
+            layer_idx = i;
+            break;
+        }
+    }
+    if (layer_idx == std.math.maxInt(usize)) {
+        std.debug.print("SKIP runFullAttnPrefillGpuSmoke (no full-attention layer in {s})\n", .{model_id});
+        return;
+    }
+
+    var gm = try gpu_model.GpuModel.upload(allocator, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+
+    // Two cases: a fresh prefill (pos_start=0) and a continuation
+    // (pos_start=2) so the batched RoPE `pos_offset` code path gets
+    // exercised distinctly from the n_pos=p path.
+    const Case = struct { n_q: u32, pos_start: usize };
+    const cases = [_]Case{
+        .{ .n_q = 4, .pos_start = 0 },
+        .{ .n_q = 3, .pos_start = 2 },
+    };
+    const max_pos: u32 = 16;
+    const hidden = cfg.hidden_size;
+    var worst_rel: f32 = 0;
+
+    // Worst-case scratch sized once over both cases.
+    var max_n_q_overall: u32 = 0;
+    for (cases) |c| if (c.n_q > max_n_q_overall) {
+        max_n_q_overall = c.n_q;
+    };
+
+    // ── GPU side: scratch / kernels / state shared across cases ─────
+    var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, max_n_q_overall, false);
+    defer sc.deinit(ctx.device);
+
+    var k = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all, @intCast(cfg.head_dim));
+    defer k.deinit();
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, 64, 64 * 8);
+    defer rec.deinit();
+
+    const tol: f32 = 1e-4;
+    const tol_continuation: f32 = 5e-5;
+    _ = tol_continuation;
+
+    for (cases) |c| {
+        const n_q = c.n_q;
+        const pos_start = c.pos_start;
+
+        // Synthetic x_norm — fresh seed per case so the two cases
+        // don't share input data.
+        var prng = std.Random.DefaultPrng.init(0xB3_DEC0DE +% @as(u64, @intCast(pos_start)) *% 0x9E3779B97F4A7C15);
+        const rng = prng.random();
+        const x_norm = try allocator.alloc(f32, n_q * hidden);
+        defer allocator.free(x_norm);
+        for (x_norm) |*v| v.* = rng.floatNorm(f32) * 0.1;
+
+        // Pre-fill the prior history (positions [0, pos_start)) with
+        // synthetic K/V on both sides, identically — so attention from
+        // the new queries against keys at [0, pos_start) sees the same
+        // values on CPU and GPU. We do this by running n=pos_start
+        // sequential `decodeStep`s with a different synthetic input
+        // first; then the n_q queries pile in via prefill.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        var kv_cpu = try cpu_full_attn.KvCache.init(allocator, cfg, max_pos);
+        defer kv_cpu.deinit(allocator);
+
+        var state = try runtime_hybrid.State.init(allocator, &ctx, cfg, max_pos, false);
+        defer state.deinit(ctx.device);
+
+        if (pos_start > 0) {
+            // Prime both sides with sequential decode at positions
+            // [0, pos_start). Use a dedicated scratch for the GPU
+            // primer so it doesn't conflict with the prefill scratch.
+            var sc_decode = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, 1, false);
+            defer sc_decode.deinit(ctx.device);
+
+            const prime_x = try arena.allocator().alloc(f32, hidden);
+            for (0..pos_start) |t| {
+                var prng_t = std.Random.DefaultPrng.init(0x70_AB_BA_DE +% @as(u64, @intCast(t)));
+                const rng_t = prng_t.random();
+                for (prime_x) |*v| v.* = rng_t.floatNorm(f32) * 0.1;
+
+                // CPU
+                const out_cpu = try arena.allocator().alloc(f32, hidden);
+                try cpu_full_attn.decodeStep(arena.allocator(), cfg, cpu.layers[layer_idx], &kv_cpu, prime_x, out_cpu, t);
+
+                // GPU — single-position fa_decode_split + merge via
+                // recordOneLayer's existing decode path. We seed
+                // sc_decode.x_norm with prime_x (the layer expects post-
+                // RMSNorm input but the synthetic prime is treated as
+                // such — since we drive recordOneLayer with our own
+                // x_norm we have to emulate it. Simplest: skip rmsnorm
+                // by writing prime_x into sc_decode.stream then running
+                // rmsnorm over it. But we want decoded K/V to match
+                // CPU's `decodeStep` on `prime_x` — so we feed prime_x
+                // straight into a single-row `recordFullAttnLayerBatched`
+                // with n_q=1, pos_start=t.
+                try sc_decode.x_norm.uploadFromHost(&ctx, f32, prime_x);
+                const pushes_t = runtime_hybrid.computeForwardPushes(cfg, t, 1, max_pos);
+                try rec.reset();
+                try rec.begin();
+                try runtime_hybrid.recordFullAttnLayerBatched(
+                    &rec,
+                    &sc_decode,
+                    &state,
+                    &gm,
+                    cfg,
+                    &k,
+                    layer_idx,
+                    &pushes_t,
+                    &sc_decode.x_norm,
+                    &sc_decode.attn_out,
+                );
+                try rec.endAndSubmit();
+            }
+        }
+
+        // ── CPU oracle: prefill at pos_start over n_q ──────────────
+        const attn_out_cpu = try allocator.alloc(f32, n_q * hidden);
+        defer allocator.free(attn_out_cpu);
+
+        const t_cpu0 = std.time.nanoTimestamp();
+        try cpu_full_attn.prefillStep(arena.allocator(), cfg, cpu.layers[layer_idx], &kv_cpu, x_norm, attn_out_cpu, pos_start, n_q);
+        const t_cpu1 = std.time.nanoTimestamp();
+        const cpu_ms: f64 = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+        // ── GPU prefill: same n_q, pos_start ──────────────────────
+        try sc.x_norm.uploadFromHost(&ctx, f32, x_norm);
+
+        const pushes = runtime_hybrid.computeForwardPushes(cfg, pos_start, n_q, max_pos);
+
+        const t_gpu0 = std.time.nanoTimestamp();
+        try rec.reset();
+        try rec.begin();
+        try runtime_hybrid.recordFullAttnLayerBatched(
+            &rec,
+            &sc,
+            &state,
+            &gm,
+            cfg,
+            &k,
+            layer_idx,
+            &pushes,
+            &sc.x_norm,
+            &sc.attn_out,
+        );
+        try rec.endAndSubmit();
+
+        const attn_out_gpu = try allocator.alloc(f32, n_q * hidden);
+        defer allocator.free(attn_out_gpu);
+        try sc.attn_out.readBack(&ctx, f32, attn_out_gpu);
+        const t_gpu1 = std.time.nanoTimestamp();
+        const gpu_ms: f64 = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+        const rel = globalRelDiff(attn_out_cpu, attn_out_gpu);
+        if (rel > tol) {
+            std.debug.print("FAIL full-attn-prefill-gpu parity (layer {d}, n_q={d} pos_start={d}): rel={e} (tol {e})\n", .{ layer_idx, n_q, pos_start, rel, tol });
+            return error.ParityFailed;
+        }
+        if (rel > worst_rel) worst_rel = rel;
+
+        var max_abs: f32 = 0;
+        for (attn_out_gpu) |v| {
+            const a = @abs(v);
+            if (a > max_abs) max_abs = a;
+        }
+
+        std.debug.print(
+            "  case n_q={d} pos_start={d}: rel={e} max|out|={d:.3} ({d:.1} ms CPU / {d:.1} ms GPU)\n",
+            .{ n_q, pos_start, rel, max_abs, cpu_ms, gpu_ms },
+        );
+    }
+
+    std.debug.print(
+        "PASS full-attn-prefill-gpu ({s} layer {d}, fp32_all, {d} cases): worst rel={e}\n",
+        .{ model_id, layer_idx, cases.len, worst_rel },
+    );
 }
 
 // ── T2: fused FA decode with TQ4-packed V cache (GPU parity) ─────────

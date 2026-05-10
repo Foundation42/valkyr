@@ -198,12 +198,18 @@ pub const SwigluPush = extern struct { n: u32 };
 /// Batched RoPE (forward + backward share this struct). One dispatch
 /// covers `n_pos` rows of `[n_heads, head_dim]`. Setting `rotary_dim
 /// = head_dim` gives full RoPE; smaller gives Qwen3.5-style partial.
+/// `pos_offset` shifts the absolute position used for the rotation
+/// angles — row `p` rotates as if it were at position `pos_offset + p`.
+/// Training-style prefill from the start of the sequence sets it to 0;
+/// chat-side batched prefill that picks up after a decoded prefix sets
+/// it to the current cursor position.
 pub const RopeBatchedPush = extern struct {
     n_pos: u32,
     n_heads: u32,
     head_dim: u32,
     rotary_dim: u32,
     theta_base: f32,
+    pos_offset: u32,
 };
 
 /// Push struct for the fused QK-RoPE shaders (qk_rope_partial_batched +

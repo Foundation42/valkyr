@@ -145,6 +145,17 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionTq4VParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--full-attn-prefill-gpu-smoke")) {
+        // MTP-1c-β-3: GPU primitive for batched-prefill of a single
+        // full-attention layer. Drives `recordFullAttnLayerBatched`
+        // against the CPU oracle `cpu/full_attn.zig::prefillStep` on
+        // a synthetic n_q=4 input through the first .full_attention
+        // layer of Qwen3.5-0.8B. Gates parity at 1e-4 rel-err. β-5
+        // wires this dispatcher into `recordOneLayer` so n_q>1 forward
+        // steps go through the FA prefill path end-to-end.
+        try smoke_gpu_train.runFullAttnPrefillGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--forward-hybrid-batched-smoke")) {
         // MTP-1c-β-1: CPU oracle for n_q-batched hybrid forward. Loads
         // Qwen3.5-0.8B, runs the same 4-token sequence through both the

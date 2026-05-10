@@ -25,6 +25,7 @@ layout(push_constant) uniform Pc {
     uint head_dim;
     uint rotary_dim;
     float theta_base;
+    uint pos_offset;
 } pc;
 
 void main() {
@@ -45,7 +46,7 @@ void main() {
     uint half_r = pc.rotary_dim / 2;
     uint freq_idx = (i < half_r) ? i : (i - half_r);
     float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
-    float angle = float(p) * freq;
+    float angle = float(pc.pos_offset + p) * freq;
     float c_a = cos(angle);
     float s_a = sin(angle);
 
