@@ -145,6 +145,16 @@ pub fn main() !void {
         try smoke_cpu.runFlashAttentionTq4VParitySmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--forward-hybrid-batched-gpu-smoke")) {
+        // MTP-1c-β-5: end-to-end batched hybrid forward (GPU parity).
+        // Drives `recordForwardStepBatched` against the β-1 CPU oracle
+        // `forwardHybridBatched` on Qwen3.5-0.8B. All 24 layers — both
+        // linear-attn (β-4) and full-attn (β-3) — go through the
+        // batched primitives when n_q>1. FFN + final-norm + LM-head
+        // widened to M=n_q. Per-row logits parity at 1e-4 rel-err.
+        try smoke_gpu_train.runForwardHybridBatchedGpuSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--linear-attn-prefill-gpu-smoke")) {
         // MTP-1c-β-4: GPU primitive for batched-prefill of a single
         // linear-attention layer. Drives `recordLinearAttnLayerBatched`

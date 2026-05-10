@@ -35,6 +35,7 @@ const hf_cache = @import("../hf_cache.zig");
 const cpu_mtp = @import("../cpu/mtp.zig");
 const cpu_full_attn = @import("../cpu/full_attn.zig");
 const cpu_gated_delta = @import("../cpu/gated_delta.zig");
+const cpu_forward = @import("../cpu/forward.zig");
 const runtime_hybrid = @import("../runtime_hybrid.zig");
 const runtime_mtp = @import("../runtime_mtp.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
@@ -6029,6 +6030,157 @@ pub fn runLinearAttnPrefillGpuSmoke(allocator: std.mem.Allocator) !void {
         "PASS linear-attn-prefill-gpu ({s} layer {d}, n_q={d}, fp32_all): rel={e} max|out|={d:.3} ({d:.0} ms CPU, {d:.0} ms GPU)\n",
         .{ model_id, layer_idx, n_q, rel, max_abs, cpu_ms, gpu_ms },
     );
+}
+
+// ── MTP-1c-β-5: end-to-end batched hybrid forward (GPU parity) ────────
+//
+// Drives `runtime_hybrid.recordForwardStepBatched` against the CPU
+// oracle `cpu/forward.zig::forwardHybridBatched` on Qwen3.5-0.8B —
+// full 24-layer hybrid forward at n_q ∈ {1, 2, 4} from a fresh
+// `HybridState` / SSM state. All linear-attention layers go through
+// β-4's `recordLinearAttnLayerBatched`, all full-attention layers
+// go through β-3's `recordFullAttnLayerBatched`, FFN + final-norm +
+// LM-head all widened to M=n_q. Per-row logits must match within
+// 1e-4 rel-err and top-1 must agree row-by-row.
+
+pub fn runForwardHybridBatchedGpuSmoke(allocator: std.mem.Allocator) !void {
+    const model_id = "Qwen/Qwen3.5-0.8B";
+    const dir_path = hf_cache.resolveModelArg(allocator, model_id) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("SKIP runForwardHybridBatchedGpuSmoke ({s} not in HF cache)\n", .{model_id});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(dir_path);
+
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    var cpu = try model_mod.Model.load(allocator, dir_path);
+    defer cpu.deinit();
+
+    const cfg = cpu.config;
+    if (cfg.family != .qwen35) {
+        std.debug.print("SKIP runForwardHybridBatchedGpuSmoke ({s} not hybrid)\n", .{model_id});
+        return;
+    }
+
+    var gm = try gpu_model.GpuModel.upload(allocator, &ctx, &cpu, .fp32_all);
+    defer gm.deinit(ctx.device);
+
+    const max_pos: u32 = 16;
+    const max_n_q: u32 = 4;
+
+    // Token sequence: spaced tokens, all in vocab.
+    const t0_id: u32 = cfg.eos_token_id orelse 0;
+    var tokens_buf = [_]u32{
+        t0_id,
+        @intCast((@as(usize, t0_id) + 17) % cfg.vocab_size),
+        @intCast((@as(usize, t0_id) + 113) % cfg.vocab_size),
+        @intCast((@as(usize, t0_id) + 251) % cfg.vocab_size),
+    };
+
+    var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, max_pos, max_n_q, false);
+    defer sc.deinit(ctx.device);
+
+    var k = try runtime_hybrid.ChatKernels.init(&ctx, .fp32_all, @intCast(cfg.head_dim));
+    defer k.deinit();
+
+    // Recorder sized for the worst-case dispatch count: 24 layers ×
+    // ~30 dispatches each at n_q=4 (linear-attn loop is 14 dispatches
+    // per row × 4 rows = 56) + embed (8) + final norm/LM head ≈ 800.
+    var rec = try gpu_recorder.Recorder.init(&ctx, 4096, 16384);
+    defer rec.deinit();
+
+    const tol: f32 = 1e-4;
+    const n_q_cases = [_]u32{ 1, 2, 4 };
+
+    for (n_q_cases) |n_q| {
+        const tokens = tokens_buf[0..n_q];
+        const pos_start: usize = 0;
+
+        // ── CPU oracle ──────────────────────────────────────────────
+        var cpu_state = try cpu_forward.HybridState.init(allocator, &cpu, max_pos);
+        defer cpu_state.deinit();
+
+        const logits_cpu = try allocator.alloc(f32, n_q * cfg.vocab_size);
+        defer allocator.free(logits_cpu);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const t_cpu0 = std.time.nanoTimestamp();
+        try cpu_forward.forwardHybridBatched(&cpu, tokens, pos_start, &cpu_state, arena.allocator(), null, logits_cpu);
+        const t_cpu1 = std.time.nanoTimestamp();
+        const cpu_ms: f64 = @as(f64, @floatFromInt(t_cpu1 - t_cpu0)) / 1_000_000.0;
+
+        // ── GPU side ────────────────────────────────────────────────
+        var gpu_state = try runtime_hybrid.State.init(allocator, &ctx, cfg, max_pos, false);
+        defer gpu_state.deinit(ctx.device);
+        try gpu_state.reset(&ctx);
+
+        const t_gpu0 = std.time.nanoTimestamp();
+        try rec.reset();
+        try rec.begin();
+        try runtime_hybrid.recordForwardStepBatched(
+            &rec,
+            &sc,
+            &gpu_state,
+            &gm,
+            cfg,
+            &k,
+            pos_start,
+            tokens,
+            max_pos,
+            true,
+        );
+        try rec.endAndSubmit();
+
+        const logits_gpu = try allocator.alloc(f32, n_q * cfg.vocab_size);
+        defer allocator.free(logits_gpu);
+        try sc.logits.readBack(&ctx, f32, logits_gpu);
+        const t_gpu1 = std.time.nanoTimestamp();
+        const gpu_ms: f64 = @as(f64, @floatFromInt(t_gpu1 - t_gpu0)) / 1_000_000.0;
+
+        // ── Per-row parity ──────────────────────────────────────────
+        var worst_rel: f32 = 0;
+        var worst_row: u32 = 0;
+        var t: u32 = 0;
+        while (t < n_q) : (t += 1) {
+            const cpu_row = logits_cpu[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+            const gpu_row = logits_gpu[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+            const rel = globalRelDiff(cpu_row, gpu_row);
+            if (rel > worst_rel) {
+                worst_rel = rel;
+                worst_row = t;
+            }
+        }
+        if (worst_rel > tol) {
+            std.debug.print("FAIL forward-hybrid-batched-gpu parity (n_q={d}): worst row={d} rel={e} (tol {e})\n", .{ n_q, worst_row, worst_rel, tol });
+            return error.ParityFailed;
+        }
+
+        // ── Top-1 per-row match ─────────────────────────────────────
+        t = 0;
+        while (t < n_q) : (t += 1) {
+            const cpu_row = logits_cpu[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+            const gpu_row = logits_gpu[t * cfg.vocab_size .. (t + 1) * cfg.vocab_size];
+            const top_cpu = cpu_forward.argmax(cpu_row);
+            const top_gpu = cpu_forward.argmax(gpu_row);
+            if (top_cpu != top_gpu) {
+                std.debug.print("FAIL forward-hybrid-batched-gpu top-1 mismatch n_q={d} row={d}: cpu={d} gpu={d}\n", .{ n_q, t, top_cpu, top_gpu });
+                return error.Top1Mismatch;
+            }
+        }
+
+        std.debug.print(
+            "  case n_q={d}: worst rel={e} top1 match all rows ({d:.0} ms CPU / {d:.0} ms GPU)\n",
+            .{ n_q, worst_rel, cpu_ms, gpu_ms },
+        );
+    }
+
+    std.debug.print("PASS forward-hybrid-batched-gpu ({s}, fp32_all, {d} cases up to n_q={d})\n", .{ model_id, n_q_cases.len, max_n_q });
 }
 
 // ── T2: fused FA decode with TQ4-packed V cache (GPU parity) ─────────

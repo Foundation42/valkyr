@@ -566,8 +566,12 @@ pub fn computeForwardPushes(cfg: config_mod.Config, pos_start: usize, n_q: u32, 
     return .{
         .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
         .qkn_push = .{ .dim = head_dim, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
-        .add_push = .{ .n = hidden },
-        .swiglu_push = .{ .n = inter },
+        // Add + swiglu pushes carry total element counts. For n_q=1
+        // these match the per-row sizes (hidden / inter); for n_q>1
+        // they cover the whole batch in one pointwise dispatch since
+        // both shaders are pure pointwise — no row decoding needed.
+        .add_push = .{ .n = n_q * hidden },
+        .swiglu_push = .{ .n = n_q * inter },
         .conv1d_push = .{ .conv_dim = conv_dim, .kernel_size = conv_kernel },
         .l2_push = .{ .head_dim = head_k, .eps = 1e-6 },
         .rms_gated_push = .{ .head_dim = head_v, .eps = cfg.rms_norm_eps },
@@ -699,9 +703,21 @@ pub fn recordOneLayer(
     const inter: u32 = @intCast(cfg.intermediate_size);
     const layer = &gm.layers[layer_idx];
 
-    try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &p.rms_push, 1);
+    // Pre-attention RMSNorm: one workgroup per row, so n_q rows just
+    // dispatches n_q workgroups. Same shader, same push.
+    try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &p.rms_push, p.n_q);
 
-    switch (layer.layer_type) {
+    if (p.n_q > 1) {
+        // ── Batched-prefill path (β-3 + β-4 primitives) ────────────
+        // TQ4-V on the prefill branch isn't covered yet — fall out
+        // explicitly so callers can't accidentally end up on a path
+        // that silently ignores the TQ4 cache.
+        if (tq4_v != null) return error.TqV4PrefillNotSupported;
+        switch (layer.layer_type) {
+            .linear_attention => try recordLinearAttnLayerBatched(rec, sc, state, gm, cfg, k, layer_idx, p, &sc.x_norm, &sc.attn_out),
+            .full_attention => try recordFullAttnLayerBatched(rec, sc, state, gm, cfg, k, layer_idx, p, &sc.x_norm, &sc.attn_out),
+        }
+    } else switch (layer.layer_type) {
         .linear_attention => {
             try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_qkv.?, &sc.mixed_qkv }, 1, p.conv_dim, hidden);
             try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.in_proj_z.?, &sc.z }, 1, p.value_dim, hidden);
@@ -803,13 +819,17 @@ pub fn recordOneLayer(
         },
     }
 
-    try runtime.recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
-    try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, 1);
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
-    try runtime.recDispatch1D(rec, &k.swiglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.swiglu_push, inter);
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
-    try runtime.recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, hidden);
+    // Residual + FFN are pure pointwise / per-row → widen by p.n_q.
+    // `add_push.n` and `swiglu_push.n` already carry n_q × hidden /
+    // n_q × inter from `computeForwardPushes`, and matmul takes M as
+    // a parameter. RMSNorm dispatches one workgroup per row.
+    try runtime.recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, p.n_q * hidden);
+    try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, p.n_q);
+    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, p.n_q, inter, hidden);
+    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, p.n_q, inter, hidden);
+    try runtime.recDispatch1D(rec, &k.swiglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.swiglu_push, p.n_q * inter);
+    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, p.n_q, hidden, inter);
+    try runtime.recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, p.n_q * hidden);
 }
 
 /// Record a single full-attention layer's forward at n_q query rows
@@ -1027,5 +1047,72 @@ pub fn recordForwardStep(
     if (compute_logits) {
         try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
         try runtime.recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+    }
+}
+
+/// n_q-batched companion to `recordForwardStep`. Embeds `token_ids`
+/// at positions `[pos_start, pos_start + n_q)` and runs every layer
+/// through the widened `recordOneLayer` (which dispatches β-3's
+/// `recordFullAttnLayerBatched` and β-4's `recordLinearAttnLayerBatched`
+/// when `n_q > 1`). If `compute_logits` is set, `sc.logits` ends up
+/// holding `[n_q, vocab]` row-major.
+///
+/// β-5 wiring chunk: gates the full hybrid forward as a batched
+/// primitive. MTP-1c-β-6 will use it for SpecDec verify (`n_q = k+1`),
+/// and prompt prefill in `--chat` becomes one call away — same shape,
+/// different caller.
+///
+/// Embed dispatch uses the existing single-token shader (writes to
+/// `outv[0..dim]`) bridged through `sc.x_norm_lin` + `slice_copy` per
+/// row, so no embed shader change is needed. TQ4-V on the prefill
+/// branch is rejected by `recordOneLayer` (no kernel for fused TQ4
+/// prefill yet); decode keeps using the existing `recordForwardStep`.
+pub fn recordForwardStepBatched(
+    rec: *recorder.Recorder,
+    sc: *const Scratch,
+    state: *const State,
+    gm: *const gpu_model.GpuModel,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    pos_start: usize,
+    token_ids: []const u32,
+    max_pos: u32,
+    compute_logits: bool,
+) !void {
+    const n_q: u32 = @intCast(token_ids.len);
+    if (n_q == 0) return error.EmptyBatch;
+
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const vocab: u32 = @intCast(cfg.vocab_size);
+    const embed_scale: f32 = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0;
+
+    const pushes = computeForwardPushes(cfg, pos_start, n_q, max_pos);
+
+    // Per-token embed → x_norm_lin → slice_copy into stream[t * hidden..].
+    // Same bridging trick β-4 uses for the linear-attn input feed —
+    // keeps the embed shader untouched.
+    var t: u32 = 0;
+    while (t < n_q) : (t += 1) {
+        const embed_push = EmbedLookupPush{
+            .token_id = token_ids[t],
+            .dim = hidden,
+            .scale = embed_scale,
+        };
+        try runtime.recDispatch1D(rec, &k.embed, &.{ &gm.embed_tokens, &sc.x_norm_lin }, &embed_push, hidden);
+        const slice_to_stream = SliceCopyPush{
+            .src_off = 0,
+            .dst_off = t * hidden,
+            .n_elem = hidden,
+        };
+        try runtime.recDispatch1D(rec, &k.slice_copy, &.{ &sc.x_norm_lin, &sc.stream }, &slice_to_stream, hidden);
+    }
+
+    for (0..cfg.num_hidden_layers) |layer_idx| {
+        try recordOneLayer(rec, sc, state, gm, cfg, k, layer_idx, pos_start, &pushes, null);
+    }
+
+    if (compute_logits) {
+        try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, n_q);
+        try runtime.recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, n_q, vocab, hidden);
     }
 }
