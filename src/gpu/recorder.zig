@@ -22,6 +22,18 @@
 //! everything; we don't try to expose dispatch-level concurrency
 //! because consecutive dispatches in a transformer almost always
 //! depend on each other (residual stream, KV cache, etc.).
+//!
+//! Per-dispatch GPU timing: opt-in via `enableTimestamps(max)`. When
+//! enabled, every dispatch is wrapped with `vkCmdWriteTimestamp` at
+//! TOP_OF_PIPE (start) and BOTTOM_OF_PIPE (end). After
+//! `endAndSubmit` (or, in embedded mode, after the host's submit
+//! fence has signalled), `lastTimestamps(out)` reads back raw u64
+//! ticks as `[start_0, end_0, start_1, end_1, ...]`. Multiply by
+//! `nsPerTick()` to get nanoseconds. The TOP/BOTTOM placement is
+//! deliberate: `end[i] - start[i]` is pure dispatch wall time, while
+//! `start[i+1] - end[i]` exposes the barrier/sync gap between
+//! dispatches — which is the question that motivated this surface
+//! (fused vs. unfused chains where the GPU looks underutilised).
 
 const std = @import("std");
 const vk = @import("vk.zig");
@@ -50,6 +62,18 @@ pub const Recorder = struct {
     // its lifetime is dispatch-graph-scoped, not frame-scoped.
     owns_cmd: bool,
     owns_fence: bool,
+
+    /// Optional GPU timestamp pool. `null` until `enableTimestamps`
+    /// is called; when non-null, each dispatch is wrapped with
+    /// TOP_OF_PIPE / BOTTOM_OF_PIPE timestamps at indices
+    /// `2*n_dispatched` and `2*n_dispatched+1`.
+    query_pool: c.VkQueryPool,
+    ts_capacity: u32,
+    ts_period_ns: f32,
+    /// Mask applied to each raw query tick before use — Vulkan
+    /// guarantees only `timestampValidBits` bits of valid data per
+    /// queue family, the rest are undefined.
+    ts_valid_mask: u64,
 
     /// Build a recorder sized for a forward pass of up to `max_sets`
     /// dispatches and `max_descriptors` total storage-buffer bindings.
@@ -94,6 +118,10 @@ pub const Recorder = struct {
             .n_dispatched = 0,
             .owns_cmd = true,
             .owns_fence = true,
+            .query_pool = null,
+            .ts_capacity = 0,
+            .ts_period_ns = 0,
+            .ts_valid_mask = 0,
         };
     }
 
@@ -134,10 +162,97 @@ pub const Recorder = struct {
             .n_dispatched = 0,
             .owns_cmd = false,
             .owns_fence = false,
+            .query_pool = null,
+            .ts_capacity = 0,
+            .ts_period_ns = 0,
+            .ts_valid_mask = 0,
         };
     }
 
+    /// Enable per-dispatch GPU timestamp capture. Must be called
+    /// BEFORE `begin()` — the query pool is reset on each
+    /// `begin()`, but newly-created queries are in an undefined
+    /// state until first reset, so timestamps recorded between
+    /// `enableTimestamps` and the first `begin()` would be garbage.
+    ///
+    /// `max_dispatches` is the cap for a single recording cycle
+    /// (one begin → endAndSubmit). The pool holds `2 * max` queries.
+    /// Returns `error.TimestampsUnsupported` when the queue family
+    /// reports `timestampValidBits == 0`. Can fail with
+    /// `error.AlreadyEnabled` if called twice.
+    pub fn enableTimestamps(self: *Recorder, max_dispatches: u32) !void {
+        if (self.query_pool != null) return error.AlreadyEnabled;
+        if (max_dispatches == 0) return error.InvalidArgument;
+
+        // Look up our queue family's timestampValidBits. The Vulkan
+        // spec splits this between physical-device props
+        // (timestampPeriod, ns/tick) and queue-family props
+        // (validBits, per-queue support). We cache the period on
+        // ctx already; the validBits we re-query here.
+        var qf_count: u32 = 0;
+        c.vkGetPhysicalDeviceQueueFamilyProperties(self.ctx.physical_device, &qf_count, null);
+        if (qf_count == 0 or self.ctx.queue_family >= qf_count) return error.NoComputeQueue;
+        var qfs: [16]c.VkQueueFamilyProperties = undefined;
+        const cap = @min(qf_count, qfs.len);
+        qf_count = cap;
+        c.vkGetPhysicalDeviceQueueFamilyProperties(self.ctx.physical_device, &qf_count, &qfs);
+        if (self.ctx.queue_family >= qf_count) return error.NoComputeQueue;
+        const valid_bits = qfs[self.ctx.queue_family].timestampValidBits;
+        if (valid_bits == 0) return error.TimestampsUnsupported;
+
+        var qpci = std.mem.zeroes(c.VkQueryPoolCreateInfo);
+        qpci.sType = c.VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qpci.queryType = c.VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 2 * max_dispatches;
+        var qp: c.VkQueryPool = null;
+        try vk.check(c.vkCreateQueryPool(self.ctx.device, &qpci, null, &qp));
+
+        self.query_pool = qp;
+        self.ts_capacity = max_dispatches;
+        self.ts_period_ns = self.ctx.props.limits.timestampPeriod;
+        self.ts_valid_mask = if (valid_bits >= 64)
+            ~@as(u64, 0)
+        else
+            (@as(u64, 1) << @intCast(valid_bits)) - 1;
+    }
+
+    /// Nanoseconds per timestamp tick on the active device. Multiply
+    /// raw deltas from `lastTimestamps` by this value to convert.
+    pub fn nsPerTick(self: *const Recorder) f32 {
+        return self.ts_period_ns;
+    }
+
+    /// Read back the timestamps written during the most recent
+    /// recording cycle. Caller must have already waited on the
+    /// submission to complete (standalone `endAndSubmit` does this
+    /// for you; embedded callers must wait on their host fence first).
+    /// `out` must have length ≥ `2 * n_dispatched`. Returns the
+    /// filled slice in `[start_0, end_0, start_1, end_1, ...]`
+    /// order, with high garbage bits already masked off.
+    pub fn lastTimestamps(self: *const Recorder, out: []u64) ![]u64 {
+        if (self.query_pool == null) return error.TimestampsNotEnabled;
+        const n_queries: u32 = 2 * self.n_dispatched;
+        if (n_queries == 0) return out[0..0];
+        if (out.len < n_queries) return error.OutputTooSmall;
+
+        try vk.check(c.vkGetQueryPoolResults(
+            self.ctx.device,
+            self.query_pool,
+            0,
+            n_queries,
+            n_queries * @sizeOf(u64),
+            out.ptr,
+            @sizeOf(u64),
+            c.VK_QUERY_RESULT_64_BIT | c.VK_QUERY_RESULT_WAIT_BIT,
+        ));
+
+        const slice = out[0..n_queries];
+        for (slice) |*v| v.* &= self.ts_valid_mask;
+        return slice;
+    }
+
     pub fn deinit(self: *Recorder) void {
+        if (self.query_pool != null) c.vkDestroyQueryPool(self.ctx.device, self.query_pool, null);
         if (self.owns_fence) c.vkDestroyFence(self.ctx.device, self.fence, null);
         if (self.owns_cmd) c.vkFreeCommandBuffers(self.ctx.device, self.ctx.cmd_pool, 1, &self.cmd);
         c.vkDestroyDescriptorPool(self.ctx.device, self.pool, null);
@@ -161,12 +276,20 @@ pub const Recorder = struct {
     pub fn begin(self: *Recorder) !void {
         if (!self.owns_cmd) {
             self.n_dispatched = 0;
+            // Embedded mode: host has already begun the cmd buffer.
+            // We can issue the query reset right here.
+            if (self.query_pool != null) {
+                c.vkCmdResetQueryPool(self.cmd, self.query_pool, 0, 2 * self.ts_capacity);
+            }
             return;
         }
         var bi = std.mem.zeroes(c.VkCommandBufferBeginInfo);
         bi.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         try vk.check(c.vkBeginCommandBuffer(self.cmd, &bi));
+        if (self.query_pool != null) {
+            c.vkCmdResetQueryPool(self.cmd, self.query_pool, 0, 2 * self.ts_capacity);
+        }
         self.n_dispatched = 0;
     }
 
@@ -186,6 +309,8 @@ pub const Recorder = struct {
         gz: u32,
     ) !void {
         if (buffers.len != kern.binding_count) return error.BindingCountMismatch;
+        if (self.query_pool != null and self.n_dispatched >= self.ts_capacity)
+            return error.TimestampPoolExhausted;
 
         // ── Memory barrier between dispatches ───────────────────────
         if (self.n_dispatched > 0) {
@@ -252,7 +377,29 @@ pub const Recorder = struct {
                 push,
             );
         }
+        // Pure dispatch wall time = end - start. The TOP_OF_PIPE
+        // start fires after the preceding barrier completes (so it
+        // marks "begin executing this dispatch") and the
+        // BOTTOM_OF_PIPE end fires once all writes have finished.
+        // Gap between consecutive end[i] and start[i+1] reflects
+        // barrier/sync wait — see the module docstring.
+        if (self.query_pool != null) {
+            c.vkCmdWriteTimestamp(
+                self.cmd,
+                c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                self.query_pool,
+                2 * self.n_dispatched,
+            );
+        }
         c.vkCmdDispatch(self.cmd, gx, gy, gz);
+        if (self.query_pool != null) {
+            c.vkCmdWriteTimestamp(
+                self.cmd,
+                c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                self.query_pool,
+                2 * self.n_dispatched + 1,
+            );
+        }
         self.n_dispatched += 1;
     }
 

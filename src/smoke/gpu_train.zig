@@ -89,6 +89,160 @@ pub fn runGpuMatmulSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print("PASS GPU matmul_nt synthetic (2×3 · (4×3)ᵀ → 2×4) on {s}\n", .{ctx.deviceName()});
 }
 
+// ── GPU recorder timestamp smoke ──────────────────────────────────────────
+//
+// Exercises the optional `vkCmdWriteTimestamp` plumbing in
+// `gpu/recorder.zig`: opens a Recorder, calls `enableTimestamps`,
+// records a small chain of `add_in_place` dispatches, and verifies
+// the readback. Asserts:
+//   - 2*N timestamps returned (start/end per dispatch);
+//   - end[i] >= start[i] for each dispatch (no time travel);
+//   - start[i+1] >= end[i] (monotonic across the chain — barriers
+//     serialise everything, so dispatches can't overlap);
+//   - dispatch durations are non-zero on a non-trivial workload;
+//   - the math is still correct (a[i] += b[i] N times).
+//
+// The point isn't the numerics — `add_in_place` is already covered
+// elsewhere — it's that the timing infrastructure works end-to-end.
+// This is the foundation we'll use to settle the T-arc fused-vs-
+// unfused FlashDecoding-TQ4-V question and any future kernel
+// decision where wall-clock per dispatch matters.
+
+pub fn runGpuRecorderTimestampSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    // Sized for a chain of N=8 add_in_place dispatches. Reusing the
+    // recorder's max_sets/max_descriptors as the same N keeps
+    // descriptor accounting simple.
+    const n_dispatches: u32 = 8;
+    var rec = try gpu_recorder.Recorder.init(&ctx, n_dispatches, n_dispatches * 2);
+    defer rec.deinit();
+
+    rec.enableTimestamps(n_dispatches) catch |err| switch (err) {
+        // Some queue families on older drivers report
+        // timestampValidBits=0; surface as a skip rather than fail.
+        error.TimestampsUnsupported => {
+            std.debug.print(
+                "SKIP GPU recorder timestamp smoke: queue family on {s} reports timestampValidBits=0\n",
+                .{ctx.deviceName()},
+            );
+            return;
+        },
+        else => return err,
+    };
+
+    var k_add = try pipeline.Kernel.init(&ctx, &shaders.add_in_place, 2, @sizeOf(runtime.AddInPlacePush));
+    defer k_add.deinit();
+
+    // ── Buffers. Choose a vector size large enough that each
+    //    dispatch is measurably above timestamp resolution
+    //    (RTX 3090: ~1 ns/tick, AMD: ~30-100 ns/tick). 1 MiB of
+    //    f32 is 256 K elements — plenty.
+    const n_elem: u32 = 1 << 18;
+    const a = try allocator.alloc(f32, n_elem);
+    defer allocator.free(a);
+    const b = try allocator.alloc(f32, n_elem);
+    defer allocator.free(b);
+    for (a, 0..) |*v, i| v.* = @floatFromInt(i % 13);
+    for (b, 0..) |*v, i| v.* = @floatFromInt((i % 7) + 1);
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, f32, b);
+    defer buf_b.deinit(ctx.device);
+
+    const push = runtime.AddInPlacePush{ .n = n_elem };
+    const groups: u32 = util.ceilDiv(n_elem, 256);
+
+    try rec.begin();
+    var i: u32 = 0;
+    while (i < n_dispatches) : (i += 1) {
+        try rec.dispatch(&k_add, &.{ &buf_a, &buf_b }, &push, groups, 1, 1);
+    }
+    try rec.endAndSubmit();
+
+    // ── Timestamp readback + invariants ─────────────────────────
+    var ticks_buf: [2 * 16]u64 = undefined; // generous over 2*n_dispatches
+    const ticks = try rec.lastTimestamps(ticks_buf[0..]);
+    if (ticks.len != 2 * n_dispatches) {
+        std.debug.print(
+            "FAIL GPU recorder timestamp smoke: expected {d} ticks, got {d}\n",
+            .{ 2 * n_dispatches, ticks.len },
+        );
+        return error.ParityFailed;
+    }
+    const ns_per_tick = rec.nsPerTick();
+    var d: u32 = 0;
+    var prev_end: u64 = 0;
+    var sum_dispatch_ns: f64 = 0;
+    var sum_gap_ns: f64 = 0;
+    while (d < n_dispatches) : (d += 1) {
+        const start = ticks[2 * d];
+        const end = ticks[2 * d + 1];
+        if (end < start) {
+            std.debug.print(
+                "FAIL GPU recorder timestamp smoke: end<start at dispatch {d}: start={d} end={d}\n",
+                .{ d, start, end },
+            );
+            return error.ParityFailed;
+        }
+        if (d > 0 and start < prev_end) {
+            std.debug.print(
+                "FAIL GPU recorder timestamp smoke: non-monotonic start at {d}: prev_end={d} start={d}\n",
+                .{ d, prev_end, start },
+            );
+            return error.ParityFailed;
+        }
+        const dur_ns = @as(f64, @floatFromInt(end - start)) * ns_per_tick;
+        sum_dispatch_ns += dur_ns;
+        if (d > 0) {
+            const gap_ns = @as(f64, @floatFromInt(start - prev_end)) * ns_per_tick;
+            sum_gap_ns += gap_ns;
+        }
+        prev_end = end;
+    }
+
+    // Expect at least one dispatch to have non-zero measured time —
+    // a 1 MiB add at typical compute throughput should be tens of
+    // microseconds, well above any timestamp granularity.
+    if (sum_dispatch_ns <= 0) {
+        std.debug.print("FAIL GPU recorder timestamp smoke: zero total dispatch time\n", .{});
+        return error.ParityFailed;
+    }
+    // Loose upper bound — 8 dispatches of a 1 MiB add should not
+    // take more than a few hundred ms even on the slowest GPU we'd
+    // run this on. If it does, something is badly wrong.
+    if (sum_dispatch_ns > 500.0 * 1_000_000.0) {
+        std.debug.print(
+            "FAIL GPU recorder timestamp smoke: implausible total dispatch time {d:.3} ms\n",
+            .{sum_dispatch_ns / 1_000_000.0},
+        );
+        return error.ParityFailed;
+    }
+
+    // ── Numerics sanity: after N dispatches a[i] = init_a[i] + N*b[i]
+    const out: []f32 = try allocator.alloc(f32, n_elem);
+    defer allocator.free(out);
+    try buf_a.readBack(&ctx, f32, out);
+    var bad: u32 = 0;
+    for (out, 0..) |got, j| {
+        const init_a: f32 = @floatFromInt(j % 13);
+        const b_val: f32 = @floatFromInt((j % 7) + 1);
+        const want = init_a + @as(f32, @floatFromInt(n_dispatches)) * b_val;
+        if (got != want) {
+            bad += 1;
+            if (bad <= 4) std.debug.print("  numerics MISMATCH at {d}: got {d} want {d}\n", .{ j, got, want });
+        }
+    }
+    if (bad != 0) return error.ParityFailed;
+
+    std.debug.print(
+        "PASS GPU recorder timestamps: N={d} sum_dispatch={d:.3} ms sum_gap={d:.3} ms (ns/tick={d:.2}) on {s}\n",
+        .{ n_dispatches, sum_dispatch_ns / 1_000_000.0, sum_gap_ns / 1_000_000.0, ns_per_tick, ctx.deviceName() },
+    );
+}
+
 // ── GPU CCE forward smoke: fused matmul + online-softmax CE vs CPU oracle ─
 //
 // Drives `cce_forward.comp` against `cpu_cce.cceForward` on Qwen-flavoured

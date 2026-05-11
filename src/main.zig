@@ -504,6 +504,15 @@ pub fn main() !void {
         try smoke_gpu_train.runGpuLoraSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--recorder-timestamp-smoke")) {
+        // Per-dispatch GPU timing infrastructure. Records a small
+        // chain of add_in_place dispatches with vkCmdWriteTimestamp
+        // wrapped around each, reads the ticks back through
+        // vkGetQueryPoolResults, and asserts monotonicity. Foundation
+        // for diagnosing chains where the GPU looks underutilised.
+        try smoke_gpu_train.runGpuRecorderTimestampSmoke(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--lora-rec-smoke")) {
         // A4-1 foundation smoke. Same parity gate as --lora-smoke but
         // routed through gpu_recorder.Recorder + the helpers in
@@ -1146,6 +1155,7 @@ pub fn main() !void {
     try smoke_gpu_train.runGpuCceBackwardDwSmoke(allocator);
     try smoke_gpu_train.runGpuLoraSmoke(allocator);
     try smoke_gpu_train.runGpuLoraRecorderSmoke(allocator);
+    try smoke_gpu_train.runGpuRecorderTimestampSmoke(allocator);
     try smoke_gpu_train.runGpuTransformerLoraQSmoke(allocator);
     try smoke_gpu_train.runGpuTransformerLoraAllSmoke(allocator);
     try smoke_gpu_train.runEmbeddedAttachSmoke(allocator);
