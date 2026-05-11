@@ -110,6 +110,12 @@ pub const ChatKernels = struct {
     rope_partial_batched: pipeline.Kernel,
     slice_copy: pipeline.Kernel,
     scale: pipeline.Kernel,
+    /// Column-major Q4_K matmul, amortizes weight dequant across M
+    /// activation rows. Only allocated when precision == q4_k_matmul
+    /// AND M>1 paths exist (i.e. the batched-prefill / MTP-verify
+    /// surface). Selected by `runtime.recDispatchMatmulPreferMCol`
+    /// at the dispatch site — M=1 callsites stay on `matmul`.
+    matmul_q4k_mcol: ?pipeline.Kernel,
 
     pub fn init(ctx: *const vk.Context, precision: gpu_model.Precision, head_dim: u32) !ChatKernels {
         // Mirrors the dense `ChatKernels.init`: precision-aware matmul
@@ -155,6 +161,10 @@ pub const ChatKernels = struct {
             .rope_partial_batched = try pipeline.Kernel.init(ctx, &shaders.rope_partial_batched, 2, @sizeOf(runtime.RopeBatchedPush)),
             .slice_copy = try pipeline.Kernel.init(ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush)),
             .scale = try pipeline.Kernel.init(ctx, &shaders.scale, 2, @sizeOf(ScalePush)),
+            .matmul_q4k_mcol = if (precision == .q4_k_matmul)
+                try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2_q4_k_mcol, 3, @sizeOf(MatmulPush))
+            else
+                null,
         };
     }
 
@@ -170,6 +180,15 @@ pub const ChatKernels = struct {
         }) |fname| {
             @field(self, fname).deinit();
         }
+        if (self.matmul_q4k_mcol) |*kk| kk.deinit();
+    }
+
+    /// Pointer-to-optional accessor for the mcol kernel, in the shape
+    /// `recDispatchMatmulPreferMCol` expects. `null` when no mcol
+    /// kernel is built (precision != q4_k_matmul), in which case the
+    /// dispatcher falls back to the row-major path.
+    pub fn matmulMColOpt(self: *const ChatKernels) ?*const pipeline.Kernel {
+        return if (self.matmul_q4k_mcol) |*km| km else null;
     }
 };
 
@@ -963,10 +982,15 @@ pub fn recordOneLayer(
     // a parameter. RMSNorm dispatches one workgroup per row.
     try runtime.recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, p.n_q * hidden);
     try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, p.n_q);
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, p.n_q, inter, hidden);
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, p.n_q, inter, hidden);
+    // n_q>1 prefers the column-major Q4_K matmul when available
+    // (M-amortized weight dequant — see runtime.recDispatchMatmulPreferMCol).
+    // For non-q4_k precisions the optional is null and we fall back
+    // to the row-major path automatically.
+    const mcol_opt = k.matmulMColOpt();
+    try runtime.recDispatchMatmulPreferMCol(rec, &k.matmul, mcol_opt, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, p.n_q, inter, hidden);
+    try runtime.recDispatchMatmulPreferMCol(rec, &k.matmul, mcol_opt, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, p.n_q, inter, hidden);
     try runtime.recDispatch1D(rec, &k.swiglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.swiglu_push, p.n_q * inter);
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, p.n_q, hidden, inter);
+    try runtime.recDispatchMatmulPreferMCol(rec, &k.matmul, mcol_opt, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, p.n_q, hidden, inter);
     try runtime.recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, p.n_q * hidden);
 }
 
@@ -1013,7 +1037,8 @@ pub fn recordFullAttnLayerBatched(
     const n_q_rows = p.n_q;
 
     // 1. Q-projection (2× wide if attn_output_gate). M = n_q.
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ x_norm_in, &layer.q_proj.?, &sc.q_gate }, n_q_rows, p.q_proj_rows, hidden);
+    const mcol_opt = k.matmulMColOpt();
+    try runtime.recDispatchMatmulPreferMCol(rec, &k.matmul, mcol_opt, &.{ x_norm_in, &layer.q_proj.?, &sc.q_gate }, n_q_rows, p.q_proj_rows, hidden);
 
     // 2. split_q_gate per row. The shader's per-element math is
     //    independent across rows, so we can dispatch
@@ -1028,8 +1053,8 @@ pub fn recordFullAttnLayerBatched(
     try runtime.recDispatch1D(rec, &k.split_q_gate, &.{ &sc.q_gate, &sc.q, &sc.gate_attn }, &split_push_batched, n_q_rows * p.q_dim);
 
     // 3. K and V projections. M = n_q.
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ x_norm_in, &layer.k_proj.?, &sc.k }, n_q_rows, p.kv_dim, hidden);
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ x_norm_in, &layer.v_proj.?, &sc.v }, n_q_rows, p.kv_dim, hidden);
+    try runtime.recDispatchMatmulPreferMCol(rec, &k.matmul, mcol_opt, &.{ x_norm_in, &layer.k_proj.?, &sc.k }, n_q_rows, p.kv_dim, hidden);
+    try runtime.recDispatchMatmulPreferMCol(rec, &k.matmul, mcol_opt, &.{ x_norm_in, &layer.v_proj.?, &sc.v }, n_q_rows, p.kv_dim, hidden);
 
     // 4. Per-head q_norm / k_norm — `n_q × n_heads` rows.
     try runtime.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.q, &layer.q_norm.?, &sc.q }, &p.qkn_push, n_q_rows * p.n_q_heads);
@@ -1067,7 +1092,7 @@ pub fn recordFullAttnLayerBatched(
     try runtime.recDispatch1D(rec, &k.sigmoid_mul, &.{ &sc.head_out, &sc.gate_attn, &sc.head_out_gated }, &sigmul_batched, n_q_rows * p.q_dim);
 
     // 9. o_proj — M = n_q.
-    try runtime.recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out_gated, &layer.o_proj.?, attn_out }, n_q_rows, hidden, p.q_dim);
+    try runtime.recDispatchMatmulPreferMCol(rec, &k.matmul, mcol_opt, &.{ &sc.head_out_gated, &layer.o_proj.?, attn_out }, n_q_rows, hidden, p.q_dim);
 }
 
 /// Record a single Gated-DeltaNet (linear-attention) layer's forward

@@ -771,6 +771,44 @@ pub fn recDispatchMatmul(
     try rec.dispatch(kern, bufs, &push, m * n, 1, 1);
 }
 
+/// `MAX_M` baked into `matmul_nt_v2_q4_k_mcol.comp`. The shader's
+/// per-thread `acc[MAX_M]` is a fixed array; pc.M ≤ MAX_M is the
+/// caller's job. MTP-verify at n_q=4 fits comfortably; batched
+/// chat prefill of typical chat-template prompts (>>8 tokens) does
+/// not — the dispatcher falls back to the row-major path for those.
+pub const Q4K_MCOL_MAX_M: u32 = 8;
+
+/// Q4_K-only column-major matmul fast path. When `k_mcol_opt` is
+/// non-null AND `m > 1` AND `m ≤ Q4K_MCOL_MAX_M`, dispatches the
+/// mcol variant (one WG per output column, weight dequant
+/// amortized across M activation rows). Otherwise falls back to
+/// `recDispatchMatmul`'s row-major kernel.
+///
+/// The mcol kernel is bit-numerics-equivalent to the row-major
+/// kernel at all valid M (parity-tested in
+/// `runGpuMatmulQ4_KMColSmoke`); for M=1 they're algorithmically
+/// identical anyway, so the dispatcher can safely route either
+/// way at M=1 — we keep the row-major path for M=1 because that's
+/// the path that's been battle-tested in production.
+pub fn recDispatchMatmulPreferMCol(
+    rec: *recorder.Recorder,
+    k_orig: *const pipeline.Kernel,
+    k_mcol_opt: ?*const pipeline.Kernel,
+    bufs: []const *const buffer.Buffer,
+    m: u32,
+    n: u32,
+    k: u32,
+) !void {
+    const push = MatmulPush{ .m = m, .n = n, .k = k };
+    if (m > 1 and m <= Q4K_MCOL_MAX_M) {
+        if (k_mcol_opt) |k_mcol| {
+            try rec.dispatch(k_mcol, bufs, &push, n, 1, 1);
+            return;
+        }
+    }
+    try rec.dispatch(k_orig, bufs, &push, m * n, 1, 1);
+}
+
 pub fn recDispatchRope(
     rec: *recorder.Recorder,
     kern: *const pipeline.Kernel,
