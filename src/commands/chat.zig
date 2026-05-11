@@ -181,6 +181,7 @@ pub fn runChat(
     batch_prompts: ?[]const PromptEntry,
     probe_prefix: ?[]const u8,
     max_new: usize,
+    max_pos_arg: u32,
     lora_ckpt: ?LoraCkpt,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
@@ -222,9 +223,11 @@ pub fn runChat(
         try stdout.print("  merge took {d:.0} ms\n", .{@as(f64, @floatFromInt(t_merge_end - t_merge_start)) / 1_000_000.0});
     }
 
-    // KV cache sized for a generous chat. 2048 positions ≈ 18 layers ×
-    // 2 (K + V) × 2048 × 256 × 4 bytes ≈ 72 MiB on disk space — fine.
-    const max_pos: usize = 2048;
+    // KV cache size. Caller-controlled via --max-pos; the 2048
+    // default ≈ 18 layers × 2 (K + V) × 2048 × 256 × 4 bytes
+    // ≈ 72 MiB for a Gemma-class shape. Cost scales linearly with
+    // max_pos; cap is whatever the GPU has free for K+V buffers.
+    const max_pos: usize = max_pos_arg;
     var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, max_pos);
     defer sc.deinit(ctx.device);
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
@@ -939,6 +942,7 @@ pub fn runChatQwen35(
     batch_prompts: ?[]const PromptEntry,
     probe_prefix: ?[]const u8,
     max_new: usize,
+    max_pos_arg: u32,
     mtp_options: MtpOptions,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
@@ -996,7 +1000,7 @@ pub fn runChatQwen35(
     }
     const tq4v_active = tq4v and (cfg.head_dim == 128 or cfg.head_dim == 256);
 
-    const max_pos: u32 = 2048;
+    const max_pos: u32 = max_pos_arg;
     // MTP-SpecDec verify dispatches `recordForwardStepBatched(n_q =
     // draft_n + 1)` — one anchor (main_tok) + k drafts. Scratch needs
     // `max_n_q ≥ draft_n + 1` when MTP is on. Plain decode stays at 1.

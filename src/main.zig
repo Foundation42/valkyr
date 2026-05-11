@@ -968,6 +968,11 @@ pub fn main() !void {
         var prompts_tsv: ?[]const u8 = null;
         var probe_prefix: ?[]const u8 = null;
         var max_new: usize = 256;
+        // KV-cache capacity (positions). The chat session can grow up
+        // to `max_pos - 64` tokens before refusing to extend (the 64
+        // is the safety margin in chat.zig). Larger values cost
+        // proportional GPU memory for K and V caches.
+        var max_pos: u32 = 2048;
         // ── --lora-ckpt fold-in. All four required together; the
         //    .lvkpt's cfg is checked against (targets, rank) at merge.
         var lora_path: ?[]const u8 = null;
@@ -1010,6 +1015,9 @@ pub fn main() !void {
                 i += 2;
             } else if (std.mem.eql(u8, a, "--max-new") and i + 1 < args.len) {
                 max_new = try std.fmt.parseInt(usize, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--max-pos") and i + 1 < args.len) {
+                max_pos = try std.fmt.parseInt(u32, args[i + 1], 10);
                 i += 2;
             } else if (std.mem.eql(u8, a, "--lora-ckpt") and i + 1 < args.len) {
                 lora_path = args[i + 1];
@@ -1111,13 +1119,13 @@ pub fn main() !void {
                 std.debug.print("--lora-ckpt is not yet supported on Qwen3.5-style hybrid models (q_proj is widened by attn_output_gate)\n", .{});
                 return;
             }
-            try commands_chat.runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, mtp_options);
+            try commands_chat.runChatQwen35(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, max_pos, mtp_options);
         } else {
             if (mtp_options.enabled) {
                 std.debug.print("--mtp is only supported on Qwen3.5/3.6 hybrid checkpoints (this model is {s})\n", .{@tagName(cfg.family)});
                 return;
             }
-            try commands_chat.runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, lora_ckpt);
+            try commands_chat.runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, max_pos, lora_ckpt);
         }
         return;
     }
