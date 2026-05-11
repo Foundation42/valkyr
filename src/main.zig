@@ -745,6 +745,7 @@ pub fn main() !void {
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--bench")) {
         var n: usize = 64;
         var tq4v: bool = false;
+        var ts: bool = false;
         var i: usize = 3;
         while (i < args.len) {
             if (std.mem.eql(u8, args[i], "--n") and i + 1 < args.len) {
@@ -753,13 +754,16 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, args[i], "--tq4v")) {
                 tq4v = true;
                 i += 1;
+            } else if (std.mem.eql(u8, args[i], "--ts")) {
+                ts = true;
+                i += 1;
             } else {
                 i += 1;
             }
         }
         const dir = try hf_cache.resolveModelArg(allocator, args[2]);
         defer allocator.free(dir);
-        try commands_bench.runBench(allocator, dir, n, tq4v);
+        try commands_bench.runBench(allocator, dir, n, tq4v, ts);
         return;
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--session-smoke")) {
