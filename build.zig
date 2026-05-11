@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
     const matmul_nt_v2_bf16_spv = compileShader(b, "matmul_nt_v2_bf16");
     const matmul_nt_v2_q4_0_spv = compileShader(b, "matmul_nt_v2_q4_0");
     const matmul_nt_v2_q4_k_spv = compileShader(b, "matmul_nt_v2_q4_k");
+    const matmul_nt_v2_q4_k_mcol_spv = compileShader(b, "matmul_nt_v2_q4_k_mcol");
     const rmsnorm_spv = compileShader(b, "rmsnorm");
     const rmsnorm_backward_spv = compileShader(b, "rmsnorm_backward");
     const layernorm_spv = compileShader(b, "layernorm");
@@ -153,6 +154,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matmul_nt_v2_bf16_spv, "matmul_nt_v2_bf16.spv");
     _ = wf.addCopyFile(matmul_nt_v2_q4_0_spv, "matmul_nt_v2_q4_0.spv");
     _ = wf.addCopyFile(matmul_nt_v2_q4_k_spv, "matmul_nt_v2_q4_k.spv");
+    _ = wf.addCopyFile(matmul_nt_v2_q4_k_mcol_spv, "matmul_nt_v2_q4_k_mcol.spv");
     _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
     _ = wf.addCopyFile(rmsnorm_backward_spv, "rmsnorm_backward.spv");
     _ = wf.addCopyFile(layernorm_spv, "layernorm.spv");
@@ -247,6 +249,7 @@ pub fn build(b: *std.Build) void {
         \\pub const matmul_nt_v2_bf16 align(4) = @embedFile("matmul_nt_v2_bf16.spv").*;
         \\pub const matmul_nt_v2_q4_0 align(4) = @embedFile("matmul_nt_v2_q4_0.spv").*;
         \\pub const matmul_nt_v2_q4_k align(4) = @embedFile("matmul_nt_v2_q4_k.spv").*;
+        \\pub const matmul_nt_v2_q4_k_mcol align(4) = @embedFile("matmul_nt_v2_q4_k_mcol.spv").*;
         \\pub const rmsnorm align(4) = @embedFile("rmsnorm.spv").*;
         \\pub const rmsnorm_backward align(4) = @embedFile("rmsnorm_backward.spv").*;
         \\pub const layernorm align(4) = @embedFile("layernorm.spv").*;

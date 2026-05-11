@@ -4148,6 +4148,235 @@ pub fn runGpuMatmulQ4_KSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print("PASS GPU matmul_nt_v2_q4_k (M={d} N={d} K={d}, max |Δ| vs CPU dequant = {e:.2})\n", .{ m, n, k, max_err });
 }
 
+// ── GPU q4_k matmul mcol parity: column-major variant ─────────────
+//
+// Verifies matmul_nt_v2_q4_k_mcol matches the CPU oracle at M=1
+// (must agree with the row-major shader bit-exactly modulo
+// reduction order) and at M=4 (the MTP-verify shape that motivated
+// this kernel). Two cases:
+//   (a) M=1 — should give identical results to the existing q4_k
+//       shader. Confirms the M-loop bookkeeping is correct.
+//   (b) M=4 — the case where M-amortization actually does work.
+//       Confirms each row's accumulator is independent.
+// K=512 (2 super-blocks) to exercise the inter-super-block boundary,
+// N=16 to keep the dispatch shape representative without ballooning
+// the smoke runtime.
+
+pub fn runGpuMatmulQ4_KMColSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const SmokeCase = struct {
+        name: []const u8,
+        m: u32,
+    };
+    const cases = [_]SmokeCase{
+        .{ .name = "M=1 (matches single-row path)", .m = 1 },
+        .{ .name = "M=4 (MTP-verify shape)", .m = 4 },
+        .{ .name = "M=8 (MAX_M boundary)", .m = 8 },
+    };
+
+    const n: u32 = 16;
+    const k: u32 = @intCast(q4_k.QK_K * 2); // 512 — 2 super-blocks
+
+    // One kernel + buffers reused across cases. M varies via push.
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_k_mcol, 3, @sizeOf(aliases.MatmulPush));
+    defer kern.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xD0DEC0DEFEED);
+    const r = prng.random();
+
+    const supers_per_row = k / q4_k.QK_K;
+    const total_supers = n * supers_per_row;
+    const b_f32 = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_f32);
+    for (b_f32) |*v| v.* = r.floatNorm(f32);
+    const b_blocks = try allocator.alloc(q4_k.Block, total_supers);
+    defer allocator.free(b_blocks);
+    for (0..n) |row| {
+        const src_row = b_f32[row * k .. (row + 1) * k];
+        const dst_row = b_blocks[row * supers_per_row .. (row + 1) * supers_per_row];
+        q4_k.quantizeRow(src_row, dst_row);
+    }
+    const b_deq = try allocator.alloc(f32, n * k);
+    defer allocator.free(b_deq);
+    for (0..n) |row| {
+        const src_row = b_blocks[row * supers_per_row .. (row + 1) * supers_per_row];
+        const dst_row = b_deq[row * k .. (row + 1) * k];
+        q4_k.dequantizeRow(src_row, dst_row);
+    }
+    const b_packed = try allocator.alloc(u32, total_supers * q4_k.GPU_U32S_PER_SUPERBLOCK);
+    defer allocator.free(b_packed);
+    q4_k.packForGpu(b_blocks, b_packed);
+
+    var buf_b = try buffer.Buffer.initStatic(&ctx, u32, b_packed);
+    defer buf_b.deinit(ctx.device);
+
+    for (cases) |cs| {
+        const m = cs.m;
+        const a_f32 = try allocator.alloc(f32, m * k);
+        defer allocator.free(a_f32);
+        for (a_f32) |*v| v.* = r.floatNorm(f32);
+
+        // CPU oracle on the dequantized weights — same path the
+        // existing q4_k smoke uses.
+        const want = try allocator.alloc(f32, m * n);
+        defer allocator.free(want);
+        for (0..m) |i| for (0..n) |j| {
+            var s: f64 = 0;
+            for (0..k) |kk| s += @as(f64, a_f32[i * k + kk]) * @as(f64, b_deq[j * k + kk]);
+            want[i * n + j] = @floatCast(s);
+        };
+
+        var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a_f32);
+        defer buf_a.deinit(ctx.device);
+        var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, m * n * @sizeOf(f32));
+        defer buf_c.deinit(ctx.device);
+        try kern.bind(&.{ &buf_a, &buf_b, &buf_c });
+
+        // One WG per N column — that's the whole point.
+        const groups: u32 = n;
+        const push = aliases.MatmulPush{ .m = m, .n = n, .k = k };
+        try buffer.submitOneShot(&ctx, struct {
+            kern: *const pipeline.Kernel,
+            push: *const aliases.MatmulPush,
+            gx: u32,
+            pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+                s.kern.dispatch(cmd, s.push, s.gx, 1, 1);
+            }
+        }{ .kern = &kern, .push = &push, .gx = groups });
+
+        const got = try allocator.alloc(f32, m * n);
+        defer allocator.free(got);
+        try buf_c.readBack(&ctx, f32, got);
+
+        var max_err: f32 = 0;
+        for (got, want) |g, w| max_err = @max(max_err, @abs(g - w));
+        if (max_err > 1e-2) {
+            std.debug.print("FAIL q4_k_mcol case '{s}': max |Δ| = {e}\n", .{ cs.name, max_err });
+            for (0..m * n) |idx| std.debug.print("  cell {d}: got {d:.5}, want {d:.5}\n", .{ idx, got[idx], want[idx] });
+            return error.ParityFailed;
+        }
+        std.debug.print("PASS GPU matmul_nt_v2_q4_k_mcol {s} (M={d} N={d} K={d}, max |Δ| vs CPU dequant = {e:.2})\n", .{ cs.name, m, n, k, max_err });
+    }
+}
+
+// ── GPU q4_k matmul microbench: original vs mcol at MTP shape ──────
+//
+// Times matmul_nt_v2_q4_k vs matmul_nt_v2_q4_k_mcol at M=4 N=4096
+// K=4096 — the rough MTP-verify shape on Qwen3.5-4B Q4_K_M. Confirms
+// the M-amortization claim before any production-path wiring: if
+// the speedup isn't close to M=4 (within reach of the
+// bandwidth-bound ceiling), the kernel design is wrong and we
+// should fix that BEFORE plumbing it into runtime.recordOneLayer
+// or the MTP verify path.
+//
+// Both variants batch n_iter dispatches into one cmd buffer + one
+// submit so submit overhead is amortized out — the measured delta
+// is GPU work, not driver bookkeeping. Buf_c is written by every
+// dispatch, so the recorder's auto-barriers serialise execution.
+
+pub fn runQ4KMColBench(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const stdout = std.io.getStdOut().writer();
+    const M: u32 = 4;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+    const n_iter: u32 = 64;
+    const n_warmup: u32 = 8;
+
+    try stdout.print("Q4_K matmul microbench M={d} N={d} K={d} on {s}\n", .{ M, N, K, ctx.deviceName() });
+
+    var prng = std.Random.DefaultPrng.init(0xC01_DEAD_C0DE);
+    const r = prng.random();
+
+    const a_f32 = try allocator.alloc(f32, M * K);
+    defer allocator.free(a_f32);
+    for (a_f32) |*v| v.* = r.floatNorm(f32);
+
+    const b_f32 = try allocator.alloc(f32, N * K);
+    defer allocator.free(b_f32);
+    for (b_f32) |*v| v.* = r.floatNorm(f32);
+
+    const supers_per_row = K / q4_k.QK_K;
+    const total_supers = N * supers_per_row;
+    const b_blocks = try allocator.alloc(q4_k.Block, total_supers);
+    defer allocator.free(b_blocks);
+    for (0..N) |row| {
+        const src_row = b_f32[row * K .. (row + 1) * K];
+        const dst_row = b_blocks[row * supers_per_row .. (row + 1) * supers_per_row];
+        q4_k.quantizeRow(src_row, dst_row);
+    }
+    const b_packed = try allocator.alloc(u32, total_supers * q4_k.GPU_U32S_PER_SUPERBLOCK);
+    defer allocator.free(b_packed);
+    q4_k.packForGpu(b_blocks, b_packed);
+
+    var buf_a = try buffer.Buffer.initStatic(&ctx, f32, a_f32);
+    defer buf_a.deinit(ctx.device);
+    var buf_b = try buffer.Buffer.initStatic(&ctx, u32, b_packed);
+    defer buf_b.deinit(ctx.device);
+    var buf_c = try buffer.Buffer.initDeviceOnly(&ctx, M * N * @sizeOf(f32));
+    defer buf_c.deinit(ctx.device);
+
+    var k_orig = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_k, 3, @sizeOf(aliases.MatmulPush));
+    defer k_orig.deinit();
+    var k_mcol = try pipeline.Kernel.init(&ctx, &shaders.matmul_nt_v2_q4_k_mcol, 3, @sizeOf(aliases.MatmulPush));
+    defer k_mcol.deinit();
+
+    const push = aliases.MatmulPush{ .m = M, .n = N, .k = K };
+    const rec_cap: u32 = n_iter + 16;
+
+    var rec = try gpu_recorder.Recorder.init(&ctx, rec_cap, rec_cap * 4);
+    defer rec.deinit();
+
+    // ── Warmup (orig) ──────────────────────────────────────────
+    try rec.reset();
+    try rec.begin();
+    for (0..n_warmup) |_| {
+        try rec.dispatch(&k_orig, &.{ &buf_a, &buf_b, &buf_c }, &push, M * N, 1, 1);
+    }
+    try rec.endAndSubmit();
+
+    // ── Time orig ──────────────────────────────────────────────
+    try rec.reset();
+    try rec.begin();
+    for (0..n_iter) |_| {
+        try rec.dispatch(&k_orig, &.{ &buf_a, &buf_b, &buf_c }, &push, M * N, 1, 1);
+    }
+    const t0o = std.time.nanoTimestamp();
+    try rec.endAndSubmit();
+    const t1o = std.time.nanoTimestamp();
+    const orig_total_ns = @as(f64, @floatFromInt(t1o - t0o));
+    const orig_per_call_us = orig_total_ns / @as(f64, @floatFromInt(n_iter)) / 1000.0;
+
+    // ── Warmup (mcol) ──────────────────────────────────────────
+    try rec.reset();
+    try rec.begin();
+    for (0..n_warmup) |_| {
+        try rec.dispatch(&k_mcol, &.{ &buf_a, &buf_b, &buf_c }, &push, N, 1, 1);
+    }
+    try rec.endAndSubmit();
+
+    // ── Time mcol ──────────────────────────────────────────────
+    try rec.reset();
+    try rec.begin();
+    for (0..n_iter) |_| {
+        try rec.dispatch(&k_mcol, &.{ &buf_a, &buf_b, &buf_c }, &push, N, 1, 1);
+    }
+    const t0m = std.time.nanoTimestamp();
+    try rec.endAndSubmit();
+    const t1m = std.time.nanoTimestamp();
+    const mcol_total_ns = @as(f64, @floatFromInt(t1m - t0m));
+    const mcol_per_call_us = mcol_total_ns / @as(f64, @floatFromInt(n_iter)) / 1000.0;
+
+    const speedup = orig_per_call_us / mcol_per_call_us;
+    try stdout.print("  original (M*N={d} WGs/call) : {d:>8.1} us/call ({d} iters)\n", .{ M * N, orig_per_call_us, n_iter });
+    try stdout.print("  mcol     (N={d} WGs/call)   : {d:>8.1} us/call ({d} iters)\n", .{ N, mcol_per_call_us, n_iter });
+    try stdout.print("  speedup: {d:.2}x  (theoretical ceiling at M={d} is ~{d}x if pure-bandwidth-bound)\n", .{ speedup, M, M });
+}
+
 // ── gpu rmsnorm smoke: synthetic vs CPU rmsnorm ────────────────────
 
 pub fn runGpuRmsnormSmoke(allocator: std.mem.Allocator) !void {

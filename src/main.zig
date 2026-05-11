@@ -504,6 +504,15 @@ pub fn main() !void {
         try smoke_gpu_train.runGpuLoraSmoke(allocator);
         return;
     }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--q4k-mcol-bench")) {
+        // Q4_K matmul M-amortization microbench. Times the existing
+        // matmul_nt_v2_q4_k (one WG per output cell, M*N WGs) vs
+        // the new matmul_nt_v2_q4_k_mcol (one WG per column, N WGs)
+        // at the MTP-verify shape M=4 N=4096 K=4096. Sanity-checks
+        // the perf claim before any runtime wiring.
+        try smoke_gpu_train.runQ4KMColBench(allocator);
+        return;
+    }
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--recorder-timestamp-smoke")) {
         // Per-dispatch GPU timing infrastructure. Records a small
         // chain of add_in_place dispatches with vkCmdWriteTimestamp
@@ -1166,6 +1175,7 @@ pub fn main() !void {
     try smoke_gpu_train.runEmbeddedRecorderSmoke(allocator);
     try smoke_gpu_train.runGpuMatmulQ4_0Smoke(allocator);
     try smoke_gpu_train.runGpuMatmulQ4_KSmoke(allocator);
+    try smoke_gpu_train.runGpuMatmulQ4_KMColSmoke(allocator);
     try smoke_gpu_train.runGpuRmsnormSmoke(allocator);
     try smoke_gpu_train.runGpuRmsnormBackwardSmoke(allocator);
     try smoke_gpu_train.runGpuLayerNormSmoke(allocator);

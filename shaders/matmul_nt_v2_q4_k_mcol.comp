@@ -1,0 +1,154 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic      : require
+
+// Column-major variant of matmul_nt_v2_q4_k. Amortizes Q4_K weight
+// dequant across M activation rows.
+//
+// matmul_nt_v2_q4_k dispatches one WG per output cell (i, j). For
+// M=1 that's fine; for M>1 every WG re-reads + re-dequantizes the
+// SAME B-column. On Q4_K_M (weight-bandwidth-bound) this turns
+// M=4 into a 4× dequant cost — the MTP-verify path lost +20%
+// predicted to a -38% measured because of exactly this.
+//
+// This kernel dispatches one WG per output column j (across all M
+// rows). Each K-chunk reads & decodes the B-column once and applies
+// the 8 weight values against all M activation rows in registers.
+// Total dequant work scales with N, not M*N — the M=1 cost stays
+// identical, every additional row is essentially free until we hit
+// the activation-bandwidth ceiling on A.
+//
+// MAX_M is compile-time and caps the per-thread accumulator array.
+// Callers MUST guarantee pc.M ≤ MAX_M; we don't shader-side-guard
+// (early-exit would leave outputs undefined, worse than a clear
+// caller-side error). For MTP verify (n_q=4) and small batched
+// prefill MAX_M=8 is the sweet spot.
+//
+// Per-element math is unchanged from matmul_nt_v2_q4_k.comp — see
+// that shader for the Q4_K layout + factored MAC explanation. The
+// only delta is the outer/inner loop swap.
+
+#ifndef MAX_M
+#define MAX_M 8
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A    { vec4 a4[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Bq4k { uint b_pack[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C    { float c[]; };
+
+layout(push_constant) uniform Pc {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+// Per-row × per-subgroup partial. Local WG has 128 threads / 32-lane
+// subgroup = 4 subgroups on Nvidia (2 on AMD's 64-lane wave). Pad to
+// 32 slots per row so the layout doesn't depend on subgroup width.
+shared float sg_partials[MAX_M * 32];
+
+const uint U32S_PER_SUPER = 36u;
+
+void main() {
+    uint j = gl_WorkGroupID.x;
+    if (j >= pc.N) return;
+
+    uint b_off_supers = j * (pc.K >> 8u);
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc[MAX_M];
+    for (uint m = 0u; m < uint(MAX_M); ++m) acc[m] = 0.0;
+
+    for (uint k = tid * 8u; k < pc.K; k += gl_WorkGroupSize.x * 8u) {
+        // ── Dequant 8 weights of B-column j at offset k ─────────────
+        uint super_idx   = b_off_supers + (k >> 8u);
+        uint base        = super_idx * U32S_PER_SUPER;
+        uint pos         = k & 255u;
+        uint sub_idx     = pos >> 5u;
+        uint elem_in_sub = pos & 31u;
+
+        vec2 d_dmin = unpackHalf2x16(b_pack[base]);
+        float d    = d_dmin.x;
+        float dmin = d_dmin.y;
+
+        uint sc, m_bias;
+        if (sub_idx < 4u) {
+            uint b_j   = (b_pack[base + 1u] >> (sub_idx * 8u)) & 0xFFu;
+            uint b_jp4 = (b_pack[base + 2u] >> (sub_idx * 8u)) & 0xFFu;
+            sc = b_j   & 63u;
+            m_bias = b_jp4 & 63u;
+        } else {
+            uint local = sub_idx - 4u;
+            uint b_jp4 = (b_pack[base + 3u] >> (local * 8u)) & 0xFFu;
+            uint b_jm4 = (b_pack[base + 1u] >> (local * 8u)) & 0xFFu;
+            uint b_j   = (b_pack[base + 2u] >> (local * 8u)) & 0xFFu;
+            sc = (b_jp4 & 0xFu) | ((b_jm4 >> 6u) << 4u);
+            m_bias = (b_jp4 >> 4u)  | ((b_j   >> 6u) << 4u);
+        }
+        float d_eff = d * float(sc);
+        float m_eff = dmin * float(m_bias);
+
+        uint pair    = sub_idx >> 1u;
+        uint which   = sub_idx & 1u;
+        uint qs_byte = pair * 32u + elem_in_sub;
+        uint qs_word = base + 4u + (qs_byte >> 2u);
+        uint w0 = b_pack[qs_word];
+        uint w1 = b_pack[qs_word + 1u];
+
+        uint shift = which * 4u;
+        vec4 q0123 = vec4(
+            float((w0 >> (0u  + shift)) & 0xFu),
+            float((w0 >> (8u  + shift)) & 0xFu),
+            float((w0 >> (16u + shift)) & 0xFu),
+            float((w0 >> (24u + shift)) & 0xFu)
+        );
+        vec4 q4567 = vec4(
+            float((w1 >> (0u  + shift)) & 0xFu),
+            float((w1 >> (8u  + shift)) & 0xFu),
+            float((w1 >> (16u + shift)) & 0xFu),
+            float((w1 >> (24u + shift)) & 0xFu)
+        );
+
+        // ── MAC against each of the M activation rows ──────────────
+        // Loop bound is runtime pc.M, capped by MAX_M. GLSL spec
+        // allows the compiler to unroll bounded loops; with MAX_M=8
+        // and a small constant ceiling on iteration count the
+        // optimizer typically unrolls fully when it can prove M ≤ N.
+        for (uint m = 0u; m < pc.M; ++m) {
+            uint a_off = m * pc.K;
+            vec4 av0 = a4[(a_off + k     ) >> 2];
+            vec4 av1 = a4[(a_off + k + 4u) >> 2];
+            float qsum = dot(av0, q0123) + dot(av1, q4567);
+            float asum = av0.x + av0.y + av0.z + av0.w
+                       + av1.x + av1.y + av1.z + av1.w;
+            acc[m] += d_eff * qsum - m_eff * asum;
+        }
+    }
+
+    // ── Per-row subgroup reduction → shared → final reduction ─────
+    // For each m we do a two-stage reduction identical to the
+    // single-row shader: subgroupAdd into the leader, leader writes
+    // to shared, then subgroup-0 reduces across the per-subgroup
+    // partials. We pay per-row barrier cost ONCE (one barrier()
+    // serves all rows since shared writes complete before the
+    // barrier).
+    for (uint m = 0u; m < pc.M; ++m) {
+        float sg_sum = subgroupAdd(acc[m]);
+        if (subgroupElect()) sg_partials[m * 32u + gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        for (uint m = 0u; m < pc.M; ++m) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                        ? sg_partials[m * 32u + gl_SubgroupInvocationID]
+                        : 0.0;
+            float total = subgroupAdd(v);
+            if (subgroupElect()) {
+                c[m * pc.N + j] = total;
+            }
+        }
+    }
+}
