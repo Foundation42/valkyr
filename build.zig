@@ -1,8 +1,28 @@
 const std = @import("std");
 
+// Mirrors the active build mode for the duration of `build()`. Set
+// from `b.standardOptimizeOption()` and read by `compileShaderD` to
+// pick glslc's -O flag. File-scope rather than threaded through 96
+// `compileShader` call sites — build scripts are single-threaded so
+// this is safe; the alternative would have been a sprawling
+// signature change. Default is "-O0" so a stray call before
+// `build()` would still produce a correct (if slow) shader.
+var g_glslc_opt: []const u8 = "-O0";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // glslc -O0 = no optimisation (default); -O = perf optimisation
+    // (runs spirv-opt's performance pass list — constant folding,
+    // inlining, loop unrolling, dead-code elimination, redundant
+    // load/store removal). For ReleaseSmall we'd want -Os; we don't
+    // currently ship that mode for shaders since smaller SPIR-V
+    // doesn't translate to smaller GPU machine code.
+    g_glslc_opt = switch (optimize) {
+        .Debug => "-O0",
+        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => "-O",
+    };
 
     // ── Compile GLSL → SPIR-V ──
     // Each .comp gets -I shaders/ so it can #include common.glsl. -MD/-MF
@@ -387,7 +407,7 @@ fn compileShaderD(b: *std.Build, src_name: []const u8, out_name: []const u8, def
     const src = b.fmt("shaders/{s}.comp", .{src_name});
     const spv = b.fmt("{s}.spv", .{out_name});
     const dep = b.fmt("{s}.d", .{out_name});
-    const cmd = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.3" });
+    const cmd = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.3", g_glslc_opt });
     cmd.addArg("-I");
     cmd.addDirectoryArg(b.path("shaders"));
     for (defines) |def| {
