@@ -2,6 +2,14 @@
 //! once, autoregressively decodes greedy from BOS for N steps, and
 //! reports cold step + warm mean/median/min/max/p99/throughput, plus
 //! early-vs-late position-dependent cost. Extracted from main.zig.
+//!
+//! Dense families (Gemma / Llama / Mistral / Qwen3) run on the
+//! `runtime.zig` stack; hybrid families (Qwen3.5 / Qwen3.6 Gated
+//! DeltaNet) run on the `runtime_hybrid.zig` stack. The timing loop
+//! and all the stats/timestamp reporting are backend-agnostic — only
+//! the per-step record call and the scratch/state objects differ, so
+//! both go through `timeDecode(backend, ...)` with a duck-typed
+//! `backend.recordStep` / `backend.readLogits`.
 
 const std = @import("std");
 const vk = @import("../gpu/vk.zig");
@@ -10,9 +18,119 @@ const gpu_model = @import("../gpu/model.zig");
 const gpu_scratch = @import("../gpu/scratch.zig");
 const gpu_recorder = @import("../gpu/recorder.zig");
 const pipeline = @import("../gpu/pipeline.zig");
+const config_mod = @import("../config.zig");
 const runtime = @import("../runtime.zig");
+const runtime_hybrid = @import("../runtime_hybrid.zig");
 const cpu_forward = @import("../cpu/forward.zig");
 const shaders = @import("shaders");
+
+/// Warm-step timestamp accumulators returned by `timeDecode`. Per-step
+/// scalars are summed across warm steps; the per-dispatch arrays
+/// (`ts_sum_ns` / `ts_gap_sum_ns`) are filled in place by `timeDecode`.
+const TsAccum = struct {
+    n_dispatched: u32 = 0,
+    warm_count: u32 = 0,
+    total_dispatch_ns: f64 = 0,
+    total_gap_ns: f64 = 0,
+};
+
+/// Dense backend (runtime.zig): full-attention every layer.
+const DenseBackend = struct {
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: *const runtime.ChatKernels,
+    tq4: ?runtime.Tq4VHooks,
+
+    fn recordStep(self: @This(), rec: *gpu_recorder.Recorder, pos: usize, token: u32) !void {
+        try runtime.recordForwardStep(rec, self.sc, self.gm, self.kv, self.cfg, self.k, pos, token, self.tq4, true);
+    }
+    fn readLogits(self: @This(), ctx: *const vk.Context, out: []f32) !void {
+        try self.sc.logits.readBack(ctx, f32, out);
+    }
+};
+
+/// Hybrid backend (runtime_hybrid.zig): per-layer dispatch branches on
+/// `layer_type` (Gated DeltaNet linear-attention vs full-attention).
+/// Carries the SSM `State` the dense path has no equivalent for.
+const HybridBackend = struct {
+    sc: *const runtime_hybrid.Scratch,
+    gm: *const gpu_model.GpuModel,
+    state: *const runtime_hybrid.State,
+    cfg: config_mod.Config,
+    k: *const runtime_hybrid.ChatKernels,
+    max_pos: u32,
+
+    fn recordStep(self: @This(), rec: *gpu_recorder.Recorder, pos: usize, token: u32) !void {
+        try runtime_hybrid.recordForwardStep(rec, self.sc, self.state, self.gm, self.cfg, self.k, pos, token, self.max_pos, null, true);
+    }
+    fn readLogits(self: @This(), ctx: *const vk.Context, out: []f32) !void {
+        try self.sc.logits.readBack(ctx, f32, out);
+    }
+};
+
+/// Decode `n_steps` greedy tokens from `bos`, timing each forward.
+/// Position 0 uses bos; subsequent steps feed back the argmax (a real
+/// autoregressive run, not a fixed-input microbenchmark). Fills
+/// `samples` (wall ms/step) and, when `ts_enabled`, the per-dispatch
+/// `ts_sum_ns` / `ts_gap_sum_ns` arrays; returns warm-step sums.
+fn timeDecode(
+    backend: anytype,
+    ctx: *const vk.Context,
+    rec: *gpu_recorder.Recorder,
+    n_steps: usize,
+    samples: []f64,
+    bos: u32,
+    logits: []f32,
+    ts_enabled: bool,
+    ts_tick_buf: []u64,
+    ts_sum_ns: []f64,
+    ts_gap_sum_ns: []f64,
+) !TsAccum {
+    var acc = TsAccum{};
+    var current: u32 = bos;
+    for (0..n_steps) |step| {
+        if (step > 0) try rec.reset();
+        try rec.begin();
+        try backend.recordStep(rec, step, current);
+        const t0 = std.time.nanoTimestamp();
+        try rec.endAndSubmit();
+        const t1 = std.time.nanoTimestamp();
+        samples[step] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+
+        if (ts_enabled and step >= 1) {
+            const ticks = try rec.lastTimestamps(ts_tick_buf);
+            const n_disp: u32 = @intCast(ticks.len / 2);
+            acc.n_dispatched = n_disp;
+            const period = rec.nsPerTick();
+            var step_dispatch_ns: f64 = 0;
+            var step_gap_ns: f64 = 0;
+            var prev_end: u64 = 0;
+            var d: u32 = 0;
+            while (d < n_disp) : (d += 1) {
+                const start = ticks[2 * d];
+                const end = ticks[2 * d + 1];
+                const dur_ns = @as(f64, @floatFromInt(end -% start)) * period;
+                ts_sum_ns[d] += dur_ns;
+                step_dispatch_ns += dur_ns;
+                if (d > 0) {
+                    const gap_ns = @as(f64, @floatFromInt(start -% prev_end)) * period;
+                    ts_gap_sum_ns[d] += gap_ns;
+                    step_gap_ns += gap_ns;
+                }
+                prev_end = end;
+            }
+            acc.total_dispatch_ns += step_dispatch_ns;
+            acc.total_gap_ns += step_gap_ns;
+            acc.warm_count += 1;
+        }
+
+        try backend.readLogits(ctx, logits);
+        current = @intCast(cpu_forward.argmax(logits));
+    }
+    return acc;
+}
 
 pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq4v: bool, ts: bool) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
@@ -24,8 +142,8 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    try stdout.print("model: {s}    layers={d}  hidden={d}  vocab={d}\n", .{
-        @tagName(cfg.family), cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size,
+    try stdout.print("model: {s}    layers={d}  hidden={d}  vocab={d}  hybrid={}\n", .{
+        @tagName(cfg.family), cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, cfg.family.isHybrid(),
     });
 
     const t_up0 = std.time.nanoTimestamp();
@@ -36,50 +154,13 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
     try stdout.print("upload (bf16 matmul): {d:.0} ms\n\n", .{upload_ms});
 
     const max_pos: usize = @max(n_steps + 16, 128);
-    var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, max_pos);
-    defer sc.deinit(ctx.device);
-    var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
-    defer kv.deinit(ctx.device);
 
-    var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
-    defer k.deinit();
-
-    // Optional TQ4-V cache (asymmetric K=fp / V=TQ4). Mirrors the chat
-    // command's setup — only allocated when --tq4v was passed. The fp32
-    // kv buffer above is still used for K; we just substitute the V path.
-    var kv_tq4 = if (tq4v)
-        try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos)
-    else
-        null;
-    defer if (kv_tq4) |*c| c.deinit(ctx.device);
-    const tq_pack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
-        &shaders.tq4_pack_to_cache128
-    else
-        &shaders.tq4_pack_to_cache;
-    const tq_unpack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
-        &shaders.tq4_unpack128
-    else
-        &shaders.tq4_unpack256;
-    var tq_pack: ?pipeline.Kernel = if (tq4v)
-        try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(runtime.Tq4PackPush))
-    else
-        null;
-    defer if (tq_pack) |*kk| kk.deinit();
-    var tq_unpack: ?pipeline.Kernel = if (tq4v)
-        try pipeline.Kernel.init(&ctx, tq_unpack_spv, 2, 0)
-    else
-        null;
-    defer if (tq_unpack) |*kk| kk.deinit();
-    const tq4_hooks: ?runtime.Tq4VHooks = if (tq4v)
-        runtime.Tq4VHooks{ .pack = &tq_pack.?, .unpack = &tq_unpack.?, .cache = &kv_tq4.? }
-    else
-        null;
-    if (tq4v) try stdout.print("kv: K=fp32 V=TQ4 (asymmetric)\n", .{});
-
-    // Big enough for Qwen3-0.6B / Gemma 2B chat-decode chains — both
-    // sit comfortably under 1k dispatches per step. The original 512
-    // worked when descriptors were silently over-allocated by the
-    // driver, but the timestamp pool enforces the cap strictly.
+    // ── Shared scaffolding (backend-agnostic) ──────────────────────
+    // Big enough for Qwen3-0.6B / Gemma 2B chat-decode chains and the
+    // Qwen3.5 hybrid chain (~480 dispatches/step) — all sit under 1k.
+    // The original 512 worked when descriptors were silently over-
+    // allocated by the driver, but the timestamp pool enforces the
+    // cap strictly.
     const rec_cap: u32 = 2048;
     var rec = try gpu_recorder.Recorder.init(&ctx, rec_cap, rec_cap * 4);
     defer rec.deinit();
@@ -110,12 +191,8 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
         break :tok_bos 2;
     };
 
-    // Time each forward, advancing position each step. Position 0 uses
-    // bos; subsequent steps feed back the argmax (a real autoregressive
-    // greedy run, not a microbenchmark on a fixed input).
     const samples = try gpa.alloc(f64, n_steps);
     defer gpa.free(samples);
-    var current: u32 = bos;
 
     // Per-dispatch-index accumulators (warm steps only — step 0 is
     // cold and excluded from the breakdown). Indices line up with the
@@ -129,56 +206,91 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
     defer gpa.free(ts_gap_sum_ns);
     @memset(ts_sum_ns, 0);
     @memset(ts_gap_sum_ns, 0);
-    var ts_warm_count: u32 = 0;
-    var ts_n_dispatched: u32 = 0;
     // Heap-allocated to match rec_cap (2*rec_cap u64s, ~32 KiB) —
     // safer than a fixed stack buffer if rec_cap ever grows.
     const ts_tick_buf = try gpa.alloc(u64, 2 * rec_cap);
     defer gpa.free(ts_tick_buf);
-    var ts_total_dispatch_ns: f64 = 0;
-    var ts_total_gap_ns: f64 = 0;
 
-    for (0..n_steps) |step| {
-        if (step > 0) try rec.reset();
-        try rec.begin();
-        try runtime.recordForwardStep(&rec, &sc, &gm, &kv, cfg, &k, step, current, tq4_hooks, true);
-        const t0 = std.time.nanoTimestamp();
-        try rec.endAndSubmit();
-        const t1 = std.time.nanoTimestamp();
-        samples[step] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+    // ── Backend-specific setup + timing loop ───────────────────────
+    var acc: TsAccum = .{};
+    if (cfg.family.isHybrid()) {
+        if (tq4v) try stdout.print("note: --tq4v not yet wired into --bench for hybrid models; benching bf16 V-cache\n", .{});
 
-        if (ts_enabled and step >= 1) {
-            const ticks = try rec.lastTimestamps(ts_tick_buf);
-            const n_disp: u32 = @intCast(ticks.len / 2);
-            ts_n_dispatched = n_disp;
-            const period = rec.nsPerTick();
-            var step_dispatch_ns: f64 = 0;
-            var step_gap_ns: f64 = 0;
-            var prev_end: u64 = 0;
-            var d: u32 = 0;
-            while (d < n_disp) : (d += 1) {
-                const start = ticks[2 * d];
-                const end = ticks[2 * d + 1];
-                const dur_ns = @as(f64, @floatFromInt(end -% start)) * period;
-                ts_sum_ns[d] += dur_ns;
-                step_dispatch_ns += dur_ns;
-                if (d > 0) {
-                    const gap_ns = @as(f64, @floatFromInt(start -% prev_end)) * period;
-                    ts_gap_sum_ns[d] += gap_ns;
-                    step_gap_ns += gap_ns;
-                }
-                prev_end = end;
-            }
-            ts_total_dispatch_ns += step_dispatch_ns;
-            ts_total_gap_ns += step_gap_ns;
-            ts_warm_count += 1;
-        }
+        var k = try runtime_hybrid.ChatKernels.init(&ctx, gm.precision, @intCast(cfg.head_dim));
+        defer k.deinit();
+        var sc = try runtime_hybrid.Scratch.init(&ctx, cfg, @intCast(max_pos), 1, false);
+        defer sc.deinit(ctx.device);
+        var state = try runtime_hybrid.State.init(gpa, &ctx, cfg, @intCast(max_pos), false);
+        defer state.deinit(ctx.device);
+        // Gated DeltaNet recurrent/conv state must start zeroed for a
+        // fresh autoregressive run (unlike the dense KV cache, which is
+        // written fresh per position).
+        try state.reset(&ctx);
 
-        try sc.logits.readBack(&ctx, f32, logits);
-        current = @intCast(cpu_forward.argmax(logits));
+        const backend = HybridBackend{
+            .sc = &sc,
+            .gm = &gm,
+            .state = &state,
+            .cfg = cfg,
+            .k = &k,
+            .max_pos = @intCast(max_pos),
+        };
+        acc = try timeDecode(backend, &ctx, &rec, n_steps, samples, bos, logits, ts_enabled, ts_tick_buf, ts_sum_ns, ts_gap_sum_ns);
+    } else {
+        var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, max_pos);
+        defer sc.deinit(ctx.device);
+        var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
+        defer kv.deinit(ctx.device);
+
+        var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
+        defer k.deinit();
+
+        // Optional TQ4-V cache (asymmetric K=fp / V=TQ4). Mirrors the
+        // chat command's setup — only allocated when --tq4v was passed.
+        // The fp32 kv buffer above is still used for K; we just
+        // substitute the V path.
+        var kv_tq4 = if (tq4v)
+            try gpu_scratch.GpuKvCacheTq4.init(gpa, &ctx, cfg, max_pos)
+        else
+            null;
+        defer if (kv_tq4) |*c| c.deinit(ctx.device);
+        const tq_pack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+            &shaders.tq4_pack_to_cache128
+        else
+            &shaders.tq4_pack_to_cache;
+        const tq_unpack_spv: []align(4) const u8 = if (cfg.head_dim == 128)
+            &shaders.tq4_unpack128
+        else
+            &shaders.tq4_unpack256;
+        var tq_pack: ?pipeline.Kernel = if (tq4v)
+            try pipeline.Kernel.init(&ctx, tq_pack_spv, 2, @sizeOf(runtime.Tq4PackPush))
+        else
+            null;
+        defer if (tq_pack) |*kk| kk.deinit();
+        var tq_unpack: ?pipeline.Kernel = if (tq4v)
+            try pipeline.Kernel.init(&ctx, tq_unpack_spv, 2, 0)
+        else
+            null;
+        defer if (tq_unpack) |*kk| kk.deinit();
+        const tq4_hooks: ?runtime.Tq4VHooks = if (tq4v)
+            runtime.Tq4VHooks{ .pack = &tq_pack.?, .unpack = &tq_unpack.?, .cache = &kv_tq4.? }
+        else
+            null;
+        if (tq4v) try stdout.print("kv: K=fp32 V=TQ4 (asymmetric)\n", .{});
+
+        const backend = DenseBackend{
+            .sc = &sc,
+            .gm = &gm,
+            .kv = &kv,
+            .cfg = cfg,
+            .k = &k,
+            .tq4 = tq4_hooks,
+        };
+        acc = try timeDecode(backend, &ctx, &rec, n_steps, samples, bos, logits, ts_enabled, ts_tick_buf, ts_sum_ns, ts_gap_sum_ns);
     }
 
-    // Stats. The first sample is the cold one (pipeline compile + cold
+    // ── Stats (backend-agnostic) ───────────────────────────────────
+    // The first sample is the cold one (pipeline compile + cold
     // caches). Steady-state stats use samples[1..].
     const cold = samples[0];
     var warm_sum: f64 = 0;
@@ -218,11 +330,11 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
     // GPU "looks underutilised" (Christian's T-arc observation), this
     // is the bucket that exposes it: gap dominating dispatch means
     // the chain is serialised more than it needs to be.
-    if (ts_enabled and ts_warm_count > 0) {
-        const warmf: f64 = @floatFromInt(ts_warm_count);
-        const mean_dispatch_ms = ts_total_dispatch_ns / warmf / 1_000_000.0;
-        const mean_gap_ms = ts_total_gap_ns / warmf / 1_000_000.0;
-        try stdout.print("\n  per-dispatch GPU timing (warm steps={d}, dispatches/step={d}):\n", .{ ts_warm_count, ts_n_dispatched });
+    if (ts_enabled and acc.warm_count > 0) {
+        const warmf: f64 = @floatFromInt(acc.warm_count);
+        const mean_dispatch_ms = acc.total_dispatch_ns / warmf / 1_000_000.0;
+        const mean_gap_ms = acc.total_gap_ns / warmf / 1_000_000.0;
+        try stdout.print("\n  per-dispatch GPU timing (warm steps={d}, dispatches/step={d}):\n", .{ acc.warm_count, acc.n_dispatched });
         try stdout.print("    mean dispatch sum (active GPU): {d:.3} ms/step\n", .{mean_dispatch_ms});
         try stdout.print("    mean gap sum     (barrier wait): {d:.3} ms/step\n", .{mean_gap_ms});
         try stdout.print("    mean GPU timeline             : {d:.3} ms/step (dispatch + gap)\n", .{mean_dispatch_ms + mean_gap_ms});
@@ -236,7 +348,7 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
         const Slot = struct { idx: u32, mean_ns: f64 };
         var top = [_]Slot{.{ .idx = 0, .mean_ns = 0 }} ** TopK;
         var d: u32 = 0;
-        while (d < ts_n_dispatched) : (d += 1) {
+        while (d < acc.n_dispatched) : (d += 1) {
             const mean = ts_sum_ns[d] / warmf;
             var min_i: u32 = 0;
             var k_idx: u32 = 1;
@@ -267,7 +379,7 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
         // overlapped (had we let them).
         var top_g = [_]Slot{.{ .idx = 0, .mean_ns = 0 }} ** TopK;
         var dg: u32 = 1;
-        while (dg < ts_n_dispatched) : (dg += 1) {
+        while (dg < acc.n_dispatched) : (dg += 1) {
             const mean = ts_gap_sum_ns[dg] / warmf;
             var min_i: u32 = 0;
             var k_idx: u32 = 1;
