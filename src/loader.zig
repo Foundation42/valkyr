@@ -91,7 +91,7 @@ pub fn loadGpuModel(
     var cpu = try model_mod.Model.load(allocator, dir_path);
     defer cpu.deinit();
 
-    var gm = try gpu_model.GpuModel.upload(allocator, ctx, &cpu, options.precision);
+    var gm = try gpu_model.GpuModel.uploadCached(allocator, ctx, &cpu, options.precision, dir_path);
     errdefer gm.deinit(ctx.device);
 
     const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{dir_path});

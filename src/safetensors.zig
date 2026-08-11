@@ -83,6 +83,14 @@ pub const Dtype = enum {
 };
 
 pub const Tensor = struct {
+    /// Fully-qualified checkpoint name (e.g.
+    /// `model.language_model.layers.7.self_attn.q_proj.weight`).
+    /// Borrowed from the parent SafeTensors arena, so it lives exactly
+    /// as long as the tensor's `bytes` do. Empty for tensors built by
+    /// hand in tests. Used as the key for the on-disk quantized-weight
+    /// cache, which is why it is worth carrying on every tensor rather
+    /// than threading names through the upload call sites.
+    name: []const u8 = "",
     dtype: Dtype,
     /// Lifetime tied to the parent SafeTensors arena.
     shape: []const usize,
@@ -227,6 +235,7 @@ pub const SafeTensors = struct {
             // Copy the name into the arena so it outlives `parsed`.
             const owned_name = try a.dupe(u8, name);
             try by_name.put(owned_name, .{
+                .name = owned_name,
                 .dtype = dtype,
                 .shape = shape,
                 .bytes = bytes,

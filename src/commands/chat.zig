@@ -205,7 +205,7 @@ pub fn runChat(
         .q4_k_matmul => "Q4_K_M",
     }});
     const t_up0_g = std.time.nanoTimestamp();
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, precision);
+    var gm = try gpu_model.GpuModel.uploadCached(gpa, &ctx, &cpu, precision, dir_path);
     defer gm.deinit(ctx.device);
     const t_up1_g = std.time.nanoTimestamp();
     try stdout.print("  upload took {d:.0} ms\n", .{@as(f64, @floatFromInt(t_up1_g - t_up0_g)) / 1_000_000.0});
@@ -990,7 +990,7 @@ pub fn runChatQwen35(
         try stdout.print("uploading weights ({s} path)...\n", .{prec_label});
     }
     const t_up0 = std.time.nanoTimestamp();
-    var gm = try gpu_model.GpuModel.upload(gpa, &ctx, &cpu, precision);
+    var gm = try gpu_model.GpuModel.uploadCached(gpa, &ctx, &cpu, precision, dir_path);
     defer gm.deinit(ctx.device);
     const t_up1 = std.time.nanoTimestamp();
     try stdout.print("  upload took {d:.0} ms\n", .{@as(f64, @floatFromInt(t_up1 - t_up0)) / 1_000_000.0});
