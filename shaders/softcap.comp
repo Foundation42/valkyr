@@ -1,0 +1,33 @@
+#version 460
+// Elementwise tanh soft-cap: `out[i] = tanh(in[i] / cap) * cap`.
+//
+// Gemma 2 onwards squash the final logits this way rather than letting
+// them run free (`final_logit_softcapping = 30.0` on Gemma 4). It is a
+// smooth clamp: values well inside ±cap pass through nearly unchanged,
+// while extremes saturate toward ±cap instead of dominating the
+// softmax.
+//
+// This runs in place over the whole vocab row (262144 wide on Gemma 4),
+// one thread per logit — no reductions, no shared memory.
+//
+// Note it must be applied AFTER the LM-head matmul and BEFORE any
+// sampling or softmax. Applying it in the wrong order, or skipping it,
+// leaves a model that still produces fluent-looking text with subtly
+// wrong token probabilities — so this is checked in the smoke suite
+// against a CPU oracle rather than eyeballed.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer In  { float in_v[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float out_v[]; };
+
+layout(push_constant) uniform Pc {
+    uint  n_elem;
+    float cap;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n_elem) return;
+    out_v[g] = tanh(in_v[g] / pc.cap) * pc.cap;
+}

@@ -10,6 +10,21 @@
 // head_dim * partial_rotary_factor)`. Get that wrong and the cos/sin
 // table drifts by a factor of `partial_rotary_factor` and parity dies.
 //
+// Gemma 4's global layers use a DIFFERENT partial scheme, which HF
+// calls rope_type "proportional". It differs on both counts above:
+//
+//   - the pair partner sits `head_dim/2` away, not `rotary_dim/2`, so
+//     the rotated elements are {0..R/2} ∪ {D/2 .. D/2+R/2} rather than
+//     a contiguous prefix (llama.cpp notes the layout as
+//     `cc000000ss000000` against ggml's native `ccss000000000000`);
+//   - inv_freq uses the FULL head_dim as denominator, so the rotating
+//     pairs take the top R/2 frequencies of a D/2-pair schedule.
+//
+// Both are covered by parameterising the pair stride and the frequency
+// denominator. `pair_stride == 0` / `freq_dim == 0` select the legacy
+// Qwen3.5 behaviour (stride = rotary_dim/2, denominator = rotary_dim),
+// so existing call sites are bit-identical and need no changes.
+//
 // One thread per output element. Threads in the rotary range read two
 // inputs (their pair partner and themselves) and write one output;
 // threads in the tail range just copy through. No shared memory, no
@@ -26,6 +41,8 @@ layout(push_constant) uniform Pc {
     uint rotary_dim;
     uint pos;
     float theta_base;
+    uint pair_stride;   // 0 = legacy (rotary_dim/2)
+    uint freq_dim;      // 0 = legacy (rotary_dim)
 } pc;
 
 void main() {
@@ -35,26 +52,33 @@ void main() {
 
     uint i = g % pc.head_dim;
 
-    // Pass-through tail.
-    if (i >= pc.rotary_dim) {
+    uint half_r   = pc.rotary_dim / 2;
+    uint stride   = (pc.pair_stride != 0u) ? pc.pair_stride : half_r;
+    uint freq_dim = (pc.freq_dim    != 0u) ? pc.freq_dim    : pc.rotary_dim;
+
+    // A rotating pair occupies (j, j + stride) for j in [0, half_r).
+    // With the legacy stride == half_r this collapses to the contiguous
+    // prefix [0, rotary_dim) the old `i >= rotary_dim` test selected.
+    bool is_cos = (i < half_r);
+    bool is_sin = (i >= stride) && (i < stride + half_r);
+    if (!is_cos && !is_sin) {
         out_v[g] = in_v[g];
         return;
     }
 
-    uint half_r = pc.rotary_dim / 2;
-    // freq depends only on (i mod half_r): pair partners share the angle.
-    uint freq_idx = (i < half_r) ? i : (i - half_r);
-    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(pc.rotary_dim));
+    // freq depends only on the pair index: partners share the angle.
+    uint freq_idx = is_cos ? i : (i - stride);
+    float freq = 1.0 / pow(pc.theta_base, (2.0 * float(freq_idx)) / float(freq_dim));
     float angle = float(pc.pos) * freq;
     float c_a = cos(angle);
     float s_a = sin(angle);
 
-    if (i < half_r) {
+    if (is_cos) {
         float a = in_v[g];
-        float b = in_v[g + half_r];
+        float b = in_v[g + stride];
         out_v[g] = a * c_a - b * s_a;
     } else {
-        float a = in_v[g - half_r];
+        float a = in_v[g - stride];
         float b = in_v[g];
         out_v[g] = a * s_a + b * c_a;
     }

@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
     const gated_delta_step_spv = compileShader(b, "gated_delta_step");
     const slice_copy_spv = compileShader(b, "slice_copy");
     const scale_spv = compileShader(b, "scale");
+    const softcap_spv = compileShader(b, "softcap");
     const softmax_spv = compileShader(b, "softmax");
     const embed_lookup_spv = compileShader(b, "embed_lookup");
     const embed_lookup_bf16_spv = compileShader(b, "embed_lookup_bf16");
@@ -178,6 +179,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(gated_delta_step_spv, "gated_delta_step.spv");
     _ = wf.addCopyFile(slice_copy_spv, "slice_copy.spv");
     _ = wf.addCopyFile(scale_spv, "scale.spv");
+    _ = wf.addCopyFile(softcap_spv, "softcap.spv");
     _ = wf.addCopyFile(softmax_spv, "softmax.spv");
     _ = wf.addCopyFile(embed_lookup_spv, "embed_lookup.spv");
     _ = wf.addCopyFile(embed_lookup_bf16_spv, "embed_lookup_bf16.spv");
@@ -273,6 +275,7 @@ pub fn build(b: *std.Build) void {
         \\pub const gated_delta_step align(4) = @embedFile("gated_delta_step.spv").*;
         \\pub const slice_copy align(4) = @embedFile("slice_copy.spv").*;
         \\pub const scale align(4) = @embedFile("scale.spv").*;
+        \\pub const softcap align(4) = @embedFile("softcap.spv").*;
         \\pub const softmax align(4) = @embedFile("softmax.spv").*;
         \\pub const embed_lookup align(4) = @embedFile("embed_lookup.spv").*;
         \\pub const embed_lookup_bf16 align(4) = @embedFile("embed_lookup_bf16.spv").*;

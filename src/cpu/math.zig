@@ -272,6 +272,60 @@ pub fn applyRopePartial(
     }
 }
 
+/// Gemma 4's "proportional" partial RoPE.
+///
+/// Differs from `applyRopePartial` on the two axes that matter, and
+/// both of them are silent if you get them wrong:
+///
+///   1. The pair partner sits `head_dim / 2` away rather than
+///      `rotary_dim / 2`, so the rotated elements are
+///      `{0 .. R/2} ∪ {D/2 .. D/2 + R/2}` — two separated runs, not a
+///      contiguous prefix.
+///   2. inv_freq is built with the FULL `head_dim` as denominator, so
+///      the rotating pairs take the top `R/2` frequencies of a
+///      `D/2`-pair schedule. Using `rotary_dim` instead rescales every
+///      angle by `1 / partial_rotary_factor`.
+///
+/// Everything outside the two rotating runs passes through unchanged.
+pub fn applyRopeProportional(
+    out: []f32,
+    in: []const f32,
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    theta_base: f32,
+) !void {
+    const total = n_heads * head_dim;
+    if (in.len != total or out.len != total) return error.LengthMismatch;
+    if (rotary_dim > head_dim) return error.RotaryDimTooLarge;
+    if (rotary_dim % 2 != 0) return error.OddRotaryDim;
+    if (head_dim % 2 != 0) return error.OddHeadDim;
+    const half_r = rotary_dim / 2;
+    const stride = head_dim / 2;
+
+    const pos_f: f32 = @floatFromInt(pos);
+    const ddim_f: f32 = @floatFromInt(head_dim);
+
+    for (0..n_heads) |h| {
+        const off = h * head_dim;
+        // Everything not in a rotating pair passes through; start from a
+        // straight copy so the two separated runs can overwrite in place.
+        for (0..head_dim) |i| out[off + i] = in[off + i];
+
+        for (0..half_r) |j| {
+            const freq = 1.0 / std.math.pow(f32, theta_base, (2.0 * @as(f32, @floatFromInt(j))) / ddim_f);
+            const angle = pos_f * freq;
+            const cos_a = @cos(angle);
+            const sin_a = @sin(angle);
+            const a = in[off + j];
+            const b = in[off + j + stride];
+            out[off + j] = a * cos_a - b * sin_a;
+            out[off + j + stride] = a * sin_a + b * cos_a;
+        }
+    }
+}
+
 /// In-place numerically stable softmax over a slice. Subtract the max
 /// before exponentiating so the largest exp() argument is 0 and we
 /// don't overflow on big positive scores; the resulting probabilities

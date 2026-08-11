@@ -238,6 +238,196 @@ pub fn runGpuRopePartialSmoke(allocator: std.mem.Allocator) !void {
     std.debug.print("PASS GPU rope_partial (rotary_dim=64 of head_dim=256, max |Δ| vs CPU = {e})\n", .{max_abs});
 }
 
+// ── gpu logit soft-cap smoke (Gemma 2+ / Gemma 4) ───────────────────
+//
+// `out = tanh(in / cap) * cap` at cap=30, the Gemma 4 value. Driven
+// over a range that spans the interesting regimes: values well inside
+// the cap (near pass-through), values near ±cap, and extremes that must
+// saturate rather than blow up. Also asserts the output is genuinely
+// bounded — a missing or mis-ordered cap would leave |logit| > cap.
+
+pub fn runGpuSoftcapSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const cap: f32 = 30.0;
+    const n: usize = 4096;
+
+    const in_v = try allocator.alloc(f32, n);
+    defer allocator.free(in_v);
+    // Sweep roughly [-300, 300] so ~10% of samples sit inside the cap
+    // and the rest are well into saturation.
+    for (in_v, 0..) |*x, i| {
+        const t = (@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n - 1))) * 2.0 - 1.0;
+        x.* = t * 300.0;
+    }
+
+    var buf_in = try buffer.Buffer.initStatic(&ctx, f32, in_v);
+    defer buf_in.deinit(ctx.device);
+    var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, n * @sizeOf(f32));
+    defer buf_out.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.softcap, 2, @sizeOf(runtime.SoftcapPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_in, &buf_out });
+
+    const push = runtime.SoftcapPush{ .n_elem = @intCast(n), .cap = cap };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const runtime.SoftcapPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .groups = @intCast((n + 255) / 256) });
+
+    const got = try allocator.alloc(f32, n);
+    defer allocator.free(got);
+    try buf_out.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    var max_out: f32 = 0;
+    for (got, in_v) |g, x| {
+        const want = std.math.tanh(x / cap) * cap;
+        const d = @abs(g - want);
+        if (d > max_abs) max_abs = d;
+        if (@abs(g) > max_out) max_out = @abs(g);
+    }
+    if (max_abs > 1e-4) {
+        std.debug.print("GPU softcap: max |Δ| vs CPU = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+    // Boundedness: nothing may exceed the cap. Catches a skipped or
+    // wrongly-ordered dispatch, which max-|Δ| alone would not if the
+    // oracle were also wrong.
+    if (max_out > cap) {
+        std.debug.print("GPU softcap: output exceeded cap ({e} > {e})\n", .{ max_out, cap });
+        return error.ParityFailed;
+    }
+    std.debug.print(
+        "PASS GPU softcap (cap={d}, {d} elems over ±300, max|out|={e:.4}, max |Δ| vs CPU = {e})\n",
+        .{ cap, n, max_out, max_abs },
+    );
+}
+
+// ── gpu rope proportional smoke (Gemma 4 global layers) ─────────────
+//
+// Same kernel, driven with `pair_stride = head_dim/2` and
+// `freq_dim = head_dim` instead of the legacy Qwen3.5 defaults. Run at
+// the real Gemma 4 12B global-layer shape: head_dim=512, partial rotary
+// 0.25 -> rotary_dim=128, theta=1e6.
+//
+// The two checks that matter are structural, not just numeric: the
+// rotated elements must be the two SEPARATED runs [0,64) and [256,320),
+// and everything else must be byte-identical to the input. A kernel
+// that rotated a contiguous [0,128) prefix would still look "close" on
+// a max-|Δ| check dominated by the pass-through region, so we assert
+// the untouched set explicitly.
+
+pub fn runGpuRopeProportionalSmoke(allocator: std.mem.Allocator) !void {
+    var ctx = try vk.Context.init(allocator);
+    defer ctx.deinit();
+
+    const n_heads: usize = 4;
+    const head_dim: usize = 512;
+    const rotary_dim: usize = 128; // 0.25 * 512
+    const stride: usize = head_dim / 2;
+    const half_r: usize = rotary_dim / 2;
+    const total = n_heads * head_dim;
+    const theta_base: f32 = 1.0e6;
+    const pos: u32 = 7;
+
+    const in_v = try allocator.alloc(f32, total);
+    defer allocator.free(in_v);
+    for (in_v, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i)) * 0.0007 - 0.5;
+
+    var buf_in = try buffer.Buffer.initStatic(&ctx, f32, in_v);
+    defer buf_in.deinit(ctx.device);
+    var buf_out = try buffer.Buffer.initDeviceOnly(&ctx, total * @sizeOf(f32));
+    defer buf_out.deinit(ctx.device);
+
+    var kern = try pipeline.Kernel.init(&ctx, &shaders.rope_partial, 2, @sizeOf(aliases.RopePartialPush));
+    defer kern.deinit();
+    try kern.bind(&.{ &buf_in, &buf_out });
+
+    const local: u32 = 256;
+    const elems: u32 = @intCast(total);
+    const groups: u32 = (elems + local - 1) / local;
+
+    const want = try allocator.alloc(f32, total);
+    defer allocator.free(want);
+    try cpu_math.applyRopeProportional(want, in_v, n_heads, head_dim, rotary_dim, pos, theta_base);
+
+    const push = aliases.RopePartialPush{
+        .n_heads = @intCast(n_heads),
+        .head_dim = @intCast(head_dim),
+        .rotary_dim = @intCast(rotary_dim),
+        .pos = pos,
+        .theta_base = theta_base,
+        .pair_stride = @intCast(stride),
+        .freq_dim = @intCast(head_dim),
+    };
+    try buffer.submitOneShot(&ctx, struct {
+        kern: *const pipeline.Kernel,
+        push: *const aliases.RopePartialPush,
+        groups: u32,
+        pub fn record(s: @This(), cmd: vk.c.VkCommandBuffer) void {
+            s.kern.dispatch(cmd, s.push, s.groups, 1, 1);
+        }
+    }{ .kern = &kern, .push = &push, .groups = groups });
+
+    const got = try allocator.alloc(f32, total);
+    defer allocator.free(got);
+    try buf_out.readBack(&ctx, f32, got);
+
+    var max_abs: f32 = 0;
+    for (got, want) |g, e| {
+        const d = @abs(g - e);
+        if (d > max_abs) max_abs = d;
+    }
+    if (max_abs > 1e-5) {
+        std.debug.print("GPU rope proportional: max |Δ| = {e}\n", .{max_abs});
+        return error.ParityFailed;
+    }
+
+    // Structural check: only [0, half_r) and [stride, stride+half_r)
+    // may move. Everything else must be bit-identical to the input.
+    for (0..n_heads) |h| {
+        for (0..head_dim) |d| {
+            const rotates = (d < half_r) or (d >= stride and d < stride + half_r);
+            if (rotates) continue;
+            const idx = h * head_dim + d;
+            if (got[idx] != in_v[idx]) {
+                std.debug.print(
+                    "rope proportional touched a pass-through element at h={d} d={d}: in={d} out={d}\n",
+                    .{ h, d, in_v[idx], got[idx] },
+                );
+                return error.ParityFailed;
+            }
+        }
+    }
+
+    // And the rotating runs must actually have moved — otherwise a
+    // kernel that passed everything through would sail past the check
+    // above.
+    var moved: usize = 0;
+    for (0..n_heads) |h| {
+        for (0..half_r) |j| {
+            if (got[h * head_dim + j] != in_v[h * head_dim + j]) moved += 1;
+            if (got[h * head_dim + j + stride] != in_v[h * head_dim + j + stride]) moved += 1;
+        }
+    }
+    if (moved == 0) {
+        std.debug.print("rope proportional rotated nothing — kernel is a no-op\n", .{});
+        return error.ParityFailed;
+    }
+
+    std.debug.print(
+        "PASS GPU rope proportional (gemma4 global: rotary_dim=128 of head_dim=512, stride=256, {d} elems rotated, max |Δ| vs CPU = {e})\n",
+        .{ moved, max_abs },
+    );
+}
+
 // ── gpu split_q_gate smoke: synthetic round-trip ────────────────────
 //
 // Validates that the `[h0_q, h0_gate, h1_q, h1_gate, …]` interleaved

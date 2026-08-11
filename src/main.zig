@@ -1211,6 +1211,8 @@ pub fn main() !void {
     try smoke_gpu_kernels.runGpuGegluSmoke(allocator);
     try smoke_gpu_kernels.runGpuRopeSmoke(allocator);
     try smoke_gpu_kernels.runGpuRopePartialSmoke(allocator);
+    try smoke_gpu_kernels.runGpuRopeProportionalSmoke(allocator);
+    try smoke_gpu_kernels.runGpuSoftcapSmoke(allocator);
     try smoke_gpu_kernels.runGpuSplitQGateSmoke(allocator);
     try smoke_gpu_kernels.runGpuSigmoidMulSmoke(allocator);
     try smoke_gpu_kernels.runSwiGluCpuSmoke(allocator);

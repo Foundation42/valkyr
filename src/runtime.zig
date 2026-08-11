@@ -74,12 +74,30 @@ pub const RopePush = extern struct {
     theta_base: f32,
 };
 
+/// tanh soft-cap on the final logits: `out = tanh(in / cap) * cap`.
+/// Gemma 4 uses cap = 30.0. Applied after the LM-head matmul and before
+/// any sampling.
+pub const SoftcapPush = extern struct {
+    n_elem: u32,
+    cap: f32,
+};
+
 pub const RopePartialPush = extern struct {
     n_heads: u32,
     head_dim: u32,
     rotary_dim: u32,
     pos: u32,
     theta_base: f32,
+    /// Distance to a rotating pair's partner within the head. Zero
+    /// selects the legacy Qwen3.5 value (`rotary_dim / 2`), which keeps
+    /// every existing call site bit-identical. Gemma 4's "proportional"
+    /// RoPE sets this to `head_dim / 2`.
+    pair_stride: u32 = 0,
+    /// Denominator used to build inv_freq. Zero selects the legacy
+    /// Qwen3.5 value (`rotary_dim`). Gemma 4 sets this to the full
+    /// `head_dim` — that is what makes its scheme "proportional", and
+    /// getting it wrong shifts every angle by a constant factor.
+    freq_dim: u32 = 0,
 };
 
 pub const KvWritePush = extern struct {
@@ -540,6 +558,10 @@ pub const ChatKernels = struct {
     rmsnorm: pipeline.Kernel,
     matmul: pipeline.Kernel,
     matmul_lm_head: pipeline.Kernel,
+    /// Gemma 2+ tanh soft-cap on the final logits. Built unconditionally
+    /// (it is a trivial elementwise kernel); the forward path only
+    /// dispatches it when `cfg.final_logit_softcapping != 0`.
+    softcap: pipeline.Kernel,
     rope: pipeline.Kernel,
     rope_partial: pipeline.Kernel,
     kv_write: pipeline.Kernel,
@@ -595,6 +617,7 @@ pub const ChatKernels = struct {
             .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
             .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
             .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
+            .softcap = try pipeline.Kernel.init(ctx, &shaders.softcap, 2, @sizeOf(SoftcapPush)),
             .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
             .rope_partial = try pipeline.Kernel.init(ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush)),
             .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
@@ -614,6 +637,7 @@ pub const ChatKernels = struct {
         self.rmsnorm.deinit();
         self.matmul.deinit();
         self.matmul_lm_head.deinit();
+        self.softcap.deinit();
         self.rope.deinit();
         self.rope_partial.deinit();
         self.kv_write.deinit();
@@ -1037,6 +1061,19 @@ pub fn recordSampleStep(
     const vocab: u32 = @intCast(cfg.vocab_size);
     try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &p.rms_push, 1);
     try recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+
+    // Gemma 2+ squash the logits through tanh before sampling. Skipped
+    // entirely when the config doesn't ask for it, so no other family
+    // pays a dispatch. In place over the logits buffer — the shader
+    // reads and writes the same binding, which is safe because every
+    // thread touches exactly one element.
+    if (cfg.final_logit_softcapping != 0) {
+        const softcap_push = SoftcapPush{
+            .n_elem = vocab,
+            .cap = cfg.final_logit_softcapping,
+        };
+        try recDispatch1D(rec, &k.softcap, &.{ &sc.logits, &sc.logits }, &softcap_push, vocab);
+    }
 }
 
 // ── High-level Forward facade ─────────────────────────────────────
