@@ -38,6 +38,7 @@ pub const MseLossGradPush = runtime.MseLossGradPush;
 
 pub const computeForwardPushes = runtime.computeForwardPushes;
 pub const recordOneLayer = runtime.recordOneLayer;
+pub const recordSampleStep = runtime.recordSampleStep;
 pub const recordForwardStep = runtime.recordForwardStep;
 pub const recDispatch1D = runtime.recDispatch1D;
 pub const recDispatchPerRow = runtime.recDispatchPerRow;

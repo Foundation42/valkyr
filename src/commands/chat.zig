@@ -778,9 +778,11 @@ fn forwardStepProbed(
     attn_scratch: ?[]f32,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
-    const vocab: u32 = @intCast(cfg.vocab_size);
 
-    const pushes = aliases.computeForwardPushes(cfg, sc, pos);
+    // Layer-independent fields only (final norm, vocab, softcap). The
+    // per-layer pushes are computed inside the loop below, because on
+    // Gemma 4 the attention geometry varies from layer to layer.
+    const tail_pushes = aliases.computeForwardPushes(cfg, sc, pos, cfg.num_hidden_layers - 1);
 
     const embed_push = aliases.EmbedLookupPush{
         .token_id = token_id,
@@ -812,6 +814,8 @@ fn forwardStepProbed(
             try bus.onLayerEntry(layer_ctx, hidden_scratch.?);
         }
 
+        const pushes = aliases.computeForwardPushes(cfg, sc, pos, layer_idx);
+
         try rec.reset();
         try rec.begin();
         try aliases.recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
@@ -837,8 +841,7 @@ fn forwardStepProbed(
     if (compute_logits) {
         try rec.reset();
         try rec.begin();
-        try aliases.recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &gm.final_norm, &sc.final_norm_out }, &pushes.rms_push, 1);
-        try aliases.recDispatchMatmul(rec, &k.matmul_lm_head, &.{ &sc.final_norm_out, &gm.lm_head, &sc.logits }, 1, vocab, hidden);
+        try aliases.recordSampleStep(rec, sc, gm, cfg, k, &tail_pushes);
         try rec.endAndSubmit();
     }
 }

@@ -542,6 +542,7 @@ pub const Session = struct {
                             self.cfg_model,
                             &b.scratch,
                             self.pos,
+                            self.fwd_layer,
                         );
                         try runtime.recordOneLayer(
                             rec,
@@ -578,10 +579,12 @@ pub const Session = struct {
                         continue;
                     }
 
+                    // Sample step reads only layer-independent fields.
                     const pushes = runtime.computeForwardPushes(
                         self.cfg_model,
                         &b.scratch,
                         self.pos,
+                        self.cfg_model.num_hidden_layers - 1,
                     );
                     try runtime.recordSampleStep(
                         rec,

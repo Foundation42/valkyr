@@ -48,6 +48,10 @@ pub const RmsnormPush = extern struct {
     dim: u32,
     eps: f32,
     gemma_quirk: u32,
+    /// Plain RMSNorm with no learned gain — the W binding is ignored.
+    /// Gemma 4 normalises V this way on every attention layer. Defaults
+    /// to 0 so every existing call site is unchanged.
+    weightless: u32 = 0,
 };
 
 /// LayerNorm has neither the gemma_quirk gain offset nor a third
@@ -99,6 +103,15 @@ pub const RopePartialPush = extern struct {
     /// getting it wrong shifts every angle by a constant factor.
     freq_dim: u32 = 0,
 };
+
+/// Elementwise `out[i] = in[i] * scale`. Shared with the hybrid
+/// runtime's `ScalePush`; Gemma 4 uses it for the per-layer output
+/// scalar.
+pub const ScalePush = extern struct { n: u32, scale: f32 };
+
+/// Copy `n_elem` floats between buffers at the given offsets. Gemma 4
+/// uses it to fork V off the k_proj output on `attention_k_eq_v` layers.
+pub const SliceCopyPush = extern struct { src_off: u32, dst_off: u32, n_elem: u32 };
 
 pub const KvWritePush = extern struct {
     n: u32,
@@ -558,6 +571,11 @@ pub const ChatKernels = struct {
     rmsnorm: pipeline.Kernel,
     matmul: pipeline.Kernel,
     matmul_lm_head: pipeline.Kernel,
+    /// Elementwise scale — Gemma 4's per-layer output scalar.
+    scale: pipeline.Kernel,
+    /// Buffer-to-buffer copy — forks V off the k_proj output where
+    /// `attention_k_eq_v` removes the v_proj weight.
+    slice_copy: pipeline.Kernel,
     /// Gemma 2+ tanh soft-cap on the final logits. Built unconditionally
     /// (it is a trivial elementwise kernel); the forward path only
     /// dispatches it when `cfg.final_logit_softcapping != 0`.
@@ -618,6 +636,8 @@ pub const ChatKernels = struct {
             .matmul = try pipeline.Kernel.init(ctx, matmul_spv, 3, @sizeOf(MatmulPush)),
             .matmul_lm_head = try pipeline.Kernel.init(ctx, lm_head_spv, 3, @sizeOf(MatmulPush)),
             .softcap = try pipeline.Kernel.init(ctx, &shaders.softcap, 2, @sizeOf(SoftcapPush)),
+            .scale = try pipeline.Kernel.init(ctx, &shaders.scale, 2, @sizeOf(ScalePush)),
+            .slice_copy = try pipeline.Kernel.init(ctx, &shaders.slice_copy, 2, @sizeOf(SliceCopyPush)),
             .rope = try pipeline.Kernel.init(ctx, &shaders.rope, 2, @sizeOf(RopePush)),
             .rope_partial = try pipeline.Kernel.init(ctx, &shaders.rope_partial, 2, @sizeOf(RopePartialPush)),
             .kv_write = try pipeline.Kernel.init(ctx, &shaders.kv_write, 2, @sizeOf(KvWritePush)),
@@ -638,6 +658,8 @@ pub const ChatKernels = struct {
         self.matmul.deinit();
         self.matmul_lm_head.deinit();
         self.softcap.deinit();
+        self.scale.deinit();
+        self.slice_copy.deinit();
         self.rope.deinit();
         self.rope_partial.deinit();
         self.kv_write.deinit();
@@ -663,6 +685,11 @@ pub const ForwardPushes = struct {
     rope_q_partial_push: RopePartialPush,
     rope_k_partial_push: RopePartialPush,
     use_partial_rope: bool,
+    /// Gemma 4 applies a plain, gain-free per-head RMSNorm to V on every
+    /// attention layer. No tensor exists for it in the checkpoint, so it
+    /// rides on the config rather than on the presence of a weight.
+    v_norm_weightless: bool,
+    v_norm_push: RmsnormPush,
     kv_write_push: KvWritePush,
     scores_push: AttnScoresPush,
     softmax_push: SoftmaxPush,
@@ -681,18 +708,45 @@ pub fn computeForwardPushes(
     cfg: config_mod.Config,
     sc: *const gpu_scratch.GpuScratch,
     pos: usize,
+    /// Which layer these pushes are for. Only Gemma 4 varies anything by
+    /// layer (head dim, KV head count, RoPE base, rotary fraction,
+    /// sliding window); for every other family the result is identical
+    /// for all layers and callers may pass 0. This is a pure arithmetic
+    /// function, so recomputing it per layer costs nothing.
+    layer_idx: usize,
 ) ForwardPushes {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
-    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
-    const gemma_quirk: u32 = if (cfg.family == .gemma) 1 else 0;
-    const heads_per_kv: u32 = @intCast(cfg.num_attention_heads / cfg.num_key_value_heads);
-    const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+    const gemma_quirk: u32 = if (cfg.family.rmsnormAddOne()) 1 else 0;
     const max_pos_u32: u32 = @intCast(sc.max_pos);
     const n_pos: u32 = @intCast(pos + 1);
-    const head_dim_u32: u32 = @intCast(cfg.head_dim);
-    const rotary_dim: u32 = @intFromFloat(@as(f32, @floatFromInt(head_dim_u32)) * cfg.partial_rotary_factor);
-    const use_partial_rope: bool = cfg.partial_rotary_factor < 1.0;
+
+    // ── Per-layer attention geometry ────────────────────────────────
+    const head_dim_i = cfg.headDimAt(layer_idx);
+    const n_kv_heads_i = cfg.numKvHeadsAt(layer_idx);
+    const head_dim_u32: u32 = @intCast(head_dim_i);
+    const kv_dim: u32 = @intCast(n_kv_heads_i * head_dim_i);
+    const heads_per_kv: u32 = @intCast(cfg.num_attention_heads / n_kv_heads_i);
+    const window: u32 = @intCast(cfg.attnWindowAt(layer_idx));
+
+    // Gemma 4 folds the 1/sqrt(head_dim) into its trained weights and
+    // uses a scale of exactly 1.0. Everyone else takes the textbook
+    // value. Named `inv_sqrt_dim` in the push structs for historical
+    // reasons — it is the pre-softmax QK scale, whatever its value.
+    const inv_sqrt_dim: f32 = cfg.attnScaleAt(layer_idx);
+
+    const rope_theta_i: f32 = cfg.ropeThetaAt(layer_idx);
+    const partial_i: f32 = cfg.partialRotaryAt(layer_idx);
+    const rotary_dim: u32 = @intFromFloat(@as(f32, @floatFromInt(head_dim_u32)) * partial_i);
+    const use_partial_rope: bool = partial_i < 1.0;
+
+    // Gemma 4's global layers use rope_type "proportional": the pair
+    // partner sits head_dim/2 away rather than rotary_dim/2, and the
+    // frequency schedule is built over the full head_dim. Zero selects
+    // the legacy Qwen3.5 behaviour in the shared kernel.
+    const rope_is_proportional = cfg.family == .gemma4 and use_partial_rope;
+    const rope_pair_stride: u32 = if (rope_is_proportional) head_dim_u32 / 2 else 0;
+    const rope_freq_dim: u32 = if (rope_is_proportional) head_dim_u32 else 0;
 
     return .{
         .rms_push = .{ .dim = hidden, .eps = cfg.rms_norm_eps, .gemma_quirk = gemma_quirk },
@@ -702,34 +756,45 @@ pub fn computeForwardPushes(
             .n_heads = @intCast(cfg.num_attention_heads),
             .head_dim = head_dim_u32,
             .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
+            .theta_base = rope_theta_i,
         },
         .rope_k_push = .{
-            .n_heads = @intCast(cfg.num_key_value_heads),
+            .n_heads = @intCast(n_kv_heads_i),
             .head_dim = head_dim_u32,
             .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
+            .theta_base = rope_theta_i,
         },
         .rope_q_partial_push = .{
             .n_heads = @intCast(cfg.num_attention_heads),
             .head_dim = head_dim_u32,
             .rotary_dim = rotary_dim,
             .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
+            .theta_base = rope_theta_i,
+            .pair_stride = rope_pair_stride,
+            .freq_dim = rope_freq_dim,
         },
         .rope_k_partial_push = .{
-            .n_heads = @intCast(cfg.num_key_value_heads),
+            .n_heads = @intCast(n_kv_heads_i),
             .head_dim = head_dim_u32,
             .rotary_dim = rotary_dim,
             .pos = @intCast(pos),
-            .theta_base = cfg.rope_theta,
+            .theta_base = rope_theta_i,
+            .pair_stride = rope_pair_stride,
+            .freq_dim = rope_freq_dim,
         },
         .use_partial_rope = use_partial_rope,
+        .v_norm_weightless = cfg.family == .gemma4,
+        .v_norm_push = .{
+            .dim = head_dim_u32,
+            .eps = cfg.rms_norm_eps,
+            .gemma_quirk = 0,
+            .weightless = 1,
+        },
         .kv_write_push = .{ .n = kv_dim, .dst_off = @intCast(pos * @as(usize, kv_dim)) },
         .scores_push = .{
             .n_heads = @intCast(cfg.num_attention_heads),
             .heads_per_kv = heads_per_kv,
-            .head_dim = @intCast(cfg.head_dim),
+            .head_dim = head_dim_u32,
             .n_pos = n_pos,
             .kv_stride = kv_dim,
             .scores_stride = max_pos_u32,
@@ -739,7 +804,7 @@ pub fn computeForwardPushes(
         .attn_out_push = .{
             .n_heads = @intCast(cfg.num_attention_heads),
             .heads_per_kv = heads_per_kv,
-            .head_dim = @intCast(cfg.head_dim),
+            .head_dim = head_dim_u32,
             .n_pos = n_pos,
             .kv_stride = kv_dim,
             .scores_stride = max_pos_u32,
@@ -756,6 +821,7 @@ pub fn computeForwardPushes(
                 .n_splits = ch.n_splits,
                 .split_size = ch.split_size,
                 .inv_sqrt_dim = inv_sqrt_dim,
+                .window = window,
             };
         },
         .fa_decode_merge_push = blk: {
@@ -885,8 +951,13 @@ pub fn recordOneLayer(
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const inter: u32 = @intCast(cfg.intermediate_size);
-    const q_dim: u32 = @intCast(cfg.num_attention_heads * cfg.head_dim);
-    const kv_dim: u32 = @intCast(cfg.num_key_value_heads * cfg.head_dim);
+    // Per-layer geometry. Uniform for every family except Gemma 4,
+    // whose global layers run 16x512 against a single 512-wide KV head
+    // while its sliding layers run 16x256 against 8.
+    const head_dim_i = cfg.headDimAt(layer_idx);
+    const n_kv_heads_i = cfg.numKvHeadsAt(layer_idx);
+    const q_dim: u32 = @intCast(cfg.num_attention_heads * head_dim_i);
+    const kv_dim: u32 = @intCast(n_kv_heads_i * head_dim_i);
 
     const layer = &gm.layers[layer_idx];
 
@@ -894,21 +965,38 @@ pub fn recordOneLayer(
 
     try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, 1, q_dim, hidden);
     try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, 1, kv_dim, hidden);
-    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.v_proj.?, &sc.v }, 1, kv_dim, hidden);
+    if (layer.v_proj) |*vp| {
+        try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, vp, &sc.v }, 1, kv_dim, hidden);
+    } else {
+        // `attention_k_eq_v`: V shares the k_proj OUTPUT, taken here —
+        // before k_norm and before RoPE. K and V diverge immediately
+        // after (K gets the learned k_norm plus RoPE; V gets a plain
+        // weightless norm and no RoPE), so this is a copy, not an alias.
+        // Re-running the k_proj matmul would give the same values for
+        // more work.
+        const copy_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = kv_dim };
+        try recDispatch1D(rec, &k.slice_copy, &.{ &sc.k, &sc.v }, &copy_push, kv_dim);
+    }
 
     if (layer.q_norm) |*qn| {
         try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.q, qn, &sc.q }, &p.qkn_push, @intCast(cfg.num_attention_heads));
     }
     if (layer.k_norm) |*kn| {
-        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &p.qkn_push, @intCast(cfg.num_key_value_heads));
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &p.qkn_push, @intCast(n_kv_heads_i));
+    }
+    if (p.v_norm_weightless) {
+        // Gemma 4 normalises V per head with NO learned gain, on every
+        // attention layer — aliased or not. The W binding is ignored by
+        // the shader but must still resolve, so it re-binds sc.v.
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.v, &sc.v, &sc.v }, &p.v_norm_push, @intCast(n_kv_heads_i));
     }
 
     if (p.use_partial_rope) {
-        try recDispatch1D(rec, &k.rope_partial, &.{ &sc.q, &sc.q_rot }, &p.rope_q_partial_push, @intCast(cfg.num_attention_heads * cfg.head_dim));
-        try recDispatch1D(rec, &k.rope_partial, &.{ &sc.k, &sc.k_rot }, &p.rope_k_partial_push, @intCast(cfg.num_key_value_heads * cfg.head_dim));
+        try recDispatch1D(rec, &k.rope_partial, &.{ &sc.q, &sc.q_rot }, &p.rope_q_partial_push, q_dim);
+        try recDispatch1D(rec, &k.rope_partial, &.{ &sc.k, &sc.k_rot }, &p.rope_k_partial_push, kv_dim);
     } else {
-        try recDispatchRope(rec, &k.rope, &.{ &sc.q, &sc.q_rot }, &p.rope_q_push, cfg.num_attention_heads, cfg.head_dim);
-        try recDispatchRope(rec, &k.rope, &.{ &sc.k, &sc.k_rot }, &p.rope_k_push, cfg.num_key_value_heads, cfg.head_dim);
+        try recDispatchRope(rec, &k.rope, &.{ &sc.q, &sc.q_rot }, &p.rope_q_push, cfg.num_attention_heads, head_dim_i);
+        try recDispatchRope(rec, &k.rope, &.{ &sc.k, &sc.k_rot }, &p.rope_k_push, n_kv_heads_i, head_dim_i);
     }
 
     const kv_layer = &kv.layers[layer_idx];
@@ -982,23 +1070,62 @@ pub fn recordOneLayer(
             &k.attn_out,
             &.{ &sc.scores, v_for_attn, &sc.head_out },
             &p.attn_out_push,
-            @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(cfg.head_dim)),
+            @as(u32, @intCast(cfg.num_attention_heads)) * @as(u32, @intCast(head_dim_i)),
             1,
             1,
         );
     }
 
     try recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, 1, hidden, q_dim);
-    try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
 
-    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, 1);
+    // ── Attention output → residual ─────────────────────────────────
+    //
+    // Two different block shapes hang off the same norm tensors, and the
+    // NAMES do not mean the same thing in each:
+    //
+    //   Llama / Qwen:  h = x + attn(...)
+    //                  h = h + mlp(post_attention_layernorm(h))
+    //     — `post_attention_layernorm` IS the pre-FFN norm.
+    //
+    //   Gemma 2+ / 4:  h = x + post_attention_layernorm(attn(...))
+    //                  h = h + post_feedforward_layernorm(
+    //                            mlp(pre_feedforward_layernorm(h)))
+    //                  h = h * layer_scalar
+    //     — `post_attention_layernorm` normalises the ATTENTION OUTPUT
+    //       before its residual, and the pre-FFN role belongs to
+    //       `pre_feedforward_layernorm`.
+    //
+    // Wiring the sandwich form by position rather than by role gives a
+    // model that runs and produces fluent-looking text while being
+    // quietly wrong, so the two paths are kept explicitly separate.
+    const sandwich = layer.pre_feedforward_layernorm != null;
+
+    if (sandwich) {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.attn_out, &layer.post_attention_layernorm, &sc.attn_out }, &p.rms_push, 1);
+        try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.pre_feedforward_layernorm.?, &sc.mid_norm }, &p.rms_push, 1);
+    } else {
+        try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &p.add_push, hidden);
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, 1);
+    }
 
     try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, 1, inter, hidden);
     try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, 1, inter, hidden);
     try recDispatch1D(rec, &k.geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &p.geglu_push, inter);
     try recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, 1, hidden, inter);
 
+    if (layer.post_feedforward_layernorm) |*pfn| {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.ffn_out, pfn, &sc.ffn_out }, &p.rms_push, 1);
+    }
+
     try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &p.add_push, hidden);
+
+    // Per-layer output scalar, applied to the whole block output after
+    // the FFN residual. Skipped entirely when the checkpoint has none.
+    if (layer.layer_scalar) |ls| {
+        const scale_push = ScalePush{ .n = hidden, .scale = ls };
+        try recDispatch1D(rec, &k.scale, &.{ &sc.stream, &sc.stream }, &scale_push, hidden);
+    }
 }
 
 /// Embedding lookup → scratch.stream. Called once per token at the
@@ -1037,13 +1164,23 @@ pub fn recordForwardStep(
     tq4_v: ?Tq4VHooks,
     compute_logits: bool,
 ) !void {
-    const pushes = computeForwardPushes(cfg, sc, pos);
     try recordEmbedding(rec, sc, gm, cfg, k, token_id);
+    // Pushes are recomputed per layer rather than hoisted: on Gemma 4
+    // the head dim, KV head count, RoPE base, rotary fraction and
+    // sliding window all vary by layer. It is pure arithmetic, so the
+    // per-layer call is free, and for uniform families every iteration
+    // produces the same struct.
     for (0..cfg.num_hidden_layers) |layer_idx| {
+        const pushes = computeForwardPushes(cfg, sc, pos, layer_idx);
         try recordOneLayer(rec, sc, gm, kv, cfg, k, layer_idx, pos, &pushes, tq4_v);
     }
     if (compute_logits) {
-        try recordSampleStep(rec, sc, gm, cfg, k, &pushes);
+        // The sample step only touches layer-independent fields
+        // (final-norm dims, vocab, softcap), so layer 0 is as good as
+        // any — but pass the last layer's index to keep the intent
+        // "whatever the stream just came out of" rather than arbitrary.
+        const tail = computeForwardPushes(cfg, sc, pos, cfg.num_hidden_layers - 1);
+        try recordSampleStep(rec, sc, gm, cfg, k, &tail);
     }
 }
 
@@ -1114,14 +1251,22 @@ pub const Forward = struct {
         token_id: u32,
         compute_logits: bool,
     ) !void {
-        const pushes = computeForwardPushes(self.cfg, sc, pos);
-        try recordEmbedding(rec, sc, gm, self.cfg, &self.kernels, token_id);
-        for (0..self.cfg.num_hidden_layers) |layer_idx| {
-            try recordOneLayer(rec, sc, gm, kv, self.cfg, &self.kernels, layer_idx, pos, &pushes, null);
-        }
-        if (compute_logits) {
-            try recordSampleStep(rec, sc, gm, self.cfg, &self.kernels, &pushes);
-        }
+        // Delegate rather than re-implement: this used to duplicate the
+        // embedding / layer-loop / sample-step sequence, which meant it
+        // also duplicated the assumption that one ForwardPushes covers
+        // every layer. That is false on Gemma 4.
+        try recordForwardStep(
+            rec,
+            sc,
+            gm,
+            kv,
+            self.cfg,
+            &self.kernels,
+            pos,
+            token_id,
+            null,
+            compute_logits,
+        );
     }
 };
 

@@ -83,6 +83,19 @@ pub const GpuLayer = struct {
     q_norm: ?buffer.Buffer = null,
     k_norm: ?buffer.Buffer = null,
 
+    // ── Gemma 4 sandwich norms + output scalar ──────────────────────
+    /// Pre-FFN norm. On Gemma 4 this is the role Llama gives to
+    /// `post_attention_layernorm`; here that field instead normalises
+    /// the attention output before its residual add.
+    pre_feedforward_layernorm: ?buffer.Buffer = null,
+    post_feedforward_layernorm: ?buffer.Buffer = null,
+    /// `layers.N.layer_scalar`, a shape-[1] weight, read to the host at
+    /// upload time and applied as a push constant rather than kept as a
+    /// one-float GPU buffer. `null` means "no scaling" (every family
+    /// except Gemma 4), which is distinct from a stored 1.0 only in that
+    /// it skips the dispatch entirely.
+    layer_scalar: ?f32 = null,
+
     // ── Linear-attention buffers (.linear_attention only) ───────────
     /// Gated DeltaNet (Qwen3.5 hybrid layers). All eight tensors must
     /// be present together — see `cpu/gated_delta.zig` for the math.
@@ -105,6 +118,7 @@ pub const GpuLayer = struct {
         inline for (.{
             "q_proj",     "k_proj", "v_proj",        "o_proj",
             "q_norm",     "k_norm",
+            "pre_feedforward_layernorm", "post_feedforward_layernorm",
             "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
             "conv1d_weight", "A_log",  "dt_bias",
             "ssm_norm_weight", "out_proj",
@@ -228,6 +242,8 @@ pub const GpuModel = struct {
         for (cpu.layers) |layer| {
             accountTensor(layer.input_layernorm,          .fp32,        &total_bytes, &max_tensor_bytes, slack_per_tensor);
             accountTensor(layer.post_attention_layernorm, .fp32,        &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            if (layer.pre_feedforward_layernorm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            if (layer.post_feedforward_layernorm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
             accountTensor(layer.gate_proj,                matmul_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
             accountTensor(layer.up_proj,                  matmul_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
             accountTensor(layer.down_proj,                matmul_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
@@ -317,11 +333,26 @@ pub const GpuModel = struct {
                 .down_proj = try uploadByPath(gpa, ctx, layer.down_proj, matmul_path, js, &pool),
             };
 
+            if (layer.pre_feedforward_layernorm) |t| {
+                layers[i].pre_feedforward_layernorm = try uploadTensor(gpa, ctx, t, js, &pool);
+            }
+            if (layer.post_feedforward_layernorm) |t| {
+                layers[i].post_feedforward_layernorm = try uploadTensor(gpa, ctx, t, js, &pool);
+            }
+            // Shape-[1] weight: read it to the host now and carry it as a
+            // push constant. A one-float SSBO plus a descriptor write per
+            // layer would cost more than the value is worth.
+            if (layer.layer_scalar) |t| layers[i].layer_scalar = readScalarTensor(t);
+
             switch (layer.layer_type) {
                 .full_attention => {
                     layers[i].q_proj = try uploadByPath(gpa, ctx, layer.q_proj.?, matmul_path, js, &pool);
                     layers[i].k_proj = try uploadByPath(gpa, ctx, layer.k_proj.?, matmul_path, js, &pool);
-                    layers[i].v_proj = try uploadByPath(gpa, ctx, layer.v_proj.?, matmul_path, js, &pool);
+                    // Absent exactly where `attention_k_eq_v` applies; the
+                    // forward path then derives V from the k_proj output.
+                    if (layer.v_proj) |t| {
+                        layers[i].v_proj = try uploadByPath(gpa, ctx, t, matmul_path, js, &pool);
+                    }
                     layers[i].o_proj = try uploadByPath(gpa, ctx, layer.o_proj.?, matmul_path, js, &pool);
                     if (layer.q_norm) |t| layers[i].q_norm = try uploadTensor(gpa, ctx, t, js, &pool);
                     if (layer.k_norm) |t| layers[i].k_norm = try uploadTensor(gpa, ctx, t, js, &pool);
@@ -449,6 +480,30 @@ fn targetBytes(t: safetensors.Tensor, path: TensorPath) usize {
         return supers * q4_k.GPU_U32S_PER_SUPERBLOCK * 4;
     }
     return t.numel() * 4; // fp32 destination
+}
+
+/// Read a shape-[1] weight straight to the host. Used for Gemma 4's
+/// `layer_scalar`, which is applied as a push constant rather than
+/// living on the device. Handles the dtypes a checkpoint realistically
+/// stores a lone scalar in; anything else is a checkpoint we don't
+/// understand, so fall back to 1.0 (the identity) rather than
+/// misinterpreting bytes.
+fn readScalarTensor(t: safetensors.Tensor) f32 {
+    std.debug.assert(t.numel() == 1);
+    return switch (t.dtype) {
+        .f32 => t.asF32()[0],
+        .bf16 => blk: {
+            var out: [1]f32 = undefined;
+            dtype.bf16SliceToF32(dtype.asU16(t.bytes), &out);
+            break :blk out[0];
+        },
+        .f16 => blk: {
+            var out: [1]f32 = undefined;
+            dtype.f16SliceToF32(dtype.asU16(t.bytes), &out);
+            break :blk out[0];
+        },
+        else => 1.0,
+    };
 }
 
 fn uploadByPath(gpa: std.mem.Allocator, ctx: *const vk.Context, t: safetensors.Tensor, path: TensorPath, js: *jobs.JobSystem, pool: *buffer.BufferPool) !buffer.Buffer {

@@ -63,8 +63,13 @@ pub const GpuScratch = struct {
     pub fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: usize) !GpuScratch {
         const hidden = cfg.hidden_size;
         const inter = cfg.intermediate_size;
-        const q_dim = cfg.num_attention_heads * cfg.head_dim;
-        const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        // Worst case across layers, not the flat config fields: Gemma 4's
+        // global layers are wider than its sliding ones (q 16x512 vs
+        // 16x256), and this scratch is reused by every layer in a step.
+        // Collapses to the flat values for every other family.
+        const q_dim = cfg.maxQDim();
+        const kv_dim = cfg.maxKvDim();
+        const head_dim_max = cfg.maxHeadDim();
 
         // Worst-case n_splits the FlashDecoding heuristic can produce
         // at any decode step. Mirrors `runtime.chooseFaDecodeSplit`
@@ -77,7 +82,7 @@ pub const GpuScratch = struct {
             4
         else
             (max_pos_u32 + 255) / 256;
-        const o_partial_elems: usize = cfg.num_attention_heads * @as(usize, max_n_splits) * cfg.head_dim;
+        const o_partial_elems: usize = cfg.num_attention_heads * @as(usize, max_n_splits) * head_dim_max;
         const ml_partial_elems: usize = cfg.num_attention_heads * @as(usize, max_n_splits);
 
         const f = @sizeOf(f32);
@@ -141,12 +146,19 @@ pub const GpuScratch = struct {
 pub const GpuKvCache = struct {
     layers: []LayerKv,
     max_pos: usize,
+    /// Flat `num_key_value_heads * head_dim`. Retained for families with
+    /// uniform geometry; prefer `layers[i].kv_dim` when addressing a
+    /// specific layer, which is what Gemma 4 requires.
     kv_dim: usize,
     allocator: std.mem.Allocator,
 
     pub const LayerKv = struct {
         k_cache: buffer.Buffer,
         v_cache: buffer.Buffer,
+        /// This layer's `n_kv_heads * head_dim`. Uniform for every family
+        /// except Gemma 4, whose sliding layers hold 8x256 = 2048 while
+        /// its global layers hold 1x512 = 512.
+        kv_dim: usize,
 
         pub fn deinit(self: *LayerKv, device: vk.c.VkDevice) void {
             self.k_cache.deinit(device);
@@ -164,10 +176,18 @@ pub const GpuKvCache = struct {
             gpa.free(layers);
         }
         const f = @sizeOf(f32);
-        for (layers) |*l| {
+        for (layers, 0..) |*l, i| {
+            // Per-layer width. Note both K and V are always allocated,
+            // even where `attention_k_eq_v` says V has no weight tensor:
+            // the aliasing happens at the projection output, after which
+            // K takes the learned k_norm plus RoPE and V takes a plain
+            // weightless RMSNorm and no RoPE. The two caches hold
+            // genuinely different values.
+            const dim = cfg.numKvHeadsAt(i) * cfg.headDimAt(i);
             l.* = .{
-                .k_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f),
-                .v_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * kv_dim * f),
+                .k_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * dim * f),
+                .v_cache = try buffer.Buffer.initDeviceOnly(ctx, max_pos * dim * f),
+                .kv_dim = dim,
             };
             done += 1;
         }

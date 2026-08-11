@@ -534,6 +534,53 @@ pub const Config = struct {
         return if (self.isSliding(il)) self.sliding_window else 0;
     }
 
+    /// Pre-softmax scaling applied to the QK dot product on layer `il`.
+    ///
+    /// Everyone else uses the textbook `1/sqrt(head_dim)`. Gemma 4 sets
+    /// its attention scale to exactly 1.0 — the scaling is folded into
+    /// the trained weights instead. This is the single easiest thing in
+    /// the whole port to get wrong silently: a model with the wrong
+    /// attention temperature still produces fluent text, just
+    /// consistently worse, and nothing in the output says so.
+    pub fn attnScaleAt(self: Config, il: usize) f32 {
+        if (self.family == .gemma4) return 1.0;
+        const hd: f32 = @floatFromInt(self.headDimAt(il));
+        return 1.0 / @sqrt(hd);
+    }
+
+    // ── Worst-case dimensions across all layers ─────────────────────
+    // Gemma 4's per-layer geometry means scratch buffers can't be sized
+    // from the flat config fields: its global layers are WIDER than its
+    // sliding ones (16x512 = 8192 vs 16x256 = 4096 for q). Scratch is
+    // reused across layers within a step, so it must fit the largest.
+    // For every other family these return the flat values unchanged.
+
+    pub fn maxHeadDim(self: Config) usize {
+        var m = self.head_dim;
+        if (self.global_head_dim > m) m = self.global_head_dim;
+        return m;
+    }
+
+    /// Widest q_proj output across layers. `num_attention_heads` is
+    /// uniform on Gemma 4; only the head dim varies.
+    pub fn maxQDim(self: Config) usize {
+        const base = self.num_attention_heads * self.maxHeadDim();
+        return if (self.attn_output_gate) 2 * base else base;
+    }
+
+    /// Widest k_proj/v_proj output across layers. Note this is NOT
+    /// `maxHeadDim * maxKvHeads` — on Gemma 4 the wide-head layers are
+    /// exactly the ones with few KV heads (global: 1x512 = 512), so
+    /// taking the product of the two maxima would over-allocate 4x.
+    pub fn maxKvDim(self: Config) usize {
+        var m: usize = 0;
+        for (0..self.num_hidden_layers) |il| {
+            const d = self.numKvHeadsAt(il) * self.headDimAt(il);
+            if (d > m) m = d;
+        }
+        return m;
+    }
+
     pub fn print(self: Config, w: anytype) !void {
         try w.print("family:                  {s}\n", .{@tagName(self.family)});
         try w.print("hidden_size:             {d}\n", .{self.hidden_size});

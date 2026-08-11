@@ -5,8 +5,15 @@
 // rmsnorm: c[r, i] = (gain[i] * rms_inv) * a[r, i]
 // where:
 //     rms_inv = 1 / sqrt(mean(a[r, :]²) + eps)
-//     gain    = (1 + w[i])   if pc.gemma_quirk != 0
-//             = w[i]         otherwise
+//     gain    = 1.0           if pc.weightless != 0
+//             = (1 + w[i])    else if pc.gemma_quirk != 0
+//             = w[i]          otherwise
+//
+// `weightless` covers plain RMSNorm with no learned gain at all. Gemma 4
+// applies exactly that to V in every attention layer — there is no
+// tensor for it in the checkpoint, so it is easy to miss entirely. The
+// W binding still has to be populated for Vulkan, but is not read;
+// callers bind whatever is convenient.
 //
 // One workgroup per row. The whole workgroup cooperates on the
 // sum-of-squares reduction (parallel sum across threads), then every
@@ -35,6 +42,7 @@ layout(push_constant) uniform Pc {
     uint dim;
     float eps;
     uint gemma_quirk;
+    uint weightless;   // 1 = ignore W entirely, gain is 1.0
 } pc;
 
 // Up to 32 subgroups per workgroup — enough for any reasonable
@@ -79,8 +87,13 @@ void main() {
 
     // ── Phase 4: per-thread output write ────────────────────────────
     for (uint i = tid; i < pc.dim; i += gl_WorkGroupSize.x) {
-        float gain = w[i];
-        if (pc.gemma_quirk != 0u) gain += 1.0;
+        float gain;
+        if (pc.weightless != 0u) {
+            gain = 1.0;
+        } else {
+            gain = w[i];
+            if (pc.gemma_quirk != 0u) gain += 1.0;
+        }
         c[row_off + i] = (gain * ri) * a[row_off + i];
     }
 }
