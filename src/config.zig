@@ -232,11 +232,15 @@ pub const Config = struct {
     /// KV head count on global layers, against `num_key_value_heads` on
     /// sliding layers. Zero means "same as `num_key_value_heads`".
     ///
-    /// NOTE: the 12B `config.json` advertises 1 here, which does not
-    /// reconcile with the uniform `k_proj` width of 2048 — 2048/512
-    /// implies 4. The projection shapes are the ground truth, so this is
-    /// parsed but must be validated against the checkpoint at load time
-    /// before it is trusted. See docs note in the Gemma 4 port.
+    /// Gemma 4 12B sets this to 1: the global layers are MQA — 16 query
+    /// heads against a single 512-wide KV head. The projections really
+    /// are per-layer-type on disk, which is what makes that consistent:
+    ///
+    ///   sliding: q [4096,3840]=16x256  k [2048,3840]=8x256  v present
+    ///   global:  q [8192,3840]=16x512  k [ 512,3840]=1x512  v absent
+    ///
+    /// So every field here is literal; `expectShape` at load time is
+    /// what keeps us honest about it.
     num_global_key_value_heads: usize = 0,
     /// Global layers ship no `v_proj` and alias V to the K projection
     /// (the checkpoint carries 40 v_proj tensors across 48 layers).

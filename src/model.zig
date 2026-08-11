@@ -54,10 +54,31 @@ pub const Layer = struct {
     k_proj: ?Tensor = null,
     v_proj: ?Tensor = null,
     o_proj: ?Tensor = null,
-    /// Qwen3 / Qwen3.5: per-head RMSNorm gain on Q and K after the
-    /// q_proj/k_proj matmuls and BEFORE RoPE. Shape [head_dim].
+    /// Qwen3 / Qwen3.5 / Gemma 4: per-head RMSNorm gain on Q and K after
+    /// the q_proj/k_proj matmuls and BEFORE RoPE. Shape [head_dim] — and
+    /// on Gemma 4 that is the *per-layer* head dim, so [512] on global
+    /// layers against [256] on sliding ones.
     q_norm: ?Tensor = null,
     k_norm: ?Tensor = null,
+
+    // ── Gemma 4 sandwich-norm fields ───────────────────────────────
+    // Gemma 2 onwards wrap both sublayers in norms rather than only
+    // pre-norming them:
+    //
+    //   h = x + post_attention_layernorm(attn(input_layernorm(x)))
+    //   h = h + post_feedforward_layernorm(mlp(pre_feedforward_layernorm(h)))
+    //   h = h * layer_scalar
+    //
+    // Careful: `post_attention_layernorm` does NOT mean the same thing
+    // across families. On Llama / Qwen it IS the pre-FFN norm; here it
+    // normalises the attention output before the residual add, and the
+    // pre-FFN role belongs to `pre_feedforward_layernorm`. All three
+    // are `null` on families that don't ship them.
+    pre_feedforward_layernorm: ?Tensor = null,
+    post_feedforward_layernorm: ?Tensor = null,
+    /// Scalar multiplier on the whole block output, applied after the
+    /// FFN residual add. Shape [1].
+    layer_scalar: ?Tensor = null,
 
     // ── Gated DeltaNet fields (linear_attention only) ──────────────
     /// `[2*key_dim + value_dim, hidden]`. Splits in-line at forward time
@@ -172,14 +193,21 @@ pub const Model = struct {
         // ── Per-layer weights ───────────────────────────────────────
         const layers = try a.alloc(Layer, cfg.num_hidden_layers);
 
-        const q_dim = cfg.num_attention_heads * cfg.head_dim;
-        const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-        // Qwen3.5 widens q_proj to (q, gate); the on-disk row count is 2×.
-        const q_proj_rows = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
         const conv_dim = cfg.linearAttnConvDim();
         const value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
 
         for (layers, 0..) |*layer, i| {
+            // Attention geometry is per-layer: Gemma 4's global layers
+            // run 16 query heads x 512 against a single 512-wide KV head
+            // (MQA), while its sliding layers run 16 x 256 against 8 KV
+            // heads. For every other family these accessors collapse to
+            // the flat config fields, so the shapes are unchanged.
+            const head_dim_i = cfg.headDimAt(i);
+            const q_dim = cfg.num_attention_heads * head_dim_i;
+            const kv_dim = cfg.numKvHeadsAt(i) * head_dim_i;
+            // Qwen3.5 widens q_proj to (q, gate); the on-disk row count is 2×.
+            const q_proj_rows = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
+
             layer.* = .{
                 .layer_type = cfg.layer_types[i],
                 .input_layernorm = undefined,
@@ -194,6 +222,26 @@ pub const Model = struct {
 
             layer.post_attention_layernorm = try requireLayerTensor(a, &shards, prefix, i, "post_attention_layernorm.weight");
             try expectShape(layer.post_attention_layernorm, "post_attention_layernorm", &.{cfg.hidden_size});
+
+            // Gemma 4's sandwich norms + per-layer output scalar. See the
+            // note on the Layer fields: here `post_attention_layernorm`
+            // normalises the attention output before the residual, and
+            // the pre-FFN role belongs to `pre_feedforward_layernorm` —
+            // the opposite of what the same field name means on Llama.
+            if (cfg.family == .gemma4) {
+                const pre_ffn = try requireLayerTensor(a, &shards, prefix, i, "pre_feedforward_layernorm.weight");
+                try expectShape(pre_ffn, "pre_feedforward_layernorm", &.{cfg.hidden_size});
+                layer.pre_feedforward_layernorm = pre_ffn;
+
+                const post_ffn = try requireLayerTensor(a, &shards, prefix, i, "post_feedforward_layernorm.weight");
+                try expectShape(post_ffn, "post_feedforward_layernorm", &.{cfg.hidden_size});
+                layer.post_feedforward_layernorm = post_ffn;
+            }
+            if (cfg.has_layer_scalar) {
+                const ls = try requireLayerTensor(a, &shards, prefix, i, "layer_scalar");
+                try expectShape(ls, "layer_scalar", &.{1});
+                layer.layer_scalar = ls;
+            }
 
             layer.gate_proj = try requireLayerTensor(a, &shards, prefix, i, "mlp.gate_proj.weight");
             try expectShape(layer.gate_proj, "gate_proj", &.{ cfg.intermediate_size, cfg.hidden_size });
@@ -214,9 +262,23 @@ pub const Model = struct {
                     try expectShape(k, "k_proj", &.{ kv_dim, cfg.hidden_size });
                     layer.k_proj = k;
 
-                    const v = try requireLayerTensor(a, &shards, prefix, i, "self_attn.v_proj.weight");
-                    try expectShape(v, "v_proj", &.{ kv_dim, cfg.hidden_size });
-                    layer.v_proj = v;
+                    // `attention_k_eq_v`: Gemma 4's global layers ship no
+                    // v_proj at all and alias V to K. We leave `v_proj`
+                    // null in that case rather than duplicating the
+                    // tensor — the forward path reads `v_proj orelse
+                    // k_proj`, so the alias costs no memory and no copy.
+                    //
+                    // The absence is only tolerated where the config says
+                    // to expect it; a genuinely missing v_proj anywhere
+                    // else still fails loudly.
+                    const v_aliases_k = cfg.attention_k_eq_v and !cfg.isSliding(i);
+                    if (v_aliases_k) {
+                        layer.v_proj = null;
+                    } else {
+                        const v = try requireLayerTensor(a, &shards, prefix, i, "self_attn.v_proj.weight");
+                        try expectShape(v, "v_proj", &.{ kv_dim, cfg.hidden_size });
+                        layer.v_proj = v;
+                    }
 
                     const o = try requireLayerTensor(a, &shards, prefix, i, "self_attn.o_proj.weight");
                     try expectShape(o, "o_proj", &.{ cfg.hidden_size, q_dim });
@@ -224,10 +286,10 @@ pub const Model = struct {
 
                     if (cfg.family.hasQkNorm()) {
                         const qn = try requireLayerTensor(a, &shards, prefix, i, "self_attn.q_norm.weight");
-                        try expectShape(qn, "q_norm", &.{cfg.head_dim});
+                        try expectShape(qn, "q_norm", &.{head_dim_i});
                         layer.q_norm = qn;
                         const kn = try requireLayerTensor(a, &shards, prefix, i, "self_attn.k_norm.weight");
-                        try expectShape(kn, "k_norm", &.{cfg.head_dim});
+                        try expectShape(kn, "k_norm", &.{head_dim_i});
                         layer.k_norm = kn;
                     }
                 },
@@ -332,6 +394,11 @@ pub const Model = struct {
             try expectShape(mtp_norm, "mtp.norm.weight", &.{cfg.hidden_size});
 
             const mtp_layers = try a.alloc(Layer, cfg.mtp_num_hidden_layers);
+            // MTP heads are Qwen3.5/3.6-only and use the flat attention
+            // geometry — no sliding/global split to resolve per layer.
+            const q_dim = cfg.num_attention_heads * cfg.head_dim;
+            const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+            const q_proj_rows = if (cfg.attn_output_gate) 2 * q_dim else q_dim;
             for (mtp_layers, 0..) |*ml, i| {
                 ml.* = .{
                     .layer_type = .full_attention,
