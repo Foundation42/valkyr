@@ -251,7 +251,8 @@ pub const GpuModel = struct {
                 .full_attention => {
                     accountTensor(layer.q_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
                     accountTensor(layer.k_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
-                    accountTensor(layer.v_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+                    // Absent on Gemma 4's global layers (attention_k_eq_v).
+                    if (layer.v_proj) |t| accountTensor(t, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
                     accountTensor(layer.o_proj.?, matmul_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
                     if (layer.q_norm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
                     if (layer.k_norm) |t| accountTensor(t, .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);

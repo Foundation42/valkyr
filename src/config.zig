@@ -117,8 +117,14 @@ pub const Family = enum {
     /// `RMSNormGated` inside the GatedDeltaNet stays plain `weight * x`,
     /// so that path takes its own dedicated route in cpu/gated_delta.zig.
     /// Llama and Qwen3 use plain `weight * x`.
+    /// Gemma 4 is NOT in this set, despite the family name. Gemma 1/2/3
+    /// use `(1 + w)`; Gemma 3n and Gemma 4 dropped the offset and use
+    /// plain `w * x/rms`. Confirmed against llama.cpp's converter, where
+    /// `Gemma3Model.norm_shift` returns 1.0 while `Gemma4Model.norm_shift`
+    /// returns 0.0. Assuming the family convention here corrupts all four
+    /// norms on all 48 layers and yields fluent-looking garbage.
     pub fn rmsnormAddOne(self: Family) bool {
-        return self == .gemma or self == .qwen35 or self == .gemma4;
+        return self == .gemma or self == .qwen35;
     }
 
     /// Tensor namespace prefix. Qwen3.5 wraps its language model under
