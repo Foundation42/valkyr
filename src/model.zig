@@ -147,6 +147,32 @@ pub const MtpHead = struct {
     layers: []Layer,
 };
 
+/// Gemma 4 Unified's entire vision tower: a linear patch embedder, no
+/// transformer. Ten tensors, all borrowed from the model's shards.
+///
+/// `patch_dense` and `patch_ln1` are indexed HWC-interleaved
+/// (`(r*48 + c)*3 + ch`) — that is the checkpoint's native column
+/// order, and since we patchify ourselves we use them unpermuted.
+pub const VisionEmbedder = struct {
+    /// [6912] — LayerNorm over the raw flattened patch.
+    patch_ln1_w: Tensor,
+    patch_ln1_b: Tensor,
+    /// [embed_dim, 6912] + [embed_dim]
+    patch_dense_w: Tensor,
+    patch_dense_b: Tensor,
+    /// [embed_dim]
+    patch_ln2_w: Tensor,
+    patch_ln2_b: Tensor,
+    /// [pos_size, 2, embed_dim] — `[pos][axis][dim]`, axis 0 keyed by
+    /// column and axis 1 by row. Both are added.
+    pos_embedding: Tensor,
+    pos_norm_w: Tensor,
+    pos_norm_b: Tensor,
+    /// [embed_dim, embed_dim] — projection into the text residual
+    /// stream, applied after a weightless RMSNorm.
+    embedding_projection: Tensor,
+};
+
 pub const Model = struct {
     config: Config,
     /// Owned. Keeps every shard's mmap alive for the lifetime of the
@@ -167,6 +193,9 @@ pub const Model = struct {
     /// `cfg.mtp_num_hidden_layers == 0`). Borrows from `shards`; freed
     /// implicitly when the model's arena is torn down.
     mtp_head: ?MtpHead = null,
+    /// Gemma 4's encoder-free vision path. Null on text-only
+    /// checkpoints. See `vision.zig` for the pipeline these feed.
+    vision: ?VisionEmbedder = null,
 
     pub fn load(gpa: std.mem.Allocator, dir_path: []const u8) !Model {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -459,10 +488,50 @@ pub const Model = struct {
             };
         };
 
+        // ── Vision embedder (Gemma 4 unified) ───────────────────────
+        // Optional: a text-only checkpoint of the same family simply
+        // has none of these, and inference stays text-only.
+        const vision: ?VisionEmbedder = blk: {
+            const dense_w = shards.get("model.vision_embedder.patch_dense.weight") orelse break :blk null;
+            const embed_dim = cfg.hidden_size;
+            const patch_elems = dense_w.shape[dense_w.shape.len - 1];
+            try expectShape(dense_w, "vision patch_dense.weight", &.{ embed_dim, patch_elems });
+
+            const v = VisionEmbedder{
+                .patch_ln1_w = try requireTensor(&shards, "model.vision_embedder.patch_ln1.weight"),
+                .patch_ln1_b = try requireTensor(&shards, "model.vision_embedder.patch_ln1.bias"),
+                .patch_dense_w = dense_w,
+                .patch_dense_b = try requireTensor(&shards, "model.vision_embedder.patch_dense.bias"),
+                .patch_ln2_w = try requireTensor(&shards, "model.vision_embedder.patch_ln2.weight"),
+                .patch_ln2_b = try requireTensor(&shards, "model.vision_embedder.patch_ln2.bias"),
+                .pos_embedding = try requireTensor(&shards, "model.vision_embedder.pos_embedding"),
+                .pos_norm_w = try requireTensor(&shards, "model.vision_embedder.pos_norm.weight"),
+                .pos_norm_b = try requireTensor(&shards, "model.vision_embedder.pos_norm.bias"),
+                .embedding_projection = try requireTensor(&shards, "model.embed_vision.embedding_projection.weight"),
+            };
+            try expectShape(v.patch_ln1_w, "vision patch_ln1.weight", &.{patch_elems});
+            try expectShape(v.patch_ln1_b, "vision patch_ln1.bias", &.{patch_elems});
+            try expectShape(v.patch_dense_b, "vision patch_dense.bias", &.{embed_dim});
+            try expectShape(v.patch_ln2_w, "vision patch_ln2.weight", &.{embed_dim});
+            try expectShape(v.patch_ln2_b, "vision patch_ln2.bias", &.{embed_dim});
+            try expectShape(v.pos_norm_w, "vision pos_norm.weight", &.{embed_dim});
+            try expectShape(v.pos_norm_b, "vision pos_norm.bias", &.{embed_dim});
+            try expectShape(v.embedding_projection, "vision embedding_projection", &.{ embed_dim, embed_dim });
+            // [pos_size, 2, embed_dim]: the middle axis must be exactly
+            // the two factorised lookups (column, row).
+            if (v.pos_embedding.shape.len != 3 or v.pos_embedding.shape[1] != 2 or
+                v.pos_embedding.shape[2] != embed_dim)
+            {
+                return error.UnexpectedVisionPosEmbeddingShape;
+            }
+            break :blk v;
+        };
+
         return .{
             .config = cfg,
             .shards = shards,
             .arena = arena,
+            .vision = vision,
             .embed_tokens = embed,
             .layers = layers,
             .final_norm = final_norm,

@@ -240,6 +240,23 @@ pub fn runLoad(allocator: std.mem.Allocator, dir_path: []const u8) !void {
         try stdout.print("\nMTP head: none\n", .{});
     }
 
+    // Vision embedder (Gemma 4 unified). Reported explicitly because
+    // the loader treats its absence as "text-only checkpoint" rather
+    // than an error — without this line a silent miss would look
+    // identical to a successful text-only load.
+    if (model.vision) |v| {
+        const patch_elems = v.patch_dense_w.shape[v.patch_dense_w.shape.len - 1];
+        try stdout.print(
+            "\nVision embedder: present (patch {d} elems, pos table {d}, embed {d})\n",
+            .{ patch_elems, v.pos_embedding.shape[0], v.embedding_projection.shape[0] },
+        );
+        bytes_touched +%= @intCast(v.patch_dense_w.bytes[0]);
+        bytes_touched +%= @intCast(v.pos_embedding.bytes[0]);
+        bytes_touched +%= @intCast(v.embedding_projection.bytes[0]);
+    } else {
+        try stdout.print("\nVision embedder: none\n", .{});
+    }
+
     // The xor folds the first/last byte of every weight into one word —
     // a cheap way to force the OS to actually touch each tensor page.
     // Print it so the optimizer can't elide the loop.
