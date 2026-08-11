@@ -23,10 +23,31 @@ pub const Family = enum {
     /// config under `text_config.*` of `config.json`. Adds attn_output_gate,
     /// partial RoPE, and a per-layer schedule (`layer_types[]`).
     qwen35,
+    /// Gemma 4 "unified" (12B / 31B). Wraps the language model under
+    /// `model.language_model.*` and the numeric config under
+    /// `text_config.*`, like Qwen3.5. What's new relative to every other
+    /// family we support:
+    ///
+    ///   - a sliding/global attention schedule (`layer_types[]`, 5:1 on
+    ///     the 12B) where the two flavors differ in mask span, RoPE
+    ///     parameters, *and* head geometry;
+    ///   - `attention_k_eq_v`: the global layers ship no `v_proj` and
+    ///     alias V to K (40 of 48 v_proj tensors present on the 12B);
+    ///   - a per-layer output scalar (`layers.N.layer_scalar`, shape [1]);
+    ///   - `final_logit_softcapping` (tanh squash on the logits);
+    ///   - an encoder-free vision path — a linear patch embedder rather
+    ///     than a ViT tower (see `vision_embedder.*` in the checkpoint).
+    ///
+    /// Note the E2B/E4B checkpoints are a *different* architecture
+    /// (`Gemma4ForConditionalGeneration`, `model_type: gemma4`): they add
+    /// per-layer embeddings, cross-layer KV sharing, and a real vision
+    /// transformer. They are deliberately not handled here.
+    gemma4,
 
     pub fn fromArchitectures(archs: []const []const u8) !Family {
         for (archs) |a| {
             if (std.mem.eql(u8, a, "GemmaForCausalLM")) return .gemma;
+            if (std.mem.eql(u8, a, "Gemma4UnifiedForConditionalGeneration")) return .gemma4;
             // Mistral & Ministral are architecturally identical to
             // Llama (SiLU + plain RMSNorm + GQA + no-bias projections);
             // only the chat template differs and that's auto-detected
@@ -48,7 +69,7 @@ pub const Family = enum {
     pub const Activation = enum { gelu, silu };
     pub fn activation(self: Family) Activation {
         return switch (self) {
-            .gemma => .gelu,
+            .gemma, .gemma4 => .gelu,
             .llama, .qwen3, .qwen35 => .silu,
         };
     }
@@ -59,7 +80,7 @@ pub const Family = enum {
     /// numerical impact — forget it and the logits diverge from step 1.
     pub fn embedScalesByDim(self: Family) bool {
         return switch (self) {
-            .gemma => true,
+            .gemma, .gemma4 => true,
             .llama, .qwen3, .qwen35 => false,
         };
     }
@@ -70,8 +91,11 @@ pub const Family = enum {
     /// Gemma and Llama don't have these. Qwen3.5 only applies them on
     /// `full_attention` layers (linear-attention layers do their own
     /// L2-norm internally).
+    /// Gemma 4 also carries them, shape [head_dim] == [256] on every
+    /// layer including the global ones (whose *attention* head dim is
+    /// 512 — the norm is still sized by the sliding head dim).
     pub fn hasQkNorm(self: Family) bool {
-        return self == .qwen3 or self == .qwen35;
+        return self == .qwen3 or self == .qwen35 or self == .gemma4;
     }
 
     /// Qwen3.5 only: the per-layer hybrid schedule mixes full-attention
@@ -94,7 +118,7 @@ pub const Family = enum {
     /// so that path takes its own dedicated route in cpu/gated_delta.zig.
     /// Llama and Qwen3 use plain `weight * x`.
     pub fn rmsnormAddOne(self: Family) bool {
-        return self == .gemma or self == .qwen35;
+        return self == .gemma or self == .qwen35 or self == .gemma4;
     }
 
     /// Tensor namespace prefix. Qwen3.5 wraps its language model under
@@ -103,7 +127,7 @@ pub const Family = enum {
     pub fn tensorPrefix(self: Family) []const u8 {
         return switch (self) {
             .gemma, .llama, .qwen3 => "model.",
-            .qwen35 => "model.language_model.",
+            .qwen35, .gemma4 => "model.language_model.",
         };
     }
 };
@@ -182,6 +206,53 @@ pub const Config = struct {
     linear_key_head_dim: usize = 0,
     linear_value_head_dim: usize = 0,
 
+    // ── Gemma 4 extensions ──────────────────────────────────────────
+    // All default to "absent" so every other family parses unchanged.
+    //
+    // Gemma 4 splits its attention layers into *sliding* and *global*
+    // flavors that differ in more than the mask: they have different
+    // head dims, different KV head counts, and different RoPE. We model
+    // that the way the llama.cpp reference does — `LayerType` stays the
+    // structural tag (attention vs Gated-DeltaNet) and the sliding/global
+    // distinction rides alongside as per-layer geometry, resolved through
+    // the `*At(il)` accessors below. Adding a third `LayerType` variant
+    // would force every exhaustive switch in the runtime to handle a
+    // case that is, structurally, still just attention.
+
+    /// Sliding-window span in tokens (Gemma 4 12B: 1024). Zero means no
+    /// layer slides, which is every other family we support.
+    sliding_window: usize = 0,
+    /// Per-layer sliding flag, parallel to `layer_types`. False
+    /// everywhere for non-Gemma4 families.
+    layer_is_sliding: [MAX_LAYERS]bool = [_]bool{false} ** MAX_LAYERS,
+    /// Head dim on *global* (non-sliding) attention layers. Gemma 4 12B
+    /// uses 512 here against `head_dim` = 256 on sliding layers. Zero
+    /// means "same as `head_dim`" — the case for every other family.
+    global_head_dim: usize = 0,
+    /// KV head count on global layers, against `num_key_value_heads` on
+    /// sliding layers. Zero means "same as `num_key_value_heads`".
+    ///
+    /// NOTE: the 12B `config.json` advertises 1 here, which does not
+    /// reconcile with the uniform `k_proj` width of 2048 — 2048/512
+    /// implies 4. The projection shapes are the ground truth, so this is
+    /// parsed but must be validated against the checkpoint at load time
+    /// before it is trusted. See docs note in the Gemma 4 port.
+    num_global_key_value_heads: usize = 0,
+    /// Global layers ship no `v_proj` and alias V to the K projection
+    /// (the checkpoint carries 40 v_proj tensors across 48 layers).
+    attention_k_eq_v: bool = false,
+    /// RoPE theta on global layers (1e6 on Gemma 4); sliding layers use
+    /// the plain `rope_theta` field (1e4). Zero means "same as
+    /// `rope_theta`".
+    global_rope_theta: f32 = 0,
+    /// tanh softcap applied to the final logits: `tanh(x/c) * c`. Gemma 4
+    /// uses 30.0. Zero disables it.
+    final_logit_softcapping: f32 = 0,
+    /// Gemma 4 carries a scalar multiplier per layer
+    /// (`layers.N.layer_scalar`, shape [1]) applied to the block output
+    /// before it rejoins the residual stream.
+    has_layer_scalar: bool = false,
+
     // ── MTP (Multi-Token Prediction) heads ──────────────────────────
     // Qwen3.5/3.6, Gemma 4 26B-A4B, DeepSeek-V3, MiMo-V2.5 ship dormant
     // MTP heads alongside the main model (DeepSeek-V3 §2.3). At inference
@@ -235,17 +306,21 @@ pub const Config = struct {
                     if (std.mem.eql(u8, mt.string, "mistral")) family = .llama;
                     if (std.mem.eql(u8, mt.string, "qwen3")) family = .qwen3;
                     if (std.mem.eql(u8, mt.string, "qwen3_5")) family = .qwen35;
+                    // Only the *unified* Gemma 4 line. Bare "gemma4" is
+                    // the E2B/E4B architecture, which we don't handle.
+                    if (std.mem.eql(u8, mt.string, "gemma4_unified")) family = .gemma4;
                 }
             }
         }
         const fam = family orelse return error.UnsupportedArchitecture;
 
-        // Qwen3.5 wraps the language-model config under `text_config`.
-        // Everything numeric (hidden_size, head counts, vocab, ...) lives
-        // there, including a nested `rope_parameters` block. For older
-        // families the inner namespace IS the outer object.
+        // Qwen3.5 and Gemma 4 wrap the language-model config under
+        // `text_config`. Everything numeric (hidden_size, head counts,
+        // vocab, ...) lives there, including a nested `rope_parameters`
+        // block. For older families the inner namespace IS the outer
+        // object.
         const inner = blk: {
-            if (fam == .qwen35) {
+            if (fam == .qwen35 or fam == .gemma4) {
                 const tc = outer.get("text_config") orelse return error.MissingTextConfig;
                 if (tc != .object) return error.InvalidTextConfig;
                 break :blk tc.object;
@@ -265,8 +340,34 @@ pub const Config = struct {
         // `partial_rotary_factor`. Read whichever shape is present.
         var rope_theta: f32 = 10000.0;
         var partial_rotary: f32 = 1.0;
+        var global_rope_theta: f32 = 0;
         if (inner.get("rope_parameters")) |rp| {
             if (rp == .object) {
+                // Gemma 4 nests one block *per layer flavor* inside
+                // `rope_parameters` rather than putting the fields flat:
+                //
+                //   "rope_parameters": {
+                //     "sliding_attention": { rope_theta: 1e4 },
+                //     "full_attention":    { rope_theta: 1e6,
+                //                            partial_rotary_factor: 0.25 }
+                //   }
+                //
+                // `rope_theta` carries the sliding value and
+                // `global_rope_theta` the global one; `partial_rotary`
+                // comes off the global block and is applied only there
+                // (see `partialRotaryAt`). Qwen3.5 keeps them flat, so
+                // read the nested shape first and fall back.
+                if (rp.object.get("sliding_attention")) |sa| {
+                    if (sa == .object) {
+                        rope_theta = optionalF32(sa.object, "rope_theta") orelse rope_theta;
+                    }
+                }
+                if (rp.object.get("full_attention")) |fa| {
+                    if (fa == .object) {
+                        global_rope_theta = optionalF32(fa.object, "rope_theta") orelse 0;
+                        partial_rotary = optionalF32(fa.object, "partial_rotary_factor") orelse partial_rotary;
+                    }
+                }
                 rope_theta = optionalF32(rp.object, "rope_theta") orelse rope_theta;
                 partial_rotary = optionalF32(rp.object, "partial_rotary_factor") orelse partial_rotary;
             }
@@ -286,7 +387,7 @@ pub const Config = struct {
             .vocab_size = try requireUsize(inner, "vocab_size"),
             .rms_norm_eps = optionalF32(inner, "rms_norm_eps") orelse 1e-6,
             .rope_theta = rope_theta,
-            .tie_word_embeddings = optionalBool(inner, "tie_word_embeddings") orelse (fam == .gemma or fam == .qwen3 or fam == .qwen35),
+            .tie_word_embeddings = optionalBool(inner, "tie_word_embeddings") orelse (fam == .gemma or fam == .qwen3 or fam == .qwen35 or fam == .gemma4),
             .bos_token_id = optionalU32(inner, "bos_token_id") orelse optionalU32(outer, "bos_token_id"),
             .eos_token_id = optionalU32(inner, "eos_token_id") orelse optionalU32(outer, "eos_token_id"),
             .pad_token_id = optionalU32(inner, "pad_token_id") orelse optionalU32(outer, "pad_token_id"),
@@ -316,6 +417,57 @@ pub const Config = struct {
             cfg.linear_value_head_dim = optionalUsize(inner, "linear_value_head_dim") orelse 0;
         }
 
+        // Gemma 4: sliding/global schedule + the per-flavor geometry.
+        if (fam == .gemma4) {
+            if (n_layers > MAX_LAYERS) return error.TooManyLayers;
+            const lt = inner.get("layer_types") orelse return error.MissingLayerTypes;
+            if (lt != .array) return error.InvalidLayerTypes;
+            if (lt.array.items.len != n_layers) return error.LayerTypesLengthMismatch;
+            for (lt.array.items, 0..) |item, i| {
+                if (item != .string) return error.InvalidLayerType;
+                const s = item.string;
+                // Both flavors stay `.full_attention` structurally — they
+                // are ordinary attention blocks. Only the mask span, RoPE,
+                // and head geometry differ, and those ride on
+                // `layer_is_sliding` (see the accessors above).
+                if (std.mem.eql(u8, s, "sliding_attention")) {
+                    cfg.layer_types[i] = .full_attention;
+                    cfg.layer_is_sliding[i] = true;
+                } else if (std.mem.eql(u8, s, "full_attention")) {
+                    cfg.layer_types[i] = .full_attention;
+                    cfg.layer_is_sliding[i] = false;
+                } else return error.UnknownLayerType;
+            }
+            cfg.sliding_window = optionalUsize(inner, "sliding_window") orelse 0;
+            cfg.global_head_dim = optionalUsize(inner, "global_head_dim") orelse 0;
+            cfg.num_global_key_value_heads = optionalUsize(inner, "num_global_key_value_heads") orelse 0;
+            cfg.attention_k_eq_v = optionalBool(inner, "attention_k_eq_v") orelse false;
+            cfg.final_logit_softcapping = optionalF32(inner, "final_logit_softcapping") orelse 0;
+            cfg.global_rope_theta = global_rope_theta;
+            cfg.has_layer_scalar = true;
+
+            // A sliding schedule with no window is a config we'd silently
+            // mis-mask, so fail loudly instead.
+            for (cfg.layer_is_sliding[0..n_layers]) |sl| {
+                if (sl and cfg.sliding_window == 0) return error.MissingSlidingWindow;
+            }
+
+            // Gemma 4's per-layer embeddings (`hidden_size_per_layer_input`)
+            // are the E2B/E4B feature and are inert on the unified line.
+            // If a checkpoint ever turns them on we'd silently drop them,
+            // so refuse rather than produce quietly wrong logits.
+            if ((optionalUsize(inner, "hidden_size_per_layer_input") orelse 0) != 0) {
+                return error.PerLayerEmbeddingsUnsupported;
+            }
+            // Likewise the MoE block (26B-A4B) and cross-layer KV sharing.
+            if (optionalBool(inner, "enable_moe_block") orelse false) {
+                return error.MoEUnsupported;
+            }
+            if ((optionalUsize(inner, "num_kv_shared_layers") orelse 0) != 0) {
+                return error.SharedKvLayersUnsupported;
+            }
+        }
+
         // MTP head fields. Qwen3.5/3.6 nest under `text_config`; older
         // families don't ship them at all. Default-zero / default-false
         // makes non-MTP checkpoints load unchanged.
@@ -334,6 +486,50 @@ pub const Config = struct {
         return 2 * k + v;
     }
 
+    // ── Per-layer attention geometry ────────────────────────────────
+    // Gemma 4 is the only family where these vary by layer; for
+    // everything else they collapse to the flat config fields, so
+    // callers can use them unconditionally.
+
+    /// Whether layer `il` uses a sliding-window mask.
+    pub fn isSliding(self: Config, il: usize) bool {
+        return self.layer_is_sliding[il];
+    }
+
+    /// Per-head dimension for layer `il`.
+    pub fn headDimAt(self: Config, il: usize) usize {
+        if (self.isSliding(il) or self.global_head_dim == 0) return self.head_dim;
+        return self.global_head_dim;
+    }
+
+    /// KV head count for layer `il`.
+    pub fn numKvHeadsAt(self: Config, il: usize) usize {
+        if (self.isSliding(il) or self.num_global_key_value_heads == 0) {
+            return self.num_key_value_heads;
+        }
+        return self.num_global_key_value_heads;
+    }
+
+    /// RoPE base frequency for layer `il`. Gemma 4 runs a short-context
+    /// theta on sliding layers and a long-context one on global layers.
+    pub fn ropeThetaAt(self: Config, il: usize) f32 {
+        if (self.isSliding(il) or self.global_rope_theta == 0) return self.rope_theta;
+        return self.global_rope_theta;
+    }
+
+    /// Rotated fraction of the head dim for layer `il`. Gemma 4 applies
+    /// partial rotary (0.25) only on global layers; sliding layers rotate
+    /// fully. Non-Gemma4 families use the flat factor everywhere.
+    pub fn partialRotaryAt(self: Config, il: usize) f32 {
+        if (self.family != .gemma4) return self.partial_rotary_factor;
+        return if (self.isSliding(il)) 1.0 else self.partial_rotary_factor;
+    }
+
+    /// Sliding-window span for layer `il`; 0 means unbounded (global).
+    pub fn attnWindowAt(self: Config, il: usize) usize {
+        return if (self.isSliding(il)) self.sliding_window else 0;
+    }
+
     pub fn print(self: Config, w: anytype) !void {
         try w.print("family:                  {s}\n", .{@tagName(self.family)});
         try w.print("hidden_size:             {d}\n", .{self.hidden_size});
@@ -347,6 +543,21 @@ pub const Config = struct {
         try w.print("rms_norm_eps:            {e}\n", .{self.rms_norm_eps});
         try w.print("rope_theta:              {d}\n", .{self.rope_theta});
         try w.print("tie_word_embeddings:     {}\n", .{self.tie_word_embeddings});
+        if (self.family == .gemma4) {
+            var n_slide: usize = 0;
+            for (self.layer_is_sliding[0..self.num_hidden_layers]) |sl| {
+                if (sl) n_slide += 1;
+            }
+            try w.print("layer schedule:          {d} sliding / {d} global\n", .{ n_slide, self.num_hidden_layers - n_slide });
+            try w.print("sliding_window:          {d}\n", .{self.sliding_window});
+            try w.print("global head_dim:         {d}\n", .{self.global_head_dim});
+            try w.print("global kv heads:         {d}\n", .{self.num_global_key_value_heads});
+            try w.print("global rope_theta:       {d}\n", .{self.global_rope_theta});
+            try w.print("partial_rotary_factor:   {d} (global layers only)\n", .{self.partial_rotary_factor});
+            try w.print("attention_k_eq_v:        {}\n", .{self.attention_k_eq_v});
+            try w.print("final_logit_softcapping: {d}\n", .{self.final_logit_softcapping});
+            try w.print("has_layer_scalar:        {}\n", .{self.has_layer_scalar});
+        }
         if (self.family.isHybrid()) {
             try w.print("partial_rotary_factor:   {d}\n", .{self.partial_rotary_factor});
             try w.print("attn_output_gate:        {}\n", .{self.attn_output_gate});

@@ -88,6 +88,20 @@ pub const ChatTemplate = struct {
     inst_open: ?u32 = null,
     /// Mistral's `[/INST]` token (set only in `.mistral` format).
     inst_close: ?u32 = null,
+    /// Empty "thought channel" emitted immediately after the assistant
+    /// header. Gemma 4 is a reasoning model, and the reference template
+    /// disables reasoning by opening and immediately closing the thought
+    /// channel (`<|channel>thought\n<channel|>`) in the generation
+    /// prompt. Omit it and the model opens a chain of thought before it
+    /// answers — which is fatal inside a frame budget, so this is not
+    /// cosmetic. `null` for every other family.
+    thought_channel: ?ThoughtChannel = null,
+
+    pub const ThoughtChannel = struct {
+        open: u32,
+        label: []const u8,
+        close: u32,
+    };
 
     pub const Format = enum {
         /// Gemma + Qwen3/3.5 share the `<sot>role\n{msg}<eot>\n` shape.
@@ -117,6 +131,33 @@ pub const ChatTemplate = struct {
                 .system_role = "system", // unused — Gemma folds system into first user
                 .header_sep = "\n",
                 .inter_turn_sep = "\n",
+            },
+            // Gemma 4 keeps the `<open>role\n{msg}<close>\n` skeleton but
+            // renames every special: `<|turn>` / `<turn|>` in place of
+            // `<start_of_turn>` / `<end_of_turn>`. Structurally identical
+            // to .gemma_qwen, so it reuses that composer rather than
+            // earning its own Format variant. Unlike Gemma 1 it has a
+            // real system turn (hasSystemTurn keys off family != .gemma).
+            //
+            // Note `<turn|>` (106) is also one of the two configured EOS
+            // ids, so the sampler's existing end_of_turn stop is correct.
+            .gemma4 => .{
+                .family = family,
+                .format = .gemma_qwen,
+                .bos = tok.specialTokenId("<bos>") orelse return error.NoBos,
+                .start_of_turn = tok.specialTokenId("<|turn>") orelse return error.NoStartOfTurn,
+                .end_of_turn = tok.specialTokenId("<turn|>") orelse return error.NoEndOfTurn,
+                .end_header = null,
+                .user_role = "user",
+                .assistant_role = "model",
+                .system_role = "system",
+                .header_sep = "\n",
+                .inter_turn_sep = "\n",
+                .thought_channel = if (tok.specialTokenId("<|channel>")) |open| .{
+                    .open = open,
+                    .label = "thought\n",
+                    .close = tok.specialTokenId("<channel|>") orelse return error.NoChannelClose,
+                } else null,
             },
             .llama => llama: {
                 // Auto-detect among the three Llama-arch chat formats:
@@ -190,6 +231,7 @@ pub const ChatTemplate = struct {
     pub fn banner(self: ChatTemplate) []const u8 {
         return switch (self.family) {
             .gemma => "Gemma chat",
+            .gemma4 => "Gemma 4 chat",
             .llama => switch (self.format) {
                 .llama3 => "Llama 3 chat",
                 .zephyr => "Llama (Zephyr-style) chat",
@@ -588,6 +630,13 @@ pub const ChatTemplate = struct {
             .gemma_qwen, .llama3 => {
                 try out.append(self.start_of_turn.?);
                 try self.appendRoleSection(gpa, tok, self.assistant_role, out);
+                if (self.thought_channel) |tc| {
+                    try out.append(tc.open);
+                    const ids = try tok.encode(gpa, tc.label);
+                    defer gpa.free(ids);
+                    try out.appendSlice(ids);
+                    try out.append(tc.close);
+                }
             },
             .zephyr => {
                 const buf = try std.fmt.allocPrint(gpa, "{s}{s}", .{ self.assistant_role, self.header_sep });
