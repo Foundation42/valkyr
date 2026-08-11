@@ -30,6 +30,11 @@
 // receive −inf so the online softmax produces 0 there. Matches the
 // CPU oracle in cpu/flash_attn.zig.
 //
+// Sliding window: when `window != 0`, keys older than `window`
+// positions before the query (k < q_abs − window + 1) are masked the
+// same way. Gemma 4 runs 40 of its 48 layers this way at window=1024.
+// Tiles entirely outside the window are skipped before their K/V load.
+//
 // Optional LSE output: when `write_lse != 0`, writes
 // `lse[q, h] = m_final + log(l_final)` for each (q, h) — the
 // quantity FlashAttention backward needs to recompute the softmax
@@ -63,6 +68,7 @@ layout(push_constant) uniform Pc {
     uint  causal;
     uint  write_lse;
     float inv_sqrt_dim;
+    uint  window;          // sliding-window span; 0 = unbounded
 } pc;
 
 shared float Q_row [HEAD_DIM_MAX];
@@ -101,13 +107,36 @@ void main() {
     }
     barrier();
 
+    // Absolute position of this query within the KV timeline. When the
+    // KV cache already holds n_kv − n_q past entries, query `q` sits at
+    // n_kv − n_q + q. Both the causal cutoff and the sliding-window
+    // floor are defined against this.
+    int q_abs = int(q) + int(pc.n_kv) - int(pc.n_q);
+
     // Causal key cutoff (inclusive). For non-causal we just use n_kv − 1.
-    int k_limit = (pc.causal != 0u)
-        ? int(q) + int(pc.n_kv) - int(pc.n_q)
-        : int(pc.n_kv) - 1;
+    int k_limit = (pc.causal != 0u) ? q_abs : int(pc.n_kv) - 1;
+
+    // Sliding-window floor (inclusive). Gemma 4's sliding layers attend
+    // only to the last `window` positions, so keys below this are masked
+    // exactly like keys above the causal cutoff. `window == 0` means
+    // unbounded, which is every other family we support.
+    int k_floor = (pc.window != 0u) ? (q_abs - int(pc.window) + 1) : 0;
 
     for (uint k_block_start = 0u; k_block_start < pc.n_kv; k_block_start += BC) {
         uint k_block_len = min(BC, pc.n_kv - k_block_start);
+
+        // Skip K/V tiles that fall entirely outside the window. This is
+        // the whole point of sliding attention on the compute side: at
+        // long context most tiles are out of range, and skipping them
+        // before the cooperative load avoids the bandwidth entirely.
+        // A fully-masked tile contributes nothing to m/l/O, so eliding
+        // it is mathematically identical to processing it.
+        //
+        // The condition is workgroup-uniform (k_block_start, window and
+        // q are all uniform), so every thread takes the same branch and
+        // the barriers below stay balanced.
+        if (pc.window != 0u && int(k_block_start + k_block_len) <= k_floor) continue;
+        if (pc.causal != 0u && int(k_block_start) > k_limit) break;
 
         // ── Cooperatively load K_tile and V_tile.
         uint kv_total = k_block_len * hd;
@@ -138,7 +167,8 @@ void main() {
                 float total = subgroupAdd(partial);
                 if (subgroupElect()) {
                     int  k_abs  = int(k_block_start + kj);
-                    bool masked = (pc.causal != 0u) && (k_abs > k_limit);
+                    bool masked = ((pc.causal != 0u) && (k_abs > k_limit))
+                               || ((pc.window != 0u) && (k_abs < k_floor));
                     S_row[kj] = masked ? NEG_INF : total * pc.inv_sqrt_dim;
                 }
             }

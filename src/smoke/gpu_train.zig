@@ -2516,6 +2516,8 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
         head_dim: u32,
         causal: bool,
         check_lse: bool,
+        /// Sliding-window span; 0 = unbounded (the pre-Gemma-4 default).
+        window: u32 = 0,
     };
     const cases = [_]FaCase{
         .{ .name = "decode-tiny       (n_q=1 n_kv=8 GQA 4:2 d=16)", .n_q = 1, .n_kv = 8, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = false, .check_lse = false },
@@ -2525,6 +2527,18 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "non-aligned-kv    (n_q=10 n_kv=37 GQA 4:2 d=16)", .n_q = 10, .n_kv = 37, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = false },
         .{ .name = "decode-qwen35     (n_q=1 n_kv=128 GQA 8:2 d=256)", .n_q = 1, .n_kv = 128, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256, .causal = false, .check_lse = false },
         .{ .name = "prefill-qwen35    (n_q=8 n_kv=8 GQA 8:2 d=256)", .n_q = 8, .n_kv = 8, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256, .causal = true, .check_lse = true },
+        // ── Gemma 4 sliding-window cases ──────────────────────────────
+        // `window` must bite (window < n_kv) or these degenerate into
+        // the plain causal cases above and prove nothing.
+        .{ .name = "swa-narrow        (n_q=32 n_kv=32 w=8 GQA 4:2 d=16)", .n_q = 32, .n_kv = 32, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = true, .window = 8 },
+        .{ .name = "swa-tile-aligned  (n_q=32 n_kv=32 w=16 GQA 4:2 d=16)", .n_q = 32, .n_kv = 32, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = false, .window = 16 },
+        .{ .name = "swa-non-aligned   (n_q=19 n_kv=53 w=13 GQA 4:2 d=16)", .n_q = 19, .n_kv = 53, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = false, .window = 13 },
+        .{ .name = "swa-decode        (n_q=1 n_kv=200 w=64 GQA 4:2 d=32)", .n_q = 1, .n_kv = 200, .n_heads = 4, .n_kv_heads = 2, .head_dim = 32, .causal = true, .check_lse = false, .window = 64 },
+        .{ .name = "swa-gemma4-sliding(n_q=8 n_kv=64 w=32 GQA 16:8 d=128)", .n_q = 8, .n_kv = 64, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .causal = true, .check_lse = true, .window = 32 },
+        // Window wider than the whole timeline must be a no-op — this is
+        // the guard against the floor accidentally clipping short
+        // contexts, which is exactly the regime the demo runs in.
+        .{ .name = "swa-inert         (n_q=8 n_kv=8 w=4096 GQA 4:2 d=16)", .n_q = 8, .n_kv = 8, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = false, .window = 4096 },
     };
 
     // Two pipelines: BC=16 HEAD_DIM=128 (d=128 cases) and BC=8 HEAD_DIM=256
@@ -2580,9 +2594,9 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
         for (K) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
         for (V) |*x| x.* = (rng.float(f32) - 0.5) * 0.5;
 
-        cpu_flash_attn.flashAttentionForward(
+        cpu_flash_attn.flashAttentionForwardWindowed(
             Q, K, V, cs.n_q, cs.n_kv, cs.n_heads, cs.n_kv_heads, cs.head_dim,
-            cs.causal, Br, Bc,
+            cs.causal, cs.window, Br, Bc,
             out_ref, lse_ref,
             s_tile, p_tile, o_acc, m_acc, l_acc,
         );
@@ -2612,6 +2626,7 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
             .causal = if (cs.causal) 1 else 0,
             .write_lse = if (cs.check_lse) 1 else 0,
             .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.head_dim))),
+            .window = cs.window,
         };
         const gx: u32 = cs.n_q * cs.n_heads;
 
@@ -2668,7 +2683,7 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print(
-        "PASS GPU fa_forward parity ({d} cases incl. GQA + causal + non-aligned + d=128 + d=256, max rel={e:.2}, lse rel={e:.2}) on {s}\n",
+        "PASS GPU fa_forward parity ({d} cases incl. GQA + causal + non-aligned + d=128 + d=256 + sliding-window, max rel={e:.2}, lse rel={e:.2}) on {s}\n",
         .{ cases.len, max_rel_seen, max_lse_rel_seen, ctx.deviceName() },
     );
 }
@@ -2702,6 +2717,8 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
         n_heads: u32,
         n_kv_heads: u32,
         head_dim: u32,
+        /// Sliding-window span; 0 = unbounded.
+        window: u32 = 0,
     };
     // Each case picks split_size such that n_splits × split_size ≥ n_kv
     // (the last split clamps via min(k_start+split_size, n_kv)).
@@ -2714,6 +2731,19 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "ctx-100 splits=4 sz=32  GQA 4:2 d=16  (last split partial)", .n_kv = 100, .n_splits = 4, .split_size = 32, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16 },
         // Qwen3.5 0.8B / 4B per-layer at long ctx — exercises BC=8 d=256 variant.
         .{ .name = "ctx-1024 splits=4 sz=256 GQA 8:2 d=256 (qwen3.5)", .n_kv = 1024, .n_splits = 4, .split_size = 256, .n_heads = 8, .n_kv_heads = 2, .head_dim = 256 },
+        // ── Gemma 4 sliding-window decode ─────────────────────────────
+        // These are the cases that exercise the split-clamping path:
+        // whole splits fall below the window floor and must collapse to
+        // the neutral partial without perturbing the merge.
+        .{ .name = "swa ctx-2048 w=1024 splits=8 sz=256 GQA 16:8 d=128 (gemma4)", .n_kv = 2048, .n_splits = 8, .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .window = 1024 },
+        // Floor lands mid-split, so one split is partially masked while
+        // the ones below it are fully elided.
+        .{ .name = "swa ctx-2048 w=900 splits=8 sz=256 GQA 16:8 d=128 (floor mid-split)", .n_kv = 2048, .n_splits = 8, .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .window = 900 },
+        // Long context where the window elides the overwhelming majority
+        // of splits — the regime sliding attention exists for.
+        .{ .name = "swa ctx-8192 w=1024 splits=32 sz=256 GQA 16:8 d=128", .n_kv = 8192, .n_splits = 32, .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .window = 1024 },
+        // Window wider than the context must be inert.
+        .{ .name = "swa ctx-128 w=4096 splits=4 sz=32 GQA 4:2 d=16 (inert)", .n_kv = 128, .n_splits = 4, .split_size = 32, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .window = 4096 },
     };
 
     var k_fa_d128 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(128), 5, @sizeOf(runtime.FaForwardPush));
@@ -2787,6 +2817,7 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
             .causal = 0,
             .write_lse = 0,
             .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.head_dim))),
+            .window = cs.window,
         };
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
@@ -2809,6 +2840,7 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
             .n_splits = cs.n_splits,
             .split_size = cs.split_size,
             .inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.head_dim))),
+            .window = cs.window,
         };
         try buffer.submitOneShot(&ctx, struct {
             kern: *const pipeline.Kernel,
@@ -2854,7 +2886,7 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print(
-        "PASS GPU fa_decode (split + merge) parity vs fa_forward ({d} cases incl. partial-tail split + d=256 (qwen3.5), max rel={e:.2}) on {s}\n",
+        "PASS GPU fa_decode (split + merge) parity vs fa_forward ({d} cases incl. partial-tail split + d=256 (qwen3.5) + sliding-window, max rel={e:.2}) on {s}\n",
         .{ cases.len, max_rel_seen, ctx.deviceName() },
     );
 }

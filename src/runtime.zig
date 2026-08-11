@@ -279,6 +279,12 @@ pub const FaForwardPush = extern struct {
     causal: u32,
     write_lse: u32,
     inv_sqrt_dim: f32,
+    /// Sliding-window span. Keys older than `window` positions before
+    /// the query are masked exactly like keys past the causal cutoff.
+    /// Zero = unbounded, which is every family except Gemma 4 (whose
+    /// sliding layers use 1024). Defaulted so existing call sites —
+    /// and every parity test — keep their current semantics.
+    window: u32 = 0,
 };
 
 /// FlashDecoding phase 1 (Tri Dao 2023). Decode-only split-K kernel:
@@ -303,6 +309,12 @@ pub const FaDecodeSplitPush = extern struct {
     n_splits: u32,
     split_size: u32,
     inv_sqrt_dim: f32,
+    /// Sliding-window span; 0 = unbounded. At decode the query sits at
+    /// n_kv − 1, so this admits keys [n_kv − window, n_kv − 1]. Splits
+    /// entirely below the floor emit the neutral partial the merge
+    /// already understands. Defaulted so existing call sites keep their
+    /// current semantics.
+    window: u32 = 0,
 };
 
 /// FlashDecoding phase 2 — merge per-split partials into the final

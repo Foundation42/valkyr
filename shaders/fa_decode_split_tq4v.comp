@@ -67,6 +67,7 @@ layout(push_constant) uniform Pc {
     uint  n_splits;
     uint  split_size;
     float inv_sqrt_dim;
+    uint  window;          // sliding-window span; 0 = unbounded
 } pc;
 
 // TBQ sign table (matches `tbq_signs` in cpu/turboquant.zig).
@@ -117,8 +118,18 @@ void main() {
     uint n_kv_heads = pc.kv_stride / hd;
     uint n_blocks_per_pos = n_kv_heads;
 
-    uint k_start = split_id * pc.split_size;
-    uint k_end   = min(k_start + pc.split_size, pc.n_kv);
+    // Sliding-window floor, identical to fa_decode_split: clamp this
+    // split's start up so out-of-window splits collapse into the
+    // neutral-partial path below. Kept in step with the dense variant —
+    // a window-blind TQ4-V path would be silently wrong on Gemma 4's
+    // sliding layers rather than obviously broken.
+    uint k_floor = (pc.window != 0u && pc.n_kv > pc.window)
+        ? (pc.n_kv - pc.window)
+        : 0u;
+
+    uint raw_start = split_id * pc.split_size;
+    uint k_end     = min(raw_start + pc.split_size, pc.n_kv);
+    uint k_start   = max(raw_start, k_floor);
 
     // ── Load Q row (q implicit = 0) + init online-softmax state.
     for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {

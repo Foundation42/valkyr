@@ -54,6 +54,7 @@ layout(push_constant) uniform Pc {
     uint  n_splits;        // K-split fan-out (= dispatch.x / n_heads)
     uint  split_size;      // ceil(n_kv / n_splits) keys per split
     float inv_sqrt_dim;
+    uint  window;          // sliding-window span; 0 = unbounded
 } pc;
 
 shared float Q_row [HEAD_DIM_MAX];
@@ -81,8 +82,19 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint hd  = pc.head_dim;
 
-    uint k_start = split_id * pc.split_size;
-    uint k_end   = min(k_start + pc.split_size, pc.n_kv);
+    // At decode the single query sits at absolute position n_kv − 1, so
+    // a sliding window of `w` admits keys [n_kv − w, n_kv − 1]. Rather
+    // than mask per key, we clamp this split's start up to the floor:
+    // splits that fall entirely below it collapse to k_start >= k_end
+    // and take the existing neutral-partial path below, costing nothing
+    // and needing no change in the merge kernel.
+    uint k_floor = (pc.window != 0u && pc.n_kv > pc.window)
+        ? (pc.n_kv - pc.window)
+        : 0u;
+
+    uint raw_start = split_id * pc.split_size;
+    uint k_end     = min(raw_start + pc.split_size, pc.n_kv);
+    uint k_start   = max(raw_start, k_floor);
 
     // ── Load Q row (q implicit = 0) + init online-softmax state.
     for (uint d = tid; d < hd; d += gl_WorkGroupSize.x) {

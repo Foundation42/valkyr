@@ -108,6 +108,46 @@ pub fn flashAttentionForward(
     m_acc: []f32,
     l_acc: []f32,
 ) void {
+    flashAttentionForwardWindowed(
+        Q,      K,      V,     n_q,   n_kv,  n_heads, n_kv_heads,
+        head_dim, causal, 0,   Br,    Bc,    out,     lse,
+        s_tile, p_tile, o_acc, m_acc, l_acc,
+    );
+}
+
+/// As `flashAttentionForward`, plus a sliding-window bound.
+///
+/// `window == 0` is unbounded and reproduces `flashAttentionForward`
+/// exactly. Otherwise query `q` attends only to keys in
+/// `[q_abs − window + 1, q_abs]`, where `q_abs = q + (n_kv − n_q)` is
+/// the query's absolute position in the KV timeline. Keys below the
+/// floor are masked with −inf exactly like keys past the causal
+/// cutoff, so the online-softmax identity is unchanged.
+///
+/// This is the oracle for `shaders/fa_forward.comp`'s `window` push
+/// constant. Gemma 4 runs 40 of its 48 layers at window=1024; every
+/// other family we support passes 0.
+pub fn flashAttentionForwardWindowed(
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    window: usize,
+    Br: usize,
+    Bc: usize,
+    out: []f32,
+    lse: ?[]f32,
+    s_tile: []f32,
+    p_tile: []f32,
+    o_acc: []f32,
+    m_acc: []f32,
+    l_acc: []f32,
+) void {
     std.debug.assert(n_heads % n_kv_heads == 0);
     const heads_per_kv = n_heads / n_kv_heads;
     std.debug.assert(Q.len == n_q * n_heads * head_dim);
@@ -146,10 +186,22 @@ pub fn flashAttentionForward(
                 for (0..q_block_len) |qi| {
                     const q = q_block_start + qi;
                     const k_limit: usize = if (causal) causalKeyLimit(q, n_q, n_kv) else n_kv - 1;
+                    // Sliding-window floor against the query's absolute
+                    // position. Saturating: a window wider than the
+                    // query's history leaves the floor at 0.
+                    const q_abs = causalKeyLimit(q, n_q, n_kv);
+                    const k_floor: usize = if (window != 0 and q_abs + 1 > window)
+                        q_abs + 1 - window
+                    else
+                        0;
                     const q_off = q * n_heads * head_dim + h * head_dim;
                     for (0..k_block_len) |ki| {
                         const k = k_block_start + ki;
                         if (causal and k > k_limit) {
+                            s_tile[qi * Bc + ki] = NEG_INF;
+                            continue;
+                        }
+                        if (window != 0 and k < k_floor) {
                             s_tile[qi * Bc + ki] = NEG_INF;
                             continue;
                         }
