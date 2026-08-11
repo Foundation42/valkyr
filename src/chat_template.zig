@@ -327,9 +327,13 @@ pub const ChatTemplate = struct {
             try out.appendSlice(ids);
         }
 
-        // Assistant turn header (no body — generation continues here)
-        try out.append(sot);
-        try self.appendRoleSection(gpa, tok, self.assistant_role, out);
+        // Assistant turn header (no body — generation continues here).
+        // Routed through appendAssistantHeader rather than emitting the
+        // two dispatches inline: this used to duplicate them, which meant
+        // it silently omitted Gemma 4's empty thought channel while
+        // composeConversation (which does call the helper) included it.
+        // Single-turn and multi-turn prompts must not diverge.
+        try self.appendAssistantHeader(gpa, tok, out);
     }
 
     fn composeZephyr(
