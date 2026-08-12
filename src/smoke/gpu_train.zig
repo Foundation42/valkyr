@@ -4230,6 +4230,14 @@ pub fn runGpuMatmulQ4_KMColSmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "M=1 (matches single-row path)", .m = 1 },
         .{ .name = "M=4 (MTP-verify shape)", .m = 4 },
         .{ .name = "M=8 (MAX_M boundary)", .m = 8 },
+        // Beyond MAX_M: the kernel tiles M internally, so these exercise
+        // the multi-pass path and the shared-memory reuse barrier
+        // between tiles. A missing barrier there corrupts only the
+        // second tile onward, which a M<=8 test cannot see.
+        .{ .name = "M=9 (first M-tile spill)", .m = 9 },
+        .{ .name = "M=16 (two full tiles)", .m = 16 },
+        .{ .name = "M=33 (ragged final tile)", .m = 33 },
+        .{ .name = "M=64 (eight tiles)", .m = 64 },
     };
 
     const n: u32 = 16;

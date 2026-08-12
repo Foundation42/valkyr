@@ -624,6 +624,10 @@ pub const ChatKernels = struct {
     fa_forward_wide: ?pipeline.Kernel,
     /// Batched RoPE over n_q rows.
     rope_partial_batched: pipeline.Kernel,
+    /// Column-major Q4_K matmul for batched prefill: one workgroup per
+    /// output COLUMN, so each weight is read once per pass over B
+    /// instead of once per output cell. Non-null only on the Q4_K path.
+    matmul_q4k_mcol: ?pipeline.Kernel,
     /// Batched embedding lookup over n_q token ids.
     embed_batched: pipeline.Kernel,
     /// FlashDecoding phase 2 — merge per-split (O, m, l) partials into
@@ -646,6 +650,11 @@ pub const ChatKernels = struct {
             if (self.fa_decode_split_wide) |*w| return w;
         }
         return &self.fa_decode_split;
+    }
+
+    /// The column-major matmul, when this precision has one.
+    pub fn matmulMColOpt(self: *const ChatKernels) ?*const pipeline.Kernel {
+        return if (self.matmul_q4k_mcol) |*km| km else null;
     }
 
     /// Same selection rule for the batched-prefill attention kernel.
@@ -729,6 +738,10 @@ pub const ChatKernels = struct {
             .fa_forward = try pipeline.Kernel.init(ctx, faForwardSpv(head_dim), 5, @sizeOf(FaForwardPush)),
             .fa_forward_wide = null,
             .rope_partial_batched = try pipeline.Kernel.init(ctx, &shaders.rope_partial_batched, 2, @sizeOf(RopeBatchedPush)),
+            .matmul_q4k_mcol = if (precision == .q4_k_matmul)
+                try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2_q4_k_mcol_m32, 3, @sizeOf(MatmulPush))
+            else
+                null,
             .embed_batched = try pipeline.Kernel.init(ctx, embed_batched_spv, 3, @sizeOf(EmbedLookupBatchedPush)),
             .fa_decode_merge = try pipeline.Kernel.init(ctx, &shaders.fa_decode_merge, 4, @sizeOf(FaDecodeMergePush)),
             .fa_decode_split_tq4v = try pipeline.Kernel.init(ctx, &shaders.fa_decode_split_tq4v, 6, @sizeOf(FaDecodeSplitPush)),
@@ -756,6 +769,7 @@ pub const ChatKernels = struct {
         self.fa_forward.deinit();
         if (self.fa_forward_wide) |*w| w.deinit();
         self.rope_partial_batched.deinit();
+        if (self.matmul_q4k_mcol) |*km| km.deinit();
         self.embed_batched.deinit();
         self.fa_decode_merge.deinit();
         self.fa_decode_split_tq4v.deinit();
@@ -1044,6 +1058,23 @@ pub fn recDispatchMatmul(
 /// caller's job. MTP-verify at n_q=4 fits comfortably; batched
 /// chat prefill of typical chat-template prompts (>>8 tokens) does
 /// not — the dispatcher falls back to the row-major path for those.
+/// Largest batch for which the column-major matmul is used.
+///
+/// The kernel is CORRECT at any M (it tiles M internally); this bound
+/// is purely about where it is faster. It stays at the MTP-verify shape
+/// because batched prefill measured slower with it, on an idle GPU,
+/// three repeats each:
+///
+///     text  413 tok (M=64 chunks)   6480 ms -> 7030 ms   with mcol
+///     image 282 tok (M=264)         4408 ms -> 4828 ms   with mcol
+///
+/// The tempting model — "mcol cuts weight traffic ~M-fold, so it must
+/// win" — does not survive the numbers. The per-output-cell kernel
+/// evidently gets good L2 reuse on a ~2 KB weight column, while mcol
+/// launches only N workgroups instead of M*N and leaves the GPU
+/// underutilised at the shapes prefill actually uses. Faster prefill
+/// needs a tiled GEMM staging BOTH operands in shared memory; a
+/// column-major reshuffle of the same access pattern is not enough.
 pub const Q4K_MCOL_MAX_M: u32 = 8;
 
 /// Q4_K-only column-major matmul fast path. When `k_mcol_opt` is
@@ -1068,6 +1099,8 @@ pub fn recDispatchMatmulPreferMCol(
     k: u32,
 ) !void {
     const push = MatmulPush{ .m = m, .n = n, .k = k };
+    // Correct at any m (the kernel tiles M internally); the bound is
+    // about where it is FASTER. See Q4K_MCOL_MAX_M.
     if (m > 1 and m <= Q4K_MCOL_MAX_M) {
         if (k_mcol_opt) |k_mcol| {
             try rec.dispatch(k_mcol, bufs, &push, n, 1, 1);

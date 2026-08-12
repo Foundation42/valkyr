@@ -19,10 +19,17 @@
 // the activation-bandwidth ceiling on A.
 //
 // MAX_M is compile-time and caps the per-thread accumulator array.
-// Callers MUST guarantee pc.M ≤ MAX_M; we don't shader-side-guard
-// (early-exit would leave outputs undefined, worse than a clear
-// caller-side error). For MTP verify (n_q=4) and small batched
-// prefill MAX_M=8 is the sweet spot.
+// It no longer caps pc.M: the kernel tiles M internally, so any M is
+// legal and MAX_M only sets how many rows share one pass over B.
+// Weight traffic is therefore ceil(M / MAX_M) passes instead of M, and
+// the caller does not have to know the limit.
+//
+// That matters at batched-prefill scale. At M=264 on Gemma 4 12B the
+// one-WG-per-cell kernel moves ~1.6 TB of weights per prefill; with
+// MAX_M=32 the same work moves ~50 GB. Larger MAX_M costs registers
+// (acc[MAX_M] per thread) and shared memory (MAX_M x 32 floats), so
+// the useful range tops out well before M does — hence a `_m32`
+// variant alongside the default 8 used by MTP verify.
 //
 // Per-element math is unchanged from matmul_nt_v2_q4_k.comp — see
 // that shader for the Q4_K layout + factored MAC explanation. The
@@ -59,6 +66,11 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
 
     float acc[MAX_M];
+
+    // Tile M so any M is legal. Each pass re-reads B once and serves up
+    // to MAX_M rows.
+    for (uint m_base = 0u; m_base < pc.M; m_base += uint(MAX_M)) {
+    uint m_hi = min(uint(MAX_M), pc.M - m_base);
     for (uint m = 0u; m < uint(MAX_M); ++m) acc[m] = 0.0;
 
     for (uint k = tid * 8u; k < pc.K; k += gl_WorkGroupSize.x * 8u) {
@@ -116,8 +128,13 @@ void main() {
         // allows the compiler to unroll bounded loops; with MAX_M=8
         // and a small constant ceiling on iteration count the
         // optimizer typically unrolls fully when it can prove M ≤ N.
-        for (uint m = 0u; m < pc.M; ++m) {
-            uint a_off = m * pc.K;
+        // Compile-time bound, NOT m_hi. A runtime bound stops the
+        // compiler unrolling, which makes `acc[m]` a dynamically-indexed
+        // local array — that spills to scratch memory and costs far more
+        // than the redundant lanes save. Out-of-range rows clamp their
+        // read and their result is simply not written back.
+        for (uint m = 0u; m < uint(MAX_M); ++m) {
+            uint a_off = min(m_base + m, pc.M - 1u) * pc.K;
             vec4 av0 = a4[(a_off + k     ) >> 2];
             vec4 av1 = a4[(a_off + k + 4u) >> 2];
             float qsum = dot(av0, q0123) + dot(av1, q4567);
@@ -134,21 +151,25 @@ void main() {
     // partials. We pay per-row barrier cost ONCE (one barrier()
     // serves all rows since shared writes complete before the
     // barrier).
-    for (uint m = 0u; m < pc.M; ++m) {
+    for (uint m = 0u; m < uint(MAX_M); ++m) {
         float sg_sum = subgroupAdd(acc[m]);
-        if (subgroupElect()) sg_partials[m * 32u + gl_SubgroupID] = sg_sum;
+        if (subgroupElect() && m < m_hi) sg_partials[m * 32u + gl_SubgroupID] = sg_sum;
     }
     barrier();
 
     if (gl_SubgroupID == 0u) {
-        for (uint m = 0u; m < pc.M; ++m) {
+        for (uint m = 0u; m < m_hi; ++m) {
             float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
                         ? sg_partials[m * 32u + gl_SubgroupInvocationID]
                         : 0.0;
             float total = subgroupAdd(v);
             if (subgroupElect()) {
-                c[m * pc.N + j] = total;
+                c[(m_base + m) * pc.N + j] = total;
             }
         }
+    }
+    // Shared `sg_partials` is reused by the next M-tile, so every
+    // thread must be past the reads above before the next pass writes.
+    barrier();
     }
 }
