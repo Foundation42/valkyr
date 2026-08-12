@@ -242,7 +242,7 @@ pub fn runBench(gpa: std.mem.Allocator, dir_path: []const u8, n_steps: usize, tq
         var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
         defer kv.deinit(ctx.device);
 
-        var k = try runtime.ChatKernels.init(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim));
+        var k = try runtime.ChatKernels.initWide(&ctx, gm.precision, cfg.family, @intCast(cfg.head_dim), @intCast(cfg.maxHeadDim()));
         defer k.deinit();
 
         // Optional TQ4-V cache (asymmetric K=fp / V=TQ4). Mirrors the

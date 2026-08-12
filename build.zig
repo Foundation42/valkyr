@@ -133,6 +133,17 @@ pub fn build(b: *std.Build) void {
     const fa_decode_split_d256_spv = compileShaderD(b, "fa_decode_split", "fa_decode_split_d256", &.{
         "HEAD_DIM_MAX=256u", "BC=8u",
     });
+
+    // Gemma 4's global (non-sliding) layers run head_dim=512. BC=4
+    // keeps shared memory at ~20 KB — Q + O (2 KB each) plus K/V tiles
+    // (8 KB each) — which clears AMD RDNA's 32 KB/WG ceiling. BC=8
+    // would need 36 KB and only fit NVIDIA.
+    const fa_forward_d512_spv = compileShaderD(b, "fa_forward", "fa_forward_d512", &.{
+        "HEAD_DIM_MAX=512u", "BC=4u",
+    });
+    const fa_decode_split_d512_spv = compileShaderD(b, "fa_decode_split", "fa_decode_split_d512", &.{
+        "HEAD_DIM_MAX=512u", "BC=4u",
+    });
     const fa_bw_dq_d256_spv = compileShaderD(b, "fa_bw_dq", "fa_bw_dq_d256", &.{
         "HEAD_DIM_MAX=256u", "BC=8u",
     });
@@ -243,6 +254,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(fa_bw_dkv_spv, "fa_bw_dkv.spv");
     _ = wf.addCopyFile(fa_forward_d256_spv, "fa_forward_d256.spv");
     _ = wf.addCopyFile(fa_decode_split_d256_spv, "fa_decode_split_d256.spv");
+    _ = wf.addCopyFile(fa_forward_d512_spv, "fa_forward_d512.spv");
+    _ = wf.addCopyFile(fa_decode_split_d512_spv, "fa_decode_split_d512.spv");
     _ = wf.addCopyFile(fa_bw_dq_d256_spv, "fa_bw_dq_d256.spv");
     _ = wf.addCopyFile(fa_bw_dkv_d256_spv, "fa_bw_dkv_d256.spv");
     _ = wf.addCopyFile(fa_decode_split_tq4v_d256_spv, "fa_decode_split_tq4v.spv");
@@ -340,6 +353,8 @@ pub fn build(b: *std.Build) void {
         \\pub const fa_bw_dkv align(4) = @embedFile("fa_bw_dkv.spv").*;
         \\pub const fa_forward_d256 align(4) = @embedFile("fa_forward_d256.spv").*;
         \\pub const fa_decode_split_d256 align(4) = @embedFile("fa_decode_split_d256.spv").*;
+        \\pub const fa_forward_d512 align(4) = @embedFile("fa_forward_d512.spv").*;
+        \\pub const fa_decode_split_d512 align(4) = @embedFile("fa_decode_split_d512.spv").*;
         \\pub const fa_bw_dq_d256 align(4) = @embedFile("fa_bw_dq_d256.spv").*;
         \\pub const fa_bw_dkv_d256 align(4) = @embedFile("fa_bw_dkv_d256.spv").*;
         \\pub const fa_decode_split_tq4v align(4) = @embedFile("fa_decode_split_tq4v.spv").*;

@@ -388,24 +388,34 @@ pub fn chooseFaDecodeSplit(n_kv: u32) struct { n_splits: u32, split_size: u32 } 
 }
 
 /// Maximum head_dim the FlashAttention / FlashDecoding shaders accept.
-/// Two SPIR-V variants ship per FA shader: the default d=128 build
-/// (BC=16) and a `_d256` build (BC=8) that lifts the cap to 256 so the
-/// Qwen3.5 family (head_dim=256) joins the FA path. The dispatcher
-/// picks at pipeline-init time via `faForwardSpv` / `faDecodeSplitSpv`
-/// / `faBwDqSpv` / `faBwDkvSpv` below — `fa_decode_merge` and `fa_bw_d`
-/// share their d=128 build at d=256 (no head_dim-sized shared mem).
-/// Heads above 256 still take the 3-pass fallback.
-pub const FA_HEAD_DIM_MAX: u32 = 256;
+/// Three SPIR-V variants ship per FA forward/decode shader: the default
+/// d=128 build (BC=16), a `_d256` build (BC=8) for the Qwen3.5 family,
+/// and a `_d512` build (BC=4) for Gemma 4's global layers. Halving BC
+/// as the head grows keeps shared memory roughly constant — ~20 KB at
+/// d=512 — which clears AMD RDNA's 32 KB/WG ceiling.
+///
+/// The dispatcher picks at pipeline-init time via `faForwardSpv` /
+/// `faDecodeSplitSpv` / `faBwDqSpv` / `faBwDkvSpv` below.
+/// `fa_decode_merge` and `fa_bw_d` share their d=128 build at any head
+/// dim (no head_dim-sized shared mem). The backward shaders stop at
+/// 256 — training doesn't run Gemma 4's geometry — so callers that
+/// need FA *backward* must still gate on 256 themselves.
+/// Heads above 512 take the 3-pass fallback.
+pub const FA_HEAD_DIM_MAX: u32 = 512;
 
 /// FA SPIR-V variant selector. `head_dim` ≤ 128 picks the BC=16 build;
 /// (128, 256] picks the BC=8 `_d256` build. Caller is responsible for
 /// gating with `head_dim ≤ FA_HEAD_DIM_MAX` first — anything larger
 /// would silently get the d=256 build and overflow shared mem.
 pub fn faForwardSpv(head_dim: u32) []const u8 {
-    return if (head_dim <= 128) shaders.fa_forward[0..] else shaders.fa_forward_d256[0..];
+    if (head_dim <= 128) return shaders.fa_forward[0..];
+    if (head_dim <= 256) return shaders.fa_forward_d256[0..];
+    return shaders.fa_forward_d512[0..];
 }
 pub fn faDecodeSplitSpv(head_dim: u32) []const u8 {
-    return if (head_dim <= 128) shaders.fa_decode_split[0..] else shaders.fa_decode_split_d256[0..];
+    if (head_dim <= 128) return shaders.fa_decode_split[0..];
+    if (head_dim <= 256) return shaders.fa_decode_split_d256[0..];
+    return shaders.fa_decode_split_d512[0..];
 }
 pub fn faBwDqSpv(head_dim: u32) []const u8 {
     return if (head_dim <= 128) shaders.fa_bw_dq[0..] else shaders.fa_bw_dq_d256[0..];
@@ -592,7 +602,17 @@ pub const ChatKernels = struct {
     /// FlashDecoding phase 1 — split-K decode kernel. Replaces the
     /// `scores → softmax → attn_out` trio when `cfg.head_dim ≤ 128`
     /// (see `FA_HEAD_DIM_MAX`); falls through to 3-pass otherwise.
+    /// FA decode kernel built for `fa_base_head_dim`. Gemma 4 varies
+    /// head_dim per layer (256 sliding / 512 global) and the SPIR-V
+    /// variant is fixed at pipeline-creation time, so one kernel cannot
+    /// serve both: dispatching the d256 build at head_dim 512 overruns
+    /// its shared-memory tiles and silently corrupts the output.
     fa_decode_split: pipeline.Kernel,
+    /// Built for `cfg.maxHeadDim()` when that exceeds the base — null
+    /// for every uniform-geometry family. Selected per layer by
+    /// `faDecodeSplitFor`.
+    fa_decode_split_wide: ?pipeline.Kernel,
+    fa_base_head_dim: u32,
     /// FlashDecoding phase 2 — merge per-split (O, m, l) partials into
     /// final attention output. Paired with `fa_decode_split`.
     fa_decode_merge: pipeline.Kernel,
@@ -605,6 +625,33 @@ pub const ChatKernels = struct {
     fa_decode_split_tq4v: pipeline.Kernel,
     add: pipeline.Kernel,
     geglu: pipeline.Kernel,
+
+    /// Pick the FA decode kernel whose SPIR-V variant covers
+    /// `head_dim`. Callers pass the *per-layer* head dim.
+    pub fn faDecodeSplitFor(self: *const ChatKernels, head_dim: u32) *const pipeline.Kernel {
+        if (head_dim > self.fa_base_head_dim) {
+            if (self.fa_decode_split_wide) |*w| return w;
+        }
+        return &self.fa_decode_split;
+    }
+
+    /// `head_dim` is the model's base (smallest) per-layer head dim;
+    /// `max_head_dim` the largest. They differ only on Gemma 4, whose
+    /// sliding layers are 256 and global layers 512.
+    pub fn initWide(
+        ctx: *const vk.Context,
+        precision: gpu_model.Precision,
+        family: config_mod.Family,
+        head_dim: u32,
+        max_head_dim: u32,
+    ) !ChatKernels {
+        var k = try init(ctx, precision, family, head_dim);
+        errdefer k.deinit();
+        if (max_head_dim > head_dim) {
+            k.fa_decode_split_wide = try pipeline.Kernel.init(ctx, faDecodeSplitSpv(max_head_dim), 6, @sizeOf(FaDecodeSplitPush));
+        }
+        return k;
+    }
 
     pub fn init(
         ctx: *const vk.Context,
@@ -648,6 +695,8 @@ pub const ChatKernels = struct {
             .softmax = try pipeline.Kernel.init(ctx, &shaders.softmax, 2, @sizeOf(SoftmaxPush)),
             .attn_out = try pipeline.Kernel.init(ctx, &shaders.attn_output, 3, @sizeOf(AttnOutputPush)),
             .fa_decode_split = try pipeline.Kernel.init(ctx, faDecodeSplitSpv(head_dim), 6, @sizeOf(FaDecodeSplitPush)),
+            .fa_decode_split_wide = null,
+            .fa_base_head_dim = head_dim,
             .fa_decode_merge = try pipeline.Kernel.init(ctx, &shaders.fa_decode_merge, 4, @sizeOf(FaDecodeMergePush)),
             .fa_decode_split_tq4v = try pipeline.Kernel.init(ctx, &shaders.fa_decode_split_tq4v, 6, @sizeOf(FaDecodeSplitPush)),
             .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
@@ -670,6 +719,7 @@ pub const ChatKernels = struct {
         self.softmax.deinit();
         self.attn_out.deinit();
         self.fa_decode_split.deinit();
+        if (self.fa_decode_split_wide) |*w| w.deinit();
         self.fa_decode_merge.deinit();
         self.fa_decode_split_tq4v.deinit();
         self.add.deinit();
@@ -1041,7 +1091,7 @@ pub fn recordOneLayer(
         // rescaled-sum.
         const split = p.fa_decode_split_push;
         try rec.dispatch(
-            &k.fa_decode_split,
+            k.faDecodeSplitFor(p.fa_decode_split_push.head_dim),
             &.{ &sc.q_rot, &kv_layer.k_cache, v_for_attn, &sc.fa_o_partial, &sc.fa_m_partial, &sc.fa_l_partial },
             &split,
             @as(u32, @intCast(cfg.num_attention_heads)) * split.n_splits,
@@ -1235,7 +1285,7 @@ pub const Forward = struct {
         gm: *const gpu_model.GpuModel,
     ) !Forward {
         return .{
-            .kernels = try ChatKernels.init(ctx, gm.precision, gm.config.family, @intCast(gm.config.head_dim)),
+            .kernels = try ChatKernels.initWide(ctx, gm.precision, gm.config.family, @intCast(gm.config.head_dim), @intCast(gm.config.maxHeadDim())),
             .cfg = gm.config,
         };
     }

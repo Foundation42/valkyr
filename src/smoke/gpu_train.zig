@@ -2539,6 +2539,13 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
         // the guard against the floor accidentally clipping short
         // contexts, which is exactly the regime the demo runs in.
         .{ .name = "swa-inert         (n_q=8 n_kv=8 w=4096 GQA 4:2 d=16)", .n_q = 8, .n_kv = 8, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .causal = true, .check_lse = false, .window = 4096 },
+        // ── Gemma 4 global-layer geometry (d=512 MQA) ────────────────
+        // 16 query heads against ONE 512-wide KV head. Exercises the
+        // BC=4 _d512 build, which exists so these layers can join the
+        // FA path instead of the 3-pass fallback.
+        .{ .name = "d512-decode-mqa   (n_q=1 n_kv=96 MQA 16:1 d=512)", .n_q = 1, .n_kv = 96, .n_heads = 16, .n_kv_heads = 1, .head_dim = 512, .causal = false, .check_lse = false },
+        .{ .name = "d512-prefill-mqa  (n_q=12 n_kv=12 MQA 16:1 d=512)", .n_q = 12, .n_kv = 12, .n_heads = 16, .n_kv_heads = 1, .head_dim = 512, .causal = true, .check_lse = true },
+        .{ .name = "d512-non-aligned  (n_q=7 n_kv=29 MQA 16:1 d=512)", .n_q = 7, .n_kv = 29, .n_heads = 16, .n_kv_heads = 1, .head_dim = 512, .causal = true, .check_lse = false },
     };
 
     // Two pipelines: BC=16 HEAD_DIM=128 (d=128 cases) and BC=8 HEAD_DIM=256
@@ -2548,6 +2555,8 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
     defer kern_d128.deinit();
     var kern_d256 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(256), 5, @sizeOf(runtime.FaForwardPush));
     defer kern_d256.deinit();
+    var kern_d512 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(512), 5, @sizeOf(runtime.FaForwardPush));
+    defer kern_d512.deinit();
 
     var max_rel_seen: f32 = 0.0;
     var max_lse_rel_seen: f32 = 0.0;
@@ -2576,7 +2585,9 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
 
         // CPU oracle scratch (Br = 1 — caller-allocated tile state).
         const Br: usize = 1;
-        const Bc: usize = 16; // matches the shader's compile-time BC.
+        // Must match the shader variant's compile-time BC, which halves
+        // as HEAD_DIM_MAX doubles to keep shared memory bounded.
+        const Bc: usize = if (cs.head_dim <= 128) 16 else if (cs.head_dim <= 256) 8 else 4;
         const s_tile = try allocator.alloc(f32, Br * Bc);
         defer allocator.free(s_tile);
         const p_tile = try allocator.alloc(f32, Br * Bc);
@@ -2613,7 +2624,9 @@ pub fn runFlashAttentionGpuSmoke(allocator: std.mem.Allocator) !void {
         var buf_lse = try buffer.Buffer.initDeviceOnly(&ctx, lse_elems * @sizeOf(f32));
         defer buf_lse.deinit(ctx.device);
 
-        var kern: *pipeline.Kernel = if (cs.head_dim <= 128) &kern_d128 else &kern_d256;
+        var kern: *pipeline.Kernel = if (cs.head_dim <= 128)
+            &kern_d128
+        else if (cs.head_dim <= 256) &kern_d256 else &kern_d512;
         try kern.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o, &buf_lse });
 
         const push = runtime.FaForwardPush{
@@ -2744,6 +2757,9 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
         .{ .name = "swa ctx-8192 w=1024 splits=32 sz=256 GQA 16:8 d=128", .n_kv = 8192, .n_splits = 32, .split_size = 256, .n_heads = 16, .n_kv_heads = 8, .head_dim = 128, .window = 1024 },
         // Window wider than the context must be inert.
         .{ .name = "swa ctx-128 w=4096 splits=4 sz=32 GQA 4:2 d=16 (inert)", .n_kv = 128, .n_splits = 4, .split_size = 32, .n_heads = 4, .n_kv_heads = 2, .head_dim = 16, .window = 4096 },
+        // Gemma 4 global layers at decode: MQA 16:1 at d=512, unbounded
+        // (global layers never slide).
+        .{ .name = "d512 ctx-512 splits=4 sz=128 MQA 16:1 d=512 (gemma4 global)", .n_kv = 512, .n_splits = 4, .split_size = 128, .n_heads = 16, .n_kv_heads = 1, .head_dim = 512 },
     };
 
     var k_fa_d128 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(128), 5, @sizeOf(runtime.FaForwardPush));
@@ -2754,6 +2770,10 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
     defer k_split_d128.deinit();
     var k_split_d256 = try pipeline.Kernel.init(&ctx, runtime.faDecodeSplitSpv(256), 6, @sizeOf(runtime.FaDecodeSplitPush));
     defer k_split_d256.deinit();
+    var k_fa_d512 = try pipeline.Kernel.init(&ctx, runtime.faForwardSpv(512), 5, @sizeOf(runtime.FaForwardPush));
+    defer k_fa_d512.deinit();
+    var k_split_d512 = try pipeline.Kernel.init(&ctx, runtime.faDecodeSplitSpv(512), 6, @sizeOf(runtime.FaDecodeSplitPush));
+    defer k_split_d512.deinit();
     var k_merge = try pipeline.Kernel.init(&ctx, &shaders.fa_decode_merge, 4, @sizeOf(runtime.FaDecodeMergePush));
     defer k_merge.deinit();
 
@@ -2804,8 +2824,12 @@ pub fn runFlashDecodingGpuSmoke(allocator: std.mem.Allocator) !void {
         defer buf_o_fd.deinit(ctx.device);
 
         // Reference: fa_forward at (n_q=1, no causal). Pick by head_dim.
-        const k_fa: *pipeline.Kernel = if (cs.head_dim <= 128) &k_fa_d128 else &k_fa_d256;
-        const k_split: *pipeline.Kernel = if (cs.head_dim <= 128) &k_split_d128 else &k_split_d256;
+        const k_fa: *pipeline.Kernel = if (cs.head_dim <= 128)
+            &k_fa_d128
+        else if (cs.head_dim <= 256) &k_fa_d256 else &k_fa_d512;
+        const k_split: *pipeline.Kernel = if (cs.head_dim <= 128)
+            &k_split_d128
+        else if (cs.head_dim <= 256) &k_split_d256 else &k_split_d512;
         try k_fa.bind(&.{ &buf_q, &buf_k, &buf_v, &buf_o_fa, &buf_lse_fa });
         const push_fa = runtime.FaForwardPush{
             .n_q = 1,
