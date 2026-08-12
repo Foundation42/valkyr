@@ -1307,6 +1307,25 @@ pub fn canBatchPrefill(cfg: config_mod.Config) bool {
     return true;
 }
 
+/// Replaces a contiguous run of rows in a batched step's embedding
+/// output with precomputed vectors — how image soft tokens enter the
+/// residual stream.
+///
+/// Applied AFTER the embedding lookup, which matters: Gemma scales
+/// token-id lookups by sqrt(hidden_size), but embeddings supplied
+/// directly must NOT be scaled (llama.cpp:
+/// `ggml_scale(inpL, ubatch.token ? sqrtf(n_embd) : 1.0f)`).
+/// Overwriting the scaled rows gives exactly that, with no special case.
+pub const EmbedOverride = struct {
+    /// `[*, hidden]` source, e.g. `VisionScratch.out`.
+    src: *const buffer.Buffer,
+    /// First source row to read.
+    src_row: u32,
+    /// First row of THIS step's batch to overwrite.
+    dst_row: u32,
+    n_rows: u32,
+};
+
 /// Ingest `token_ids.len` tokens in one recorded step, appending them
 /// to the KV cache at [pos_start, pos_start + n).
 ///
@@ -1327,6 +1346,9 @@ pub fn recordForwardStepBatched(
     n_q: usize,
     tok_buf: *const buffer.Buffer,
     compute_logits: bool,
+    /// Rows of this batch whose embeddings come from elsewhere (an
+    /// image), rather than from the token table.
+    embed_override: ?EmbedOverride,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const nq: u32 = @intCast(n_q);
@@ -1337,6 +1359,18 @@ pub fn recordForwardStepBatched(
         .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
     };
     try recDispatch1D(rec, &k.embed_batched, &.{ &gm.embed_tokens, tok_buf, &sc.stream }, &embed_push, nq * hidden);
+
+    if (embed_override) |ov| {
+        if (ov.n_rows > 0) {
+            if (ov.dst_row + ov.n_rows > nq) return error.OverrideOutsideBatch;
+            const copy = SliceCopyPush{
+                .src_off = ov.src_row * hidden,
+                .dst_off = ov.dst_row * hidden,
+                .n_elem = ov.n_rows * hidden,
+            };
+            try recDispatch1D(rec, &k.slice_copy, &.{ ov.src, &sc.stream }, &copy, ov.n_rows * hidden);
+        }
+    }
 
     for (0..cfg.num_hidden_layers) |layer_idx| {
         const p = computeForwardPushesBatched(cfg, sc, pos_start, n_q, layer_idx);

@@ -311,3 +311,88 @@ pub fn embedCpu(
         matvec(out[i * d ..][0..d], wts.proj_w, t3, d, d);
     }
 }
+
+// ── Image input ───────────────────────────────────────────────────
+
+pub const Image = struct {
+    rgb: []u8,
+    w: usize,
+    h: usize,
+    gpa: std.mem.Allocator,
+
+    pub fn deinit(self: *Image) void {
+        self.gpa.free(self.rgb);
+    }
+};
+
+/// Load a binary PPM (P6) as 8-bit RGB.
+///
+/// Deliberately the only decoder here. The demo's real input is a raw
+/// framebuffer — already RGB, no decoding — and PPM covers testing
+/// without vendoring a JPEG/PNG library for a format the engine will
+/// never produce. `convert in.jpg out.ppm` bridges the gap.
+pub fn loadPpm(gpa: std.mem.Allocator, path: []const u8) !Image {
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    defer file.close();
+    const bytes = try file.readToEndAlloc(gpa, 512 * 1024 * 1024);
+    defer gpa.free(bytes);
+
+    var i: usize = 0;
+    // P6 magic, then width, height, maxval — whitespace-separated, with
+    // '#' comments legal between any two tokens.
+    if (bytes.len < 2 or bytes[0] != 'P' or bytes[1] != '6') return error.NotBinaryPpm;
+    i = 2;
+
+    var fields: [3]usize = undefined;
+    var got: usize = 0;
+    while (got < 3) {
+        while (i < bytes.len and std.ascii.isWhitespace(bytes[i])) i += 1;
+        if (i < bytes.len and bytes[i] == '#') {
+            while (i < bytes.len and bytes[i] != '\n') i += 1;
+            continue;
+        }
+        var v: usize = 0;
+        var any = false;
+        while (i < bytes.len and std.ascii.isDigit(bytes[i])) {
+            v = v * 10 + (bytes[i] - '0');
+            i += 1;
+            any = true;
+        }
+        if (!any) return error.MalformedPpmHeader;
+        fields[got] = v;
+        got += 1;
+    }
+    // Exactly one whitespace byte separates the header from the data.
+    if (i >= bytes.len) return error.TruncatedPpm;
+    i += 1;
+
+    const w = fields[0];
+    const h = fields[1];
+    const maxval = fields[2];
+    if (w == 0 or h == 0) return error.EmptyImage;
+    if (maxval != 255) return error.UnsupportedPpmMaxval;
+    const need = w * h * CHANNELS;
+    if (bytes.len - i < need) return error.TruncatedPpm;
+
+    const rgb = try gpa.alloc(u8, need);
+    @memcpy(rgb, bytes[i .. i + need]);
+    return .{ .rgb = rgb, .w = w, .h = h, .gpa = gpa };
+}
+
+/// Where an image's soft tokens sit in the prompt, in absolute
+/// positions. `len == 0` means "no image".
+pub const Span = struct {
+    start: usize = 0,
+    len: usize = 0,
+
+    /// Overlap of this span with the batch covering
+    /// `[pos_start, pos_start + n)`, as (row within the batch, row
+    /// within the image, count). Zero count when they don't intersect.
+    pub fn overlap(self: Span, pos_start: usize, n: usize) struct { dst_row: usize, src_row: usize, count: usize } {
+        if (self.len == 0) return .{ .dst_row = 0, .src_row = 0, .count = 0 };
+        const lo = @max(self.start, pos_start);
+        const hi = @min(self.start + self.len, pos_start + n);
+        if (hi <= lo) return .{ .dst_row = 0, .src_row = 0, .count = 0 };
+        return .{ .dst_row = lo - pos_start, .src_row = lo - self.start, .count = hi - lo };
+    }
+};

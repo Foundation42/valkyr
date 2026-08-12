@@ -950,6 +950,7 @@ pub fn main() !void {
         // Parse optional sampling flags + final user_msg. Format:
         //   --chat <dir> [--temp T] [--top-k K] [--top-p P] [--seed S]
         //                [--tq4v] [--q4|--q4k] [user_msg]
+        var image_path: ?[]const u8 = null;
         // --tq4v switches the V cache to TurboQuant TQ4 (asymmetric:
         //   K stays full precision).
         // --q4   switches the per-layer projections to Q4_0 (4-bit weights,
@@ -1020,6 +1021,12 @@ pub fn main() !void {
                 i += 2;
             } else if (std.mem.eql(u8, a, "--max-pos") and i + 1 < args.len) {
                 max_pos = try std.fmt.parseInt(u32, args[i + 1], 10);
+                i += 2;
+            } else if (std.mem.eql(u8, a, "--image") and i + 1 < args.len) {
+                // Binary PPM (P6). The demo's real input is a raw
+                // framebuffer; PPM exists so the path is testable from
+                // the CLI without vendoring a JPEG decoder.
+                image_path = args[i + 1];
                 i += 2;
             } else if (std.mem.eql(u8, a, "--lora-ckpt") and i + 1 < args.len) {
                 lora_path = args[i + 1];
@@ -1127,7 +1134,7 @@ pub fn main() !void {
                 std.debug.print("--mtp is only supported on Qwen3.5/3.6 hybrid checkpoints (this model is {s})\n", .{@tagName(cfg.family)});
                 return;
             }
-            try commands_chat.runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, max_pos, lora_ckpt);
+            try commands_chat.runChat(allocator, dir, user_msg, sp, seed, tq4v, precision, probe_path, batch_prompts, probe_prefix, max_new, max_pos, lora_ckpt, image_path);
         }
         return;
     }

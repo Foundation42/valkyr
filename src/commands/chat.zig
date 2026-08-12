@@ -20,12 +20,49 @@ const probe = @import("../probe.zig");
 const shaders = @import("shaders");
 
 const aliases = @import("../runtime_aliases.zig");
+const vision = @import("../vision.zig");
+const dtype = @import("../dtype.zig");
+
+/// Materialise a weight tensor as fp32 on the host.
+fn tensorToF32(gpa: std.mem.Allocator, t: model_mod.Tensor) ![]f32 {
+    const out = try gpa.alloc(f32, t.numel());
+    errdefer gpa.free(out);
+    switch (t.dtype) {
+        .f32 => @memcpy(out, t.asF32()),
+        .bf16 => dtype.bf16SliceToF32(dtype.asU16(t.bytes), out),
+        .f16 => dtype.f16SliceToF32(dtype.asU16(t.bytes), out),
+        else => return error.UnsupportedWeightDtype,
+    }
+    return out;
+}
 
 /// Query rows per batched-prefill submit. Sized so one submit stays
 /// well inside the recorder's 10 s fence timeout: batching does not
 /// reduce total GPU work (the matmul is one workgroup per output cell),
 /// so a chunk costs roughly `chunk x per-token decode time`.
 const PREFILL_CHUNK: usize = 64;
+
+/// Precomputed image soft tokens plus where they sit in the prompt.
+pub const ImageEmbed = struct {
+    /// `[n, hidden]` on the device — the vision embedder's output.
+    src: *const buffer.Buffer,
+    span: vision.Span,
+};
+
+/// Slice of an image span that falls inside one prefill chunk, or null
+/// when they don't overlap. A 280-token image straddles several chunks,
+/// so each submit overwrites only its own rows.
+fn chunkOverride(img: ?ImageEmbed, pos_start: usize, n: usize) ?aliases.EmbedOverride {
+    const ie = img orelse return null;
+    const ov = ie.span.overlap(pos_start, n);
+    if (ov.count == 0) return null;
+    return .{
+        .src = ie.src,
+        .src_row = @intCast(ov.src_row),
+        .dst_row = @intCast(ov.dst_row),
+        .n_rows = @intCast(ov.count),
+    };
+}
 const lora_merge = @import("lora_merge.zig");
 const runtime = @import("../runtime.zig");
 const runtime_hybrid = @import("../runtime_hybrid.zig");
@@ -189,6 +226,8 @@ pub fn runChat(
     max_new: usize,
     max_pos_arg: u32,
     lora_ckpt: ?LoraCkpt,
+    /// Optional PPM image to prepend to the user turn as soft tokens.
+    image_path: ?[]const u8,
 ) !void {
     var cpu = try model_mod.Model.load(gpa, dir_path);
     defer cpu.deinit();
@@ -451,10 +490,77 @@ pub fn runChat(
                 gpa, &ctx, &rec, &sc, &gm, &kv, cfg, &k, &tok, entry.text, &pos, logits,
                 sample_scratch, sample_params, rng, tmpl, false, tq4_hooks,
                 &bus, probe_info, &token_index, hidden_scratch, attn_scratch,
-                max_new,
+                max_new, null,
             );
         }
         return;
+    }
+
+    // ── Image → soft tokens ─────────────────────────────────────────
+    // Run the vision embedder once, up front. The result is a
+    // [n_patches, hidden] device buffer whose rows the prefill splices
+    // over the `<|image|>` placeholders. `span.start` is filled in by
+    // the prompt composer, which knows where the placeholders land.
+    var vk_kernels: ?aliases.VisionKernels = null;
+    defer if (vk_kernels) |*vkk| vkk.deinit();
+    var vs: ?aliases.VisionScratch = null;
+    defer if (vs) |*v| v.deinit(ctx.device);
+    var img_embed: ?ImageEmbed = null;
+
+    if (image_path) |ipath| {
+        const gv = if (gm.vision) |*g| g else {
+            try stdout.print("--image given but this checkpoint has no vision embedder\n", .{});
+            return error.NoVisionEmbedder;
+        };
+        var img = try vision.loadPpm(gpa, ipath);
+        defer img.deinit();
+        var patches = try vision.preprocess(gpa, img.rgb, img.w, img.h);
+        defer patches.deinit();
+        const n_patches = patches.count();
+
+        // Per-patch positional sum, host-side: axis 0 keyed by column,
+        // axis 1 by row. Keeps the 8.6M-element table off the device.
+        const vcpu = cpu.vision.?;
+        const pos_emb = try tensorToF32(gpa, vcpu.pos_embedding);
+        defer gpa.free(pos_emb);
+        const hidden_sz = cfg.hidden_size;
+        const pos_sum = try gpa.alloc(f32, n_patches * hidden_sz);
+        defer gpa.free(pos_sum);
+        for (0..n_patches) |i| {
+            const ex = pos_emb[(patches.colOf(i) * 2 + 0) * hidden_sz ..][0..hidden_sz];
+            const ey = pos_emb[(patches.rowOf(i) * 2 + 1) * hidden_sz ..][0..hidden_sz];
+            const dst = pos_sum[i * hidden_sz ..][0..hidden_sz];
+            for (0..hidden_sz) |j| dst[j] = ex[j] + ey[j];
+        }
+
+        vk_kernels = try aliases.VisionKernels.init(&ctx);
+        vs = try aliases.VisionScratch.init(&ctx, n_patches, gv.patch_elems, hidden_sz);
+
+        var buf_patches = try buffer.Buffer.initStatic(&ctx, f32, patches.data);
+        defer buf_patches.deinit(ctx.device);
+        var buf_pos = try buffer.Buffer.initStatic(&ctx, f32, pos_sum);
+        defer buf_pos.deinit(ctx.device);
+
+        const t_v0 = std.time.nanoTimestamp();
+        try rec.reset();
+        try rec.begin();
+        try aliases.recordVisionEmbed(
+            &rec, &vs.?, &buf_patches, &buf_pos, gv, &vk_kernels.?,
+            @intCast(n_patches), @intCast(hidden_sz),
+        );
+        try rec.endAndSubmit();
+        const t_v1 = std.time.nanoTimestamp();
+
+        try stdout.print(
+            "image: {d}x{d} -> {d}x{d} patches = {d} soft tokens (embedded in {d:.1} ms)\n",
+            .{
+                img.w, img.h, patches.n_cols, patches.n_rows, n_patches,
+                @as(f64, @floatFromInt(t_v1 - t_v0)) / 1_000_000.0,
+            },
+        );
+        // `start` is a placeholder — chatTurn's composer sets the real
+        // absolute position; only `len` is read before then.
+        img_embed = .{ .src = &vs.?.out, .span = .{ .start = 0, .len = n_patches } };
     }
 
     // Position counter persists across turns (multi-turn chat builds on
@@ -471,6 +577,7 @@ pub fn runChat(
             probe_hidden_scratch,
             probe_attn_scratch,
             max_new,
+            if (img_embed) |*ie| ie.* else null,
         );
         return;
     }
@@ -496,6 +603,7 @@ pub fn runChat(
             probe_hidden_scratch,
             probe_attn_scratch,
             max_new,
+            null,
         );
         if (pos >= max_pos - 64) {
             try stdout.print("\n[KV cache near capacity, ending session]\n", .{});
@@ -534,12 +642,22 @@ fn chatTurn(
     probe_hidden_scratch: ?[]f32,
     probe_attn_scratch: ?[]f32,
     max_new: usize,
+    /// Precomputed image soft tokens for this turn, if any.
+    image: ?ImageEmbed,
 ) !void {
     const stdout = std.io.getStdOut().writer();
 
     var prompt = std.ArrayList(u32).init(gpa);
     defer prompt.deinit();
-    try tmpl.composePrompt(gpa, tok, user_msg, pos.* == 0, &prompt);
+    var img_span: vision.Span = .{};
+    if (image) |ie| {
+        const sp = try tmpl.composePromptWithImage(
+            gpa, tok, user_msg, pos.* == 0, ie.span.len, pos.*, &prompt,
+        );
+        img_span = .{ .start = sp.start, .len = sp.len };
+    } else {
+        try tmpl.composePrompt(gpa, tok, user_msg, pos.* == 0, &prompt);
+    }
 
     if (!is_repl) {
         try stdout.print("\nprompt ({d} tokens, starting at pos {d}):\n  ", .{ prompt.items.len, pos.* });
@@ -610,7 +728,7 @@ fn chatTurn(
 
             if (pos.* > 0 or done > 0) try rec.reset();
             try rec.begin();
-            try aliases.recordForwardStepBatched(rec, sc, gm, kv, cfg, k, pos.*, take, &tok_buf, false);
+            try aliases.recordForwardStepBatched(rec, sc, gm, kv, cfg, k, pos.*, take, &tok_buf, false, chunkOverride(if (image) |ie| ImageEmbed{ .src = ie.src, .span = img_span } else null, pos.*, take));
             try rec.endAndSubmit();
 
             pos.* += take;

@@ -47,6 +47,9 @@ const tokenizer_mod = @import("tokenizer.zig");
 
 pub const Role = enum { system, user, assistant };
 
+/// Absolute position range occupied by an image's soft tokens.
+pub const ImageSpan = struct { start: usize, len: usize };
+
 pub const Message = struct {
     role: Role,
     content: []const u8,
@@ -297,6 +300,64 @@ pub const ChatTemplate = struct {
             .zephyr => try self.composeZephyr(gpa, tok, user_msg, out),
             .mistral => try self.composeMistral(gpa, tok, user_msg, out),
         }
+    }
+
+    /// Compose a single-turn prompt with an image span in the user turn.
+    ///
+    /// Gemma 4 wraps image soft tokens as
+    /// `<|image>` + n x `<|image|>` + `<image|>`, and the model card puts
+    /// the image BEFORE the text within the turn. The n placeholder ids
+    /// are never looked up in the embedding table — the forward pass
+    /// overwrites those rows with the vision embedder's output — but
+    /// they must be present so positions, the KV cache and the mask all
+    /// line up.
+    ///
+    /// Returns the absolute span the placeholders occupy, for the caller
+    /// to hand to the forward pass. `pos_base` is the position the first
+    /// token of `out` will occupy.
+    pub fn composePromptWithImage(
+        self: ChatTemplate,
+        gpa: std.mem.Allocator,
+        tok: *const tokenizer_mod.Tokenizer,
+        user_msg: []const u8,
+        is_first: bool,
+        n_img_tokens: usize,
+        pos_base: usize,
+        out: *std.ArrayList(u32),
+    ) !ImageSpan {
+        if (self.format != .gemma_qwen) return error.ImagePromptUnsupportedFormat;
+        const boi = tok.specialTokenId("<|image>") orelse return error.NoBoiToken;
+        const img = tok.specialTokenId("<|image|>") orelse return error.NoImageToken;
+        const eoi = tok.specialTokenId("<image|>") orelse return error.NoEoiToken;
+
+        if (is_first) {
+            if (self.bos) |b| try out.append(b);
+        }
+
+        // User turn header.
+        try out.append(self.start_of_turn.?);
+        try self.appendRoleSection(gpa, tok, self.user_role, out);
+
+        // Image first, then the text.
+        try out.append(boi);
+        const span_start = pos_base + out.items.len;
+        try out.appendNTimes(img, n_img_tokens);
+        try out.append(eoi);
+
+        {
+            const ids = try tok.encode(gpa, user_msg);
+            defer gpa.free(ids);
+            try out.appendSlice(ids);
+        }
+        try out.append(self.end_of_turn);
+        if (self.inter_turn_sep.len > 0) {
+            const ids = try tok.encode(gpa, self.inter_turn_sep);
+            defer gpa.free(ids);
+            try out.appendSlice(ids);
+        }
+
+        try self.appendAssistantHeader(gpa, tok, out);
+        return .{ .start = span_start, .len = n_img_tokens };
     }
 
     fn composeWithSpecials(
