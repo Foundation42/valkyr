@@ -277,7 +277,9 @@ pub fn runChat(
     // Cap the batch at 512 rows: enough for a 280-token image plus a
     // healthy prompt, while keeping the extra scratch to a few tens of
     // MB rather than scaling with max_pos.
-    const max_batch: usize = @min(max_pos, PREFILL_CHUNK);
+    // Must fit the largest single batch: a whole image span (up to
+    // vision.MAX_TOKENS) when one is present, else a text chunk.
+    const max_batch: usize = @min(max_pos, @max(PREFILL_CHUNK, if (image_path != null) vision.MAX_TOKENS else 0));
     var sc = try gpu_scratch.GpuScratch.initBatched(&ctx, cfg, max_pos, max_batch);
     defer sc.deinit(ctx.device);
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
@@ -720,15 +722,47 @@ fn chatTurn(
         // each submit bounded while still collapsing hundreds of
         // round-trips into a handful.
         const t_pf0 = std.time.nanoTimestamp();
+        const img_here: ?ImageEmbed = if (image) |ie|
+            ImageEmbed{ .src = ie.src, .span = img_span }
+        else
+            null;
+
+        // The image span goes through as ONE batch, unsplit and
+        // non-causal. Gemma 4 attends bidirectionally across image
+        // tokens, and a query row can only see rows in its own batch —
+        // so splitting the span would silently degrade it to
+        // "each patch sees only earlier patches in raster order",
+        // which reads as plausible-but-wrong descriptions rather than
+        // an obvious failure. Text before and after stays causal and
+        // chunked.
         var done: usize = 0;
+        var first_submit = true;
         while (done < n_pre) {
-            const take = @min(PREFILL_CHUNK, n_pre - done);
+            const abs = pos.*;
+            const in_image = img_span.len > 0 and
+                abs >= img_span.start and abs < img_span.start + img_span.len;
+
+            const take = if (in_image)
+                // Whole remaining span in one go.
+                @min(img_span.start + img_span.len - abs, n_pre - done)
+            else if (img_span.len > 0 and abs < img_span.start)
+                // Stop exactly at the span boundary so the image batch
+                // starts clean.
+                @min(@min(PREFILL_CHUNK, img_span.start - abs), n_pre - done)
+            else
+                @min(PREFILL_CHUNK, n_pre - done);
+
             var tok_buf = try buffer.Buffer.initStatic(ctx, u32, prompt.items[done..][0..take]);
             defer tok_buf.deinit(ctx.device);
 
-            if (pos.* > 0 or done > 0) try rec.reset();
+            if (!first_submit or pos.* > 0) try rec.reset();
+            first_submit = false;
             try rec.begin();
-            try aliases.recordForwardStepBatched(rec, sc, gm, kv, cfg, k, pos.*, take, &tok_buf, false, chunkOverride(if (image) |ie| ImageEmbed{ .src = ie.src, .span = img_span } else null, pos.*, take));
+            try aliases.recordForwardStepBatched(
+                rec, sc, gm, kv, cfg, k, pos.*, take, &tok_buf, false,
+                chunkOverride(img_here, pos.*, take),
+                !in_image,
+            );
             try rec.endAndSubmit();
 
             pos.* += take;

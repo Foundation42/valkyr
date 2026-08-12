@@ -1349,6 +1349,12 @@ pub fn recordForwardStepBatched(
     /// Rows of this batch whose embeddings come from elsewhere (an
     /// image), rather than from the token table.
     embed_override: ?EmbedOverride,
+    /// Causal masking WITHIN this step. Text is causal; an image span
+    /// is not — Gemma 4 attends bidirectionally across image tokens
+    /// (llama.cpp `mtmd_decode_use_non_causal` is true for GEMMA4UV).
+    /// Prior KV is always visible either way, so passing false only
+    /// lets the rows of this step see each other.
+    causal: bool,
 ) !void {
     const hidden: u32 = @intCast(cfg.hidden_size);
     const nq: u32 = @intCast(n_q);
@@ -1373,7 +1379,8 @@ pub fn recordForwardStepBatched(
     }
 
     for (0..cfg.num_hidden_layers) |layer_idx| {
-        const p = computeForwardPushesBatched(cfg, sc, pos_start, n_q, layer_idx);
+        var p = computeForwardPushesBatched(cfg, sc, pos_start, n_q, layer_idx);
+        if (!causal) p.fa_forward_push.causal = 0;
         try recordOneLayerBatched(rec, sc, gm, kv, cfg, k, layer_idx, &p);
     }
 

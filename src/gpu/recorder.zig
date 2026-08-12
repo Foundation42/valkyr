@@ -427,7 +427,14 @@ pub const Recorder = struct {
         // duration on Gemma 2B; if we hit it, something has gone
         // catastrophically wrong (driver hang, infinite loop in a
         // shader) and we want to surface the failure rather than wedge.
-        const timeout_ns: u64 = 10 * 1_000_000_000;
+        // 60 s. This is a deadlock backstop, not a latency budget: a
+        // batched prefill legitimately puts several seconds of work
+        // behind one fence (an image span must go through as ONE batch
+        // to be attended non-causally, and cannot be split to suit a
+        // timeout). A too-tight value here surfaces as VK_TIMEOUT after
+        // the work has already been queued, which reads like a slowdown
+        // rather than a failure.
+        const timeout_ns: u64 = 60 * 1_000_000_000;
         try vk.check(c.vkWaitForFences(self.ctx.device, 1, &self.fence, c.VK_TRUE, timeout_ns));
     }
 };
