@@ -34,6 +34,9 @@ pub const GpuScratch = struct {
     /// rows of stride `max_pos` and softmax/attn_output read up to
     /// `n_pos` per row.
     max_pos: usize,
+    /// Largest `n_q` the per-layer activation buffers can hold. 1 for
+    /// pure single-token decode.
+    max_batch: usize = 1,
 
     // Per-layer reused scratch.
     x_norm: buffer.Buffer,
@@ -60,7 +63,17 @@ pub const GpuScratch = struct {
     fa_m_partial: buffer.Buffer,
     fa_l_partial: buffer.Buffer,
 
+    /// `max_pos` sizes the attention-scores row stride; `max_batch` is
+    /// the largest `n_q` a single recorded step will process. Batched
+    /// prefill needs every per-layer activation to hold n_q rows rather
+    /// than one — at n_q=280 and hidden=3840 that is a few tens of MB,
+    /// which is cheap against the alternative of ingesting an image one
+    /// token at a time.
     pub fn init(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: usize) !GpuScratch {
+        return initBatched(ctx, cfg, max_pos, 1);
+    }
+
+    pub fn initBatched(ctx: *const vk.Context, cfg: config_mod.Config, max_pos: usize, max_batch: usize) !GpuScratch {
         const hidden = cfg.hidden_size;
         const inter = cfg.intermediate_size;
         // Worst case across layers, not the flat config fields: Gemma 4's
@@ -70,6 +83,7 @@ pub const GpuScratch = struct {
         const q_dim = cfg.maxQDim();
         const kv_dim = cfg.maxKvDim();
         const head_dim_max = cfg.maxHeadDim();
+        const mb = @max(max_batch, 1);
 
         // Worst-case n_splits the FlashDecoding heuristic can produce
         // at any decode step. Mirrors `runtime.chooseFaDecodeSplit`
@@ -82,29 +96,39 @@ pub const GpuScratch = struct {
             4
         else
             (max_pos_u32 + 255) / 256;
+        // FlashDecoding partials are decode-only (n_q = 1), but the
+        // batched path reuses `fa_lse` as fa_forward's LSE output, which
+        // is [n_q, n_heads]. Size for the larger of the two.
         const o_partial_elems: usize = cfg.num_attention_heads * @as(usize, max_n_splits) * head_dim_max;
-        const ml_partial_elems: usize = cfg.num_attention_heads * @as(usize, max_n_splits);
+        const ml_partial_elems: usize = @max(
+            cfg.num_attention_heads * @as(usize, max_n_splits),
+            mb * cfg.num_attention_heads,
+        );
 
         const f = @sizeOf(f32);
         return .{
-            .stream         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            // `stream` holds n_q rows during batched prefill; the
+            // final-norm / logits pair stays single-row because only the
+            // last position of a batch needs logits.
+            .stream         = try buffer.Buffer.initDeviceOnly(ctx, mb * hidden * f),
             .final_norm_out = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
             .logits         = try buffer.Buffer.initDeviceOnly(ctx, cfg.vocab_size * f),
             .scores         = try buffer.Buffer.initDeviceOnly(ctx, cfg.num_attention_heads * max_pos * f),
             .max_pos        = max_pos,
-            .x_norm         = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .q              = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .k              = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .v              = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .q_rot          = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .k_rot          = try buffer.Buffer.initDeviceOnly(ctx, kv_dim * f),
-            .head_out       = try buffer.Buffer.initDeviceOnly(ctx, q_dim * f),
-            .attn_out       = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .mid_norm       = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
-            .gate           = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .up             = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .fused          = try buffer.Buffer.initDeviceOnly(ctx, inter * f),
-            .ffn_out        = try buffer.Buffer.initDeviceOnly(ctx, hidden * f),
+            .max_batch      = max_batch,
+            .x_norm         = try buffer.Buffer.initDeviceOnly(ctx, mb * hidden * f),
+            .q              = try buffer.Buffer.initDeviceOnly(ctx, mb * q_dim * f),
+            .k              = try buffer.Buffer.initDeviceOnly(ctx, mb * kv_dim * f),
+            .v              = try buffer.Buffer.initDeviceOnly(ctx, mb * kv_dim * f),
+            .q_rot          = try buffer.Buffer.initDeviceOnly(ctx, mb * q_dim * f),
+            .k_rot          = try buffer.Buffer.initDeviceOnly(ctx, mb * kv_dim * f),
+            .head_out       = try buffer.Buffer.initDeviceOnly(ctx, mb * q_dim * f),
+            .attn_out       = try buffer.Buffer.initDeviceOnly(ctx, mb * hidden * f),
+            .mid_norm       = try buffer.Buffer.initDeviceOnly(ctx, mb * hidden * f),
+            .gate           = try buffer.Buffer.initDeviceOnly(ctx, mb * inter * f),
+            .up             = try buffer.Buffer.initDeviceOnly(ctx, mb * inter * f),
+            .fused          = try buffer.Buffer.initDeviceOnly(ctx, mb * inter * f),
+            .ffn_out        = try buffer.Buffer.initDeviceOnly(ctx, mb * hidden * f),
             .fa_o_partial   = try buffer.Buffer.initDeviceOnly(ctx, o_partial_elems * f),
             .fa_m_partial   = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),
             .fa_l_partial   = try buffer.Buffer.initDeviceOnly(ctx, ml_partial_elems * f),

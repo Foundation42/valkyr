@@ -20,6 +20,12 @@ const probe = @import("../probe.zig");
 const shaders = @import("shaders");
 
 const aliases = @import("../runtime_aliases.zig");
+
+/// Query rows per batched-prefill submit. Sized so one submit stays
+/// well inside the recorder's 10 s fence timeout: batching does not
+/// reduce total GPU work (the matmul is one workgroup per output cell),
+/// so a chunk costs roughly `chunk x per-token decode time`.
+const PREFILL_CHUNK: usize = 64;
 const lora_merge = @import("lora_merge.zig");
 const runtime = @import("../runtime.zig");
 const runtime_hybrid = @import("../runtime_hybrid.zig");
@@ -228,7 +234,12 @@ pub fn runChat(
     // ≈ 72 MiB for a Gemma-class shape. Cost scales linearly with
     // max_pos; cap is whatever the GPU has free for K+V buffers.
     const max_pos: usize = max_pos_arg;
-    var sc = try gpu_scratch.GpuScratch.init(&ctx, cfg, max_pos);
+    // Batched prefill needs the per-layer activations to hold n_q rows.
+    // Cap the batch at 512 rows: enough for a 280-token image plus a
+    // healthy prompt, while keeping the extra scratch to a few tens of
+    // MB rather than scaling with max_pos.
+    const max_batch: usize = @min(max_pos, PREFILL_CHUNK);
+    var sc = try gpu_scratch.GpuScratch.initBatched(&ctx, cfg, max_pos, max_batch);
     defer sc.deinit(ctx.device);
     var kv = try gpu_scratch.GpuKvCache.init(gpa, &ctx, cfg, max_pos);
     defer kv.deinit(ctx.device);
@@ -557,6 +568,64 @@ fn chatTurn(
     // apples-to-apples across model families.
     var t_decode_start: i128 = 0;
     var decode_started = false;
+
+
+    // ── Batched prefill ─────────────────────────────────────────────
+    // Ingest the whole prompt in one recorded step instead of one token
+    // at a time. Single-token prefill costs a full decode step per token
+    // (~28 ms on Gemma 4 12B), so this is the difference between the
+    // prompt being nearly free and a 280-token image costing 8 seconds.
+    //
+    // Skipped when a probe wants per-layer readbacks (it needs the
+    // token-at-a-time split), when TQ4-V is on (decode-only), or when
+    // the model's geometry can't take the FA-based batched attention.
+    // In every skipped case the loop below behaves exactly as before.
+    const probe_wants_split = if (probe_bus) |bus|
+        bus.needs_hidden_pre or bus.needs_hidden_post or bus.needs_attention
+    else
+        false;
+    const can_batch = prompt.items.len > 1 and
+        tq4_v == null and
+        !probe_wants_split and
+        aliases.canBatchPrefill(cfg);
+
+    if (can_batch) {
+        // All but the final prompt token: the last is left to the
+        // ordinary loop so sampling stays in exactly one place.
+        const n_pre = prompt.items.len - 1;
+
+        // Chunked, not one giant submit. The matmul kernel dispatches
+        // one workgroup per output cell, so batching does not reduce
+        // total GPU work — it removes per-token submits and fence waits.
+        // A single 400-token submit therefore lands ~11 s of work behind
+        // one fence and trips the recorder's 10 s timeout. Chunking keeps
+        // each submit bounded while still collapsing hundreds of
+        // round-trips into a handful.
+        const t_pf0 = std.time.nanoTimestamp();
+        var done: usize = 0;
+        while (done < n_pre) {
+            const take = @min(PREFILL_CHUNK, n_pre - done);
+            var tok_buf = try buffer.Buffer.initStatic(ctx, u32, prompt.items[done..][0..take]);
+            defer tok_buf.deinit(ctx.device);
+
+            if (pos.* > 0 or done > 0) try rec.reset();
+            try rec.begin();
+            try aliases.recordForwardStepBatched(rec, sc, gm, kv, cfg, k, pos.*, take, &tok_buf, false);
+            try rec.endAndSubmit();
+
+            pos.* += take;
+            done += take;
+        }
+        const t_pf1 = std.time.nanoTimestamp();
+        if (!is_repl) try stdout.print(
+            "[prefill {d} tok in {d:.0} ms]\n",
+            .{ n_pre, @as(f64, @floatFromInt(t_pf1 - t_pf0)) / 1_000_000.0 },
+        );
+
+        prompt_idx = n_pre;
+        current = prompt.items[n_pre];
+        probe_token_index.* += @intCast(n_pre);
+    }
 
     while (true) {
         // We only need logits at the LAST prefill position (to sample

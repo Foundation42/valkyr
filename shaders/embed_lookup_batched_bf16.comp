@@ -1,0 +1,45 @@
+#version 460
+// Batched embedding lookup, bf16-on-device variant.
+//
+//     out[p, i] = embed[token_ids[p] * dim + i] * scale
+//
+// The bf16 counterpart to `embed_lookup_batched.comp`, in the same way
+// `embed_lookup_bf16.comp` is to `embed_lookup.comp`. Needed because
+// every precision above fp32_all keeps `embed_tokens` as raw bf16, so a
+// batched prefill that read it as fp32 would produce garbage — silently,
+// since the values stay finite.
+//
+// Two consecutive bf16 elements pack into a u32 in std430
+// little-endian order (first in low 16 bits), matching the
+// matmul_nt_v2_bf16 weight layout.
+//
+// `dim` must be even (always true for transformer hidden_size).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Embed { uint  embed_pack[];  };
+layout(set = 0, binding = 1, std430) readonly buffer TIds  { uint  token_ids[];   };
+layout(set = 0, binding = 2, std430) writeonly buffer Out  { float outv[];        };
+
+layout(push_constant) uniform Pc {
+    uint  dim;
+    uint  n_pos;
+    float scale;
+} pc;
+
+float bf16_load(uint idx) {
+    uint packed = embed_pack[idx >> 1];
+    uint half16 = ((idx & 1u) == 0u) ? (packed & 0xFFFFu) : (packed >> 16);
+    return uintBitsToFloat(half16 << 16);
+}
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint total = pc.n_pos * pc.dim;
+    if (g >= total) return;
+
+    uint p = g / pc.dim;
+    uint i = g - p * pc.dim;
+    uint src = token_ids[p] * pc.dim + i;
+    outv[g] = bf16_load(src) * pc.scale;
+}

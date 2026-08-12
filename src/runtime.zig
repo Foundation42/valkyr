@@ -244,6 +244,11 @@ pub const RopeBatchedPush = extern struct {
     rotary_dim: u32,
     theta_base: f32,
     pos_offset: u32,
+    /// See `RopePartialPush` — same generalisation, batched. Zero on
+    /// either field selects the legacy Qwen3.5 behaviour, so existing
+    /// call sites are bit-identical.
+    pair_stride: u32 = 0,
+    freq_dim: u32 = 0,
 };
 
 /// Push struct for the fused QK-RoPE shaders (qk_rope_partial_batched +
@@ -613,6 +618,14 @@ pub const ChatKernels = struct {
     /// `faDecodeSplitFor`.
     fa_decode_split_wide: ?pipeline.Kernel,
     fa_base_head_dim: u32,
+    /// Batched-prefill attention. Same base/wide split as the decode
+    /// pair, for the same reason.
+    fa_forward: pipeline.Kernel,
+    fa_forward_wide: ?pipeline.Kernel,
+    /// Batched RoPE over n_q rows.
+    rope_partial_batched: pipeline.Kernel,
+    /// Batched embedding lookup over n_q token ids.
+    embed_batched: pipeline.Kernel,
     /// FlashDecoding phase 2 — merge per-split (O, m, l) partials into
     /// final attention output. Paired with `fa_decode_split`.
     fa_decode_merge: pipeline.Kernel,
@@ -635,6 +648,14 @@ pub const ChatKernels = struct {
         return &self.fa_decode_split;
     }
 
+    /// Same selection rule for the batched-prefill attention kernel.
+    pub fn faForwardFor(self: *const ChatKernels, head_dim: u32) *const pipeline.Kernel {
+        if (head_dim > self.fa_base_head_dim) {
+            if (self.fa_forward_wide) |*w| return w;
+        }
+        return &self.fa_forward;
+    }
+
     /// `head_dim` is the model's base (smallest) per-layer head dim;
     /// `max_head_dim` the largest. They differ only on Gemma 4, whose
     /// sliding layers are 256 and global layers 512.
@@ -649,6 +670,7 @@ pub const ChatKernels = struct {
         errdefer k.deinit();
         if (max_head_dim > head_dim) {
             k.fa_decode_split_wide = try pipeline.Kernel.init(ctx, faDecodeSplitSpv(max_head_dim), 6, @sizeOf(FaDecodeSplitPush));
+            k.fa_forward_wide = try pipeline.Kernel.init(ctx, faForwardSpv(max_head_dim), 5, @sizeOf(FaForwardPush));
         }
         return k;
     }
@@ -676,6 +698,13 @@ pub const ChatKernels = struct {
             .fp32_all => &shaders.embed_lookup,
             .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.embed_lookup_bf16,
         };
+        // Must track `embed_spv`: every precision above fp32_all keeps
+        // embed_tokens as raw bf16, and a batched lookup that read it as
+        // fp32 would produce finite-but-wrong embeddings.
+        const embed_batched_spv: []align(4) const u8 = switch (precision) {
+            .fp32_all => &shaders.embed_lookup_batched,
+            .bf16_matmul, .q4_0_matmul, .q4_k_matmul => &shaders.embed_lookup_batched_bf16,
+        };
         const ffn_spv: []align(4) const u8 = switch (family.activation()) {
             .gelu => &shaders.geglu,
             .silu => &shaders.swiglu,
@@ -697,6 +726,10 @@ pub const ChatKernels = struct {
             .fa_decode_split = try pipeline.Kernel.init(ctx, faDecodeSplitSpv(head_dim), 6, @sizeOf(FaDecodeSplitPush)),
             .fa_decode_split_wide = null,
             .fa_base_head_dim = head_dim,
+            .fa_forward = try pipeline.Kernel.init(ctx, faForwardSpv(head_dim), 5, @sizeOf(FaForwardPush)),
+            .fa_forward_wide = null,
+            .rope_partial_batched = try pipeline.Kernel.init(ctx, &shaders.rope_partial_batched, 2, @sizeOf(RopeBatchedPush)),
+            .embed_batched = try pipeline.Kernel.init(ctx, embed_batched_spv, 3, @sizeOf(EmbedLookupBatchedPush)),
             .fa_decode_merge = try pipeline.Kernel.init(ctx, &shaders.fa_decode_merge, 4, @sizeOf(FaDecodeMergePush)),
             .fa_decode_split_tq4v = try pipeline.Kernel.init(ctx, &shaders.fa_decode_split_tq4v, 6, @sizeOf(FaDecodeSplitPush)),
             .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
@@ -720,6 +753,10 @@ pub const ChatKernels = struct {
         self.attn_out.deinit();
         self.fa_decode_split.deinit();
         if (self.fa_decode_split_wide) |*w| w.deinit();
+        self.fa_forward.deinit();
+        if (self.fa_forward_wide) |*w| w.deinit();
+        self.rope_partial_batched.deinit();
+        self.embed_batched.deinit();
         self.fa_decode_merge.deinit();
         self.fa_decode_split_tq4v.deinit();
         self.add.deinit();
@@ -755,12 +792,43 @@ pub const ForwardPushes = struct {
     fa_decode_merge_push: FaDecodeMergePush,
     geglu_push: GegluPush,
     n_pos: u32,
+
+    // ── Batched-prefill fields ──────────────────────────────────────
+    // Populated for every call; with n_q == 1 they describe the same
+    // single-row step the decode path already takes, so the two paths
+    // never disagree about geometry.
+    /// Query rows in this step.
+    n_q: u32,
+    /// Absolute position of row 0. Rows cover [pos_start, pos_start+n_q).
+    pos_start: u32,
+    rope_q_batched_push: RopeBatchedPush,
+    rope_k_batched_push: RopeBatchedPush,
+    /// fa_forward over the whole batch: causal within the step, plus the
+    /// per-layer sliding window.
+    fa_forward_push: FaForwardPush,
+    q_dim: u32,
+    kv_dim: u32,
+    head_dim: u32,
+    n_kv_heads: u32,
 };
 
 pub fn computeForwardPushes(
     cfg: config_mod.Config,
     sc: *const gpu_scratch.GpuScratch,
     pos: usize,
+    layer_idx: usize,
+) ForwardPushes {
+    return computeForwardPushesBatched(cfg, sc, pos, 1, layer_idx);
+}
+
+/// As `computeForwardPushes`, for a step covering `n_q` query rows
+/// starting at absolute position `pos_start`. With n_q == 1 the result
+/// is identical to the single-token form.
+pub fn computeForwardPushesBatched(
+    cfg: config_mod.Config,
+    sc: *const gpu_scratch.GpuScratch,
+    pos_start: usize,
+    n_q: usize,
     /// Which layer these pushes are for. Only Gemma 4 varies anything by
     /// layer (head dim, KV head count, RoPE base, rotary fraction,
     /// sliding window); for every other family the result is identical
@@ -772,7 +840,11 @@ pub fn computeForwardPushes(
     const inter: u32 = @intCast(cfg.intermediate_size);
     const gemma_quirk: u32 = if (cfg.family.rmsnormAddOne()) 1 else 0;
     const max_pos_u32: u32 = @intCast(sc.max_pos);
-    const n_pos: u32 = @intCast(pos + 1);
+    const pos = pos_start;
+    // Total KV length visible to this step: everything already cached
+    // plus the n_q rows this step appends.
+    const n_pos: u32 = @intCast(pos_start + n_q);
+    const n_q_u32: u32 = @intCast(n_q);
 
     // ── Per-layer attention geometry ────────────────────────────────
     const head_dim_i = cfg.headDimAt(layer_idx);
@@ -887,6 +959,47 @@ pub fn computeForwardPushes(
         },
         .geglu_push = .{ .n = inter },
         .n_pos = n_pos,
+        .n_q = n_q_u32,
+        .pos_start = @intCast(pos_start),
+        .rope_q_batched_push = .{
+            .n_pos = n_q_u32,
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .head_dim = head_dim_u32,
+            // rotary_dim == head_dim is full RoPE, so the one batched
+            // kernel covers both the sliding layers (full) and the
+            // global ones (partial 0.25).
+            .rotary_dim = if (use_partial_rope) rotary_dim else head_dim_u32,
+            .theta_base = rope_theta_i,
+            .pos_offset = @intCast(pos_start),
+            .pair_stride = rope_pair_stride,
+            .freq_dim = rope_freq_dim,
+        },
+        .rope_k_batched_push = .{
+            .n_pos = n_q_u32,
+            .n_heads = @intCast(n_kv_heads_i),
+            .head_dim = head_dim_u32,
+            .rotary_dim = if (use_partial_rope) rotary_dim else head_dim_u32,
+            .theta_base = rope_theta_i,
+            .pos_offset = @intCast(pos_start),
+            .pair_stride = rope_pair_stride,
+            .freq_dim = rope_freq_dim,
+        },
+        .fa_forward_push = .{
+            .n_q = n_q_u32,
+            .n_heads = @intCast(cfg.num_attention_heads),
+            .heads_per_kv = heads_per_kv,
+            .head_dim = head_dim_u32,
+            .n_kv = n_pos,
+            .kv_stride = kv_dim,
+            .causal = 1,
+            .write_lse = 0,
+            .inv_sqrt_dim = inv_sqrt_dim,
+            .window = window,
+        },
+        .q_dim = @intCast(cfg.num_attention_heads * head_dim_i),
+        .kv_dim = kv_dim,
+        .head_dim = head_dim_u32,
+        .n_kv_heads = @intCast(n_kv_heads_i),
     };
 }
 
@@ -1178,6 +1291,188 @@ pub fn recordOneLayer(
     if (layer.layer_scalar) |ls| {
         const scale_push = ScalePush{ .n = hidden, .scale = ls };
         try recDispatch1D(rec, &k.scale, &.{ &sc.stream, &sc.stream }, &scale_push, hidden);
+    }
+}
+
+/// Whether a model can take the batched-prefill path at all.
+///
+/// The batched attention is `fa_forward`, so every layer's head dim
+/// must be inside the FA cap. TQ4-V is decode-only and forces the
+/// single-token path.
+pub fn canBatchPrefill(cfg: config_mod.Config) bool {
+    for (0..cfg.num_hidden_layers) |il| {
+        if (cfg.layer_types[il] != .full_attention) return false;
+        if (cfg.headDimAt(il) > FA_HEAD_DIM_MAX) return false;
+    }
+    return true;
+}
+
+/// Ingest `token_ids.len` tokens in one recorded step, appending them
+/// to the KV cache at [pos_start, pos_start + n).
+///
+/// `tok_buf` must already hold the ids as u32 on the device — the
+/// caller owns it because it changes per step.
+///
+/// When `compute_logits` is set, the LAST row's hidden state is copied
+/// to row 0 of the stream and the ordinary sample step runs on it: only
+/// the final position of a prompt needs logits.
+pub fn recordForwardStepBatched(
+    rec: *recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    pos_start: usize,
+    n_q: usize,
+    tok_buf: *const buffer.Buffer,
+    compute_logits: bool,
+) !void {
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const nq: u32 = @intCast(n_q);
+
+    const embed_push = EmbedLookupBatchedPush{
+        .dim = hidden,
+        .n_pos = nq,
+        .scale = if (cfg.family.embedScalesByDim()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+    };
+    try recDispatch1D(rec, &k.embed_batched, &.{ &gm.embed_tokens, tok_buf, &sc.stream }, &embed_push, nq * hidden);
+
+    for (0..cfg.num_hidden_layers) |layer_idx| {
+        const p = computeForwardPushesBatched(cfg, sc, pos_start, n_q, layer_idx);
+        try recordOneLayerBatched(rec, sc, gm, kv, cfg, k, layer_idx, &p);
+    }
+
+    if (compute_logits) {
+        // Fold the last row down to row 0 so the existing single-row
+        // sample step applies unchanged. Safe to clobber: the following
+        // step re-embeds into the stream from scratch.
+        if (nq > 1) {
+            const last = SliceCopyPush{
+                .src_off = (nq - 1) * hidden,
+                .dst_off = 0,
+                .n_elem = hidden,
+            };
+            try recDispatch1D(rec, &k.slice_copy, &.{ &sc.stream, &sc.stream }, &last, hidden);
+        }
+        const tail = computeForwardPushesBatched(cfg, sc, pos_start, n_q, cfg.num_hidden_layers - 1);
+        try recordSampleStep(rec, sc, gm, cfg, k, &tail);
+    }
+}
+
+/// Batched form of `recordOneLayer`: processes `p.n_q` query rows in one
+/// pass instead of one token at a time.
+///
+/// Why it matters: single-token prefill costs the same as a decode step
+/// per token (~28 ms on Gemma 4 12B), so a 280-token image would take
+/// ~8 s to ingest. Batching also gets the matmuls off M=1, where they
+/// are purely memory-bound, and onto shapes with real arithmetic
+/// intensity.
+///
+/// Attention is `fa_forward` — causal within the batch, plus the layer's
+/// sliding window — so this requires `head_dim <= FA_HEAD_DIM_MAX`.
+/// That is why the d512 variants exist.
+///
+/// Not supported here: TQ4-V (decode-only) and the 3-pass fallback.
+/// Callers gate with `canBatchLayer`.
+pub fn recordOneLayerBatched(
+    rec: *recorder.Recorder,
+    sc: *const gpu_scratch.GpuScratch,
+    gm: *const gpu_model.GpuModel,
+    kv: *const gpu_scratch.GpuKvCache,
+    cfg: config_mod.Config,
+    k: *const ChatKernels,
+    layer_idx: usize,
+    p: *const ForwardPushes,
+) !void {
+    if (p.n_q < 1) return error.InvalidNq;
+    if (p.n_q > sc.max_batch) return error.BatchLargerThanScratch;
+    if (p.head_dim > FA_HEAD_DIM_MAX) return error.HeadDimTooLargeForFa;
+
+    const hidden: u32 = @intCast(cfg.hidden_size);
+    const inter: u32 = @intCast(cfg.intermediate_size);
+    const nq = p.n_q;
+    const layer = &gm.layers[layer_idx];
+
+    // Every norm below is "one workgroup per row", so the batched form
+    // is the same dispatch with a larger row count.
+    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.input_layernorm, &sc.x_norm }, &p.rms_push, nq);
+
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.q_proj.?, &sc.q }, nq, p.q_dim, hidden);
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, &layer.k_proj.?, &sc.k }, nq, p.kv_dim, hidden);
+    if (layer.v_proj) |*vp| {
+        try recDispatchMatmul(rec, &k.matmul, &.{ &sc.x_norm, vp, &sc.v }, nq, p.kv_dim, hidden);
+    } else {
+        // attention_k_eq_v — see recordOneLayer for why this is a copy
+        // of the projection output rather than an alias.
+        const copy_push = SliceCopyPush{ .src_off = 0, .dst_off = 0, .n_elem = nq * p.kv_dim };
+        try recDispatch1D(rec, &k.slice_copy, &.{ &sc.k, &sc.v }, &copy_push, nq * p.kv_dim);
+    }
+
+    // Per-head norms: n_q x n_heads rows, since [n_q, heads, dim] flat
+    // is identical to [n_q * heads, dim].
+    if (layer.q_norm) |*qn| {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.q, qn, &sc.q }, &p.qkn_push, nq * @as(u32, @intCast(cfg.num_attention_heads)));
+    }
+    if (layer.k_norm) |*kn| {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.k, kn, &sc.k }, &p.qkn_push, nq * p.n_kv_heads);
+    }
+    if (p.v_norm_weightless) {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.v, &sc.v, &sc.v }, &p.v_norm_push, nq * p.n_kv_heads);
+    }
+
+    // Batched RoPE covers [pos_start, pos_start + n_q) in one dispatch.
+    try recDispatch1D(rec, &k.rope_partial_batched, &.{ &sc.q, &sc.q_rot }, &p.rope_q_batched_push, nq * p.q_dim);
+    try recDispatch1D(rec, &k.rope_partial_batched, &.{ &sc.k, &sc.k_rot }, &p.rope_k_batched_push, nq * p.kv_dim);
+
+    // Append n_q rows to the KV cache. Source and destination are both
+    // contiguous, so one write per buffer.
+    const kv_layer = &kv.layers[layer_idx];
+    const kv_write_batched = KvWritePush{
+        .n = nq * p.kv_dim,
+        .dst_off = p.pos_start * p.kv_dim,
+    };
+    try recDispatch1D(rec, &k.kv_write, &.{ &sc.k_rot, &kv_layer.k_cache }, &kv_write_batched, nq * p.kv_dim);
+    try recDispatch1D(rec, &k.kv_write, &.{ &sc.v, &kv_layer.v_cache }, &kv_write_batched, nq * p.kv_dim);
+
+    // fa_forward: n_q x n_heads workgroups over the full cache.
+    try rec.dispatch(
+        k.faForwardFor(p.head_dim),
+        &.{ &sc.q_rot, &kv_layer.k_cache, &kv_layer.v_cache, &sc.head_out, &sc.fa_l_partial },
+        &p.fa_forward_push,
+        nq * @as(u32, @intCast(cfg.num_attention_heads)),
+        1,
+        1,
+    );
+
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.head_out, &layer.o_proj.?, &sc.attn_out }, nq, hidden, p.q_dim);
+
+    // Block shape — see recordOneLayer for why the two forms are kept
+    // apart rather than wired by position.
+    const sandwich = layer.pre_feedforward_layernorm != null;
+    const add_all = AddInPlacePush{ .n = nq * hidden };
+    if (sandwich) {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.attn_out, &layer.post_attention_layernorm, &sc.attn_out }, &p.rms_push, nq);
+        try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &add_all, nq * hidden);
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.pre_feedforward_layernorm.?, &sc.mid_norm }, &p.rms_push, nq);
+    } else {
+        try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.attn_out }, &add_all, nq * hidden);
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.stream, &layer.post_attention_layernorm, &sc.mid_norm }, &p.rms_push, nq);
+    }
+
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.gate_proj, &sc.gate }, nq, inter, hidden);
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.mid_norm, &layer.up_proj, &sc.up }, nq, inter, hidden);
+    try recDispatch1D(rec, &k.geglu, &.{ &sc.gate, &sc.up, &sc.fused }, &GegluPush{ .n = nq * inter }, nq * inter);
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.fused, &layer.down_proj, &sc.ffn_out }, nq, hidden, inter);
+
+    if (layer.post_feedforward_layernorm) |*pfn| {
+        try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.ffn_out, pfn, &sc.ffn_out }, &p.rms_push, nq);
+    }
+    try recDispatch1D(rec, &k.add, &.{ &sc.stream, &sc.ffn_out }, &add_all, nq * hidden);
+
+    if (layer.layer_scalar) |ls| {
+        const scale_push = ScalePush{ .n = nq * hidden, .scale = ls };
+        try recDispatch1D(rec, &k.scale, &.{ &sc.stream, &sc.stream }, &scale_push, nq * hidden);
     }
 }
 
