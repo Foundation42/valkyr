@@ -523,11 +523,6 @@ pub const GpuModel = struct {
             };
         }
 
-        // Submit the final batch + tear down staging. Pool's
-        // VkDeviceMemory survives in `GpuModel` so weight reads stay
-        // valid.
-        try pool.finalize(ctx);
-
         // Vision embedder. Uploaded fp32 and uncached — it is ~200 MB
         // against the text weights' several GB, and skipping the cache
         // keeps the cache's contents purely about the expensive path.
@@ -546,6 +541,11 @@ pub const GpuModel = struct {
                 .patch_elems = pe,
             };
         } else null;
+
+        // Submit the final batch + tear down staging. Pool's
+        // VkDeviceMemory survives in `GpuModel` so weight reads stay
+        // valid.
+        try pool.finalize(ctx);
 
         return .{
             .config = cfg,
