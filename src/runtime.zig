@@ -196,6 +196,9 @@ pub const AttnBackwardDkPush = extern struct {
 
 pub const AddInPlacePush = extern struct { n: u32 };
 
+/// Broadcast a bias vector across rows of a batched matmul result.
+pub const AddBiasRowsPush = extern struct { n_rows: u32, dim: u32 };
+
 pub const ReluPush = extern struct { n: u32 };
 
 pub const ReluBackwardPush = extern struct { n: u32 };
@@ -1287,4 +1290,116 @@ pub fn sampleArgmax(logits: []const f32) u32 {
         }
     }
     return best;
+}
+
+// ── Gemma 4 vision embedder ───────────────────────────────────────
+//
+// Runs the whole image at once: every dispatch below is batched over
+// `n_patches` rows, so a 280-token image costs the same number of
+// dispatches as a single-token one. See `vision.zig` for the pipeline
+// and for why the norms are what they are.
+
+/// Kernels for the vision embedder. Built separately from ChatKernels
+/// because a text-only checkpoint never needs them.
+pub const VisionKernels = struct {
+    layernorm: pipeline.Kernel,
+    rmsnorm: pipeline.Kernel,
+    matmul: pipeline.Kernel,
+    add: pipeline.Kernel,
+    add_bias_rows: pipeline.Kernel,
+
+    pub fn init(ctx: *const vk.Context) !VisionKernels {
+        return .{
+            .layernorm = try pipeline.Kernel.init(ctx, &shaders.layernorm, 4, @sizeOf(LayernormPush)),
+            .rmsnorm = try pipeline.Kernel.init(ctx, &shaders.rmsnorm, 3, @sizeOf(RmsnormPush)),
+            // fp32 matmul: the vision weights are uploaded fp32, so the
+            // quantized variants would be reading the wrong layout.
+            .matmul = try pipeline.Kernel.init(ctx, &shaders.matmul_nt_v2, 3, @sizeOf(MatmulPush)),
+            .add = try pipeline.Kernel.init(ctx, &shaders.add_in_place, 2, @sizeOf(AddInPlacePush)),
+            .add_bias_rows = try pipeline.Kernel.init(ctx, &shaders.add_bias_rows, 2, @sizeOf(AddBiasRowsPush)),
+        };
+    }
+
+    pub fn deinit(self: *VisionKernels) void {
+        self.layernorm.deinit();
+        self.rmsnorm.deinit();
+        self.matmul.deinit();
+        self.add.deinit();
+        self.add_bias_rows.deinit();
+    }
+};
+
+/// Device-side scratch for one image. Sized for `max_patches`; a
+/// smaller image just uses a prefix of each buffer.
+/// Intermediates only. The two INPUTS (patches, pos_sum) are supplied
+/// by the caller at record time rather than owned here: they change per
+/// image and, in an embedded host, arrive from wherever the framebuffer
+/// was staged.
+pub const VisionScratch = struct {
+    a: buffer.Buffer,
+    b: buffer.Buffer,
+    /// [max_patches, embed] — the soft tokens, ready to splice.
+    out: buffer.Buffer,
+    max_patches: usize,
+
+    pub fn init(ctx: *const vk.Context, max_patches: usize, patch_elems: usize, embed: usize) !VisionScratch {
+        const f = @sizeOf(f32);
+        return .{
+            .a = try buffer.Buffer.initDeviceOnly(ctx, max_patches * @max(patch_elems, embed) * f),
+            .b = try buffer.Buffer.initDeviceOnly(ctx, max_patches * embed * f),
+            .out = try buffer.Buffer.initDeviceOnly(ctx, max_patches * embed * f),
+            .max_patches = max_patches,
+        };
+    }
+
+    pub fn deinit(self: *VisionScratch, device: vk.c.VkDevice) void {
+        self.a.deinit(device);
+        self.b.deinit(device);
+        self.out.deinit(device);
+    }
+};
+
+/// Record the patch embedder.
+///
+///   `patches`  [n_patches, patch_elems] preprocessed image
+///   `pos_sum`  [n_patches, embed] per-patch sum of the two positional
+///              rows (axis 0 by column, axis 1 by row), summed host-side
+///
+/// Result lands in `sc.out` as [n_patches, embed].
+pub fn recordVisionEmbed(
+    rec: *recorder.Recorder,
+    sc: *const VisionScratch,
+    patches: *const buffer.Buffer,
+    pos_sum: *const buffer.Buffer,
+    gv: *const gpu_model.GpuVision,
+    k: *const VisionKernels,
+    n_patches: u32,
+    embed_dim: u32,
+) !void {
+    const pe: u32 = @intCast(gv.patch_elems);
+    // PyTorch LayerNorm default, deliberately not the model's rms eps.
+    const ln_push = LayernormPush{ .dim = pe, .eps = 1e-5 };
+    const ln_embed_push = LayernormPush{ .dim = embed_dim, .eps = 1e-5 };
+
+    // LayerNorm over the raw patch, one workgroup per patch.
+    try recDispatchPerRow(rec, &k.layernorm, &.{ patches, &gv.patch_ln1_w, &gv.patch_ln1_b, &sc.a }, &ln_push, n_patches);
+
+    // [n_patches, 6912] x [embed, 6912]^T -> [n_patches, embed], + bias.
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.a, &gv.patch_dense_w, &sc.b }, n_patches, embed_dim, pe);
+    const bias_push = AddBiasRowsPush{ .n_rows = n_patches, .dim = embed_dim };
+    try recDispatch1D(rec, &k.add_bias_rows, &.{ &gv.patch_dense_b, &sc.b }, &bias_push, n_patches * embed_dim);
+
+    try recDispatchPerRow(rec, &k.layernorm, &.{ &sc.b, &gv.patch_ln2_w, &gv.patch_ln2_b, &sc.a }, &ln_embed_push, n_patches);
+
+    // + posemb(col) + posemb(row), pre-summed on the host.
+    try recDispatch1D(rec, &k.add, &.{ &sc.a, pos_sum }, &AddInPlacePush{ .n = n_patches * embed_dim }, n_patches * embed_dim);
+
+    try recDispatchPerRow(rec, &k.layernorm, &.{ &sc.a, &gv.pos_norm_w, &gv.pos_norm_b, &sc.b }, &ln_embed_push, n_patches);
+
+    // Weightless RMSNorm (no gain tensor exists); W binding is ignored
+    // by the shader but must still resolve, so it re-binds the input.
+    const rms_push = RmsnormPush{ .dim = embed_dim, .eps = 1e-6, .gemma_quirk = 0, .weightless = 1 };
+    try recDispatchPerRow(rec, &k.rmsnorm, &.{ &sc.b, &sc.b, &sc.a }, &rms_push, n_patches);
+
+    try recDispatchMatmul(rec, &k.matmul, &.{ &sc.a, &gv.embedding_projection, &sc.out }, n_patches, embed_dim, embed_dim);
 }

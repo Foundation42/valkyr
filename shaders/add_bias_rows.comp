@@ -1,0 +1,26 @@
+#version 460
+// Broadcast a bias vector across rows: `out[r*dim + i] += bias[i]`.
+//
+// The matmul kernels emit a bare product; layers with a bias term (the
+// Gemma 4 vision patch embedder's `patch_dense`) need it added across
+// every row of a batched result. One thread per output element, flat
+// 1D grid over rows*dim.
+//
+// In-place safe: each thread touches exactly one element.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer B  { float bias[]; };
+layout(set = 0, binding = 1, std430)          buffer IO { float io[];   };
+
+layout(push_constant) uniform Pc {
+    uint n_rows;
+    uint dim;
+} pc;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint total = pc.n_rows * pc.dim;
+    if (g >= total) return;
+    io[g] += bias[g % pc.dim];
+}

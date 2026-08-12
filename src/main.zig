@@ -26,6 +26,7 @@ const smoke_layer_tests = @import("smoke/layer_tests.zig");
 const smoke_decoder = @import("smoke/decoder.zig");
 const smoke_gpu_kernels = @import("smoke/gpu_kernels.zig");
 const smoke_vision = @import("smoke/vision.zig");
+const smoke_vision_gpu = @import("smoke/vision_gpu.zig");
 const smoke_gpu_train = @import("smoke/gpu_train.zig");
 
 pub fn main() !void {
@@ -1215,6 +1216,7 @@ pub fn main() !void {
     try smoke_gpu_kernels.runGpuRopeProportionalSmoke(allocator);
     try smoke_gpu_kernels.runGpuSoftcapSmoke(allocator);
     try smoke_vision.runVisionPreprocessSmoke(allocator);
+    try smoke_vision_gpu.runVisionGpuParity(allocator);
     try smoke_gpu_kernels.runGpuSplitQGateSmoke(allocator);
     try smoke_gpu_kernels.runGpuSigmoidMulSmoke(allocator);
     try smoke_gpu_kernels.runSwiGluCpuSmoke(allocator);

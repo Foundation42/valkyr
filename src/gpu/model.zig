@@ -157,6 +157,39 @@ pub const GpuMtpHead = struct {
     }
 };
 
+/// Gemma 4's vision embedder on the device. Everything is kept fp32:
+/// the whole tower is ~200 MB and runs once per image, so quantizing it
+/// would trade real accuracy for memory nobody is short of.
+///
+/// `pos_embedding` deliberately does NOT live here. Each patch needs
+/// exactly two rows of it (one per axis), so the host sums the pair per
+/// patch and uploads a [n_patches, embed] buffer instead — that turns a
+/// gather into a plain elementwise add and keeps an 8.6M-element table
+/// off the device entirely.
+pub const GpuVision = struct {
+    patch_ln1_w: buffer.Buffer,
+    patch_ln1_b: buffer.Buffer,
+    patch_dense_w: buffer.Buffer,
+    patch_dense_b: buffer.Buffer,
+    patch_ln2_w: buffer.Buffer,
+    patch_ln2_b: buffer.Buffer,
+    pos_norm_w: buffer.Buffer,
+    pos_norm_b: buffer.Buffer,
+    embedding_projection: buffer.Buffer,
+    /// Flattened patch length (6912 = 48*48*3).
+    patch_elems: usize,
+
+    pub fn deinit(self: *GpuVision, device: vk.c.VkDevice) void {
+        inline for (.{
+            "patch_ln1_w",  "patch_ln1_b", "patch_dense_w", "patch_dense_b",
+            "patch_ln2_w",  "patch_ln2_b", "pos_norm_w",    "pos_norm_b",
+            "embedding_projection",
+        }) |f| {
+            @field(self, f).deinit(device);
+        }
+    }
+};
+
 /// Reader and/or writer for the on-disk quantized-weight cache. A hit
 /// on `reader` skips conversion entirely; a miss records into `writer`
 /// so the next load is fast. Either half may be absent — the cache is
@@ -186,6 +219,8 @@ pub const GpuModel = struct {
     /// (for the future memory-saving path), even though the buffers are
     /// distinct. For now informational only.
     lm_head_tied: bool,
+    /// Gemma 4 vision embedder; null on text-only checkpoints.
+    vision: ?GpuVision = null,
     /// Single VkDeviceMemory backing every weight tensor's VkBuffer.
     /// Outlives the upload — freed by `deinit`. The persistent staging
     /// buffer + cmd buffer it manages are torn down by `pool.finalize`
@@ -288,6 +323,17 @@ pub const GpuModel = struct {
         accountTensor(cpu.embed_tokens, lm_head_path, &total_bytes, &max_tensor_bytes, slack_per_tensor);
         accountTensor(cpu.final_norm,   .fp32,         &total_bytes, &max_tensor_bytes, slack_per_tensor);
         accountTensor(cpu.lm_head,      lm_head_path,  &total_bytes, &max_tensor_bytes, slack_per_tensor);
+        // Vision embedder — all fp32. Must be accounted here or the pool
+        // is undersized and the uploads below fail at the last tensor.
+        if (cpu.vision) |v| {
+            inline for (.{
+                "patch_ln1_w",  "patch_ln1_b", "patch_dense_w", "patch_dense_b",
+                "patch_ln2_w",  "patch_ln2_b", "pos_norm_w",    "pos_norm_b",
+                "embedding_projection",
+            }) |f| {
+                accountTensor(@field(v, f), .fp32, &total_bytes, &max_tensor_bytes, slack_per_tensor);
+            }
+        }
         for (cpu.layers) |layer| {
             accountTensor(layer.input_layernorm,          .fp32,        &total_bytes, &max_tensor_bytes, slack_per_tensor);
             accountTensor(layer.post_attention_layernorm, .fp32,        &total_bytes, &max_tensor_bytes, slack_per_tensor);
@@ -482,10 +528,30 @@ pub const GpuModel = struct {
         // valid.
         try pool.finalize(ctx);
 
+        // Vision embedder. Uploaded fp32 and uncached — it is ~200 MB
+        // against the text weights' several GB, and skipping the cache
+        // keeps the cache's contents purely about the expensive path.
+        const gpu_vision: ?GpuVision = if (cpu.vision) |v| blk: {
+            const pe = v.patch_dense_w.shape[v.patch_dense_w.shape.len - 1];
+            break :blk GpuVision{
+                .patch_ln1_w = try uploadTensor(gpa, ctx, v.patch_ln1_w, js, &pool),
+                .patch_ln1_b = try uploadTensor(gpa, ctx, v.patch_ln1_b, js, &pool),
+                .patch_dense_w = try uploadTensor(gpa, ctx, v.patch_dense_w, js, &pool),
+                .patch_dense_b = try uploadTensor(gpa, ctx, v.patch_dense_b, js, &pool),
+                .patch_ln2_w = try uploadTensor(gpa, ctx, v.patch_ln2_w, js, &pool),
+                .patch_ln2_b = try uploadTensor(gpa, ctx, v.patch_ln2_b, js, &pool),
+                .pos_norm_w = try uploadTensor(gpa, ctx, v.pos_norm_w, js, &pool),
+                .pos_norm_b = try uploadTensor(gpa, ctx, v.pos_norm_b, js, &pool),
+                .embedding_projection = try uploadTensor(gpa, ctx, v.embedding_projection, js, &pool),
+                .patch_elems = pe,
+            };
+        } else null;
+
         return .{
             .config = cfg,
             .precision = precision,
             .embed_tokens = embed,
+            .vision = gpu_vision,
             .layers = layers,
             .final_norm = final_norm,
             .lm_head = lm_head,
@@ -502,6 +568,7 @@ pub const GpuModel = struct {
         self.embed_tokens.deinit(device);
         self.final_norm.deinit(device);
         self.lm_head.deinit(device);
+        if (self.vision) |*v| v.deinit(device);
         if (self.mtp_head) |*m| m.deinit(self.allocator, device);
         // VkBuffer handles came from the pool; the pool owns their
         // backing VkDeviceMemory.
