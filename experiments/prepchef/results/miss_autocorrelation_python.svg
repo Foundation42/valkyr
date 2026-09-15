@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Miss-indicator autocorrelation (python)">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Miss-indicator autocorrelation (python)</text>
+<text class="sub" x="74" y="40">P(miss at i+h | miss at i) / P(miss); 1.0 means no structure at that lag</text>
+<line class="gridline" x1="74" y1="439.7" x2="550" y2="439.7"/>
+<text class="tick" x="66" y="443.2" text-anchor="end">2.0</text>
+<line class="gridline" x1="74" y1="346.3" x2="550" y2="346.3"/>
+<text class="tick" x="66" y="349.8" text-anchor="end">3.0</text>
+<line class="gridline" x1="74" y1="253.0" x2="550" y2="253.0"/>
+<text class="tick" x="66" y="256.5" text-anchor="end">4.0</text>
+<line class="gridline" x1="74" y1="159.6" x2="550" y2="159.6"/>
+<text class="tick" x="66" y="163.1" text-anchor="end">5.0</text>
+<line class="gridline" x1="74" y1="66.2" x2="550" y2="66.2"/>
+<text class="tick" x="66" y="69.7" text-anchor="end">6.0</text>
+<line class="gridline" x1="85.8" y1="46" x2="85.8" y2="404"/>
+<text class="tick" x="85.8" y="421" text-anchor="middle">0</text>
+<line class="gridline" x1="222.9" y1="46" x2="222.9" y2="404"/>
+<text class="tick" x="222.9" y="421" text-anchor="middle">10</text>
+<line class="gridline" x1="360.0" y1="46" x2="360.0" y2="404"/>
+<text class="tick" x="360.0" y="421" text-anchor="middle">20</text>
+<line class="gridline" x1="497.1" y1="46" x2="497.1" y2="404"/>
+<text class="tick" x="497.1" y="421" text-anchor="middle">30</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">lag h (data references)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">lift over base miss rate</text>
+<path d="M99.5,121.3 L113.2,233.9 L126.9,273.2 L140.6,75.8 L154.3,195.1 L168.0,176.8 L181.8,326.3 L195.5,246.9 L209.2,246.1 L222.9,219.9 L236.6,232.3 L250.3,169.5 L264.0,326.6 L277.7,343.0 L291.4,241.8 L305.1,209.0 L318.9,374.2 L332.6,281.4 L346.3,314.2 L360.0,240.6 L373.7,271.6 L387.4,313.7 L401.1,372.6 L414.8,157.5 L428.5,313.4 L442.2,331.0 L456.0,311.3 L469.7,307.6 L483.4,361.4 L497.1,295.9 L510.8,307.2 L524.5,285.2" fill="none" stroke="#3b6fd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="121.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="113.2" cy="233.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="126.9" cy="273.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="140.6" cy="75.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="154.3" cy="195.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="168.0" cy="176.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="181.8" cy="326.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="195.5" cy="246.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="209.2" cy="246.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="222.9" cy="219.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="236.6" cy="232.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="250.3" cy="169.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="264.0" cy="326.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="277.7" cy="343.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="291.4" cy="241.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="305.1" cy="209.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="318.9" cy="374.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="332.6" cy="281.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="346.3" cy="314.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="360.0" cy="240.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="373.7" cy="271.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="387.4" cy="313.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="401.1" cy="372.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="414.8" cy="157.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="428.5" cy="313.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="442.2" cy="331.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="456.0" cy="311.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="469.7" cy="307.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="483.4" cy="361.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="497.1" cy="295.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="510.8" cy="307.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="524.5" cy="285.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">miss lift</text>
+</svg>

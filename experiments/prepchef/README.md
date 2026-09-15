@@ -24,13 +24,14 @@ src/learner.hpp     association learners and the economic null gate
 src/predictor.hpp   PrepChef + registered controls + strong prefetcher baselines
 src/engine.hpp      the one place prefetches are issued, deduped, expired, credited
 src/scorer.hpp      an independent scorer that shares no code with the engine
+src/spectro.hpp     model-free trace spectra (no learner, no context, no gate)
 src/experiment.cpp  phase drivers; every run appends a row to results/runs.csv
 src/din2vtr.cpp     valgrind/lackey (or Dinero .din) -> binary trace
 tools/gen_traces.sh generates the real traces
 tools/concat_traces.py  builds concatenated traces for phase-change probes
 tools/plot.py       dependency-free SVG plots
 LABBOOK.md          hypothesis -> registered control -> result -> next experiment
-results/            CSV of every run, plus plots
+results/            runs.csv (every run), spectro.csv (trace spectra), plots
 ```
 
 ## Traces
@@ -68,6 +69,9 @@ tools/gen_traces.sh traces 16000000
 make
 ./build/prepchef audit  traces/gcc.vtr          # Phase A: Gate A + audits
 ./build/prepchef all    traces/gcc.vtr          # everything, one trace
+./build/prepchef spectro traces/tsort.vtr      # model-free trace spectrum
+./build/prepchef lead   traces/tsort.vtr        # horizon sweep h = 1..32
+PREPCHEF_PEAK_H=9 ./build/prepchef peak traces/sort.vtr
 ./build/prepchef drift  traces/drift_gcc_tsort.vtr
 python3 tools/plot.py results/runs.csv results/
 ```
@@ -127,6 +131,19 @@ Full write-up in [`LABBOOK.md`](LABBOOK.md). In short:
 5. **Aim further ahead.** Moving the label from "next data reference" to "four
    data references later" triples the lead time *and* improves real-miss
    coverage.
-6. **No novelty or performance claim is made.** Under the miss-filtered rule,
+6. **The horizon is a workload property, not a hyperparameter.** Sweeping
+   every integer horizon h = 1..32 with nothing else changed gives each
+   workload a characteristic spectrum — `sort` a razor-sharp line at h = 9/10,
+   `tsort` lines at 1/4/6, `gcc` a smooth decay, `xz` nothing at all. A
+   model-free control computed from the reference stream with **no learner**
+   reproduces the same shape (r = +0.77 on tsort, +0.70 on gcc), so this is
+   execution phase structure, not a predictor artefact.
+7. **At its own horizon, `sort` inverts the ranking.** At h = 9 PrepChef covers
+   58.3% of real misses against next-line's 41.3%, using **21× fewer
+   prefetches**, at 30× the precision, net-positive where next-line is −59.5
+   per 1K. Every neighbouring horizon is exactly 0.0%. Stable across twelve
+   chronological splits. `sort` was the workload where PrepChef looked worst —
+   it had been declining to play at the wrong horizon.
+8. **No novelty or performance claim is made.** Under the miss-filtered rule,
    plain next-line still covers more real misses than anything else here. What
    survives is a narrower claim about efficiency per action.

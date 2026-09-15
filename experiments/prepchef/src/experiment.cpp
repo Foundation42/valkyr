@@ -18,6 +18,7 @@
 #include "predictor.hpp"
 #include "engine.hpp"
 #include "scorer.hpp"
+#include "spectro.hpp"
 
 #include <cmath>
 #include <cstdarg>
@@ -575,18 +576,60 @@ static void phase_g(const Trace& tr)
 // data references later instead of the very next one.
 static void phase_h(const Trace& tr)
 {
-    std::printf("\n=== Phase H: how far ahead can it see? -- %s ===\n", tr.name.c_str());
-    for (int h : {1, 2, 4, 8, 16, 32}) {
-        for (int mode = 0; mode < 2; ++mode) {
-            RunCfg rc;
-            if (mode) rc.reward_mode = RunCfg::Reward::MissFiltered;
-            LearnCfg l = pcbase_learn(rc.waste);
-            l.horizon = h;
-            l.label = "horizon-" + std::to_string(h) + (mode ? "/miss-reward" : "/window-reward");
+    std::printf("\n=== Phase H / horizon spectroscopy: h = 1..32 -- %s ===\n", tr.name.c_str());
+    // Every integer horizon, nothing else changed.  Three gates so that a peak
+    // can be attributed: the PC-BASE gate under the window reward (does the
+    // anomaly exist in the metric that cannot see misses at all?), and the
+    // realised-reward gate at two prices.
+    for (int h = 1; h <= 32; ++h) {
+        { RunCfg rc;
+          LearnCfg l = pcbase_learn(rc.waste); l.horizon = h; l.label = "counts-eu";
+          char b[64]; std::snprintf(b, sizeof b, "h%02d/counts-eu/window", h);
+          PrepChef p(pcbase_ctx(), l);
+          report("H", tr, b, p, rc, pcbase_ctx().label, l.label); }
+        for (float w : {0.05f, 0.25f}) {
+            RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            LearnCfg l = pcbase_learn(w);
+            l.kind = LearnCfg::Kind::RealizedEV; l.horizon = h; l.label = "realized-ev";
+            char b[64]; std::snprintf(b, sizeof b, "h%02d/realized-ev/miss-w%.2f", h, w);
             PrepChef p(pcbase_ctx(), l);
-            report("H", tr, l.label, p, rc, pcbase_ctx().label, l.label);
+            report("H", tr, b, p, rc, pcbase_ctx().label, l.label);
         }
     }
+}
+
+// ============================== model-free trace spectroscopy (no learner) ==
+
+static void phase_spectro(const Trace& tr)
+{
+    std::printf("\n=== Model-free trace spectroscopy -- %s ===\n", tr.name.c_str());
+    const char* path = std::getenv("PREPCHEF_SPECTRO_CSV");
+    std::string out = path ? path : "results/spectro.csv";
+    bool exists = false;
+    if (std::FILE* f = std::fopen(out.c_str(), "rb")) { std::fseek(f, 0, SEEK_END); exists = std::ftell(f) > 0; std::fclose(f); }
+    std::FILE* f = std::fopen(out.c_str(), "ab");
+    if (!f) { std::perror("spectro csv"); return; }
+    if (!exists)
+        std::fprintf(f, "trace,n,miss_rate,h,recur,miss_lift,top1_mass,top1_delta,"
+                        "top1_miss,top1nz_mass,top1nz_delta,top1nz_miss,"
+                        "missdelta_top1,missdelta_delta\n");
+
+    SpectroResult sr = spectroscopy(tr, 32, 0.20, 64, 8, 2);
+    std::printf("  scored %llu refs, miss rate %.3f%%\n",
+                (unsigned long long)sr.n, 100 * sr.miss_rate);
+    std::printf("   h  recur  missLift  top1Δ≠0 mass (Δ)  ->lands on miss  missΔtop1 (Δ)\n");
+    for (const SpectroRow& r : sr.rows) {
+        std::fprintf(f, "%s,%llu,%.8f,%d,%.8f,%.6f,%.8f,%lld,%.8f,%.8f,%lld,%.8f,%.8f,%lld\n",
+                     tr.name.c_str(), (unsigned long long)sr.n, sr.miss_rate, r.h,
+                     r.recur, r.miss_lift, r.top1_mass, (long long)r.top1_delta,
+                     r.top1_miss, r.top1nz_mass, (long long)r.top1nz_delta, r.top1nz_miss,
+                     r.missdelta_top1, (long long)r.missdelta_delta);
+        std::printf("  %2d  %5.1f%%  %7.2fx  %10.2f%% (%+4lld)  %11.2f%%  %7.2f%% (%+4lld)\n",
+                    r.h, 100 * r.recur, r.miss_lift, 100 * r.top1nz_mass,
+                    (long long)r.top1nz_delta, 100 * r.top1nz_miss,
+                    100 * r.missdelta_top1, (long long)r.missdelta_delta);
+    }
+    std::fclose(f);
 }
 
 // ====================================== the combination worth carrying on ===
@@ -622,6 +665,44 @@ static void phase_best(const Trace& tr)
     }
     { RunCfg rc; rc.reward_mode = RunCfg::Reward::MissFiltered;
       NextLine nl; report("best", tr, "next-line", nl, rc, "-", "next-line"); }
+}
+
+// ============================== robustness check for a single spectral peak ==
+
+// A peak worth believing has to survive the splits.  PREPCHEF_PEAK_H selects
+// the horizon; the run repeats it across warm-up fractions and rolling
+// evaluation windows, with the neighbouring horizons as controls.
+static void phase_peak(const Trace& tr)
+{
+    const char* e = std::getenv("PREPCHEF_PEAK_H");
+    const int h0 = e ? std::atoi(e) : 4;
+    std::printf("\n=== Spectral peak robustness at h=%d -- %s ===\n", h0, tr.name.c_str());
+
+    auto mk = [](int h, float w) {
+        LearnCfg l = pcbase_learn(w);
+        l.kind = LearnCfg::Kind::RealizedEV; l.horizon = h; l.label = "realized-ev";
+        return l;
+    };
+    for (int h : {h0 - 1, h0, h0 + 1}) {
+        if (h < 1) continue;
+        for (double wu : {0.10, 0.20, 0.35, 0.50}) {
+            RunCfg rc; rc.waste = 0.05f; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            rc.warmup_frac = wu; rc.eval_begin = wu;
+            char b[80]; std::snprintf(b, sizeof b, "peak-h%d-warmup%.2f", h, wu);
+            PrepChef p(pcbase_ctx(), mk(h, 0.05f));
+            report("peak", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+        }
+        for (int k = 0; k < 8; ++k) {
+            RunCfg rc; rc.waste = 0.05f; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            rc.warmup_frac = 0.20;
+            rc.eval_begin = 0.20 + 0.10 * k;
+            rc.eval_end = std::min(1.0, rc.eval_begin + 0.10);
+            if (rc.eval_begin >= 1.0) break;
+            char b[80]; std::snprintf(b, sizeof b, "peak-h%d-roll%.2f", h, rc.eval_begin);
+            PrepChef p(pcbase_ctx(), mk(h, 0.05f));
+            report("peak", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+        }
+    }
 }
 
 // ================================================= hot-path cost (Phase I) ==
@@ -717,7 +798,7 @@ int main(int argc, char** argv)
 {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: prepchef <audit|base|ctx|rep|learn|base2|splits|econ|lead|best|cost|drift|all> <trace.vtr...>\n");
+            "usage: prepchef <audit|base|ctx|rep|learn|base2|splits|econ|lead|spectro|peak|best|cost|drift|all> <trace.vtr...>\n");
         return 2;
     }
     const std::string cmd = argv[1];
@@ -756,6 +837,8 @@ int main(int argc, char** argv)
         if (cmd == "econ" || cmd == "all") phase_g(tr);
         if (cmd == "lead" || cmd == "all") phase_h(tr);
         if (cmd == "cost") phase_cost(tr);
+        if (cmd == "spectro") phase_spectro(tr);
+        if (cmd == "peak") phase_peak(tr);
         if (cmd == "best" || cmd == "all") phase_best(tr);
     }
     if (g_csv) std::fclose(g_csv);

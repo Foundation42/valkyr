@@ -225,7 +225,7 @@ Combined — realised-reward gate × label horizon, miss-filtered reward:
 
 | trace | config | action rate | strict acc | strict cov | strict net/1K | lead |
 |-------|--------|-------------|-----------|-----------|---------------|------|
-| gcc   | ev, h=4, w=0.05 | 7.4%  | 4.9%  | 35.0% | **+0.12** | 14.8 |
+| gcc   | ev, h=4, w=0.05 | 7.4%  | 4.9%  | 35.0% | +0.12 [^1] | 14.8 |
 | tsort | ev, h=4, w=0.25 | 2.3%  | 43.2% | 31.6% | **+6.52** | 18.5 |
 | tsort | ev, h=4, w=0.05 | 4.1%  | 24.9% | 32.9% | **+8.59** | 16.3 |
 | sort  | ev, h=1, w=0.05 | 0.09% | 7.1%  | 0.6%  | +0.02 | 6.9 |
@@ -237,6 +237,10 @@ vs 33.7%) using **14× fewer prefetches**, and is the only policy in the entire 
 benefit under real prices. On sort it correctly declines to play. On gcc it is
 barely positive and next-line still covers more misses (47.1% vs 35.0%) — at
 4.4× the traffic and a net of −74.
+
+[^1]: Superseded — the horizon-spectroscopy entry below shows this gcc figure
+does not survive the rolling windows. The net-positive workloads are `tsort`
+and `sort`.
 
 **This is the honest headline:** *the primitive becomes economically real only
 when it is paid real prices and aimed further ahead, and even then it wins on
@@ -343,6 +347,137 @@ reference in every trace here.
 
 ---
 
+## Horizon spectroscopy — the anomaly is phase structure, and it is worth money
+
+*(Follow-up entry. Christian's instruction: sweep h = 1..32 with nothing else
+changed, do not explain the tsort anomaly away, and do not touch the
+representation.)*
+
+**Hypothesis.** The non-monotonic tsort result (h ∈ {1,4} good, {2,8} bad) is
+a property of the workload's execution dynamics, not an artefact of the
+predictor.
+
+**Registered control — a model-free spectrum.** `src/spectro.hpp` computes,
+from the reference stream alone with no learner, no context and no gate:
+
+- `recur(h)` = P(L[i+h] = L[i])
+- `miss_lift(h)` = P(m[i+h] | m[i]) / P(m)
+- `top1nz_mass(h)` = max over d ≠ 0 of P(L[i+h] − L[i] = d)
+- **`top1nz_miss(h)`** = P(L[i+h] − L[i] = d\* **and** m[i+h]) / P(m) — the
+  fraction of real misses a single global non-zero delta at lag *h* would
+  cover. Delta 0 is excluded because a delta-0 "preparation" prepares nothing
+  and can never land on a miss; leaving it in, it dominates every lag and the
+  statistic says nothing. (The self-prefetch artefact shows up here too.)
+
+**Result 1 — the control has the same shape as the learned result** (tsort):
+
+| h | model-free ceiling `top1nz_miss` (best Δ≠0) | PrepChef strict coverage |
+|---|---|---|
+| 1 | 21.4% (Δ = −1) | 22.0% |
+| 2 | **0.00%** | 0.48% |
+| 3 | 0.00% | 0.55% |
+| 4 | **33.1% (Δ = +1)** | 34.2% |
+| 5 | 0.00% | 12.2% |
+| 8 | 0.55% | 1.08% |
+| 28 | 6.42% | 6.84% |
+
+Correlation between the model-free curve and PrepChef's strict coverage across
+all 32 lags: **tsort r = +0.77, gcc r = +0.70**, awkhash +0.46, sort +0.34,
+python +0.05, xz −0.43. Where there is structure, the learner tracks it; where
+there is none (python is broadband, xz is flat) the statistic is uninformative,
+which is the honest reading rather than a failure.
+
+**Not an artefact, and not ordinary prediction distance.** The window metric
+decays smoothly with h on tsort (66.5 → 62.5 → 51.4 → 46.2 → 34.4 → 27.2%)
+while real-miss coverage does not. Only the miss-filtered view sees the
+structure, because the structure is in *which references miss*, not in which
+references are predictable.
+
+**Result 2 — the spectra are workload signatures, and they differ in kind:**
+
+| trace | shape | horizons with positive net (realised-reward gate, w = 0.05) |
+|-------|-------|---------------------------------------------------------------|
+| `sort` | **razor-sharp line spectrum** | 9, 10, 18, 21, 23, 25, 27, 29 |
+| `tsort` | line spectrum | 1, 3, 4, 5, 6, 7, 10, 28 |
+| `gcc` | smooth decay + a weak lobe near 4–5 and 14–15 | 4 (marginal, see below) |
+| `python` | broadband, gently peaked at 6 and 15–16 | none |
+| `awkhash` | h = 1 only | none |
+| `xz` | flat — there is nothing to predict | none |
+
+**Result 3 — and this is the one that matters. `sort`, the workload where
+PrepChef looked worst, is where it looks best, at the right horizon.**
+
+| h | strict cov | strict acc | action rate | strict net/1K | lead (total refs) |
+|---|-----------|-----------|-------------|---------------|-------------------|
+| 8  | 0.00%  | 0.00%  | 0.079% | −0.04 | 16.8 |
+| **9**  | **58.26%** | **46.83%** | **1.226%** | **+5.42** | **43.9** |
+| **10** | 58.26% | 46.83% | 1.226% | +5.42 | 42.9 |
+| 11 | 0.00%  | 0.00%  | 0.079% | −0.04 | 37.4 |
+| 18 | 41.74% | 31.27% | 1.316% | +3.66 | 79.3 |
+| next-line (for comparison) | 41.32% | 1.58% | 25.8% | **−59.5** | 60.9 |
+
+At h = 9 PrepChef covers **more real misses than next-line (58.3% vs 41.3%)
+using 21× fewer prefetches, at 30× the precision, and is net-positive where
+next-line is deeply negative.** Every neighbouring horizon is *exactly* zero.
+
+Earlier in this lab book, "on `sort` it switches itself off" was recorded as a
+success for the null action. It still is — but the fuller reading is that it
+was declining to play **at the wrong horizon**. The opportunity was there the
+whole time, nine references away.
+
+**Robustness (`peak` phase, 108 runs).** A peak this sharp needs checking, so
+it was re-run across four warm-up fractions and eight rolling windows with
+h±1 as controls:
+
+- `sort` h = 9: strict coverage **58.1–59.2%** across all twelve splits, net
+  +5.18 to +5.42; h = 8 is **0.0% in all twelve**. Stable and razor-edged.
+- `tsort` h = 4: 32.5–35.4%, net +3.46 to +8.67; h = 3 and h = 5 clearly
+  lower. Stable.
+- `gcc` h = 4: 23.9–45.1%, net −4.86 to +1.45 — **the h = 4 advantage is
+  inside the split-to-split variation, and the net is negative in most rolling
+  windows.**
+
+**Correction to an earlier entry.** The combined-configuration table above
+lists gcc at h = 4 with strict net +0.12. That figure is real for the default
+split but it does **not** survive the rolling windows, so gcc should not be
+counted as a net-positive workload. The net-positive results in this lab are
+`tsort` and `sort`, not gcc.
+
+**Interpretation.** The horizon is not a hyperparameter with a good global
+value. It is a property of the host's execution dynamics — the distance at
+which the future becomes both predictable *and* expensive — and it differs by
+an order of magnitude between workloads (1 for `awkhash`, 4 for `tsort`, 9 for
+`sort`, ~6 for `python`, none at all for `xz`). A primitive frozen at h = 1
+does not merely under-perform on `sort`; it sees nothing there and correctly
+concludes that nothing is worth doing.
+
+This also sharpens what the fading state is for. It answers "when things feel
+like this". The spectrum answers a second, separable question: "*how far
+ahead* does feeling like this tell you anything". Those are different
+quantities and the current primitive only learns the first.
+
+**Next experiment (designed, deliberately not built).** Christian asked to
+investigate before touching the architecture, so this is a proposal, not a
+result. Make the horizon part of the action rather than a constant: keep a
+small set of candidate horizons *H* = {1, 2, 4, 8, 16, 32}, run one delay ring
+and one association per h (cheap: the context and its hash are computed once
+and shared), and let the **existing** realised-reward gate choose among them —
+it already selects on realised value, and "act at horizon h" is just another
+arm. Two properties make this attractive: the per-workload spectra above are
+sparse, so the gate would be choosing between a handful of live arms and a
+great many dead ones, which is the regime a running-mean estimator handles
+well; and it needs no new mechanism, only more arms. The registered controls
+should be (a) the best fixed h per trace, as the ceiling, and (b) a uniform
+random horizon at matched action rate, as the floor. The risk to watch is that
+six arms multiply the table and the update cost by six, against a primitive
+whose hot-path cost is already its weakest column.
+
+**Also frozen, as instructed.** The Bitty representation (4 banks × 8 heads,
+ternary at ±0.20) is not touched by any of this and will not be optimised
+further until the horizon question is settled.
+
+---
+
 ## Threats to validity
 
 1. **L1 only.** The counterfactual is a 32 KB 8-way L1 with no L2/LLC, no
@@ -361,7 +496,11 @@ reference in every trace here.
    not be compared line by line.
 5. **Learning continues during the scored region** (this is an online
    prefetcher). Warm-up is unscored and cannot leak reward; that is audited.
-6. `signed_hash_features` is a splitmix64 bit-extraction, not necessarily the
+6. **Spectral peaks are measured at one line size and one cache geometry.**
+   Which references miss is what creates the structure, so a different L1
+   capacity or associativity would move the peaks. The peaks are a property of
+   the workload *and* the memory system, not of the workload alone.
+7. `signed_hash_features` is a splitmix64 bit-extraction, not necessarily the
    original hash. Any deterministic ±1 hash should behave the same, but this
    has not been verified against the original.
 

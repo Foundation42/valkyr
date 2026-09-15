@@ -154,8 +154,24 @@ def load(path):
     return rows
 
 
+def load_spectro(path):
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        for k, v in r.items():
+            if k != "trace":
+                try:
+                    r[k] = float(v)
+                except (TypeError, ValueError):
+                    r[k] = 0.0
+    return rows
+
+
 def main(csv_path, out_dir):
     rows = load(csv_path)
+    spectro = load_spectro(os.path.join(os.path.dirname(csv_path) or ".", "spectro.csv"))
     os.makedirs(out_dir, exist_ok=True)
     traces = sorted({r["trace"] for r in rows})
 
@@ -272,6 +288,53 @@ def main(csv_path, out_dir):
               "miss-filtered coverage against action rate; up and to the left is better",
               "action rate (% of scored data refs)", "miss-filtered coverage (%)",
               sorted(s.items()))
+
+
+    # 9. horizon spectroscopy: every integer horizon, nothing else changed
+    for tr in traces:
+        s = defaultdict(list)
+        for r in rows:
+            if r["phase"] != "H" or r["trace"] != tr or "/" not in r["config"]:
+                continue
+            gate = r["config"].split("/", 1)[1]
+            h = int(r["config"].split("/")[0][1:])
+            s[gate + " — strict coverage"].append((h, 100 * r["strict_cov"], ""))
+            if gate.startswith("realized-ev/miss-w0.05"):
+                s["realized-ev w0.05 — action rate"].append((h, 100 * r["action_rate"], ""))
+        if s:
+            chart(os.path.join(out_dir, f"horizon_spectrum_{tr}.svg"),
+                  f"Horizon spectroscopy — h = 1..32 ({tr})",
+                  "label aimed h data references ahead; context, learner and protocol unchanged",
+                  "label horizon h (data references)", "percent",
+                  sorted(s.items()), mode="line")
+
+    # 10. the control that matters: does a learner-free statistic have the same
+    #     shape as the learned result?
+    for tr in traces:
+        sp = [r for r in spectro if r["trace"] == tr]
+        if not sp:
+            continue
+        s = {}
+        s["model-free ceiling (top-1 Δ≠0 landing on a miss)"] = [
+            (r["h"], 100 * r["top1nz_miss"], "") for r in sp]
+        pc_rows = [r for r in rows
+                   if r["phase"] == "H" and r["trace"] == tr
+                   and r["config"].endswith("/counts-eu/window")]
+        if pc_rows:
+            s["PrepChef strict coverage (counts gate)"] = [
+                (int(r["config"].split("/")[0][1:]), 100 * r["strict_cov"], "")
+                for r in pc_rows]
+        chart(os.path.join(out_dir, f"horizon_modelfree_{tr}.svg"),
+              f"Phase structure, not predictor artefact ({tr})",
+              "the model-free curve uses no learner, no context and no gate — only the reference stream",
+              "lag / label horizon h (data references)", "real-miss coverage (%)",
+              sorted(s.items()), mode="line")
+
+        chart(os.path.join(out_dir, f"miss_autocorrelation_{tr}.svg"),
+              f"Miss-indicator autocorrelation ({tr})",
+              "P(miss at i+h | miss at i) / P(miss); 1.0 means no structure at that lag",
+              "lag h (data references)", "lift over base miss rate",
+              [("miss lift", [(r["h"], r["miss_lift"], "") for r in sp])], mode="line")
 
 
 if __name__ == "__main__":

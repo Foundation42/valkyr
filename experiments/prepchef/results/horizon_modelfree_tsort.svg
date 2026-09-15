@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Phase structure, not predictor artefact (tsort)">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Phase structure, not predictor artefact (tsort)</text>
+<text class="sub" x="74" y="40">the model-free curve uses no learner, no context and no gate — only the reference stream</text>
+<line class="gridline" x1="74" y1="374.2" x2="550" y2="374.2"/>
+<text class="tick" x="66" y="377.7" text-anchor="end">0</text>
+<line class="gridline" x1="74" y1="286.8" x2="550" y2="286.8"/>
+<text class="tick" x="66" y="290.3" text-anchor="end">10</text>
+<line class="gridline" x1="74" y1="199.5" x2="550" y2="199.5"/>
+<text class="tick" x="66" y="203.0" text-anchor="end">20</text>
+<line class="gridline" x1="74" y1="112.2" x2="550" y2="112.2"/>
+<text class="tick" x="66" y="115.7" text-anchor="end">30</text>
+<line class="gridline" x1="74" y1="24.9" x2="550" y2="24.9"/>
+<text class="tick" x="66" y="28.4" text-anchor="end">40</text>
+<line class="gridline" x1="85.8" y1="46" x2="85.8" y2="404"/>
+<text class="tick" x="85.8" y="421" text-anchor="middle">0</text>
+<line class="gridline" x1="222.9" y1="46" x2="222.9" y2="404"/>
+<text class="tick" x="222.9" y="421" text-anchor="middle">10</text>
+<line class="gridline" x1="360.0" y1="46" x2="360.0" y2="404"/>
+<text class="tick" x="360.0" y="421" text-anchor="middle">20</text>
+<line class="gridline" x1="497.1" y1="46" x2="497.1" y2="404"/>
+<text class="tick" x="497.1" y="421" text-anchor="middle">30</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">lag / label horizon h (data references)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">real-miss coverage (%)</text>
+<path d="M99.5,182.3 L113.2,370.0 L126.9,369.4 L140.6,75.8 L154.3,267.4 L168.0,162.2 L181.8,281.4 L195.5,364.8 L209.2,356.3 L222.9,236.8 L236.6,342.6 L250.3,342.1 L264.0,350.1 L277.7,344.9 L291.4,345.0 L305.1,338.4 L318.9,344.6 L332.6,350.8 L346.3,354.6 L360.0,344.9 L373.7,350.9 L387.4,355.1 L401.1,356.5 L414.8,360.8 L428.5,361.7 L442.2,361.3 L456.0,357.9 L469.7,314.4 L483.4,365.5 L497.1,372.4 L510.8,365.0 L524.5,364.0" fill="none" stroke="#3b6fd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="182.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="113.2" cy="370.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="126.9" cy="369.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="140.6" cy="75.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="154.3" cy="267.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="168.0" cy="162.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="181.8" cy="281.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="195.5" cy="364.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="209.2" cy="356.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="222.9" cy="236.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="236.6" cy="342.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="250.3" cy="342.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="264.0" cy="350.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="277.7" cy="344.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="291.4" cy="345.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="305.1" cy="338.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="318.9" cy="344.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="332.6" cy="350.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="346.3" cy="354.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="360.0" cy="344.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="373.7" cy="350.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="387.4" cy="355.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="401.1" cy="356.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="414.8" cy="360.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="428.5" cy="361.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="442.2" cy="361.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="456.0" cy="357.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="469.7" cy="314.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="483.4" cy="365.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="497.1" cy="372.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="510.8" cy="365.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="524.5" cy="364.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">PrepChef strict coverage (counts gate)</text>
+<path d="M99.5,186.9 L113.2,374.2 L126.9,374.2 L140.6,85.6 L154.3,374.2 L168.0,373.2 L181.8,374.1 L195.5,369.4 L209.2,374.2 L222.9,374.1 L236.6,374.2 L250.3,373.0 L264.0,373.3 L277.7,374.2 L291.4,374.2 L305.1,370.4 L318.9,374.2 L332.6,374.2 L346.3,374.2 L360.0,374.1 L373.7,374.1 L387.4,373.0 L401.1,374.2 L414.8,371.4 L428.5,374.2 L442.2,374.1 L456.0,374.1 L469.7,318.1 L483.4,374.1 L497.1,374.2 L510.8,374.2 L524.5,374.2" fill="none" stroke="#d4693b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="186.9" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="113.2" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="126.9" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="140.6" cy="85.6" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="154.3" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="168.0" cy="373.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="181.8" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="195.5" cy="369.4" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="209.2" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="222.9" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="236.6" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="250.3" cy="373.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="264.0" cy="373.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="277.7" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="291.4" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="305.1" cy="370.4" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="318.9" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="332.6" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="346.3" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="360.0" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="373.7" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="387.4" cy="373.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="401.1" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="414.8" cy="371.4" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="428.5" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="442.2" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="456.0" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="469.7" cy="318.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="483.4" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="497.1" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="510.8" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="524.5" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">model-free ceiling (top-1 Δ≠0 landing on a miss)</text>
+</svg>
