@@ -154,6 +154,11 @@ def load(path):
     return rows
 
 
+# Columns that must stay strings; everything else in these side tables is
+# numeric.  (Coercing "fixture" to 0.0 silently drops every filter on it.)
+_TEXT_COLS = {"trace", "fixture", "config"}
+
+
 def load_spectro(path):
     if not os.path.exists(path):
         return []
@@ -161,17 +166,20 @@ def load_spectro(path):
         rows = list(csv.DictReader(f))
     for r in rows:
         for k, v in r.items():
-            if k != "trace":
-                try:
-                    r[k] = float(v)
-                except (TypeError, ValueError):
-                    r[k] = 0.0
+            if k in _TEXT_COLS:
+                continue
+            try:
+                r[k] = float(v)
+            except (TypeError, ValueError):
+                r[k] = 0.0
     return rows
 
 
 def main(csv_path, out_dir):
     rows = load(csv_path)
-    spectro = load_spectro(os.path.join(os.path.dirname(csv_path) or ".", "spectro.csv"))
+    here = os.path.dirname(csv_path) or "."
+    spectro = load_spectro(os.path.join(here, "spectro.csv"))
+    arms = load_spectro(os.path.join(here, "arms.csv"))
     os.makedirs(out_dir, exist_ok=True)
     traces = sorted({r["trace"] for r in rows})
 
@@ -335,6 +343,44 @@ def main(csv_path, out_dir):
               "P(miss at i+h | miss at i) / P(miss); 1.0 means no structure at that lag",
               "lag h (data references)", "lift over base miss rate",
               [("miss lift", [(r["h"], r["miss_lift"], "") for r in sp])], mode="line")
+
+
+    # 11. G65: the learned action distribution over horizons, against the
+    #     independently measured spectrum.  The registered falsification test.
+    for tr in traces:
+        occ = [(r["h"], 100 * r["share_useful_miss"]) for r in arms
+               if r["trace"] == tr and r["fixture"] == "h32"
+               and r["config"] == "h32/best-ev-w0.05"]
+        sp = [(r["h"], 100 * r["top1nz_miss"]) for r in spectro if r["trace"] == tr]
+        if not occ or not sp:
+            continue
+        chart(os.path.join(out_dir, f"G65_arm_occupancy_{tr}.svg"),
+              f"Learned horizon occupancy vs measured spectrum ({tr})",
+              "share of real misses covered by each arm, against the learner-free ceiling at that lag",
+              "horizon h", "percent",
+              [("learned occupancy (share of real misses covered)",
+                [(h, v, "") for h, v in sorted(occ)]),
+               ("model-free spectrum (top-1 Δ≠0 landing on a miss)",
+                [(h, v, "") for h, v in sorted(sp)])], mode="line")
+
+    # 12. G65 frontier: multi-horizon against single-horizon at matched action rate
+    s = defaultdict(list)
+    for r in rows:
+        if r["phase"] != "G65p":
+            continue
+        c = r["config"]
+        fam = ("h32 best-ev" if c.startswith("h32/best-ev") else
+               "coarse best-ev" if c.startswith("coarse/best-ev") else
+               "h32 pooled" if c.startswith("h32/pooled") else
+               "single fixed h" if c.startswith("single-h") else None)
+        if fam and r["action_rate"] > 0:
+            s[fam].append((100 * r["action_rate"], 100 * r["strict_cov"], ""))
+    if s:
+        chart(os.path.join(out_dir, "G65_frontier.svg"),
+              "Multi-horizon vs single-horizon at matched action rate (all traces)",
+              "price swept 0.05..256; up and to the left is better",
+              "action rate (% of scored data refs)", "miss-filtered coverage (%)",
+              sorted(s.items()))
 
 
 if __name__ == "__main__":

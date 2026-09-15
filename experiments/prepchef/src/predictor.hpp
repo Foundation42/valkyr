@@ -14,8 +14,9 @@ namespace pc {
 struct Proposal {
     bool act = false;
     uint64_t target = 0;
-    uint64_t ctx = 0;
+    uint64_t ctx = 0;          // the key the reward must be routed back to
     int64_t action = 0;
+    uint32_t arm = 0;          // which horizon arm proposed it (reporting only)
 };
 
 struct Predictor {
@@ -107,6 +108,173 @@ private:
     Learner learn_;
     std::vector<std::pair<uint64_t, uint64_t>> ring_;   // (context, line) delay line
     uint64_t seen_ = 0;
+};
+
+// ------------------------------------------------- G65: multi-horizon PrepChef
+
+// Exactly one thing changes from PrepChef: the action gains a dimension.
+// Instead of a = delta it is a = (h, delta), and the *existing* realised-reward
+// gate chooses among the arms, with the null action still competing.
+//
+// Three implementation choices keep "one thing" literally true:
+//
+//   * One association table, keyed by hash(context, h), at the same capacity
+//     the single-horizon learner uses.  The arms compete for the same slots,
+//     so multi-horizon gets no memory advantage by construction (evictions are
+//     reported).
+//   * One delay ring of length max(H), read back h steps, rather than |H|
+//     rings.  |H| rings would be a strawman cost.
+//   * The context and its hash are computed once per data reference and shared
+//     by every arm, so the expensive part -- the fading-state update, which
+//     runs per *instruction* -- is not multiplied.  Only the per-data-reference
+//     table lookups are.
+class MultiPrepChef : public Predictor {
+public:
+    enum class Select {
+        BestEV,          // argmax over arms of realised-reward estimate (the system under test)
+        UniformRandom,   // commit to a random arm, then let that arm's gate decide (floor)
+        Pooled,          // one estimator fed by every arm's evidence, no ability to tell h apart
+        BestEVTested,    // as BestEV, but an untested arm cannot win the argmax:
+                         // only one designated explorer may fire on its prior
+    };
+
+    MultiPrepChef(const CtxCfg& c, const LearnCfg& l, std::vector<int> horizons,
+                  Select sel, std::string label)
+        : ccfg_(c), lcfg_(l), horizons_(std::move(horizons)), sel_(sel), label_(std::move(label))
+    {
+        ctx_.configure(ccfg_);
+        learn_.configure(lcfg_);
+        learn_.ensureBandit();
+        max_h_ = 1;
+        for (int h : horizons_) if (h > max_h_) max_h_ = h;
+        ring_.assign(size_t(max_h_), {0, 0});
+    }
+
+    void reset() override
+    {
+        ctx_.reset();
+        learn_.reset();
+        std::fill(ring_.begin(), ring_.end(), std::pair<uint64_t, uint64_t>{0, 0});
+        seen_ = 0;
+        rng_ = 0x9E3779B97F4A7C15ull;
+    }
+
+    void observeInstr(uint64_t addr) override { last_pc_ = addr; ctx_.observeInstr(addr); }
+
+    Proposal onData(uint64_t line, int type, uint64_t) override
+    {
+        // (a) one delayed label per arm.  All reads happen before the write
+        //     below, so no arm can see its own future.
+        for (size_t k = 0; k < horizons_.size(); ++k) {
+            const uint64_t h = uint64_t(horizons_[k]);
+            if (seen_ < h) continue;
+            const auto& past = ring_[size_t((seen_ - h) % uint64_t(max_h_))];
+            const int64_t outcome = lcfg_.outcome_delta ? int64_t(line) - int64_t(past.second)
+                                                        : int64_t(line);
+            learn_.learn(key(past.first, sel_ == Select::Pooled ? kPoolId : horizons_[k]), outcome);
+        }
+
+        // (b) advance the shared context, then read it once
+        ctx_.observeData(line, type);
+        const uint64_t id = ctx_.id();
+        ring_[size_t(seen_ % uint64_t(max_h_))] = {id, line};
+        ++seen_;
+
+        // (c) choose among { null, (h, delta) ... }
+        Proposal out;
+        switch (sel_) {
+        case Select::BestEV:
+        case Select::BestEVTested: {
+            // With one arm an optimistic prior costs a few wasted prefetches and
+            // is then corrected.  Taking the argmax over |H| arms makes it a
+            // maximisation bias: some untested arm is almost always sitting at
+            // the prior, so the null action stops competing.  BestEVTested
+            // therefore ranks only arms that have seen a realised reward, and
+            // lets a single designated explorer (the shortest horizon) fire on
+            // its prior, so exploration is one arm per context rather than |H|.
+            const bool tested_only = (sel_ == Select::BestEVTested);
+            float best_u = 0.0f;
+            bool have = false;
+            size_t explorer = horizons_.size();
+            for (size_t k = 0; k < horizons_.size(); ++k) {
+                const uint64_t ck = key(id, horizons_[k]);
+                Learner::Proposal pr = learn_.propose(ck);
+                if (!pr.act) continue;
+                if (tested_only && pr.n_reward == 0) {
+                    if (explorer == horizons_.size()) {
+                        explorer = k;
+                        expl_ctx_ = ck; expl_action_ = pr.action;
+                    }
+                    continue;
+                }
+                if (!have || pr.utility > best_u) {
+                    have = true; best_u = pr.utility;
+                    out.ctx = ck; out.action = pr.action; out.arm = uint32_t(k);
+                }
+            }
+            if (!have) {
+                if (!tested_only || explorer == horizons_.size()) return Proposal{};
+                out.ctx = expl_ctx_; out.action = expl_action_; out.arm = uint32_t(explorer);
+            }
+            break;
+        }
+        case Select::UniformRandom: {
+            const size_t k = size_t(next_rand() % horizons_.size());
+            const uint64_t ck = key(id, horizons_[k]);
+            Learner::Proposal pr = learn_.propose(ck);
+            if (!pr.act) return Proposal{};
+            out.ctx = ck; out.action = pr.action; out.arm = uint32_t(k);
+            break;
+        }
+        case Select::Pooled: {
+            const uint64_t ck = key(id, kPoolId);
+            Learner::Proposal pr = learn_.propose(ck);
+            if (!pr.act) return Proposal{};
+            // The pooled estimator cannot tell the horizons apart, so it has no
+            // basis for preferring one; it acts at a uniformly random horizon.
+            out.ctx = ck; out.action = pr.action;
+            out.arm = uint32_t(next_rand() % horizons_.size());
+            break;
+        }
+        }
+
+        const int64_t t = lcfg_.outcome_delta ? int64_t(line) + out.action : out.action;
+        if (t < 0) return Proposal{};
+        out.act = true;
+        out.target = uint64_t(t);
+        return out;
+    }
+
+    void reward(uint64_t ctx, int64_t action, float r) override { learn_.reward(ctx, action, r); }
+
+    size_t stateBytes() const override { return ctx_.stateBytes() + ring_.size() * 16; }
+    size_t tableBytes() const override { return learn_.tableBytes(); }
+    uint64_t updateOps() const override { return ctx_.updateOps(); }
+    uint64_t evictions() const override { return learn_.evictions(); }
+    uint64_t inserts() const override { return learn_.inserts(); }
+    std::string label() const override { return label_; }
+    const std::vector<int>& horizons() const { return horizons_; }
+
+private:
+    static constexpr int kPoolId = 0x7FFF;
+    static uint64_t key(uint64_t ctx, int h)
+    {
+        return hash_combine(ctx, 0xA0000ull + uint64_t(h)) | 1;
+    }
+    uint64_t next_rand() { rng_ = mix64(rng_); return rng_; }
+
+    CtxCfg ccfg_;
+    LearnCfg lcfg_;
+    std::vector<int> horizons_;
+    Select sel_;
+    std::string label_;
+    ContextEngine ctx_;
+    Learner learn_;
+    std::vector<std::pair<uint64_t, uint64_t>> ring_;
+    int max_h_ = 1;
+    uint64_t seen_ = 0, rng_ = 0;
+    uint64_t expl_ctx_ = 0;
+    int64_t expl_action_ = 0;
 };
 
 // --------------------------------------------------------------- baselines --

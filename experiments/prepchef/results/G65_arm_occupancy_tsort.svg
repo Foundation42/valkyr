@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Learned horizon occupancy vs measured spectrum (tsort)">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Learned horizon occupancy vs measured spectrum (tsort)</text>
+<text class="sub" x="74" y="40">share of real misses covered by each arm, against the learner-free ceiling at that lag</text>
+<line class="gridline" x1="74" y1="374.2" x2="550" y2="374.2"/>
+<text class="tick" x="66" y="377.7" text-anchor="end">0</text>
+<line class="gridline" x1="74" y1="283.9" x2="550" y2="283.9"/>
+<text class="tick" x="66" y="287.4" text-anchor="end">10</text>
+<line class="gridline" x1="74" y1="193.6" x2="550" y2="193.6"/>
+<text class="tick" x="66" y="197.1" text-anchor="end">20</text>
+<line class="gridline" x1="74" y1="103.3" x2="550" y2="103.3"/>
+<text class="tick" x="66" y="106.8" text-anchor="end">30</text>
+<line class="gridline" x1="74" y1="13.1" x2="550" y2="13.1"/>
+<text class="tick" x="66" y="16.6" text-anchor="end">40</text>
+<line class="gridline" x1="85.8" y1="46" x2="85.8" y2="404"/>
+<text class="tick" x="85.8" y="421" text-anchor="middle">0</text>
+<line class="gridline" x1="222.9" y1="46" x2="222.9" y2="404"/>
+<text class="tick" x="222.9" y="421" text-anchor="middle">10</text>
+<line class="gridline" x1="360.0" y1="46" x2="360.0" y2="404"/>
+<text class="tick" x="360.0" y="421" text-anchor="middle">20</text>
+<line class="gridline" x1="497.1" y1="46" x2="497.1" y2="404"/>
+<text class="tick" x="497.1" y="421" text-anchor="middle">30</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">horizon h</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">percent</text>
+<path d="M99.5,226.5 L99.5,226.5 L113.2,373.8 L113.2,373.8 L126.9,253.8 L126.9,253.8 L140.6,167.3 L140.6,167.3 L154.3,294.3 L154.3,294.3 L168.0,352.0 L168.0,352.0 L181.8,321.0 L181.8,321.0 L195.5,372.7 L195.5,372.7 L209.2,373.4 L209.2,373.4 L222.9,287.1 L222.9,287.1 L236.6,367.8 L236.6,367.8 L250.3,367.2 L250.3,367.2 L264.0,366.8 L264.0,366.8 L277.7,370.4 L277.7,370.4 L291.4,371.8 L291.4,371.8 L305.1,369.5 L305.1,369.5 L318.9,372.4 L318.9,372.4 L332.6,368.2 L332.6,368.2 L346.3,373.9 L346.3,373.9 L360.0,372.8 L360.0,372.8 L373.7,372.1 L373.7,372.1 L387.4,370.4 L387.4,370.4 L401.1,372.7 L401.1,372.7 L414.8,371.9 L414.8,371.9 L428.5,371.9 L428.5,371.9 L442.2,373.0 L442.2,373.0 L456.0,370.9 L456.0,370.9 L469.7,253.3 L469.7,253.3 L483.4,373.3 L483.4,373.3 L497.1,373.9 L497.1,373.9 L510.8,372.5 L510.8,372.5 L524.5,372.0 L524.5,372.0" fill="none" stroke="#3b6fd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="226.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="99.5" cy="226.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="113.2" cy="373.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="113.2" cy="373.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="126.9" cy="253.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="126.9" cy="253.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="140.6" cy="167.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="140.6" cy="167.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="154.3" cy="294.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="154.3" cy="294.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="168.0" cy="352.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="168.0" cy="352.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="181.8" cy="321.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="181.8" cy="321.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="195.5" cy="372.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="195.5" cy="372.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="209.2" cy="373.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="209.2" cy="373.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="222.9" cy="287.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="222.9" cy="287.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="236.6" cy="367.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="236.6" cy="367.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="250.3" cy="367.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="250.3" cy="367.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="264.0" cy="366.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="264.0" cy="366.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="277.7" cy="370.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="277.7" cy="370.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="291.4" cy="371.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="291.4" cy="371.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="305.1" cy="369.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="305.1" cy="369.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="318.9" cy="372.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="318.9" cy="372.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="332.6" cy="368.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="332.6" cy="368.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="346.3" cy="373.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="346.3" cy="373.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="360.0" cy="372.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="360.0" cy="372.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="373.7" cy="372.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="373.7" cy="372.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="387.4" cy="370.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="387.4" cy="370.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="401.1" cy="372.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="401.1" cy="372.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="414.8" cy="371.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="414.8" cy="371.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="428.5" cy="371.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="428.5" cy="371.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="442.2" cy="373.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="442.2" cy="373.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="456.0" cy="370.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="456.0" cy="370.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="469.7" cy="253.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="469.7" cy="253.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="483.4" cy="373.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="483.4" cy="373.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="497.1" cy="373.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="497.1" cy="373.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="510.8" cy="372.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="510.8" cy="372.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="524.5" cy="372.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="524.5" cy="372.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">learned occupancy (share of real misses covered)</text>
+<path d="M99.5,180.6 L113.2,374.2 L126.9,374.2 L140.6,75.8 L154.3,374.2 L168.0,373.1 L181.8,374.1 L195.5,369.2 L209.2,374.2 L222.9,374.1 L236.6,374.2 L250.3,373.0 L264.0,373.3 L277.7,374.2 L291.4,374.2 L305.1,370.3 L318.9,374.2 L332.6,374.2 L346.3,374.2 L360.0,374.1 L373.7,374.1 L387.4,372.9 L401.1,374.2 L414.8,371.3 L428.5,374.2 L442.2,374.1 L456.0,374.1 L469.7,316.2 L483.4,374.1 L497.1,374.2 L510.8,374.2 L524.5,374.2" fill="none" stroke="#d4693b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="180.6" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="113.2" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="126.9" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="140.6" cy="75.8" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="154.3" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="168.0" cy="373.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="181.8" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="195.5" cy="369.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="209.2" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="222.9" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="236.6" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="250.3" cy="373.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="264.0" cy="373.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="277.7" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="291.4" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="305.1" cy="370.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="318.9" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="332.6" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="346.3" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="360.0" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="373.7" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="387.4" cy="372.9" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="401.1" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="414.8" cy="371.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="428.5" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="442.2" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="456.0" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="469.7" cy="316.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="483.4" cy="374.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="497.1" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="510.8" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="524.5" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">model-free spectrum (top-1 Δ≠0 landing on a miss)</text>
+</svg>

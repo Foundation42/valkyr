@@ -31,7 +31,8 @@ tools/gen_traces.sh generates the real traces
 tools/concat_traces.py  builds concatenated traces for phase-change probes
 tools/plot.py       dependency-free SVG plots
 LABBOOK.md          hypothesis -> registered control -> result -> next experiment
-results/            runs.csv (every run), spectro.csv (trace spectra), plots
+results/            runs.csv (every run), spectro.csv (trace spectra),
+                    arms.csv (per-horizon occupancy), plots
 ```
 
 ## Traces
@@ -72,6 +73,9 @@ make
 ./build/prepchef spectro traces/tsort.vtr      # model-free trace spectrum
 ./build/prepchef lead   traces/tsort.vtr        # horizon sweep h = 1..32
 PREPCHEF_PEAK_H=9 ./build/prepchef peak traces/sort.vtr
+./build/prepchef g65      traces/sort.vtr      # horizon as an action dimension
+./build/prepchef g65audit traces/sort.vtr      # Gate A for the multi-horizon path
+./build/prepchef g65price traces/sort.vtr      # matched-action-rate frontier
 ./build/prepchef drift  traces/drift_gcc_tsort.vtr
 python3 tools/plot.py results/runs.csv results/
 ```
@@ -144,6 +148,19 @@ Full write-up in [`LABBOOK.md`](LABBOOK.md). In short:
    per 1K. Every neighbouring horizon is exactly 0.0%. Stable across twelve
    chronological splits. `sort` was the workload where PrepChef looked worst —
    it had been declining to play at the wrong horizon.
-8. **No novelty or performance claim is made.** Under the miss-filtered rule,
+8. **Horizon-as-action (G65) is a good detector and a bad policy.** Making the
+   action `(h, δ)` and letting the existing realised-reward gate choose among
+   arms does concentrate speculation on the measured spectral peaks — given the
+   same candidate set for every workload and never told where to look, it put
+   58% of `sort`'s covered misses on h = 9, and recovered `tsort`'s {4, 1, 28}
+   (occupancy vs spectrum: r = +0.80, +0.74, +0.72). But at matched action rate
+   the best *fixed* horizon beats it on five of six traces, because exploration
+   cost is linear in |H| — each new `(context, h)` slot gets one optimistic
+   trial, and price cannot suppress that because it happens before any reward.
+   The control intended as a floor — a **pooled** estimator, one slot per
+   context — turned out to be the design: it learns from every horizon's
+   evidence at single-horizon exploration cost, and on `sort` reproduces the
+   hand-picked oracle exactly without being told the horizon.
+9. **No novelty or performance claim is made.** Under the miss-filtered rule,
    plain next-line still covers more real misses than anything else here. What
    survives is a narrower claim about efficiency per action.

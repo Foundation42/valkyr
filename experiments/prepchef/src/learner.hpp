@@ -61,6 +61,7 @@ public:
         act_.assign(slots_ * size_t(cfg_.max_actions), 0);
         cnt_.assign(slots_ * size_t(cfg_.max_actions), 0.0f);
         ev_.assign(slots_, cfg_.ev_init);
+        nrew_.assign(slots_, 0);
         reset();
     }
 
@@ -70,6 +71,7 @@ public:
         std::fill(total_.begin(), total_.end(), 0.0f);
         std::fill(nact_.begin(), nact_.end(), uint8_t(0));
         std::fill(ev_.begin(), ev_.end(), cfg_.ev_init);
+        std::fill(nrew_.begin(), nrew_.end(), uint16_t(0));
         evictions_ = 0; inserts_ = 0;
     }
 
@@ -96,7 +98,10 @@ public:
     {
         if (cfg_.kind == LearnCfg::Kind::RealizedEV) {
             size_t s = find(ctx, /*create=*/false);
-            if (s != kNone) ev_[s] += cfg_.lr * (r - ev_[s]);
+            if (s != kNone) {
+                ev_[s] += cfg_.lr * (r - ev_[s]);
+                if (nrew_[s] < 65535) ++nrew_[s];
+            }
             return;
         }
         if (cfg_.kind != LearnCfg::Kind::Bandit) return;
@@ -108,7 +113,14 @@ public:
             if (a[i] == action) { q[i] += cfg_.lr * (r - q[i]); return; }
     }
 
-    struct Proposal { bool act = false; int64_t action = 0; float p = 0.0f; float utility = 0.0f; };
+    struct Proposal {
+        bool act = false; int64_t action = 0; float p = 0.0f; float utility = 0.0f;
+        // How many *realised* rewards this estimate rests on.  With one arm an
+        // optimistic prior is harmless; selecting the argmax over many arms
+        // turns it into a maximisation bias, so a caller comparing arms needs
+        // to know which estimates have been tested.
+        uint32_t n_reward = 0;
+    };
 
     Proposal propose(uint64_t ctx) const
     {
@@ -148,6 +160,7 @@ public:
 
         if (cfg_.kind == LearnCfg::Kind::RealizedEV) {
             out.utility = ev_[s];
+            out.n_reward = nrew_[s];
             out.act = ev_[s] > 0.0f;
             return out;
         }
@@ -166,7 +179,7 @@ public:
     {
         return slots_ * (8 + 4 + 1 + size_t(cfg_.max_actions) * (8 + 4)
                          + (cfg_.kind == LearnCfg::Kind::Bandit ? size_t(cfg_.max_actions) * 4 : 0)
-                         + (cfg_.kind == LearnCfg::Kind::RealizedEV ? 4 : 0));
+                         + (cfg_.kind == LearnCfg::Kind::RealizedEV ? 6 : 0));
     }
     uint64_t evictions() const { return evictions_; }
     uint64_t inserts() const { return inserts_; }
@@ -191,14 +204,15 @@ private:
             if (key_[s] == ctx) return s;
             if (key_[s] == 0) {
                 if (!create) return kNone;
-                key_[s] = ctx; total_[s] = 0.0f; nact_[s] = 0; ev_[s] = cfg_.ev_init;
+                key_[s] = ctx; total_[s] = 0.0f; nact_[s] = 0; ev_[s] = cfg_.ev_init; nrew_[s] = 0;
                 ++inserts_;
                 return s;
             }
             if (total_[s] < weakest_total) { weakest_total = total_[s]; weakest = s; }
         }
         if (!create) return kNone;
-        key_[weakest] = ctx; total_[weakest] = 0.0f; nact_[weakest] = 0; ev_[weakest] = cfg_.ev_init;
+        key_[weakest] = ctx; total_[weakest] = 0.0f; nact_[weakest] = 0;
+        ev_[weakest] = cfg_.ev_init; nrew_[weakest] = 0;
         ++evictions_;
         return weakest;
     }
@@ -244,6 +258,7 @@ private:
     std::vector<float> cnt_;
     std::vector<float> qval_;
     std::vector<float> ev_;
+    std::vector<uint16_t> nrew_;
     uint64_t evictions_ = 0, inserts_ = 0;
 };
 

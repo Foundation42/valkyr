@@ -478,6 +478,146 @@ further until the horizon question is settled.
 
 ---
 
+## G65 — Multi-horizon PrepChef: horizon as an action dimension
+
+*(Registered follow-up. Frozen: Bitty representation, realised-reward gate,
+prices, protocol. Changed: exactly one thing — `a = δ` becomes `a = (h, δ)`,
+and the existing gate chooses among arms with the null action still
+competing.)*
+
+**Registered hypothesis.** *If horizon spectroscopy reflects exploitable
+temporal structure in expensive events, a realised-reward PrepChef given
+multiple horizon arms should (i) concentrate speculative activity near
+independently measured spectral peaks and (ii) approach the best fixed-horizon
+policy without being told those peaks.*
+
+**Result: (i) is supported. (ii) is falsified.**
+
+### Implementation, and why it is honestly "one thing"
+
+- One association table keyed by `hash(context, h)`, at the *same* capacity the
+  single-horizon learner uses. Arms compete for the same slots, so the
+  multi-horizon system gets no memory advantage by construction.
+- One delay ring of length max(H), read back h steps — not |H| rings, which
+  would have been a strawman cost.
+- The context and its hash are computed **once** per data reference and shared
+  by every arm, so the expensive part (the fading-state update, which runs per
+  *instruction*) is not multiplied.
+
+**Audit first.** The per-arm reporting added to the engine was verified
+semantically neutral: `audit.txt` is byte-identical before and after. A result
+this large needs its own audit, so Gate A, the duplicate-suppression invariant
+and the post-hoc-corruption test were re-run against the multi-horizon
+predictor at full resolution (`g65audit`) and all pass — on `sort` the engine
+and the independent scorer agree at 117,393 issued / 84,011 useful.
+
+### (i) The learner finds the spectrum unaided
+
+Share of real misses covered by each arm, `h32` fixture, against the
+model-free spectrum measured with no learner:
+
+| trace | corr r | top arms by share of real misses covered | model-free peaks |
+|-------|--------|------------------------------------------|------------------|
+| tsort | **+0.80** | h4:23% h1:16% h28:13% h3:13% h10:10% | h4, h1, h28 |
+| gcc | +0.74 | h2:33% h5:20% h3:12% h1:9% | h1–h5, h27 |
+| python | +0.72 | h2:16% h6:14% h1:9% h4:8% | h1, h3, h6, h5 |
+| sort | +0.52 | **h9:58%** h29:41% | h9 (its only non-zero lag) |
+| awkhash | +0.31 | h10:23% h13:12% h1:11% | h1 |
+| xz | +0.24 | h4:35% h2:17% | (spectrally empty) |
+
+Given the same candidate set for every workload and never told where to look,
+the gate put 58% of `sort`'s covered misses on **h = 9** — the single lag the
+model-free statistic flags — and recovered `tsort`'s {4, 1, 28} including the
+obscure h = 28. The learned action distribution is an empirical resource-demand
+spectrum, as hoped. On the two spectrally uninteresting traces (`awkhash`,
+`xz`) agreement is weak, which is the honest reading rather than a failure:
+there is no spectrum to agree with.
+
+### (ii) It cannot pay for itself
+
+At w = 0.05, `sort` looks spectacular — `h32` reaches **99.9% real-miss
+coverage** at a 3.9% action rate, net +8.39, beating the hand-picked h = 9
+oracle. That does not generalise. Swept across prices 0.05 → 256 and compared
+**at matched action rate**, the best fixed horizon beats multi-horizon
+selection on **five of six traces**:
+
+| trace | best multi-horizon | best single fixed h | winner |
+|-------|--------------------|---------------------|--------|
+| sort | h32 +8.39 @ 3.9% act | h = 9: +5.42 @ 1.2% act | multi (at w = 0.05 only) |
+| tsort | coarse +8.88 @ 11.1% act | h = 4: +8.59 @ 4.1% act | **single** (2.7× fewer actions) |
+| gcc | coarse −5.81 | h = 4: **+0.12** | **single** |
+| python | coarse −6.52 | h = 9: −2.31 | **single** |
+| awkhash | coarse −3.66 | h = 1: −0.82 | **single** |
+| xz | coarse −8.10 | h = 9: −2.03 | **single** |
+
+### Why — diagnosed, after one wrong guess
+
+My first diagnosis was that an optimistic prior turns `argmax` over |H| arms
+into a maximisation bias dominated by *untested* arms. I implemented the fix
+(`BestEVTested`: an untested arm cannot win the argmax; one designated explorer
+per context may fire on its prior) and **it did nothing** — action rates were
+unchanged or marginally worse on every trace. Recorded as a failed repair.
+
+The real mechanism is visible in an independent counter. At a punitive price
+(w = 256, where nothing profitable should fire) the action rate hits a floor
+that scales with the number of arms:
+
+| trace | policy | action rate | table inserts | evictions |
+|-------|--------|-------------|---------------|-----------|
+| gcc | single h = 1 | 0.88% | 174,934 | 0 |
+| gcc | h32 pooled | 1.49% | **174,934** | 0 |
+| gcc | coarse (6 arms) | 3.95% | 1,049,541 (**6.0×**) | 58 |
+| gcc | h32 (32 arms) | 11.38% | 4,082,267 (table-capped) | **1,589,860** |
+
+**The floor is exploration cost, and it is linear in |H|.** Each new
+`(context, h)` slot gets one optimistic trial, and |H| arms create |H|× as many
+slots. Price cannot suppress it, because exploration happens *before* any
+reward is observed — which is also why barring untested arms did not help: it
+still allows one explorer per context, and there are now 32× as many contexts.
+At |H| = 32 the shared table additionally thrashes (1.59M evictions), and an
+evicted slot is reset to the prior and explores again.
+
+### The result that is actually useful
+
+Look at the pooled control's insert count: **174,934 — identical to
+single-horizon.** Because it keys one slot per context rather than per
+(context, h), it learns from every horizon's evidence at *single-horizon
+exploration cost*. And on `sort` it reproduces the oracle **exactly** — 58.26%
+coverage, 1.227% action rate, net +5.42, the same three figures as the
+hand-picked h = 9 — without being told the horizon and without paying for 32
+arms. It is the best-behaved multi-arm variant on four of six traces.
+
+The control intended as a floor turned out to be the design.
+
+### Cost
+
+Hot-path cost scales with |H| as expected and worse than my predicted 6×: on
+gcc, 112 ns/ref (single) → 289 (coarse) → 2,050 (h32), an 18× regression
+against the primitive's already-weakest column. The fading-state update is
+correctly not multiplied; the |H| table probes per data reference are.
+
+### Interpretation
+
+Horizon-as-action is a good **detector** and a bad **policy**. The evidence
+that the spectrum is real and learnable is strong — the occupancy correlations
+are the cleanest confirmation in this lab that the gate is not lying. But
+selection among |H| arms costs |H| explorations per context, and on these
+workloads that exceeds the value of choosing correctly, except where a single
+peak carries almost everything (`sort`).
+
+**Next experiment (designed, not built).** Separate the two questions the
+current design conflates. Gate on a *pooled* estimator — one slot per context,
+single-horizon exploration cost, deciding only "is it worth acting here at
+all?" — and consult the per-h deltas only once that gate says yes, choosing
+among them by evidence already accumulated rather than by optimistic trial.
+That has pooled's exploration cost and best-ev's resolution, which is the
+combination neither variant has. Registered controls: pooled alone (which we
+now know is strong) and best fixed h at matched action rate.
+
+**Still frozen.** Bitty untouched throughout.
+
+---
+
 ## Threats to validity
 
 1. **L1 only.** The counterfactual is a 32 KB 8-way L1 with no L2/LLC, no
@@ -500,7 +640,11 @@ further until the horizon question is settled.
    Which references miss is what creates the structure, so a different L1
    capacity or associativity would move the peaks. The peaks are a property of
    the workload *and* the memory system, not of the workload alone.
-7. `signed_hash_features` is a splitmix64 bit-extraction, not necessarily the
+7. **The multi-horizon exploration cost is specific to an optimistic-prior
+   gate.** A gate that could decide "not worth trying" without trying would not
+   pay it. The finding is about this gate, not about horizon selection in
+   general.
+8. `signed_hash_features` is a splitmix64 bit-extraction, not necessarily the
    original hash. Any deterministic ±1 hash should behave the same, but this
    has not been verified against the original.
 

@@ -71,8 +71,8 @@ static void csv_row(const char* phase, const std::string& trace, const std::stri
     std::fflush(g_csv);
 }
 
-static void report(const char* phase, const Trace& tr, const std::string& cfgname,
-                   Predictor& p, const RunCfg& rc, const std::string& ctxl, const std::string& lrl)
+static Metrics report(const char* phase, const Trace& tr, const std::string& cfgname,
+                      Predictor& p, const RunCfg& rc, const std::string& ctxl, const std::string& lrl)
 {
     Engine eng;
     Metrics m = eng.run(tr, p, rc);
@@ -83,6 +83,36 @@ static void report(const char* phase, const Trace& tr, const std::string& cfgnam
                 m.mean_lead_data(), m.mean_lead_total(), 100 * m.action_rate(),
                 m.state_bytes, m.ns_per_ref);
     std::fflush(stdout);
+    return m;
+}
+
+// Per-arm occupancy: the learned action distribution over horizons.  Written to
+// its own table because the column count depends on the fixture.
+static void report_arms(const Trace& tr, const std::string& fixture, const std::string& cfgname,
+                        const std::vector<int>& horizons, const Metrics& m, const RunCfg& rc)
+{
+    const char* path = std::getenv("PREPCHEF_ARMS_CSV");
+    std::string out = path ? path : "results/arms.csv";
+    bool exists = false;
+    if (std::FILE* f = std::fopen(out.c_str(), "rb")) { std::fseek(f, 0, SEEK_END); exists = std::ftell(f) > 0; std::fclose(f); }
+    std::FILE* f = std::fopen(out.c_str(), "ab");
+    if (!f) { std::perror("arms csv"); return; }
+    if (!exists)
+        std::fprintf(f, "trace,fixture,config,waste,h,issued,useful,useful_miss,"
+                        "share_issued,share_useful_miss,total_issued,total_useful_miss,scored_misses\n");
+    for (size_t k = 0; k < horizons.size(); ++k) {
+        const uint64_t ai = k < m.arm_issued.size() ? m.arm_issued[k] : 0;
+        const uint64_t au = k < m.arm_useful.size() ? m.arm_useful[k] : 0;
+        const uint64_t am = k < m.arm_useful_miss.size() ? m.arm_useful_miss[k] : 0;
+        std::fprintf(f, "%s,%s,%s,%.3f,%d,%llu,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu\n",
+                     tr.name.c_str(), fixture.c_str(), cfgname.c_str(), rc.waste, horizons[k],
+                     (unsigned long long)ai, (unsigned long long)au, (unsigned long long)am,
+                     m.issued ? double(ai) / double(m.issued) : 0.0,
+                     m.useful_miss ? double(am) / double(m.useful_miss) : 0.0,
+                     (unsigned long long)m.issued, (unsigned long long)m.useful_miss,
+                     (unsigned long long)m.scored_misses);
+    }
+    std::fclose(f);
 }
 
 // ------------------------------------------------------------- pc-base ------
@@ -667,6 +697,187 @@ static void phase_best(const Trace& tr)
       NextLine nl; report("best", tr, "next-line", nl, rc, "-", "next-line"); }
 }
 
+// A result as large as multi-horizon's needs its own audit: a bug in the delay
+// ring at large h would look exactly like a spectacular discovery.  These are
+// the same two checks Phase A applies, run against the multi-horizon predictor
+// at full resolution.
+static void audit_multi(const Trace& tr)
+{
+    std::printf("\n=== G65 audit: multi-horizon predictor -- %s ===\n", tr.name.c_str());
+    std::vector<int> H;
+    for (int i = 1; i <= 32; ++i) H.push_back(i);
+    auto ev = []() {
+        LearnCfg l = pcbase_learn(0.05f);
+        l.kind = LearnCfg::Kind::RealizedEV; l.label = "realized-ev";
+        return l;
+    };
+    Engine eng;
+
+    // Gate A: the independent scorer must reproduce the engine's counts.
+    {
+        RunCfg rc; rc.waste = 0.05f; rc.reward_mode = RunCfg::Reward::MissFiltered;
+        rc.log_events = true;
+        EventLog log;
+        MultiPrepChef p(pcbase_ctx(), ev(), H, MultiPrepChef::Select::BestEV, "audit");
+        Metrics m = eng.run(tr, p, rc, &log);
+        IndepResult ir = score_independently(log);
+        std::printf("  engine: issued %llu useful %llu | indep: issued %llu useful %llu\n",
+                    (unsigned long long)m.issued, (unsigned long long)m.useful,
+                    (unsigned long long)ir.issued, (unsigned long long)ir.useful);
+        check(ir.issued == m.issued && ir.useful == m.useful,
+              "Gate A holds for the multi-horizon predictor");
+        check(ir.dup_outstanding_violations == 0, "duplicate outstanding fetches suppressed");
+    }
+    // No future information, at full horizon resolution.  Corrupting the trace
+    // beyond the scored region plus its window must change nothing.
+    {
+        RunCfg a; a.waste = 0.05f; a.reward_mode = RunCfg::Reward::MissFiltered; a.eval_end = 0.60;
+        RunCfg b = a; b.corrupt_after_pos = uint64_t(double(tr.n) * 0.80);
+        MultiPrepChef pa(pcbase_ctx(), ev(), H, MultiPrepChef::Select::BestEV, "audit");
+        MultiPrepChef pb(pcbase_ctx(), ev(), H, MultiPrepChef::Select::BestEV, "audit");
+        Metrics ma = eng.run(tr, pa, a), mb = eng.run(tr, pb, b);
+        check(ma.issued == mb.issued && ma.useful == mb.useful && ma.useful_miss == mb.useful_miss,
+              "multi-horizon scored region invariant to post-hoc corruption",
+              "a=" + std::to_string(ma.useful_miss) + " b=" + std::to_string(mb.useful_miss));
+    }
+    // A horizon longer than the usefulness window cannot be credited by its own
+    // label, so h > W must degrade rather than improve.  Registered sanity bound.
+    {
+        RunCfg rc; rc.waste = 0.05f; rc.reward_mode = RunCfg::Reward::MissFiltered;
+        LearnCfg l = ev(); l.horizon = 64;
+        PrepChef p(pcbase_ctx(), l);
+        Metrics m = eng.run(tr, p, rc);
+        std::printf("  single h=64 (> window 32): strict cov %.2f%%, action rate %.3f%%\n",
+                    100 * m.strict_coverage(), 100 * m.action_rate());
+    }
+    std::printf("  %s\n", g_fail ? "FAILURES PRESENT" : "multi-horizon audit passed");
+}
+
+// ================================ G65: horizon as an action dimension =======
+//
+// Frozen: Bitty representation, realised-reward gate, prices, protocol.
+// Changed: exactly one thing -- a = (h, delta) instead of a = delta.
+//
+// Fixtures answer two questions that must not be conflated:
+//   coarse  H = {1,2,4,8,16,32}   does horizon selection work at all?  This set
+//                                 deliberately does not contain sort's h = 9,
+//                                 so it also prices coarse quantisation.
+//   h16     H = {1..16}           how much resolution is economically worth it?
+//   h32     H = {1..32}           full resolution, full cost.
+//
+// Controls: the single-horizon system it replaces; a uniform-random arm (swept
+// over prices so a matched-action-rate point can be read off); and a pooled
+// horizon-agnostic estimator that receives every arm's evidence but cannot tell
+// the horizons apart -- the control that separates temporal *selection* from
+// merely having more opportunities.
+static void phase_g65(const Trace& tr)
+{
+    std::printf("\n=== G65: multi-horizon PrepChef -- %s ===\n", tr.name.c_str());
+
+    auto ev = [](float w) {
+        LearnCfg l = pcbase_learn(w);
+        l.kind = LearnCfg::Kind::RealizedEV;
+        l.label = "realized-ev";
+        return l;
+    };
+
+    struct Fixture { const char* name; std::vector<int> H; };
+    std::vector<Fixture> fixtures;
+    fixtures.push_back({"coarse", {1, 2, 4, 8, 16, 32}});
+    { std::vector<int> h; for (int i = 1; i <= 16; ++i) h.push_back(i); fixtures.push_back({"h16", h}); }
+    { std::vector<int> h; for (int i = 1; i <= 32; ++i) h.push_back(i); fixtures.push_back({"h32", h}); }
+
+    // The single-horizon system these replace, at the same price.
+    for (float w : {0.05f, 0.25f}) {
+        RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+        LearnCfg l = ev(w); l.horizon = 1;
+        char b[64]; std::snprintf(b, sizeof b, "single-h1-w%.2f", w);
+        PrepChef p(pcbase_ctx(), l);
+        report("G65", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+    }
+
+    for (const Fixture& fx : fixtures) {
+        std::printf(" -- fixture %s (|H| = %zu)\n", fx.name, fx.H.size());
+        for (float w : {0.05f, 0.25f}) {
+            RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            char b[80]; std::snprintf(b, sizeof b, "%s/best-ev-w%.2f", fx.name, w);
+            MultiPrepChef p(pcbase_ctx(), ev(w), fx.H, MultiPrepChef::Select::BestEV, b);
+            Metrics m = report("G65", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+            report_arms(tr, fx.name, b, fx.H, m, rc);
+        }
+        // Floor: commit to a random arm, then let that arm's gate decide.  Swept
+        // over prices so the comparison can be made at a matched action rate.
+        for (float w : {0.01f, 0.02f, 0.05f, 0.10f, 0.25f}) {
+            RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            char b[80]; std::snprintf(b, sizeof b, "%s/uniform-random-w%.2f", fx.name, w);
+            MultiPrepChef p(pcbase_ctx(), ev(w), fx.H, MultiPrepChef::Select::UniformRandom, b);
+            Metrics m = report("G65", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+            report_arms(tr, fx.name, b, fx.H, m, rc);
+        }
+        // Same total evidence, no ability to distinguish h.
+        for (float w : {0.05f, 0.25f}) {
+            RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            char b[80]; std::snprintf(b, sizeof b, "%s/pooled-w%.2f", fx.name, w);
+            MultiPrepChef p(pcbase_ctx(), ev(w), fx.H, MultiPrepChef::Select::Pooled, b);
+            Metrics m = report("G65", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+            report_arms(tr, fx.name, b, fx.H, m, rc);
+        }
+        // Repair under test: the same selection rule, with untested arms barred
+        // from winning the argmax.  This isolates the maximisation bias that
+        // BestEV suffers; it adds no new mechanism, only a counter already
+        // implied by "learn from realised reward".
+        for (float w : {0.05f, 0.25f}) {
+            RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            char b[80]; std::snprintf(b, sizeof b, "%s/best-ev-tested-w%.2f", fx.name, w);
+            MultiPrepChef p(pcbase_ctx(), ev(w), fx.H, MultiPrepChef::Select::BestEVTested, b);
+            Metrics m = report("G65", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+            report_arms(tr, fx.name, b, fx.H, m, rc);
+        }
+    }
+}
+
+// Barring untested arms did not move the action rate, so the maximisation bias
+// is not about untested arms: it is intrinsic to "max over |H| noisy means > 0",
+// and it needs a null threshold that scales with the number of arms.  The waste
+// price is already exactly that threshold, so the honest comparison is not at
+// equal price but along the whole frontier, at matched action rate.
+static void phase_g65_price(const Trace& tr)
+{
+    std::printf("\n=== G65 price frontier: multi-horizon vs single, matched action rate -- %s ===\n",
+                tr.name.c_str());
+    auto ev = [](float w) {
+        LearnCfg l = pcbase_learn(w);
+        l.kind = LearnCfg::Kind::RealizedEV; l.label = "realized-ev";
+        return l;
+    };
+    std::vector<int> H32; for (int i = 1; i <= 32; ++i) H32.push_back(i);
+    const std::vector<int> Hc{1, 2, 4, 8, 16, 32};
+
+    for (float w : {0.05f, 0.25f, 1.0f, 4.0f, 16.0f, 64.0f, 256.0f}) {
+        RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+        char b[80];
+        { std::snprintf(b, sizeof b, "h32/best-ev-w%.2f", w);
+          MultiPrepChef p(pcbase_ctx(), ev(w), H32, MultiPrepChef::Select::BestEV, b);
+          Metrics m = report("G65p", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+          report_arms(tr, "h32", b, H32, m, rc); }
+        { std::snprintf(b, sizeof b, "coarse/best-ev-w%.2f", w);
+          MultiPrepChef p(pcbase_ctx(), ev(w), Hc, MultiPrepChef::Select::BestEV, b);
+          Metrics m = report("G65p", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+          report_arms(tr, "coarse", b, Hc, m, rc); }
+        { std::snprintf(b, sizeof b, "h32/pooled-w%.2f", w);
+          MultiPrepChef p(pcbase_ctx(), ev(w), H32, MultiPrepChef::Select::Pooled, b);
+          report("G65p", tr, b, p, rc, pcbase_ctx().label, "realized-ev"); }
+        // The single-horizon system it has to beat, at the same price, at each
+        // trace's own best fixed horizon and at the default h = 1.
+        for (int h : {1, 4, 9}) {
+            LearnCfg l = ev(w); l.horizon = h;
+            std::snprintf(b, sizeof b, "single-h%d-w%.2f", h, w);
+            PrepChef p(pcbase_ctx(), l);
+            report("G65p", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+        }
+    }
+}
+
 // ============================== robustness check for a single spectral peak ==
 
 // A peak worth believing has to survive the splits.  PREPCHEF_PEAK_H selects
@@ -798,7 +1009,7 @@ int main(int argc, char** argv)
 {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: prepchef <audit|base|ctx|rep|learn|base2|splits|econ|lead|spectro|peak|best|cost|drift|all> <trace.vtr...>\n");
+            "usage: prepchef <audit|base|ctx|rep|learn|base2|splits|econ|lead|spectro|peak|g65|best|cost|drift|all> <trace.vtr...>\n");
         return 2;
     }
     const std::string cmd = argv[1];
@@ -839,6 +1050,9 @@ int main(int argc, char** argv)
         if (cmd == "cost") phase_cost(tr);
         if (cmd == "spectro") phase_spectro(tr);
         if (cmd == "peak") phase_peak(tr);
+        if (cmd == "g65") phase_g65(tr);
+        if (cmd == "g65audit") audit_multi(tr);
+        if (cmd == "g65price") phase_g65_price(tr);
         if (cmd == "best" || cmd == "all") phase_best(tr);
     }
     if (g_csv) std::fclose(g_csv);

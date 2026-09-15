@@ -52,6 +52,10 @@ struct Metrics {
     double lead_data_sum = 0, lead_total_sum = 0;
     uint64_t distinct_data_lines = 0;
     uint64_t evictions = 0, inserts = 0;
+    // Per-arm reporting only.  Nothing in the engine's decisions reads these;
+    // they exist so the *learned* action distribution over horizons can be
+    // compared against the independently measured model-free spectrum.
+    std::vector<uint64_t> arm_issued, arm_useful, arm_useful_miss;
     size_t state_bytes = 0, table_bytes = 0;
     uint64_t update_ops = 0;
     double ns_per_ref = 0;
@@ -90,6 +94,12 @@ struct EventLog {
 
 class Engine {
 public:
+    static void bump_arm(std::vector<uint64_t>& v, uint32_t arm)
+    {
+        if (v.size() <= arm) v.resize(size_t(arm) + 1, 0);
+        ++v[arm];
+    }
+
     Metrics run(const Trace& tr, Predictor& p, const RunCfg& cfg, EventLog* log = nullptr)
     {
         Metrics m;
@@ -107,7 +117,8 @@ public:
         l1.configure(cfg.l1_sets, cfg.l1_ways);
         p.reset();
 
-        struct Rec { uint64_t issue_index, issue_total; uint64_t ctx; int64_t action; bool self_pf; };
+        struct Rec { uint64_t issue_index, issue_total; uint64_t ctx; int64_t action;
+                     bool self_pf; uint32_t arm; };
         std::unordered_map<uint64_t, Rec> outstanding;
         outstanding.reserve(1u << 12);
         std::deque<std::pair<uint64_t, uint64_t>> fifo;   // (issue_index, line)
@@ -152,6 +163,8 @@ public:
                     m.lead_data_sum += double(di - it->second.issue_index);
                     m.lead_total_sum += double(i - it->second.issue_total);
                     if (it->second.self_pf) ++m.self_useful;
+                    bump_arm(m.arm_useful, it->second.arm);
+                    if (would_miss) bump_arm(m.arm_useful_miss, it->second.arm);
                     const float r = (cfg.reward_mode == RunCfg::Reward::Window)
                                         ? cfg.value
                                         : (would_miss ? cfg.value : -cfg.waste);
@@ -184,9 +197,10 @@ public:
                 } else if (outstanding.count(target)) {
                     ++m.dedup_suppressed;
                 } else {
-                    outstanding.emplace(target, Rec{di, i, pr.ctx, pr.action, self_pf});
+                    outstanding.emplace(target, Rec{di, i, pr.ctx, pr.action, self_pf, pr.arm});
                     fifo.emplace_back(di, target);
                     ++m.issued;
+                    bump_arm(m.arm_issued, pr.arm);
                     if (self_pf) ++m.self_issued;
                     if (log) {
                         // Issues are logged in *scored-region* data indices so
