@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Precision / coverage frontier — context ablation (awkhash)">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Precision / coverage frontier — context ablation (awkhash)</text>
+<text class="sub" x="74" y="40">one point per waste price (0.10, 0.25, 1.00); decision rule fixed</text>
+<line class="gridline" x1="74" y1="398.5" x2="550" y2="398.5"/>
+<text class="tick" x="66" y="402.0" text-anchor="end">60</text>
+<line class="gridline" x1="74" y1="315.2" x2="550" y2="315.2"/>
+<text class="tick" x="66" y="318.7" text-anchor="end">70</text>
+<line class="gridline" x1="74" y1="232.0" x2="550" y2="232.0"/>
+<text class="tick" x="66" y="235.5" text-anchor="end">80</text>
+<line class="gridline" x1="74" y1="148.7" x2="550" y2="148.7"/>
+<text class="tick" x="66" y="152.2" text-anchor="end">90</text>
+<line class="gridline" x1="74" y1="65.5" x2="550" y2="65.5"/>
+<text class="tick" x="66" y="69.0" text-anchor="end">100</text>
+<line class="gridline" x1="99.1" y1="46" x2="99.1" y2="404"/>
+<text class="tick" x="99.1" y="421" text-anchor="middle">0</text>
+<line class="gridline" x1="212.1" y1="46" x2="212.1" y2="404"/>
+<text class="tick" x="212.1" y="421" text-anchor="middle">20</text>
+<line class="gridline" x1="325.1" y1="46" x2="325.1" y2="404"/>
+<text class="tick" x="325.1" y="421" text-anchor="middle">40</text>
+<line class="gridline" x1="438.1" y1="46" x2="438.1" y2="404"/>
+<text class="tick" x="438.1" y="421" text-anchor="middle">60</text>
+<line class="gridline" x1="551.0" y1="46" x2="551.0" y2="404"/>
+<text class="tick" x="551.0" y="421" text-anchor="middle">80</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">coverage (% of scored data refs)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">accuracy (% of prefetches used)</text>
+<path d="M480.4,96.9 L505.4,117.9 L505.7,121.5" fill="none" stroke="#3b6fd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="505.7" cy="121.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="505.4" cy="117.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="480.4" cy="96.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">bitty-1x8-tau32</text>
+<path d="M477.8,97.1 L506.4,116.0 L507.9,122.6" fill="none" stroke="#d4693b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="507.9" cy="122.6" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="506.4" cy="116.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="477.8" cy="97.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">bitty-1x8-tau8</text>
+<path d="M518.0,83.1 L523.9,88.2 L524.5,95.2" fill="none" stroke="#3ba36b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="524.5" cy="95.2" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="523.9" cy="88.2" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="518.0" cy="83.1" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="562" cy="78" r="4" fill="#3ba36b"/>
+<text class="leg" x="572" y="82">bitty-4x8-ternary</text>
+<path d="M346.1,83.6 L353.9,109.0 L354.4,124.3" fill="none" stroke="#a03bd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="354.4" cy="124.3" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="353.9" cy="109.0" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="346.1" cy="83.6" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="562" cy="93" r="4" fill="#a03bd4"/>
+<text class="leg" x="572" y="97">bitty-data-only</text>
+<path d="M503.2,75.8 L508.7,99.7 L509.0,109.0" fill="none" stroke="#c9a227" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="509.0" cy="109.0" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="508.7" cy="99.7" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="503.2" cy="75.8" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="562" cy="108" r="4" fill="#c9a227"/>
+<text class="leg" x="572" y="112">bitty-instr+data</text>
+<path d="M518.0,83.1 L523.9,88.2 L524.5,95.2" fill="none" stroke="#2aa1b3" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="524.5" cy="95.2" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="523.9" cy="88.2" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="518.0" cy="83.1" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="562" cy="123" r="4" fill="#2aa1b3"/>
+<text class="leg" x="572" y="127">bitty-instr-only</text>
+<path d="M489.4,95.9 L513.0,122.1 L513.9,128.6" fill="none" stroke="#c0392b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="513.9" cy="128.6" r="3.6" fill="#c0392b" fill-opacity="0.9"/>
+<circle cx="513.0" cy="122.1" r="3.6" fill="#c0392b" fill-opacity="0.9"/>
+<circle cx="489.4" cy="95.9" r="3.6" fill="#c0392b" fill-opacity="0.9"/>
+<circle cx="562" cy="138" r="4" fill="#c0392b"/>
+<text class="leg" x="572" y="142">bitty-no-delta</text>
+<path d="M512.4,83.8 L521.4,90.9 L522.4,97.0" fill="none" stroke="#7f8c8d" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="522.4" cy="97.0" r="3.6" fill="#7f8c8d" fill-opacity="0.9"/>
+<circle cx="521.4" cy="90.9" r="3.6" fill="#7f8c8d" fill-opacity="0.9"/>
+<circle cx="512.4" cy="83.8" r="3.6" fill="#7f8c8d" fill-opacity="0.9"/>
+<circle cx="562" cy="153" r="4" fill="#7f8c8d"/>
+<text class="leg" x="572" y="157">bitty-no-type</text>
+<path d="M99.5,197.1 L100.1,329.9 L100.2,364.8" fill="none" stroke="#8e44ad" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="100.2" cy="364.8" r="3.6" fill="#8e44ad" fill-opacity="0.9"/>
+<circle cx="100.1" cy="329.9" r="3.6" fill="#8e44ad" fill-opacity="0.9"/>
+<circle cx="99.5" cy="197.1" r="3.6" fill="#8e44ad" fill-opacity="0.9"/>
+<circle cx="562" cy="168" r="4" fill="#8e44ad"/>
+<text class="leg" x="572" y="172">bitty-shuffled-instr</text>
+<path d="M426.8,124.4 L499.4,145.2 L500.3,150.7" fill="none" stroke="#16a085" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="500.3" cy="150.7" r="3.6" fill="#16a085" fill-opacity="0.9"/>
+<circle cx="499.4" cy="145.2" r="3.6" fill="#16a085" fill-opacity="0.9"/>
+<circle cx="426.8" cy="124.4" r="3.6" fill="#16a085" fill-opacity="0.9"/>
+<circle cx="562" cy="183" r="4" fill="#16a085"/>
+<text class="leg" x="572" y="187">explicit-1</text>
+<path d="M451.8,111.4 L496.7,124.9 L497.4,127.0" fill="none" stroke="#e67e22" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="497.4" cy="127.0" r="3.6" fill="#e67e22" fill-opacity="0.9"/>
+<circle cx="496.7" cy="124.9" r="3.6" fill="#e67e22" fill-opacity="0.9"/>
+<circle cx="451.8" cy="111.4" r="3.6" fill="#e67e22" fill-opacity="0.9"/>
+<circle cx="562" cy="198" r="4" fill="#e67e22"/>
+<text class="leg" x="572" y="202">explicit-16</text>
+<path d="M439.8,118.5 L491.0,136.9 L492.0,142.8" fill="none" stroke="#2c3e50" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="492.0" cy="142.8" r="3.6" fill="#2c3e50" fill-opacity="0.9"/>
+<circle cx="491.0" cy="136.9" r="3.6" fill="#2c3e50" fill-opacity="0.9"/>
+<circle cx="439.8" cy="118.5" r="3.6" fill="#2c3e50" fill-opacity="0.9"/>
+<circle cx="562" cy="213" r="4" fill="#2c3e50"/>
+<text class="leg" x="572" y="217">explicit-2</text>
+<path d="M445.0,117.3 L494.5,136.1 L495.2,137.7" fill="none" stroke="#27ae60" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="495.2" cy="137.7" r="3.6" fill="#27ae60" fill-opacity="0.9"/>
+<circle cx="494.5" cy="136.1" r="3.6" fill="#27ae60" fill-opacity="0.9"/>
+<circle cx="445.0" cy="117.3" r="3.6" fill="#27ae60" fill-opacity="0.9"/>
+<circle cx="562" cy="228" r="4" fill="#27ae60"/>
+<text class="leg" x="572" y="232">explicit-4</text>
+<path d="M452.3,113.5 L497.5,127.9 L498.1,129.4" fill="none" stroke="#d35400" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="498.1" cy="129.4" r="3.6" fill="#d35400" fill-opacity="0.9"/>
+<circle cx="497.5" cy="127.9" r="3.6" fill="#d35400" fill-opacity="0.9"/>
+<circle cx="452.3" cy="113.5" r="3.6" fill="#d35400" fill-opacity="0.9"/>
+<circle cx="562" cy="243" r="4" fill="#d35400"/>
+<text class="leg" x="572" y="247">explicit-8</text>
+<path d="M426.8,124.4 L499.4,145.2 L500.3,150.7" fill="none" stroke="#5d6d7e" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="500.3" cy="150.7" r="3.6" fill="#5d6d7e" fill-opacity="0.9"/>
+<circle cx="499.4" cy="145.2" r="3.6" fill="#5d6d7e" fill-opacity="0.9"/>
+<circle cx="426.8" cy="124.4" r="3.6" fill="#5d6d7e" fill-opacity="0.9"/>
+<circle cx="562" cy="258" r="4" fill="#5d6d7e"/>
+<text class="leg" x="572" y="262">pc-only</text>
+<path d="M103.7,261.7 L121.8,368.3 L121.9,374.2" fill="none" stroke="#3b6fd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="121.9" cy="374.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="121.8" cy="368.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="103.7" cy="261.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="273" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="277">random-matched</text>
+<path d="M331.8,159.6 L385.8,191.1 L452.2,253.1" fill="none" stroke="#d4693b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="452.2" cy="253.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="385.8" cy="191.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="331.8" cy="159.6" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="562" cy="288" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="292">type+delta</text>
+</svg>

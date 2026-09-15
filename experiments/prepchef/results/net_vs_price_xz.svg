@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Net benefit vs waste price (xz)">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Net benefit vs waste price (xz)</text>
+<text class="sub" x="74" y="40">window usefulness, value +1 per useful prefetch</text>
+<line class="gridline" x1="74" y1="366.7" x2="550" y2="366.7"/>
+<text class="tick" x="66" y="370.2" text-anchor="end">-500</text>
+<line class="gridline" x1="74" y1="253.2" x2="550" y2="253.2"/>
+<text class="tick" x="66" y="256.7" text-anchor="end">0</text>
+<line class="gridline" x1="74" y1="139.8" x2="550" y2="139.8"/>
+<text class="tick" x="66" y="143.3" text-anchor="end">500</text>
+<line class="gridline" x1="74" y1="26.3" x2="550" y2="26.3"/>
+<text class="tick" x="66" y="29.8" text-anchor="end">1,000</text>
+<line class="gridline" x1="55.1" y1="46" x2="55.1" y2="404"/>
+<text class="tick" x="55.1" y="421" text-anchor="middle">0.03</text>
+<line class="gridline" x1="166.7" y1="46" x2="166.7" y2="404"/>
+<text class="tick" x="166.7" y="421" text-anchor="middle">0.10</text>
+<line class="gridline" x1="278.4" y1="46" x2="278.4" y2="404"/>
+<text class="tick" x="278.4" y="421" text-anchor="middle">0.32</text>
+<line class="gridline" x1="390.0" y1="46" x2="390.0" y2="404"/>
+<text class="tick" x="390.0" y="421" text-anchor="middle">1.0</text>
+<line class="gridline" x1="501.7" y1="46" x2="501.7" y2="404"/>
+<text class="tick" x="501.7" y="421" text-anchor="middle">3.2</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">waste price (relative to +1 useful)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">net benefit per 1K data refs</text>
+<path d="M99.5,75.8 L99.5,75.8 L166.7,76.5 L166.7,76.5 L255.6,78.2 L255.6,78.2 L322.8,81.0 L322.8,81.0 L390.0,88.0 L390.0,88.0 L457.3,99.2 L457.3,99.2 L524.5,106.4" fill="none" stroke="#3b6fd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="75.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="166.7" cy="76.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="255.6" cy="78.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="322.8" cy="81.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="390.0" cy="88.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="457.3" cy="99.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="99.5" cy="75.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="166.7" cy="76.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="255.6" cy="78.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="322.8" cy="81.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="390.0" cy="88.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="457.3" cy="99.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="524.5" cy="106.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">bitty-4x8-ternary</text>
+<circle cx="255.6" cy="143.7" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">delta-markov</text>
+<path d="M99.5,99.6 L99.5,99.6 L166.7,100.8 L166.7,100.8 L255.6,104.1 L255.6,104.1 L322.8,113.7 L322.8,113.7 L390.0,135.1 L390.0,135.1 L457.3,151.9 L457.3,151.9 L524.5,161.1" fill="none" stroke="#3ba36b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="99.6" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="166.7" cy="100.8" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="255.6" cy="104.1" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="322.8" cy="113.7" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="390.0" cy="135.1" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="457.3" cy="151.9" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="99.5" cy="99.6" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="166.7" cy="100.8" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="255.6" cy="104.1" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="322.8" cy="113.7" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="390.0" cy="135.1" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="457.3" cy="151.9" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="524.5" cy="161.1" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="562" cy="78" r="4" fill="#3ba36b"/>
+<text class="leg" x="572" y="82">explicit-4</text>
+<circle cx="255.6" cy="197.9" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="562" cy="93" r="4" fill="#a03bd4"/>
+<text class="leg" x="572" y="97">ghb-gdc</text>
+<path d="M99.5,223.7 L166.7,227.5 L255.6,239.1 L255.6,239.1 L322.8,258.4 L390.0,297.0 L457.3,374.2" fill="none" stroke="#c9a227" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="223.7" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="166.7" cy="227.5" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="255.6" cy="239.1" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="322.8" cy="258.4" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="390.0" cy="297.0" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="457.3" cy="374.2" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="255.6" cy="239.1" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="562" cy="108" r="4" fill="#c9a227"/>
+<text class="leg" x="572" y="112">last-stride</text>
+<path d="M99.5,233.1 L166.7,235.0 L255.6,241.0 L255.6,241.0 L322.8,250.9 L390.0,270.6 L457.3,310.2" fill="none" stroke="#2aa1b3" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="233.1" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="166.7" cy="235.0" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="255.6" cy="241.0" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="322.8" cy="250.9" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="390.0" cy="270.6" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="457.3" cy="310.2" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="255.6" cy="241.0" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="562" cy="123" r="4" fill="#2aa1b3"/>
+<text class="leg" x="572" y="127">next-line</text>
+<circle cx="255.6" cy="253.2" r="3.6" fill="#c0392b" fill-opacity="0.9"/>
+<circle cx="562" cy="138" r="4" fill="#c0392b"/>
+<text class="leg" x="572" y="142">pc-stride</text>
+<circle cx="255.6" cy="187.4" r="3.6" fill="#7f8c8d" fill-opacity="0.9"/>
+<circle cx="562" cy="153" r="4" fill="#7f8c8d"/>
+<text class="leg" x="572" y="157">spp-lite</text>
+</svg>

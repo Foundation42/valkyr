@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Speculation is self-limiting once the gate is paid real prices">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Speculation is self-limiting once the gate is paid real prices</text>
+<text class="sub" x="74" y="40">realised-reward gate, miss-filtered reward; action rate = prefetches per scored data ref</text>
+<line class="gridline" x1="74" y1="374.3" x2="550" y2="374.3"/>
+<text class="tick" x="66" y="377.8" text-anchor="end">0</text>
+<line class="gridline" x1="74" y1="290.8" x2="550" y2="290.8"/>
+<text class="tick" x="66" y="294.3" text-anchor="end">5.0</text>
+<line class="gridline" x1="74" y1="207.3" x2="550" y2="207.3"/>
+<text class="tick" x="66" y="210.8" text-anchor="end">10</text>
+<line class="gridline" x1="74" y1="123.8" x2="550" y2="123.8"/>
+<text class="tick" x="66" y="127.3" text-anchor="end">15</text>
+<line class="gridline" x1="74" y1="40.4" x2="550" y2="40.4"/>
+<text class="tick" x="66" y="43.9" text-anchor="end">20</text>
+<line class="gridline" x1="61.1" y1="46" x2="61.1" y2="404"/>
+<text class="tick" x="61.1" y="421" text-anchor="middle">0.03</text>
+<line class="gridline" x1="157.5" y1="46" x2="157.5" y2="404"/>
+<text class="tick" x="157.5" y="421" text-anchor="middle">0.10</text>
+<line class="gridline" x1="254.0" y1="46" x2="254.0" y2="404"/>
+<text class="tick" x="254.0" y="421" text-anchor="middle">0.32</text>
+<line class="gridline" x1="350.4" y1="46" x2="350.4" y2="404"/>
+<text class="tick" x="350.4" y="421" text-anchor="middle">1.0</text>
+<line class="gridline" x1="446.8" y1="46" x2="446.8" y2="404"/>
+<text class="tick" x="446.8" y="421" text-anchor="middle">3.2</text>
+<line class="gridline" x1="543.2" y1="46" x2="543.2" y2="404"/>
+<text class="tick" x="543.2" y="421" text-anchor="middle">10</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">waste price (relative to +1 for a saved miss)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">action rate (%)</text>
+<path d="M99.5,337.4 L157.5,351.2 L234.3,361.8 L292.3,367.6 L350.4,370.8 L408.4,370.9 L466.5,370.9 L524.5,371.0" fill="none" stroke="#3b6fd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="337.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="157.5" cy="351.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="234.3" cy="361.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="292.3" cy="367.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="350.4" cy="370.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="408.4" cy="370.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="466.5" cy="370.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="524.5" cy="371.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">awkhash</text>
+<path d="M99.5,245.1 L157.5,288.8 L234.3,326.0 L292.3,347.0 L350.4,358.9 L408.4,359.1 L466.5,359.1 L524.5,359.3" fill="none" stroke="#d4693b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="245.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="157.5" cy="288.8" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="234.3" cy="326.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="292.3" cy="347.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="350.4" cy="358.9" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="408.4" cy="359.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="466.5" cy="359.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="524.5" cy="359.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">gcc</text>
+<path d="M99.5,75.8 L157.5,164.7 L234.3,248.5 L292.3,303.4 L350.4,335.3 L408.4,336.3 L466.5,336.6 L524.5,336.8" fill="none" stroke="#3ba36b" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="75.8" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="157.5" cy="164.7" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="234.3" cy="248.5" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="292.3" cy="303.4" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="350.4" cy="335.3" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="408.4" cy="336.3" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="466.5" cy="336.6" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="524.5" cy="336.8" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="562" cy="78" r="4" fill="#3ba36b"/>
+<text class="leg" x="572" y="82">python</text>
+<path d="M99.5,372.8 L157.5,373.4 L234.3,373.7 L292.3,373.9 L350.4,374.2 L408.4,374.2 L466.5,374.2 L524.5,374.2" fill="none" stroke="#a03bd4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="372.8" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="157.5" cy="373.4" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="234.3" cy="373.7" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="292.3" cy="373.9" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="350.4" cy="374.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="408.4" cy="374.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="466.5" cy="374.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="524.5" cy="374.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="562" cy="93" r="4" fill="#a03bd4"/>
+<text class="leg" x="572" y="97">sort</text>
+<path d="M99.5,311.9 L157.5,329.0 L234.3,350.4 L292.3,361.5 L350.4,366.1 L408.4,366.3 L466.5,366.3 L524.5,370.1" fill="none" stroke="#c9a227" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="311.9" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="157.5" cy="329.0" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="234.3" cy="350.4" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="292.3" cy="361.5" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="350.4" cy="366.1" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="408.4" cy="366.3" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="466.5" cy="366.3" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="524.5" cy="370.1" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<circle cx="562" cy="108" r="4" fill="#c9a227"/>
+<text class="leg" x="572" y="112">tsort</text>
+<path d="M99.5,298.2 L157.5,327.7 L234.3,349.6 L292.3,361.5 L350.4,367.7 L408.4,367.7 L466.5,367.7 L524.5,367.7" fill="none" stroke="#2aa1b3" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="99.5" cy="298.2" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="157.5" cy="327.7" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="234.3" cy="349.6" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="292.3" cy="361.5" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="350.4" cy="367.7" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="408.4" cy="367.7" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="466.5" cy="367.7" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="524.5" cy="367.7" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<circle cx="562" cy="123" r="4" fill="#2aa1b3"/>
+<text class="leg" x="572" y="127">xz</text>
+</svg>

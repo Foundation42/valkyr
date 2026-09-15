@@ -1,0 +1,60 @@
+
+##### trace gcc: 16000000 refs #####
+
+=== Phase A: freeze, reproduce, audit -- gcc ===
+  refs 16000000 (instr 12038636, data 3961364)  scored 3169092  misses 33055
+  engine: issued 2406855 useful 2227133 lead 1.350
+  indep : issued 2406855 useful 2227133 lead 1.350
+  [PASS] Gate A: independent scorer matches engine      
+  [PASS] Gate A: independent lead sum matches           
+  [PASS] duplicate outstanding fetches suppressed       violations=0
+  [PASS] brute-force scorer matches independent scorer  brute=111921 indep=111921
+  [PASS] no prefetch credited twice (bounds)            
+  [PASS] no future information enters the context       
+  [PASS] scored region invariant to post-hoc trace corruption a=1026605 b=1026605
+  [PASS] warm-up issues nothing and earns nothing       
+  [PASS] instruction/data reference accounting closes   
+  [PASS] instruction and data feature namespaces are separated differing heads=4
+  [PASS] demand at exactly the window edge is useful    useful=1
+  [PASS] demand one past the window edge is waste       useful=0
+  audit result: all checks passed
+
+##### trace tsort: 16000000 refs #####
+
+=== Phase A: freeze, reproduce, audit -- tsort ===
+  refs 16000000 (instr 12039463, data 3960537)  scored 3168430  misses 97428
+  engine: issued 2224408 useful 2105939 lead 1.089
+  indep : issued 2224408 useful 2105939 lead 1.089
+  [PASS] Gate A: independent scorer matches engine      
+  [PASS] Gate A: independent lead sum matches           
+  [PASS] duplicate outstanding fetches suppressed       violations=0
+  [PASS] brute-force scorer matches independent scorer  brute=134381 indep=134381
+  [PASS] no prefetch credited twice (bounds)            
+  [PASS] no future information enters the context       
+  [PASS] scored region invariant to post-hoc trace corruption a=1059289 b=1059289
+  [PASS] warm-up issues nothing and earns nothing       
+  [PASS] instruction/data reference accounting closes   
+  [PASS] instruction and data feature namespaces are separated differing heads=4
+  [PASS] demand at exactly the window edge is useful    useful=1
+  [PASS] demand one past the window edge is waste       useful=0
+  audit result: all checks passed
+
+##### trace python: 16000000 refs #####
+
+=== Phase A: freeze, reproduce, audit -- python ===
+  refs 16000000 (instr 11558690, data 4441310)  scored 3553048  misses 107021
+  engine: issued 1966417 useful 1650730 lead 1.631
+  indep : issued 1966417 useful 1650730 lead 1.631
+  [PASS] Gate A: independent scorer matches engine      
+  [PASS] Gate A: independent lead sum matches           
+  [PASS] duplicate outstanding fetches suppressed       violations=0
+  [PASS] brute-force scorer matches independent scorer  brute=98480 indep=98480
+  [PASS] no prefetch credited twice (bounds)            
+  [PASS] no future information enters the context       
+  [PASS] scored region invariant to post-hoc trace corruption a=824068 b=824068
+  [PASS] warm-up issues nothing and earns nothing       
+  [PASS] instruction/data reference accounting closes   
+  [PASS] instruction and data feature namespaces are separated differing heads=4
+  [PASS] demand at exactly the window edge is useful    useful=1
+  [PASS] demand one past the window edge is waste       useful=0
+  audit result: all checks passed

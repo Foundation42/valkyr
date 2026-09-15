@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Net benefit vs hot-path cost (sort)">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Net benefit vs hot-path cost (sort)</text>
+<text class="sub" x="74" y="40">ns per trace reference, whole evaluation loop, single core</text>
+<line class="gridline" x1="74" y1="374.2" x2="550" y2="374.2"/>
+<text class="tick" x="66" y="377.7" text-anchor="end">0</text>
+<line class="gridline" x1="74" y1="285.1" x2="550" y2="285.1"/>
+<text class="tick" x="66" y="288.6" text-anchor="end">200</text>
+<line class="gridline" x1="74" y1="196.0" x2="550" y2="196.0"/>
+<text class="tick" x="66" y="199.5" text-anchor="end">400</text>
+<line class="gridline" x1="74" y1="106.8" x2="550" y2="106.8"/>
+<text class="tick" x="66" y="110.3" text-anchor="end">600</text>
+<line class="gridline" x1="74" y1="17.7" x2="550" y2="17.7"/>
+<text class="tick" x="66" y="21.2" text-anchor="end">800</text>
+<line class="gridline" x1="92.7" y1="46" x2="92.7" y2="404"/>
+<text class="tick" x="92.7" y="421" text-anchor="middle">0</text>
+<line class="gridline" x1="199.9" y1="46" x2="199.9" y2="404"/>
+<text class="tick" x="199.9" y="421" text-anchor="middle">100</text>
+<line class="gridline" x1="307.0" y1="46" x2="307.0" y2="404"/>
+<text class="tick" x="307.0" y="421" text-anchor="middle">200</text>
+<line class="gridline" x1="414.2" y1="46" x2="414.2" y2="404"/>
+<text class="tick" x="414.2" y="421" text-anchor="middle">300</text>
+<line class="gridline" x1="521.3" y1="46" x2="521.3" y2="404"/>
+<text class="tick" x="521.3" y="421" text-anchor="middle">400</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">hot-path cost (ns / reference)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">net benefit per 1K data refs</text>
+<circle cx="112.7" cy="354.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="114.4" cy="283.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="118.1" cy="283.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="118.8" cy="293.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="122.2" cy="293.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="128.5" cy="293.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="142.4" cy="288.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="138.7" cy="303.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="140.4" cy="305.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="164.0" cy="289.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="188.9" cy="371.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="265.4" cy="332.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="162.3" cy="299.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="164.1" cy="289.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="162.4" cy="289.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="208.2" cy="361.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="232.2" cy="294.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="112.3" cy="365.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="114.0" cy="288.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="117.0" cy="288.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="118.6" cy="298.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="121.4" cy="298.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="127.6" cy="298.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="140.6" cy="294.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="137.1" cy="307.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="138.2" cy="313.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="163.5" cy="295.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="175.5" cy="373.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="252.3" cy="356.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="165.0" cy="302.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="161.6" cy="295.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="162.5" cy="295.4" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="197.1" cy="364.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="223.5" cy="294.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="111.8" cy="374.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="113.8" cy="323.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="116.8" cy="323.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="118.6" cy="312.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="122.1" cy="312.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="127.9" cy="312.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="142.3" cy="312.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="137.9" cy="312.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="142.0" cy="324.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="163.4" cy="302.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="174.6" cy="374.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="244.9" cy="370.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="160.2" cy="312.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="160.4" cy="302.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="162.0" cy="302.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="191.6" cy="371.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="219.8" cy="295.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">B</text>
+<circle cx="122.6" cy="346.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="129.5" cy="314.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="140.2" cy="299.4" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="171.0" cy="295.4" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="218.9" cy="291.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="313.5" cy="291.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="524.5" cy="290.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">C-heads</text>
+<circle cx="164.0" cy="297.4" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="164.4" cy="295.4" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="165.6" cy="290.4" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="182.5" cy="290.5" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="184.4" cy="290.3" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<circle cx="562" cy="78" r="4" fill="#3ba36b"/>
+<text class="leg" x="572" y="82">C-tau</text>
+<circle cx="103.2" cy="346.4" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="108.5" cy="159.4" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="99.5" cy="374.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="109.8" cy="90.5" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="109.9" cy="75.8" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="103.1" cy="318.4" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="163.7" cy="288.8" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="123.2" cy="288.7" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="163.0" cy="289.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="121.9" cy="293.3" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="162.0" cy="295.4" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="121.5" cy="298.7" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="162.1" cy="295.9" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="121.5" cy="300.0" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="161.8" cy="302.1" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="121.3" cy="312.8" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="161.8" cy="302.1" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="120.9" cy="307.7" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="178.3" cy="302.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="130.4" cy="307.7" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<circle cx="562" cy="93" r="4" fill="#a03bd4"/>
+<text class="leg" x="572" y="97">E</text>
+</svg>

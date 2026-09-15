@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Coverage vs temporal state bytes (xz)">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">Coverage vs temporal state bytes (xz)</text>
+<text class="sub" x="74" y="40">waste price 0.25; state bytes = live fading/history state only</text>
+<line class="gridline" x1="74" y1="374.2" x2="550" y2="374.2"/>
+<text class="tick" x="66" y="377.7" text-anchor="end">0</text>
+<line class="gridline" x1="74" y1="299.4" x2="550" y2="299.4"/>
+<text class="tick" x="66" y="302.9" text-anchor="end">20</text>
+<line class="gridline" x1="74" y1="224.6" x2="550" y2="224.6"/>
+<text class="tick" x="66" y="228.1" text-anchor="end">40</text>
+<line class="gridline" x1="74" y1="149.8" x2="550" y2="149.8"/>
+<text class="tick" x="66" y="153.3" text-anchor="end">60</text>
+<line class="gridline" x1="74" y1="75.0" x2="550" y2="75.0"/>
+<text class="tick" x="66" y="78.5" text-anchor="end">80</text>
+<line class="gridline" x1="119.0" y1="46" x2="119.0" y2="404"/>
+<text class="tick" x="119.0" y="421" text-anchor="middle">10</text>
+<line class="gridline" x1="219.7" y1="46" x2="219.7" y2="404"/>
+<text class="tick" x="219.7" y="421" text-anchor="middle">32</text>
+<line class="gridline" x1="320.3" y1="46" x2="320.3" y2="404"/>
+<text class="tick" x="320.3" y="421" text-anchor="middle">100</text>
+<line class="gridline" x1="421.0" y1="46" x2="421.0" y2="404"/>
+<text class="tick" x="421.0" y="421" text-anchor="middle">316</text>
+<line class="gridline" x1="521.7" y1="46" x2="521.7" y2="404"/>
+<text class="tick" x="521.7" y="421" text-anchor="middle">1,000</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">temporal state (bytes, log)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">coverage (%)</text>
+<circle cx="109.8" cy="179.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="115.8" y="174.5">type+delta</text>
+<circle cx="165.4" cy="122.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="171.4" y="117.7">pc-only</text>
+<circle cx="165.4" cy="122.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="171.4" y="117.7">explicit-1</text>
+<circle cx="199.1" cy="126.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="205.1" y="121.7">explicit-2</text>
+<circle cx="242.4" cy="120.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="248.4" y="115.2">explicit-4</text>
+<circle cx="292.8" cy="114.6" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="298.8" y="109.6">explicit-8</text>
+<circle cx="347.9" cy="107.1" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="102.1">explicit-16</text>
+<circle cx="242.4" cy="116.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="248.4" y="111.5">bitty-1x8-tau8</text>
+<circle cx="242.4" cy="110.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="248.4" y="105.0">bitty-1x8-tau32</text>
+<circle cx="347.9" cy="81.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="76.2">bitty-4x8-ternary</text>
+<circle cx="99.5" cy="355.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="105.5" y="350.8">random-matched</text>
+<circle cx="347.9" cy="365.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="360.5">bitty-shuffled-instr</text>
+<circle cx="347.9" cy="98.7" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="93.7">bitty-no-delta</text>
+<circle cx="347.9" cy="82.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="77.3">bitty-no-type</text>
+<circle cx="347.9" cy="81.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="76.2">bitty-instr-only</text>
+<circle cx="347.9" cy="143.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="138.2">bitty-data-only</text>
+<circle cx="347.9" cy="77.0" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="72.0">bitty-instr+data</text>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">B (contexts)</text>
+<circle cx="199.1" cy="154.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="205.1" y="149.3">heads-1</text>
+<circle cx="242.4" cy="112.5" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="248.4" y="107.5">heads-2</text>
+<circle cx="292.8" cy="90.6" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="298.8" y="85.6">heads-4</text>
+<circle cx="347.9" cy="81.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="76.2">heads-8</text>
+<circle cx="405.5" cy="81.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="411.5" y="76.3">heads-16</text>
+<circle cx="464.7" cy="89.5" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="470.7" y="84.5">heads-32</text>
+<circle cx="524.5" cy="117.0" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="530.5" y="112.0">heads-64</text>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">C-heads</text>
+<circle cx="292.8" cy="80.3" r="3.6" fill="#3ba36b" fill-opacity="0.9"/>
+<text class="tick" x="298.8" y="75.3">integer-q8.8-shift</text>
+<circle cx="562" cy="78" r="4" fill="#3ba36b"/>
+<text class="leg" x="572" y="82">C-int</text>
+<circle cx="347.9" cy="82.5" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="77.5">quant-sign</text>
+<circle cx="347.9" cy="81.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="76.2">quant-ternary</text>
+<circle cx="347.9" cy="75.8" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="70.8">quant-2-bit</text>
+<circle cx="347.9" cy="78.6" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="73.6">quant-3-bit</text>
+<circle cx="347.9" cy="248.3" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="243.3">quant-int8</text>
+<circle cx="347.9" cy="374.2" r="3.6" fill="#a03bd4" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="369.2">quant-float</text>
+<circle cx="562" cy="93" r="4" fill="#a03bd4"/>
+<text class="leg" x="572" y="97">C-quant</text>
+<circle cx="347.9" cy="110.7" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="105.7">tau{1|2|4|8}</text>
+<circle cx="347.9" cy="81.2" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="76.2">tau{2|8|32|128}</text>
+<circle cx="347.9" cy="82.6" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="77.6">tau{4|16|64|256}</text>
+<circle cx="381.4" cy="78.2" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<text class="tick" x="387.4" y="73.2">tau{2|4|8|16|32|64}</text>
+<circle cx="381.4" cy="99.9" r="3.6" fill="#c9a227" fill-opacity="0.9"/>
+<text class="tick" x="387.4" y="94.9">tau{1|4|16|64|256|1024}</text>
+<circle cx="562" cy="108" r="4" fill="#c9a227"/>
+<text class="leg" x="572" y="112">C-tau</text>
+<circle cx="347.9" cy="80.4" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="75.4">ternary-thresh-0.05</text>
+<circle cx="347.9" cy="77.5" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="72.5">ternary-thresh-0.10</text>
+<circle cx="347.9" cy="81.2" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="76.2">ternary-thresh-0.20</text>
+<circle cx="347.9" cy="82.2" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="77.2">ternary-thresh-0.35</text>
+<circle cx="347.9" cy="85.6" r="3.6" fill="#2aa1b3" fill-opacity="0.9"/>
+<text class="tick" x="353.9" y="80.6">ternary-thresh-0.50</text>
+<circle cx="562" cy="123" r="4" fill="#2aa1b3"/>
+<text class="leg" x="572" y="127">C-thresh</text>
+</svg>
