@@ -180,6 +180,7 @@ def main(csv_path, out_dir):
     here = os.path.dirname(csv_path) or "."
     spectro = load_spectro(os.path.join(here, "spectro.csv"))
     arms = load_spectro(os.path.join(here, "arms.csv"))
+    gate = load_spectro(os.path.join(here, "gate.csv"))
     os.makedirs(out_dir, exist_ok=True)
     traces = sorted({r["trace"] for r in rows})
 
@@ -304,10 +305,10 @@ def main(csv_path, out_dir):
         for r in rows:
             if r["phase"] != "H" or r["trace"] != tr or "/" not in r["config"]:
                 continue
-            gate = r["config"].split("/", 1)[1]
+            gate_name = r["config"].split("/", 1)[1]
             h = int(r["config"].split("/")[0][1:])
-            s[gate + " — strict coverage"].append((h, 100 * r["strict_cov"], ""))
-            if gate.startswith("realized-ev/miss-w0.05"):
+            s[gate_name + " — strict coverage"].append((h, 100 * r["strict_cov"], ""))
+            if gate_name.startswith("realized-ev/miss-w0.05"):
                 s["realized-ev w0.05 — action rate"].append((h, 100 * r["action_rate"], ""))
         if s:
             chart(os.path.join(out_dir, f"horizon_spectrum_{tr}.svg"),
@@ -381,6 +382,42 @@ def main(csv_path, out_dir):
               "price swept 0.05..256; up and to the left is better",
               "action rate (% of scored data refs)", "miss-filtered coverage (%)",
               sorted(s.items()))
+
+
+    # 13. G66: cost against benefit for the two-stage architecture and its
+    #     four registered controls.
+    s = defaultdict(list)
+    for r in rows:
+        if r["phase"] != "G66":
+            continue
+        c = r["config"]
+        fam = ("conditional (whether, then when)" if "/conditional-" in c else
+               "cond-random (gating only)" if "/cond-random-" in c else
+               "pooled (timing-blind)" if "/pooled-" in c else
+               "best-ev (horizon as action)" if "/best-ev-" in c else
+               "best fixed h (hindsight)" if c.startswith("single-h") else None)
+        if fam:
+            s[fam].append((max(r["ns_per_ref"], 1), r["strict_net_per_1k"], ""))
+    if s:
+        chart(os.path.join(out_dir, "G66_cost_vs_benefit.svg"),
+              "G66 — two-stage selection against its four controls (all traces)",
+              "price swept 0.05..4; up and to the left is better",
+              "hot-path cost (ns / reference, log)", "miss-filtered net benefit per 1K data refs",
+              sorted(s.items()), xlog=True)
+
+    # 14. The architectural claim: second-stage work per reference.
+    s = defaultdict(list)
+    for r in gate:
+        if "/conditional-" not in r["config"] or abs(r["waste"] - 0.05) > 1e-9:
+            continue
+        n_h = 32 if r["fixture"] == "h32" else 6
+        s[f"|H| = {n_h}"].append((100 * r["admit_rate"], r["selector_lookups_per_ref"], r["trace"]))
+    if s:
+        chart(os.path.join(out_dir, "G66_second_stage_cost.svg"),
+              "How cold is the cold path?",
+              "a flat policy pays |H| selector lookups on every reference; a gated one pays admit-rate x |H|",
+              "gate admit rate (% of data refs)", "selector lookups per data reference",
+              sorted(s.items()), annotate=True)
 
 
 if __name__ == "__main__":

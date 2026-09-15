@@ -86,6 +86,37 @@ static Metrics report(const char* phase, const Trace& tr, const std::string& cfg
     return m;
 }
 
+// Second-stage cost: how often the expensive machinery is consulted at all.
+// The architectural claim of a two-stage policy lives or dies on this table.
+static void report_gate(const Trace& tr, const std::string& fixture, const std::string& cfgname,
+                        const Predictor& p, const Metrics& m, const RunCfg& rc)
+{
+    const char* path = std::getenv("PREPCHEF_GATE_CSV");
+    std::string out = path ? path : "results/gate.csv";
+    bool exists = false;
+    if (std::FILE* f = std::fopen(out.c_str(), "rb")) { std::fseek(f, 0, SEEK_END); exists = std::ftell(f) > 0; std::fclose(f); }
+    std::FILE* f = std::fopen(out.c_str(), "ab");
+    if (!f) { std::perror("gate csv"); return; }
+    if (!exists)
+        std::fprintf(f, "trace,fixture,config,waste,data_refs,gate_lookups,gate_admits,"
+                        "admit_rate,selector_lookups,selector_updates,pooled_updates,"
+                        "selector_lookups_per_ref,inserts,evictions,action_rate,"
+                        "strict_cov,strict_net_per_1k,ns_per_ref\n");
+    const double n = double(m.data_refs ? m.data_refs : 1);
+    std::fprintf(f, "%s,%s,%s,%.3f,%llu,%llu,%llu,%.6f,%llu,%llu,%llu,%.4f,%llu,%llu,%.6f,%.6f,%.3f,%.2f\n",
+                 tr.name.c_str(), fixture.c_str(), cfgname.c_str(), rc.waste,
+                 (unsigned long long)m.data_refs,
+                 (unsigned long long)p.gateLookups(), (unsigned long long)p.gateAdmits(),
+                 double(p.gateAdmits()) / n,
+                 (unsigned long long)p.selectorLookups(), (unsigned long long)p.selectorUpdates(),
+                 (unsigned long long)p.pooledUpdates(),
+                 double(p.selectorLookups()) / n,
+                 (unsigned long long)m.inserts, (unsigned long long)m.evictions,
+                 m.action_rate(), m.strict_coverage(),
+                 m.strict_net_per_1k(rc.value, rc.waste), m.ns_per_ref);
+    std::fclose(f);
+}
+
 // Per-arm occupancy: the learned action distribution over horizons.  Written to
 // its own table because the column count depends on the fixture.
 static void report_arms(const Trace& tr, const std::string& fixture, const std::string& cfgname,
@@ -740,6 +771,33 @@ static void audit_multi(const Trace& tr)
               "multi-horizon scored region invariant to post-hoc corruption",
               "a=" + std::to_string(ma.useful_miss) + " b=" + std::to_string(mb.useful_miss));
     }
+    // The two-stage path needs the same guarantees as the flat one.
+    {
+        RunCfg rc; rc.waste = 0.05f; rc.reward_mode = RunCfg::Reward::MissFiltered;
+        rc.log_events = true;
+        EventLog log;
+        MultiPrepChef p(pcbase_ctx(), ev(), H, MultiPrepChef::Select::Conditional, "audit");
+        Metrics m = eng.run(tr, p, rc, &log);
+        IndepResult ir = score_independently(log);
+        check(ir.issued == m.issued && ir.useful == m.useful,
+              "Gate A holds for the two-stage (conditional) predictor",
+              "engine=" + std::to_string(m.useful) + " indep=" + std::to_string(ir.useful));
+        check(p.gateAdmits() <= p.gateLookups(), "gate admits are a subset of gate lookups");
+        check(p.selectorLookups() <= p.gateAdmits() * uint64_t(H.size()),
+              "selector is consulted only for admitted contexts",
+              "sel=" + std::to_string(p.selectorLookups()) +
+              " bound=" + std::to_string(p.gateAdmits() * uint64_t(H.size())));
+    }
+    {
+        RunCfg a; a.waste = 0.05f; a.reward_mode = RunCfg::Reward::MissFiltered; a.eval_end = 0.60;
+        RunCfg b = a; b.corrupt_after_pos = uint64_t(double(tr.n) * 0.80);
+        MultiPrepChef pa(pcbase_ctx(), ev(), H, MultiPrepChef::Select::Conditional, "audit");
+        MultiPrepChef pb(pcbase_ctx(), ev(), H, MultiPrepChef::Select::Conditional, "audit");
+        Metrics ma = eng.run(tr, pa, a), mb = eng.run(tr, pb, b);
+        check(ma.issued == mb.issued && ma.useful_miss == mb.useful_miss,
+              "two-stage scored region invariant to post-hoc corruption");
+    }
+
     // A horizon longer than the usefulness window cannot be credited by its own
     // label, so h > W must degrade rather than improve.  Registered sanity bound.
     {
@@ -832,6 +890,76 @@ static void phase_g65(const Trace& tr)
             MultiPrepChef p(pcbase_ctx(), ev(w), fx.H, MultiPrepChef::Select::BestEVTested, b);
             Metrics m = report("G65", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
             report_arms(tr, fx.name, b, fx.H, m, rc);
+        }
+    }
+}
+
+// =================== G66: whether, then when (conditional horizon selection) =
+//
+// G65 made every horizon answer both questions at once, so each new context
+// acquired |H| little gamblers, each entitled to its introductory free bet.
+// Here the two questions are separated:
+//
+//   stage 1  pooled value gate   "is this situation worth preparing for at all?"
+//                                one lookup, one slot per context
+//   stage 2  horizon selector    "and when?"  -- consulted only for contexts
+//                                stage 1 admitted, on both the lookup and the
+//                                learning path, so its key space is cold too
+//
+// Registered hypothesis: conditional horizon selection should approach the best
+// fixed-horizon miss coverage at matched action rate, while its exploration and
+// action overhead scales with the number of contexts the gate admits rather
+// than with |H| across all contexts.
+static void phase_g66(const Trace& tr)
+{
+    std::printf("\n=== G66: conditional horizon selection -- %s ===\n", tr.name.c_str());
+    auto ev = [](float w) {
+        LearnCfg l = pcbase_learn(w);
+        l.kind = LearnCfg::Kind::RealizedEV; l.label = "realized-ev";
+        return l;
+    };
+    std::vector<int> H32; for (int i = 1; i <= 32; ++i) H32.push_back(i);
+    const std::vector<int> Hc{1, 2, 4, 8, 16, 32};
+
+    struct Fx { const char* name; const std::vector<int>* H; };
+    const Fx fixtures[] = {{"coarse", &Hc}, {"h32", &H32}};
+
+    for (float w : {0.05f, 0.25f, 1.00f, 4.00f}) {
+        for (const Fx& fx : fixtures) {
+            char b[96];
+            // The architecture under test.
+            { std::snprintf(b, sizeof b, "%s/conditional-w%.2f", fx.name, w);
+              RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+              MultiPrepChef p(pcbase_ctx(), ev(w), *fx.H, MultiPrepChef::Select::Conditional, b);
+              Metrics m = report("G66", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+              report_arms(tr, fx.name, b, *fx.H, m, rc);
+              report_gate(tr, fx.name, b, p, m, rc); }
+            // Control: same gate, random arm.  Isolates resolution from gating.
+            { std::snprintf(b, sizeof b, "%s/cond-random-w%.2f", fx.name, w);
+              RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+              MultiPrepChef p(pcbase_ctx(), ev(w), *fx.H, MultiPrepChef::Select::ConditionalRandom, b);
+              Metrics m = report("G66", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+              report_gate(tr, fx.name, b, p, m, rc); }
+            // Control: pooled only -- the cheap timing-blind baseline.
+            { std::snprintf(b, sizeof b, "%s/pooled-w%.2f", fx.name, w);
+              RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+              MultiPrepChef p(pcbase_ctx(), ev(w), *fx.H, MultiPrepChef::Select::Pooled, b);
+              Metrics m = report("G66", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+              report_gate(tr, fx.name, b, p, m, rc); }
+            // Control: full horizon-as-action -- the known expensive detector.
+            { std::snprintf(b, sizeof b, "%s/best-ev-w%.2f", fx.name, w);
+              RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+              MultiPrepChef p(pcbase_ctx(), ev(w), *fx.H, MultiPrepChef::Select::BestEV, b);
+              Metrics m = report("G66", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
+              report_gate(tr, fx.name, b, p, m, rc); }
+        }
+        // Control: the hindsight ceiling, at each candidate fixed horizon.
+        for (int h : {1, 2, 4, 6, 9, 10, 16}) {
+            RunCfg rc; rc.waste = w; rc.reward_mode = RunCfg::Reward::MissFiltered;
+            LearnCfg l = ev(w); l.horizon = h;
+            char b[96]; std::snprintf(b, sizeof b, "single-h%d-w%.2f", h, w);
+            PrepChef p(pcbase_ctx(), l);
+            report("G66", tr, b, p, rc, pcbase_ctx().label, "realized-ev");
         }
     }
 }
@@ -1009,7 +1137,7 @@ int main(int argc, char** argv)
 {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: prepchef <audit|base|ctx|rep|learn|base2|splits|econ|lead|spectro|peak|g65|best|cost|drift|all> <trace.vtr...>\n");
+            "usage: prepchef <audit|base|ctx|rep|learn|base2|splits|econ|lead|spectro|peak|g65|g66|best|cost|drift|all> <trace.vtr...>\n");
         return 2;
     }
     const std::string cmd = argv[1];
@@ -1053,6 +1181,7 @@ int main(int argc, char** argv)
         if (cmd == "g65") phase_g65(tr);
         if (cmd == "g65audit") audit_multi(tr);
         if (cmd == "g65price") phase_g65_price(tr);
+        if (cmd == "g66") phase_g66(tr);
         if (cmd == "best" || cmd == "all") phase_best(tr);
     }
     if (g_csv) std::fclose(g_csv);

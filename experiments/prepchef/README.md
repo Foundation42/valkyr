@@ -32,7 +32,8 @@ tools/concat_traces.py  builds concatenated traces for phase-change probes
 tools/plot.py       dependency-free SVG plots
 LABBOOK.md          hypothesis -> registered control -> result -> next experiment
 results/            runs.csv (every run), spectro.csv (trace spectra),
-                    arms.csv (per-horizon occupancy), plots
+                    arms.csv (per-horizon occupancy),
+                    gate.csv (two-stage admit rates and second-stage cost), plots
 ```
 
 ## Traces
@@ -76,6 +77,7 @@ PREPCHEF_PEAK_H=9 ./build/prepchef peak traces/sort.vtr
 ./build/prepchef g65      traces/sort.vtr      # horizon as an action dimension
 ./build/prepchef g65audit traces/sort.vtr      # Gate A for the multi-horizon path
 ./build/prepchef g65price traces/sort.vtr      # matched-action-rate frontier
+./build/prepchef g66      traces/tsort.vtr     # whether, then when
 ./build/prepchef drift  traces/drift_gcc_tsort.vtr
 python3 tools/plot.py results/runs.csv results/
 ```
@@ -161,6 +163,18 @@ Full write-up in [`LABBOOK.md`](LABBOOK.md). In short:
    context — turned out to be the design: it learns from every horizon's
    evidence at single-horizon exploration cost, and on `sort` reproduces the
    hand-picked oracle exactly without being told the horizon.
-9. **No novelty or performance claim is made.** Under the miss-filtered rule,
+9. **Separating *whether* from *when* (G66) fixes it.** A pooled value gate
+   decides whether this situation is worth preparing for at all — one lookup,
+   one slot per context — and the per-horizon selector is consulted only for
+   admitted contexts, on the learning path as well as the lookup path. That
+   **matches or beats the best fixed horizon on all six traces without
+   hindsight**, beating it outright on `tsort` (+9.68 vs +8.59 net/1K) and
+   turning `python` net-positive for the first time in the lab. Take the
+   resolution away and keep the gate (`cond-random`) and the gain vanishes
+   entirely, so it is not the gate doing the work alone. The cost story is only
+   half supported: the second stage is 2–5× cheaper than a flat search, but the
+   gate admits 20–50% of references rather than the few percent that would make
+   it genuinely cold.
+10. **No novelty or performance claim is made.** Under the miss-filtered rule,
    plain next-line still covers more real misses than anything else here. What
    survives is a narrower claim about efficiency per action.

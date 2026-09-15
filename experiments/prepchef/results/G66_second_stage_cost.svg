@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="How cold is the cold path?">
+<style>
+  .bg{fill:#ffffff}.fg{fill:#1b1f24}.gridline{stroke:#e3e6ea;stroke-width:1}
+  .axis{stroke:#9aa3ad;stroke-width:1.2}
+  text{font-family:'DejaVu Sans',system-ui,sans-serif;fill:#1b1f24}
+  .ttl{font-size:16px;font-weight:600}.sub{font-size:11px;fill:#6a737d}
+  .tick{font-size:10.5px;fill:#6a737d}.lbl{font-size:11.5px}
+  .leg{font-size:10.5px}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0f1216}.fg{fill:#e6e9ee}.gridline{stroke:#262b32}
+    .axis{stroke:#5b646f}text{fill:#e6e9ee}.sub,.tick{fill:#9aa3ad}
+  }
+</style>
+<rect class="bg" width="760" height="460"/>
+<text class="ttl" x="74" y="24">How cold is the cold path?</text>
+<text class="sub" x="74" y="40">a flat policy pays |H| selector lookups on every reference; a gated one pays admit-rate x |H|</text>
+<line class="gridline" x1="74" y1="397.5" x2="550" y2="397.5"/>
+<text class="tick" x="66" y="401.0" text-anchor="end">0</text>
+<line class="gridline" x1="74" y1="297.4" x2="550" y2="297.4"/>
+<text class="tick" x="66" y="300.9" text-anchor="end">5.0</text>
+<line class="gridline" x1="74" y1="197.4" x2="550" y2="197.4"/>
+<text class="tick" x="66" y="200.9" text-anchor="end">10</text>
+<line class="gridline" x1="74" y1="97.3" x2="550" y2="97.3"/>
+<text class="tick" x="66" y="100.8" text-anchor="end">15</text>
+<line class="gridline" x1="74" y1="-2.7" x2="550" y2="-2.7"/>
+<text class="tick" x="66" y="0.8" text-anchor="end">20</text>
+<line class="gridline" x1="106.9" y1="46" x2="106.9" y2="404"/>
+<text class="tick" x="106.9" y="421" text-anchor="middle">20</text>
+<line class="gridline" x1="234.2" y1="46" x2="234.2" y2="404"/>
+<text class="tick" x="234.2" y="421" text-anchor="middle">30</text>
+<line class="gridline" x1="361.5" y1="46" x2="361.5" y2="404"/>
+<text class="tick" x="361.5" y="421" text-anchor="middle">40</text>
+<line class="gridline" x1="488.8" y1="46" x2="488.8" y2="404"/>
+<text class="tick" x="488.8" y="421" text-anchor="middle">50</text>
+<line class="axis" x1="74" y1="404" x2="550" y2="404"/>
+<line class="axis" x1="74" y1="46" x2="74" y2="404"/>
+<text class="lbl" x="312" y="446" text-anchor="middle">gate admit rate (% of data refs)</text>
+<text class="lbl" transform="translate(18,225) rotate(-90)" text-anchor="middle">selector lookups per data reference</text>
+<circle cx="132.6" cy="256.5" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="138.6" y="251.5">awkhash</text>
+<circle cx="255.3" cy="194.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="261.3" y="189.8">gcc</text>
+<circle cx="491.7" cy="75.8" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="497.7" y="70.8">python</text>
+<circle cx="111.4" cy="267.2" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="117.4" y="262.2">sort</text>
+<circle cx="161.6" cy="241.9" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="167.6" y="236.9">tsort</text>
+<circle cx="170.9" cy="237.3" r="3.6" fill="#3b6fd4" fill-opacity="0.9"/>
+<text class="tick" x="176.9" y="232.3">xz</text>
+<circle cx="562" cy="48" r="4" fill="#3b6fd4"/>
+<text class="leg" x="572" y="52">|H| = 32</text>
+<circle cx="130.1" cy="371.3" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="136.1" y="366.3">awkhash</text>
+<circle cx="253.9" cy="359.6" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="259.9" y="354.6">gcc</text>
+<circle cx="524.5" cy="334.1" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="530.5" y="329.1">python</text>
+<circle cx="99.5" cy="374.2" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="105.5" y="369.2">sort</text>
+<circle cx="157.8" cy="368.7" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="163.8" y="363.7">tsort</text>
+<circle cx="166.6" cy="367.8" r="3.6" fill="#d4693b" fill-opacity="0.9"/>
+<text class="tick" x="172.6" y="362.8">xz</text>
+<circle cx="562" cy="63" r="4" fill="#d4693b"/>
+<text class="leg" x="572" y="67">|H| = 6</text>
+</svg>

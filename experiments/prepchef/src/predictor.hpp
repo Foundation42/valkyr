@@ -15,6 +15,8 @@ struct Proposal {
     bool act = false;
     uint64_t target = 0;
     uint64_t ctx = 0;          // the key the reward must be routed back to
+    uint64_t ctx2 = 0;         // a second key, when a decision has two stages
+                               // that both need to learn from the outcome
     int64_t action = 0;
     uint32_t arm = 0;          // which horizon arm proposed it (reporting only)
 };
@@ -25,7 +27,14 @@ struct Predictor {
     virtual void observeInstr(uint64_t addr) { last_pc_ = addr; }
     // Learn from this reference, then decide whether to prepare anything.
     virtual Proposal onData(uint64_t line, int type, uint64_t data_index) = 0;
-    virtual void reward(uint64_t, int64_t, float) {}
+    virtual void reward(uint64_t, uint64_t, int64_t, float) {}
+    // Second-stage instrumentation.  A two-stage policy claims its expensive
+    // machinery is cold-path; these counters are how that claim is checked.
+    virtual uint64_t gateLookups() const { return 0; }
+    virtual uint64_t gateAdmits() const { return 0; }
+    virtual uint64_t selectorLookups() const { return 0; }
+    virtual uint64_t selectorUpdates() const { return 0; }
+    virtual uint64_t pooledUpdates() const { return 0; }
     virtual size_t stateBytes() const { return 0; }
     virtual size_t tableBytes() const { return 0; }
     virtual uint64_t updateOps() const { return 0; }
@@ -90,7 +99,10 @@ public:
         return out;
     }
 
-    void reward(uint64_t ctx, int64_t action, float r) override { learn_.reward(ctx, action, r); }
+    void reward(uint64_t ctx, uint64_t, int64_t action, float r) override
+    {
+        learn_.reward(ctx, action, r);
+    }
 
     size_t stateBytes() const override { return ctx_.stateBytes(); }
     size_t tableBytes() const override { return learn_.tableBytes(); }
@@ -136,6 +148,9 @@ public:
         Pooled,          // one estimator fed by every arm's evidence, no ability to tell h apart
         BestEVTested,    // as BestEV, but an untested arm cannot win the argmax:
                          // only one designated explorer may fire on its prior
+        Conditional,     // G66: pooled gate decides *whether*, then -- and only
+                         // then -- the per-h arms decide *when*
+        ConditionalRandom,  // same gate, random arm: isolates resolution from gating
     };
 
     MultiPrepChef(const CtxCfg& c, const LearnCfg& l, std::vector<int> horizons,
@@ -147,16 +162,17 @@ public:
         learn_.ensureBandit();
         max_h_ = 1;
         for (int h : horizons_) if (h > max_h_) max_h_ = h;
-        ring_.assign(size_t(max_h_), {0, 0});
+        ring_.assign(size_t(max_h_), Past{});
     }
 
     void reset() override
     {
         ctx_.reset();
         learn_.reset();
-        std::fill(ring_.begin(), ring_.end(), std::pair<uint64_t, uint64_t>{0, 0});
+        std::fill(ring_.begin(), ring_.end(), Past{});
         seen_ = 0;
         rng_ = 0x9E3779B97F4A7C15ull;
+        gate_lookups_ = gate_admits_ = sel_lookups_ = sel_updates_ = pooled_updates_ = 0;
     }
 
     void observeInstr(uint64_t addr) override { last_pc_ = addr; ctx_.observeInstr(addr); }
@@ -165,20 +181,38 @@ public:
     {
         // (a) one delayed label per arm.  All reads happen before the write
         //     below, so no arm can see its own future.
+        const bool two_stage = (sel_ == Select::Conditional || sel_ == Select::ConditionalRandom);
         for (size_t k = 0; k < horizons_.size(); ++k) {
             const uint64_t h = uint64_t(horizons_[k]);
             if (seen_ < h) continue;
-            const auto& past = ring_[size_t((seen_ - h) % uint64_t(max_h_))];
-            const int64_t outcome = lcfg_.outcome_delta ? int64_t(line) - int64_t(past.second)
+            const Past& past = ring_[size_t((seen_ - h) % uint64_t(max_h_))];
+            const int64_t outcome = lcfg_.outcome_delta ? int64_t(line) - int64_t(past.line)
                                                         : int64_t(line);
-            learn_.learn(key(past.first, sel_ == Select::Pooled ? kPoolId : horizons_[k]), outcome);
+            if (sel_ == Select::Pooled) {
+                learn_.learn(key(past.ctx, kPoolId), outcome);
+                ++pooled_updates_;
+            } else if (two_stage) {
+                // The gate learns from every horizon's evidence -- that is what
+                // makes it as informed as the pooled estimator -- but it costs
+                // one slot per context, not per (context, h).
+                learn_.learn(key(past.ctx, kPoolId), outcome);
+                ++pooled_updates_;
+                // The selector only accumulates evidence for contexts the gate
+                // admitted, so its *key space* is cold-path too, not just its
+                // lookups.  This is why the ring has to remember the decision.
+                if (past.admitted) {
+                    learn_.learn(key(past.ctx, horizons_[k]), outcome);
+                    ++sel_updates_;
+                }
+            } else {
+                learn_.learn(key(past.ctx, horizons_[k]), outcome);
+            }
         }
 
         // (b) advance the shared context, then read it once
         ctx_.observeData(line, type);
         const uint64_t id = ctx_.id();
-        ring_[size_t(seen_ % uint64_t(max_h_))] = {id, line};
-        ++seen_;
+        // (written after the selection below, which decides `admitted`)
 
         // (c) choose among { null, (h, delta) ... }
         Proposal out;
@@ -213,7 +247,7 @@ public:
                 }
             }
             if (!have) {
-                if (!tested_only || explorer == horizons_.size()) return Proposal{};
+                if (!tested_only || explorer == horizons_.size()) { finish(id, line, false); return Proposal{}; }
                 out.ctx = expl_ctx_; out.action = expl_action_; out.arm = uint32_t(explorer);
             }
             break;
@@ -222,14 +256,53 @@ public:
             const size_t k = size_t(next_rand() % horizons_.size());
             const uint64_t ck = key(id, horizons_[k]);
             Learner::Proposal pr = learn_.propose(ck);
-            if (!pr.act) return Proposal{};
+            if (!pr.act) { finish(id, line, false); return Proposal{}; }
             out.ctx = ck; out.action = pr.action; out.arm = uint32_t(k);
+            break;
+        }
+        case Select::Conditional:
+        case Select::ConditionalRandom: {
+            // Stage 1 -- whether.  One lookup, one slot per context.
+            const uint64_t gk = key(id, kPoolId);
+            ++gate_lookups_;
+            Learner::Proposal g = learn_.propose(gk);
+            if (!g.act) { finish(id, line, false); return Proposal{}; }
+            ++gate_admits_;
+
+            // Stage 2 -- when.  Only reached by admitted contexts.
+            float best_u = 0.0f;
+            bool have = false;
+            if (sel_ == Select::ConditionalRandom) {
+                const size_t k = size_t(next_rand() % horizons_.size());
+                const uint64_t ck = key(id, horizons_[k]);
+                ++sel_lookups_;
+                Learner::Proposal pr = learn_.propose(ck);
+                if (pr.act) {
+                    have = true;
+                    out.ctx = ck; out.ctx2 = gk; out.action = pr.action; out.arm = uint32_t(k);
+                }
+            } else {
+                for (size_t k = 0; k < horizons_.size(); ++k) {
+                    const uint64_t ck = key(id, horizons_[k]);
+                    ++sel_lookups_;
+                    Learner::Proposal pr = learn_.propose(ck);
+                    if (!pr.act) continue;
+                    if (!have || pr.utility > best_u) {
+                        have = true; best_u = pr.utility;
+                        out.ctx = ck; out.ctx2 = gk; out.action = pr.action; out.arm = uint32_t(k);
+                    }
+                }
+            }
+            // The null action still competes at the second stage.
+            if (!have) { finish(id, line, true); return Proposal{}; }
             break;
         }
         case Select::Pooled: {
             const uint64_t ck = key(id, kPoolId);
+            ++gate_lookups_;
             Learner::Proposal pr = learn_.propose(ck);
-            if (!pr.act) return Proposal{};
+            if (!pr.act) { finish(id, line, false); return Proposal{}; }
+            ++gate_admits_;
             // The pooled estimator cannot tell the horizons apart, so it has no
             // basis for preferring one; it acts at a uniformly random horizon.
             out.ctx = ck; out.action = pr.action;
@@ -238,6 +311,7 @@ public:
         }
         }
 
+        finish(id, line, true);
         const int64_t t = lcfg_.outcome_delta ? int64_t(line) + out.action : out.action;
         if (t < 0) return Proposal{};
         out.act = true;
@@ -245,17 +319,36 @@ public:
         return out;
     }
 
-    void reward(uint64_t ctx, int64_t action, float r) override { learn_.reward(ctx, action, r); }
+    // A two-stage decision must pay both stages: the gate learns whether this
+    // situation was worth acting on at all, the arm learns whether this was the
+    // right moment.
+    void reward(uint64_t ctx, uint64_t ctx2, int64_t action, float r) override
+    {
+        learn_.reward(ctx, action, r);
+        if (ctx2) learn_.reward(ctx2, action, r);
+    }
 
-    size_t stateBytes() const override { return ctx_.stateBytes() + ring_.size() * 16; }
+    size_t stateBytes() const override { return ctx_.stateBytes() + ring_.size() * 24; }
     size_t tableBytes() const override { return learn_.tableBytes(); }
     uint64_t updateOps() const override { return ctx_.updateOps(); }
     uint64_t evictions() const override { return learn_.evictions(); }
     uint64_t inserts() const override { return learn_.inserts(); }
+    uint64_t gateLookups() const override { return gate_lookups_; }
+    uint64_t gateAdmits() const override { return gate_admits_; }
+    uint64_t selectorLookups() const override { return sel_lookups_; }
+    uint64_t selectorUpdates() const override { return sel_updates_; }
+    uint64_t pooledUpdates() const override { return pooled_updates_; }
     std::string label() const override { return label_; }
     const std::vector<int>& horizons() const { return horizons_; }
 
 private:
+    // Advance the delay ring, recording whether the gate admitted this context.
+    void finish(uint64_t id, uint64_t line, bool admitted)
+    {
+        ring_[size_t(seen_ % uint64_t(max_h_))] = Past{id, line, admitted};
+        ++seen_;
+    }
+
     static constexpr int kPoolId = 0x7FFF;
     static uint64_t key(uint64_t ctx, int h)
     {
@@ -270,11 +363,14 @@ private:
     std::string label_;
     ContextEngine ctx_;
     Learner learn_;
-    std::vector<std::pair<uint64_t, uint64_t>> ring_;
+    struct Past { uint64_t ctx = 0, line = 0; bool admitted = false; };
+    std::vector<Past> ring_;
     int max_h_ = 1;
     uint64_t seen_ = 0, rng_ = 0;
     uint64_t expl_ctx_ = 0;
     int64_t expl_action_ = 0;
+    uint64_t gate_lookups_ = 0, gate_admits_ = 0;
+    uint64_t sel_lookups_ = 0, sel_updates_ = 0, pooled_updates_ = 0;
 };
 
 // --------------------------------------------------------------- baselines --

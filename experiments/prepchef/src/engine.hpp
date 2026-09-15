@@ -117,7 +117,7 @@ public:
         l1.configure(cfg.l1_sets, cfg.l1_ways);
         p.reset();
 
-        struct Rec { uint64_t issue_index, issue_total; uint64_t ctx; int64_t action;
+        struct Rec { uint64_t issue_index, issue_total; uint64_t ctx, ctx2; int64_t action;
                      bool self_pf; uint32_t arm; };
         std::unordered_map<uint64_t, Rec> outstanding;
         outstanding.reserve(1u << 12);
@@ -145,7 +145,7 @@ public:
                 auto it = outstanding.find(ln);
                 if (it != outstanding.end() && it->second.issue_index == ix) {
                     ++m.wasted;
-                    p.reward(it->second.ctx, it->second.action, -cfg.waste);
+                    p.reward(it->second.ctx, it->second.ctx2, it->second.action, -cfg.waste);
                     outstanding.erase(it);
                 }
             }
@@ -168,7 +168,7 @@ public:
                     const float r = (cfg.reward_mode == RunCfg::Reward::Window)
                                         ? cfg.value
                                         : (would_miss ? cfg.value : -cfg.waste);
-                    p.reward(it->second.ctx, it->second.action, r);
+                    p.reward(it->second.ctx, it->second.ctx2, it->second.action, r);
                     outstanding.erase(it);
                     credited = true;
                 }
@@ -197,7 +197,8 @@ public:
                 } else if (outstanding.count(target)) {
                     ++m.dedup_suppressed;
                 } else {
-                    outstanding.emplace(target, Rec{di, i, pr.ctx, pr.action, self_pf, pr.arm});
+                    outstanding.emplace(target,
+                                        Rec{di, i, pr.ctx, pr.ctx2, pr.action, self_pf, pr.arm});
                     fifo.emplace_back(di, target);
                     ++m.issued;
                     bump_arm(m.arm_issued, pr.arm);

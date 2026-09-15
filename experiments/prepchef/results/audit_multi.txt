@@ -1,0 +1,14 @@
+
+##### trace sort: 16000000 refs #####
+
+=== G65 audit: multi-horizon predictor -- sort ===
+  engine: issued 117393 useful 84011 | indep: issued 117393 useful 84011
+  [PASS] Gate A holds for the multi-horizon predictor   
+  [PASS] duplicate outstanding fetches suppressed       
+  [PASS] multi-horizon scored region invariant to post-hoc corruption a=14785 b=14785
+  [PASS] Gate A holds for the two-stage (conditional) predictor engine=35738 indep=35738
+  [PASS] gate admits are a subset of gate lookups       
+  [PASS] selector is consulted only for admitted contexts sel=24506112 bound=24506112
+  [PASS] two-stage scored region invariant to post-hoc corruption 
+  single h=64 (> window 32): strict cov 62.02%, action rate 1.566%
+  multi-horizon audit passed

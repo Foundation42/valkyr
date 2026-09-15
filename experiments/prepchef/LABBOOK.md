@@ -618,6 +618,151 @@ now know is strong) and best fixed h at matched action rate.
 
 ---
 
+## G66 — Whether, then when: conditional horizon selection
+
+*(Registered follow-up to G65. Frozen: Bitty, realised reward, prices,
+protocol. Changed: the single decision is split into two.)*
+
+G65's pathology was that every horizon independently answered both questions,
+so each new context acquired |H| little gamblers, each entitled to its
+introductory free bet. G66 separates them:
+
+```
+        Bitty fading state
+                 │
+                 ▼
+     ┌───────────────────────┐   stage 1: one lookup, one slot per context
+     │  pooled value gate    │   "is this situation worth preparing for at all?"
+     └───────────┬───────────┘
+          no ◄───┴───► yes
+          │             │
+       NOTHING          ▼
+                 horizon selector       stage 2: consulted only for admitted
+                 1  2  3 ... |H|         contexts, on the lookup path *and*
+                        │                the learning path
+                        ▼
+                 prepare resource
+                        │
+                        ▼
+                 realised reward ──► pooled value  +  horizon evidence
+```
+
+The second stage is cold on **both** paths, which is why the delay ring had to
+start carrying the gate's decision: a context the gate rejected never creates a
+`(context, h)` slot at all. The reward fans out to both stages, which needed a
+second key on the proposal.
+
+**Registered hypothesis.** *Conditional horizon selection should approach the
+best fixed-horizon miss coverage at matched action rate, while its exploration
+and action overhead scales primarily with the number of contexts admitted by
+the pooled gate rather than with |H| across all contexts.*
+
+**Audits first.** The single-horizon audit output is byte-identical after the
+two-key reward change. The two-stage path gets its own: Gate A holds
+(engine and independent scorer agree at 35,738 useful on `sort`), admits are a
+subset of lookups, the selector is consulted only for admitted contexts
+(`sel = 24,506,112`, bound `24,506,112` — exactly tight), and the scored region
+is invariant to post-hoc trace corruption.
+
+### Clause 1 — quality: **supported, and exceeded on two traces**
+
+Best over the price sweep (0.05 … 4), miss-filtered:
+
+| trace | conditional (h32) | best fixed h (hindsight) | pooled | best-ev (flat) | cond-random |
+|-------|-------------------|--------------------------|--------|----------------|-------------|
+| sort | +5.41 @ 1.23% | +5.42 @ 1.23% | +5.42 | **+8.39** @ 3.9% | −0.04 |
+| tsort | **+9.68** @ 4.32% | +8.59 @ 4.06% | +4.98 | +4.71 @ 21% | −1.03 |
+| gcc | +0.10 @ 6.94% | +0.12 @ 7.42% | −1.84 | −12.10 | −2.07 |
+| python | +0.03 (coarse **+0.41**) | −1.56 | −3.06 | −8.72 | −3.04 |
+| awkhash | −0.61 @ 2.13% | −0.66 | −0.90 | −9.95 | −0.91 |
+| xz | −2.00 @ 4.35% | −2.03 | −2.16 | −16.11 | −2.06 |
+
+Conditional selection **matches or beats the hindsight ceiling on all six
+traces, without hindsight.** It beats it outright on `tsort` (+9.68 vs +8.59,
+36.7% vs 32.9% miss coverage at essentially the same action rate) and on
+`python`, where it produces that trace's first net-positive result in the whole
+lab (+0.41 coarse vs −1.56 for the best fixed horizon).
+
+The one place it loses is `sort`, where flat `best-ev` reaches 99.9% coverage
+at a 3.9% action rate (+8.39) and conditional settles at the h = 9 solution
+(+5.41). That aggressive mode is out of the gated architecture's reach.
+
+**The controls behave.**
+
+- **cond-random** — same gate, random arm — is catastrophic everywhere
+  (−0.04 to −3.04 against conditional's +5.41 to −2.00). **Resolution, not
+  gating alone, provides the gain.** This is the control that matters most and
+  it is unambiguous.
+- **pooled** is beaten on five of six and tied on `sort`: the second stage
+  earns its keep over timing-blind pooling.
+- **best-ev (flat)** is beaten on five of six.
+
+### Clause 2 — cost: **supported in direction, weaker than hoped in magnitude**
+
+| trace | admit rate | selector lookups / data ref (|H| = 32) | (|H| = 6) | inserts, conditional vs flat |
+|-------|-----------|----------------------------------------|-----------|------------------------------|
+| sort | 20.4% | 6.51 | 1.16 | 238k vs 744k |
+| tsort | 24.3% | 7.77 | 1.44 | 594k vs 1,150k |
+| gcc | 31.7% | 10.13 | 1.89 | 2,459k vs 4,082k |
+| python | 50.2% | 16.07 | 3.17 | 4,190k vs 4,194k (**table-capped**) |
+| awkhash | 22.0% | 7.04 | 1.31 | 526k vs 1,154k |
+| xz | 25.0% | 8.01 | 1.48 | 842k vs 1,483k |
+
+The scaling is real — a flat policy pays |H| selector lookups on *every*
+reference, a gated one pays admit-rate × |H| — but **the gate admits 20–50% of
+references, not the ~3% that would have made the second stage genuinely cold.**
+The saving is 2–5× on lookups and 1.7–3.1× on exploration slots, not an order
+of magnitude. Hot-path cost: 424–1,296 ns/ref at |H| = 32 against 63–129 for
+single-horizon.
+
+Why the gate is permissive: it is trained on evidence pooled across all |H|
+horizons, so its value estimate is positive for many contexts in which no
+*particular* horizon pays. The real filtering then happens at stage 2, whose
+null action declines most admitted contexts. Architecturally that is a
+reasonable division of labour — cheap stage permissive, precise stage
+decisive — but it is not the one the hypothesis predicted, and the cold path is
+lukewarm.
+
+**The practical configuration is the coarse fixture.** At |H| = 6 the selector
+runs 1.16–3.17 times per data reference and costs 121–312 ns/ref (≈2× single
+horizon), while matching or beating the hindsight ceiling on four of six traces
+and producing the best `python` result in the lab. Its one failure is `sort`,
+whose peak at h = 9 is not in the candidate set — which is exactly the price of
+coarse horizon quantisation that G65 was designed to measure.
+
+### Interpretation
+
+The separation is the right one. Splitting *whether* from *when* recovers
+everything horizon-as-action found and fixes what it broke: the action rate
+stays at single-horizon levels while the miss coverage moves to the best fixed
+horizon's and past it. And the mechanism is confirmed negatively as well as
+positively — take the resolution away (cond-random) and the gain vanishes
+entirely, so it is not the gate doing the work alone.
+
+What the experiment does **not** support is the cost story as registered. The
+second stage is cheaper than a flat search but not cold, because a gate trained
+on pooled evidence is not selective enough to keep it cold. Making the gate
+sharper — without making it a second horizon predictor — is the open problem.
+
+### Next experiment (designed, not built)
+
+The gate is permissive because pooled evidence conflates "some horizon pays
+here" with "this context pays". A sharper stage-1 signal that costs nothing
+extra is already being computed: the **max** over arms of realised value for
+contexts previously admitted. Cache that scalar per context at stage 2 and let
+stage 1 gate on it, falling back to the pooled estimate only for contexts never
+yet admitted. That keeps one slot per context for the gate, adds no lookups,
+and should pull the admit rate down towards the action rate. Registered
+controls: the present pooled gate (which we now know is permissive but
+effective), and an oracle gate admitting exactly the references at which some
+arm would have earned positive reward, as the ceiling on what gate sharpening
+can buy.
+
+**Bitty remains frozen.** It has now been innocent through every crime
+investigated.
+
+---
+
 ## Threats to validity
 
 1. **L1 only.** The counterfactual is a 32 KB 8-way L1 with no L2/LLC, no
@@ -644,7 +789,11 @@ now know is strong) and best fixed h at matched action rate.
    gate.** A gate that could decide "not worth trying" without trying would not
    pay it. The finding is about this gate, not about horizon selection in
    general.
-8. `signed_hash_features` is a splitmix64 bit-extraction, not necessarily the
+8. **`python` at |H| = 32 saturates the context table** (4,190,336 inserts
+   against a 4,194,304-slot table), so its G66 numbers at full resolution are
+   measured under thrashing. The coarse fixture does not saturate and is the
+   figure to trust for that trace.
+9. `signed_hash_features` is a splitmix64 bit-extraction, not necessarily the
    original hash. Any deterministic ±1 hash should behave the same, but this
    has not been verified against the original.
 
